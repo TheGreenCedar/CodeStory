@@ -111,9 +111,18 @@ impl Fixture {
         fixture
     }
 
-    fn set_forward_schema(&self) {
+    fn set_forward_schema(&self) -> u32 {
         // Fault a real complete current generation to model a future writer.
         // This is not an archived schema fixture or a newer-binary claim.
+        // The forward version is the seeded database's own schema plus one —
+        // the seeded bytes carry the build's CURRENT_SCHEMA_VERSION, so this
+        // stays forward no matter which schema the binary ships.
+        let seeded: u32 =
+            Connection::open_with_flags(&self.database, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("read seeded schema")
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .expect("seeded schema version");
+        let forward = seeded + 1;
         let original = fs::metadata(&self.database)
             .expect("metadata")
             .permissions();
@@ -132,7 +141,7 @@ impl Fixture {
         assert_eq!(&bytes[..16], b"SQLite format 3\0");
         // SQLite's user_version is the big-endian word at header offset 60.
         // Change exactly this fault boundary, without enabling a WAL writer.
-        bytes[60..64].copy_from_slice(&36_u32.to_be_bytes());
+        bytes[60..64].copy_from_slice(&forward.to_be_bytes());
         fs::set_permissions(&self.database, writable).expect("fixture writable");
         fs::write(&self.database, bytes).expect("forward-schema header fault");
         fs::set_permissions(&self.database, original).expect("restore sealed permissions");
@@ -149,7 +158,7 @@ impl Fixture {
         let version: u32 = reader
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("forward schema version");
-        assert_eq!(version, 36);
+        assert_eq!(version, forward);
         for table in ["node", "edge", "index_publication"] {
             let count: i64 = reader
                 .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
@@ -158,6 +167,7 @@ impl Fixture {
                 .expect("retained complete graph/publication");
             assert!(count > 0, "{table} must survive fault injection");
         }
+        forward
     }
 
     fn run(&self, args: &[&str]) -> Output {
@@ -236,17 +246,18 @@ fn dry_run_identifies_newer_immutable_core_without_mutation() {
 #[test]
 fn confirmed_reset_recovers_newer_immutable_core_and_preserves_annotations() {
     let fixture = Fixture::new();
-    fixture.set_forward_schema();
+    let forward = fixture.set_forward_schema();
     let refused = fixture.run(&["index", "--refresh", "full", "--format", "json"]);
     assert!(
         !refused.status.success(),
         "newer schema must refuse ordinary full refresh"
     );
     let refused_json: Value = serde_json::from_slice(&refused.stdout).expect("JSON error");
+    let expected = format!("Unsupported database schema version: {forward}");
     assert!(
         refused_json["error"]["message"]
             .as_str()
-            .is_some_and(|message| message.contains("Unsupported database schema version: 36")),
+            .is_some_and(|message| message.contains(&expected)),
         "{refused:?}"
     );
     let annotations = snapshot_annotations(&fixture.cache);

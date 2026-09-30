@@ -87,6 +87,7 @@ pub(super) fn run_smoke(cmd: SmokeCommand) -> Result<()> {
                 embedding_retry: None,
                 disk_space: None,
                 coverage_gaps: Vec::new(),
+                peer_writer: None,
             },
         ))
         .with_context(serde_json::to_value(&output).context("serialize smoke failure context")?);

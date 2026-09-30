@@ -1510,13 +1510,15 @@ fn resolve_descriptor_batch_mode(
 mod tests {
     use super::*;
     use crate::CandidateHit;
-    use crate::index::finalize_index;
     use crate::sidecar_search::SidecarSearch;
     use crate::test_support::retrieval_manifest_fixture;
+    #[cfg(feature = "test-support")]
     use codestory_contracts::graph::{Node, NodeId, NodeKind};
-    use codestory_store::{FileInfo, FileRole, LlmSymbolDoc, SearchSymbolProjection};
+    #[cfg(feature = "test-support")]
+    use codestory_store::FileInfo;
+    use codestory_store::FileRole;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
     use tempfile::TempDir;
 
@@ -2500,10 +2502,17 @@ mod tests {
 
     #[test]
     fn strict_batch_slow_prefetch_falls_back_within_item_budgets() {
-        struct SlowPrefetchSidecars;
+        struct SlowPrefetchSidecars {
+            prefetch_observed_ms: AtomicU64,
+        }
 
         impl SidecarSearch for SlowPrefetchSidecars {
+            /// Slower than the ~50ms remaining budget the charged prefetch
+            /// leaves a 100ms item, but faster than an uncharged 100ms budget:
+            /// the stage can only complete if the prefetch elapsed was never
+            /// subtracted.
             fn lexical_search(&self, query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                std::thread::sleep(Duration::from_millis(80));
                 Ok(vec![CandidateHit::lexical_stub(
                     format!("src/{query}.rs"),
                     1.0,
@@ -2515,9 +2524,14 @@ mod tests {
                 _queries: &[(String, usize)],
                 context: &SearchExecutionContext,
             ) -> Result<Option<Vec<Vec<CandidateHit>>>> {
+                let started = Instant::now();
                 while !context.is_cancelled() {
                     std::thread::sleep(Duration::from_millis(1));
                 }
+                self.prefetch_observed_ms.store(
+                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    Ordering::Release,
+                );
                 anyhow::bail!("simulated slow lexical prefetch")
             }
 
@@ -2538,6 +2552,9 @@ mod tests {
             }
         }
 
+        let sidecars = Arc::new(SlowPrefetchSidecars {
+            prefetch_observed_ms: AtomicU64::new(0),
+        });
         let queries = [
             QueryBatchItem {
                 query: "alpha flow",
@@ -2549,7 +2566,7 @@ mod tests {
             },
         ];
         let results = execute_strict_retrieval_query_batch_against_sidecars(
-            Arc::new(SlowPrefetchSidecars),
+            sidecars.clone(),
             Some(manifest_for("testproj", "slow-prefetch", 2)),
             Arc::new(HashMap::new()),
             cancellation_flag(),
@@ -2560,12 +2577,31 @@ mod tests {
         )
         .expect("slow prefetch falls back");
 
+        // The prefetch must be bounded by roughly half of the smallest item
+        // budget (100ms / 2 = 50ms): the batch returned at all, so the shared
+        // context cancelled the loop, and the observed duration proves it was
+        // the prefetch deadline rather than an unbounded wait.
+        let observed = sidecars.prefetch_observed_ms.load(Ordering::Acquire);
+        assert!(
+            (30..=90).contains(&observed),
+            "prefetch context did not apply the half-budget deadline: {observed}ms"
+        );
         assert!(results.iter().all(|result| {
             result.trace.total_budget_ms == 100
+                // The measured prefetch elapsed is folded into the item's
+                // elapsed time, so the charge is visible in the trace.
+                && result.trace.elapsed_ms >= observed.min(30)
+                // The remaining ~50ms cannot fit the 80ms lexical stage; a
+                // completed stage would prove the prefetch was never charged.
+                && result.trace.stages.iter().any(|stage| {
+                    stage.stage == crate::planner::RetrievalStageKind::Stage1Lexical
+                        && stage.completion_status
+                            != crate::executor::StageCompletionStatus::Completed
+                })
                 && result
                     .hits
                     .iter()
-                    .any(|hit| hit.provenance.iter().any(|label| label == "lexical_source"))
+                    .all(|hit| !hit.provenance.iter().any(|label| label == "lexical_source"))
         }));
     }
 
@@ -2947,123 +2983,92 @@ mod tests {
         assert!(error.to_string().contains("cancelled"));
     }
 
+    #[cfg(feature = "test-support")]
     #[test]
-    #[ignore = "requires a live embedding runtime; run explicitly with cargo test -p codestory-retrieval integration_query_against_fixture_manifest -- --ignored --nocapture"]
     fn integration_query_against_fixture_manifest() {
-        if crate::embeddings::embed_query("function").is_err() {
-            return;
-        }
+        use crate::test_support::env_lock;
+        use codestory_store::{IndexPublicationMode, IndexPublicationRecord};
 
+        let _env = env_lock();
         let project = TempDir::new().expect("project");
-        std::fs::write(
-            project.path().join("lib.rs"),
-            "pub fn extension_service() {}",
-        )
-        .expect("write");
+        let lib_path = project.path().join("lib.rs");
+        std::fs::write(&lib_path, "pub fn extension_service() {}\n").expect("write");
         let storage_dir = TempDir::new().expect("storage");
+        let cache_root = TempDir::new().expect("cache root");
         let storage_path = storage_dir.path().join("codestory.db");
+        let publication = IndexPublicationRecord {
+            generation: 1,
+            generation_id: "11111111-1111-4111-8111-111111111111".into(),
+            run_id: "run-one".into(),
+            mode: IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
         {
             let mut storage = Store::open(&storage_path).expect("open db");
-            let file_id = 10_i64;
-            let source_path = project.path().join("lib.rs");
             storage
                 .insert_file(&FileInfo {
-                    id: file_id,
-                    path: source_path.clone(),
+                    id: 1,
+                    path: lib_path.clone(),
                     language: "rust".to_string(),
-                    modification_time: live_mtime_millis(&source_path),
+                    modification_time: live_mtime_millis(&lib_path),
                     indexed: true,
                     complete: true,
                     line_count: 1,
-                    file_role: FileRole::Entrypoint,
+                    file_role: FileRole::Source,
                 })
-                .expect("insert file");
-            storage
-                .insert_nodes_batch(&[
-                    Node {
-                        id: NodeId(file_id),
-                        kind: NodeKind::FILE,
-                        serialized_name: "lib.rs".to_string(),
-                        qualified_name: None,
-                        canonical_id: None,
-                        file_node_id: None,
-                        start_line: Some(1),
-                        start_col: Some(0),
-                        end_line: Some(1),
-                        end_col: Some(0),
-                    },
-                    Node {
-                        id: NodeId(11),
-                        kind: NodeKind::FUNCTION,
-                        serialized_name: "extension_service".to_string(),
-                        qualified_name: Some("extension_service".to_string()),
-                        canonical_id: None,
-                        file_node_id: Some(NodeId(file_id)),
-                        start_line: Some(1),
-                        start_col: Some(0),
-                        end_line: Some(1),
-                        end_col: Some(30),
-                    },
-                ])
-                .expect("insert nodes");
-            storage
-                .upsert_search_symbol_projection_batch(&[SearchSymbolProjection {
-                    node_id: NodeId(11),
-                    display_name: "extension_service".to_string(),
-                }])
-                .expect("projection");
-            storage
-                .upsert_llm_symbol_docs_batch(&[LlmSymbolDoc {
-                    node_id: NodeId(11),
-                    file_node_id: Some(NodeId(file_id)),
-                    kind: NodeKind::FUNCTION,
-                    display_name: "extension_service".to_string(),
-                    qualified_name: Some("extension_service".to_string()),
-                    file_path: Some(project.path().join("lib.rs").display().to_string()),
-                    start_line: Some(1),
-                    doc_text:
-                        "semantic_doc_version: 4\nsymbol_kind: FUNCTION\nname: extension_service"
-                            .to_string(),
-                    doc_version: 4,
-                    doc_hash: "extension-service-doc".to_string(),
-                    embedding_profile: Some("coderank-embed".to_string()),
-                    embedding_model: "legacy-producer".to_string(),
-                    embedding_backend: Some("legacy".to_string()),
-                    embedding_dim: 768,
-                    doc_shape: Some("semantic_doc_version=4;scope=durable_symbols".to_string()),
-                    semantic_policy_version: Some(
-                        crate::generation::SEMANTIC_POLICY_VERSION.into(),
-                    ),
-                    dense_reason: Some("public_api".into()),
-                    embedding: vec![0.01; 768],
-                    updated_at_epoch_ms: chrono::Utc::now().timestamp_millis(),
-                }])
-                .expect("semantic doc");
+                .expect("insert indexed file");
+            crate::test_support::publish_complete_core_fixture(
+                &mut storage,
+                project.path(),
+                &publication,
+            )
+            .expect("publish complete core fixture");
         }
-        if let Err(error) = finalize_index(project.path(), &storage_path) {
-            eprintln!(
-                "skipping live retrieval query fixture because sidecar indexing failed: {error:#}"
-            );
-            return;
-        }
+        let runtime = crate::config::with_test_cache_root(cache_root.path(), || {
+            SidecarRuntimeConfig::for_project_profile(
+                Some(project.path()),
+                crate::SidecarProfile::Local,
+            )
+        });
+        crate::test_support::publish_zero_dense_pinned_query_fixture(
+            project.path(),
+            &storage_path,
+            &runtime,
+        )
+        .expect("publish strict query fixture");
 
-        let result = execute_retrieval_query(QueryRequest {
-            project_root: project.path(),
-            storage_path: &storage_path,
-            query: "extension",
-            budget_ms: Some(500),
-            cancelled: None,
+        let result = crate::config::with_test_cache_root(cache_root.path(), || {
+            execute_retrieval_query(QueryRequest {
+                project_root: project.path(),
+                storage_path: &storage_path,
+                query: "extension",
+                budget_ms: Some(500),
+                cancelled: None,
+            })
         })
         .expect("query");
 
         assert_eq!(result.trace.retrieval_mode, "full");
-        assert!(!result.hits.is_empty() || !result.trace.stages.is_empty());
+        assert!(
+            result.trace.stages.iter().any(|stage| {
+                stage.completion_status == crate::executor::StageCompletionStatus::Completed
+                    && stage.candidates_added > 0
+            }),
+            "strict fixture query must produce candidate evidence from a completed stage: {:?}",
+            result.trace.stages
+        );
+        assert!(
+            !result.hits.is_empty(),
+            "strict fixture query must return real hits: {:?}",
+            result.hits
+        );
     }
 
     #[test]
     fn query_rejects_legacy_manifest_before_sidecar_access() {
         let project = TempDir::new().expect("project");
         let storage_dir = TempDir::new().expect("storage");
+        let cache_root = TempDir::new().expect("cache root");
         let storage_path = storage_dir.path().join("codestory.db");
         let project_id = crate::index::project_id_for_root(project.path());
         {
@@ -3096,12 +3101,14 @@ mod tests {
                 .expect("manifest");
         }
 
-        let error = execute_retrieval_query(QueryRequest {
-            project_root: project.path(),
-            storage_path: &storage_path,
-            query: "ExtensionHostManager",
-            budget_ms: Some(100),
-            cancelled: None,
+        let error = crate::config::with_test_cache_root(cache_root.path(), || {
+            execute_retrieval_query(QueryRequest {
+                project_root: project.path(),
+                storage_path: &storage_path,
+                query: "ExtensionHostManager",
+                budget_ms: Some(100),
+                cancelled: None,
+            })
         })
         .expect_err("legacy manifests must fail closed");
 
@@ -3112,6 +3119,7 @@ mod tests {
     fn query_rejects_manifest_with_stale_projection_count() {
         let project = TempDir::new().expect("project");
         let storage_dir = TempDir::new().expect("storage");
+        let cache_root = TempDir::new().expect("cache root");
         let storage_path = storage_dir.path().join("codestory.db");
         let project_id = crate::index::project_id_for_root(project.path());
         {
@@ -3121,135 +3129,170 @@ mod tests {
                 .expect("manifest");
         }
 
-        let error = execute_retrieval_query(QueryRequest {
-            project_root: project.path(),
-            storage_path: &storage_path,
-            query: "ExtensionHostManager",
-            budget_ms: Some(100),
-            cancelled: None,
+        let error = crate::config::with_test_cache_root(cache_root.path(), || {
+            execute_retrieval_query(QueryRequest {
+                project_root: project.path(),
+                storage_path: &storage_path,
+                query: "ExtensionHostManager",
+                budget_ms: Some(100),
+                cancelled: None,
+            })
         })
         .expect_err("stale manifests must fail closed");
 
         assert!(error.to_string().contains("retrieval_manifest_stale"));
     }
 
-    #[test]
-    fn query_rejects_manifest_when_indexed_file_changes_or_is_removed() {
-        let project = TempDir::new().expect("project");
-        let storage_dir = TempDir::new().expect("storage");
+    /// Fixture shared by the source-change rejection tests: a strict-valid
+    /// pinned publication whose manifest was computed from the real input
+    /// fingerprint, so every gate ahead of the source-change check passes and
+    /// the observed refusal can only come from the workspace freshness plan.
+    #[cfg(feature = "test-support")]
+    fn publish_strict_source_fixture(
+        project: &TempDir,
+        storage_dir: &TempDir,
+        cache_root: &TempDir,
+    ) -> (PathBuf, SidecarRuntimeConfig) {
+        use codestory_store::{IndexPublicationMode, IndexPublicationRecord};
+
         let storage_path = storage_dir.path().join("codestory.db");
         let source_path = project.path().join("src").join("lib.rs");
         std::fs::create_dir_all(source_path.parent().expect("source parent"))
             .expect("create source parent");
         std::fs::write(&source_path, "pub fn indexed() {}\n").expect("write source");
         let indexed_mtime = live_mtime_millis(&source_path);
-        let project_id = crate::index::project_id_for_root(project.path());
-        {
-            let mut storage = Store::open(&storage_path).expect("open db");
-            storage
-                .insert_file(&FileInfo {
-                    id: 1,
-                    path: source_path.clone(),
-                    language: "rust".into(),
-                    modification_time: indexed_mtime,
-                    indexed: true,
-                    complete: true,
-                    line_count: 1,
-                    file_role: FileRole::Source,
-                })
-                .expect("insert indexed file");
-            storage
-                .upsert_retrieval_index_manifest(&manifest_for(
-                    &project_id,
-                    "changedfeedcafebeef",
-                    0,
-                ))
-                .expect("manifest");
-        }
+        let publication = IndexPublicationRecord {
+            generation: 1,
+            generation_id: "11111111-1111-4111-8111-111111111111".into(),
+            run_id: "run-one".into(),
+            mode: IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        let mut store = Store::open(&storage_path).expect("open db");
+        store
+            .insert_file(&FileInfo {
+                id: 1,
+                path: source_path.clone(),
+                language: "rust".into(),
+                modification_time: indexed_mtime,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: FileRole::Source,
+            })
+            .expect("insert indexed file");
+        crate::test_support::publish_complete_core_fixture(
+            &mut store,
+            project.path(),
+            &publication,
+        )
+        .expect("publish complete core fixture");
+        drop(store);
+        let runtime = crate::config::with_test_cache_root(cache_root.path(), || {
+            SidecarRuntimeConfig::for_project_profile(
+                Some(project.path()),
+                crate::SidecarProfile::Local,
+            )
+        });
+        crate::test_support::publish_zero_dense_pinned_query_fixture(
+            project.path(),
+            &storage_path,
+            &runtime,
+        )
+        .expect("publish strict source fixture");
+        (source_path, runtime)
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn query_rejects_manifest_when_indexed_file_changes_or_is_removed() {
+        use crate::test_support::env_lock;
+
+        let _env = env_lock();
+        let project = TempDir::new().expect("project");
+        let storage_dir = TempDir::new().expect("storage");
+        let cache_root = TempDir::new().expect("cache root");
+        let storage_path = storage_dir.path().join("codestory.db");
+        let (source_path, _runtime) =
+            publish_strict_source_fixture(&project, &storage_dir, &cache_root);
 
         std::thread::sleep(std::time::Duration::from_millis(5));
         std::fs::write(&source_path, "pub fn indexed() -> usize { 1 }\n").expect("mutate source");
-        let changed_error = execute_retrieval_query(QueryRequest {
-            project_root: project.path(),
-            storage_path: &storage_path,
-            query: "indexed",
-            budget_ms: Some(100),
-            cancelled: None,
+        let changed_error = crate::config::with_test_cache_root(cache_root.path(), || {
+            execute_retrieval_query(QueryRequest {
+                project_root: project.path(),
+                storage_path: &storage_path,
+                query: "indexed",
+                budget_ms: Some(100),
+                cancelled: None,
+            })
         })
         .expect_err("changed indexed file must fail closed");
         assert!(
             changed_error
                 .to_string()
-                .contains("retrieval_manifest_stale")
+                .contains("indexable_file_added_or_changed_after_retrieval_manifest"),
+            "expected the source-change refusal, got: {changed_error:#}"
         );
 
         std::fs::remove_file(&source_path).expect("remove source");
-        let removed_error = execute_retrieval_query(QueryRequest {
-            project_root: project.path(),
-            storage_path: &storage_path,
-            query: "indexed",
-            budget_ms: Some(100),
-            cancelled: None,
+        let removed_error = crate::config::with_test_cache_root(cache_root.path(), || {
+            execute_retrieval_query(QueryRequest {
+                project_root: project.path(),
+                storage_path: &storage_path,
+                query: "indexed",
+                budget_ms: Some(100),
+                cancelled: None,
+            })
         })
         .expect_err("removed indexed file must fail closed");
         assert!(
             removed_error
                 .to_string()
-                .contains("retrieval_manifest_stale")
+                .contains("indexed_file_removed_after_retrieval_manifest"),
+            "expected the source-removal refusal, got: {removed_error:#}"
         );
     }
 
+    #[cfg(feature = "test-support")]
     #[test]
     fn query_rejects_manifest_when_new_indexable_file_is_added() {
+        use crate::test_support::env_lock;
+
+        let _env = env_lock();
         let project = TempDir::new().expect("project");
         let storage_dir = TempDir::new().expect("storage");
+        let cache_root = TempDir::new().expect("cache root");
         let storage_path = storage_dir.path().join("codestory.db");
-        let source_path = project.path().join("src").join("lib.rs");
-        std::fs::create_dir_all(source_path.parent().expect("source parent"))
-            .expect("create source parent");
-        std::fs::write(&source_path, "pub fn indexed() {}\n").expect("write source");
-        let indexed_mtime = live_mtime_millis(&source_path);
-        let project_id = crate::index::project_id_for_root(project.path());
-        {
-            let mut storage = Store::open(&storage_path).expect("open db");
-            storage
-                .insert_file(&FileInfo {
-                    id: 1,
-                    path: source_path.clone(),
-                    language: "rust".into(),
-                    modification_time: indexed_mtime,
-                    indexed: true,
-                    complete: true,
-                    line_count: 1,
-                    file_role: FileRole::Source,
-                })
-                .expect("insert indexed file");
-            storage
-                .upsert_retrieval_index_manifest(&manifest_for(
-                    &project_id,
-                    "newfilefeedcafebeef",
-                    0,
-                ))
-                .expect("manifest");
-        }
+        let (_source_path, _runtime) =
+            publish_strict_source_fixture(&project, &storage_dir, &cache_root);
+
         std::fs::write(
             project.path().join("src").join("new_module.rs"),
             "pub fn newly_added() {}\n",
         )
         .expect("write new source");
 
-        let error = execute_retrieval_query(QueryRequest {
-            project_root: project.path(),
-            storage_path: &storage_path,
-            query: "newly_added",
-            budget_ms: Some(100),
-            cancelled: None,
+        let error = crate::config::with_test_cache_root(cache_root.path(), || {
+            execute_retrieval_query(QueryRequest {
+                project_root: project.path(),
+                storage_path: &storage_path,
+                query: "newly_added",
+                budget_ms: Some(100),
+                cancelled: None,
+            })
         })
         .expect_err("new indexable file must fail closed");
 
-        assert!(error.to_string().contains("retrieval_manifest_stale"));
+        assert!(
+            error
+                .to_string()
+                .contains("indexable_file_added_or_changed_after_retrieval_manifest"),
+            "expected the source-addition refusal, got: {error:#}"
+        );
     }
 
+    #[cfg(feature = "test-support")]
     fn live_mtime_millis(path: &Path) -> i64 {
         std::fs::metadata(path)
             .expect("metadata")

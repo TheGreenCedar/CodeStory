@@ -1,7 +1,3 @@
-#[cfg(test)]
-use crate::search_runtime::HybridSearchConfig;
-#[cfg(test)]
-use codestory_contracts::api::{AgentHybridWeightsDto, SearchHybridLimitsDto};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -25,55 +21,6 @@ pub(crate) const SEMANTIC_FILE_TEXT_CACHE_MAX_BYTES: usize = 64 * 1_024 * 1_024;
 /// `.codestory.toml` override.
 pub(crate) fn hybrid_retrieval_enabled() -> bool {
     codestory_retrieval::hybrid_retrieval_enabled_from_process_env()
-}
-
-#[cfg(test)]
-pub(crate) fn normalized_hybrid_weights(
-    request_weights: Option<AgentHybridWeightsDto>,
-    fallback: &HybridSearchConfig,
-) -> (f32, f32, f32) {
-    let lexical = request_weights
-        .as_ref()
-        .and_then(|weights| weights.lexical)
-        .unwrap_or(fallback.lexical_weight)
-        .clamp(0.0, 1.0);
-    let semantic = request_weights
-        .as_ref()
-        .and_then(|weights| weights.semantic)
-        .unwrap_or(fallback.semantic_weight)
-        .clamp(0.0, 1.0);
-    let graph = request_weights
-        .and_then(|weights| weights.graph)
-        .unwrap_or(fallback.graph_weight)
-        .clamp(0.0, 1.0);
-
-    let sum = lexical + semantic + graph;
-    if sum <= f32::EPSILON {
-        return (
-            fallback.lexical_weight,
-            fallback.semantic_weight,
-            fallback.graph_weight,
-        );
-    }
-
-    (lexical / sum, semantic / sum, graph / sum)
-}
-
-#[cfg(test)]
-pub(crate) fn apply_hybrid_limits(
-    request_limits: Option<SearchHybridLimitsDto>,
-    config: &mut HybridSearchConfig,
-) {
-    const MAX_CANDIDATE_LIMIT: u32 = 1_000;
-    let Some(limits) = request_limits else {
-        return;
-    };
-    if let Some(lexical) = limits.lexical {
-        config.lexical_limit = lexical.min(MAX_CANDIDATE_LIMIT) as usize;
-    }
-    if let Some(semantic) = limits.semantic {
-        config.semantic_limit = semantic.min(MAX_CANDIDATE_LIMIT) as usize;
-    }
 }
 
 pub(crate) fn node_display_name(node: &codestory_contracts::graph::Node) -> String {

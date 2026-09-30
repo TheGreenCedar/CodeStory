@@ -1,14 +1,16 @@
 use super::super::{
-    EmbeddingCompatibility, EmbeddingConnectIntent, PerUserEmbeddingClient, PerUserEmbeddingError,
-    RETRIEVAL_EMBEDDING_DIM, embedding_capacity_pressure, embedding_retry_state,
-    embedding_scope_id, is_server_loss,
+    EmbeddingCompatibility, EmbeddingConnectIntent, EmbeddingOperation, EmbeddingResult,
+    PerUserEmbeddingClient, PerUserEmbeddingError, RETRIEVAL_EMBEDDING_DIM,
+    embedding_capacity_pressure, embedding_retry_state, embedding_scope_id, is_server_loss,
 };
 use super::{
-    BootstrapConnectOutcome, BootstrapTestTransport, ClientTestTransport,
-    ControlledCancelTestTransport, DeadlineBudgetTransport, ExplicitDeadlineTransport, test_client,
+    BlockingScriptState, BootstrapConnectOutcome, BootstrapTestTransport, ClientTestTransport,
+    ControlledCancelTestTransport, DeadlineBudgetTransport, ExplicitDeadlineTransport,
+    ScriptOutcome, ScriptStream, test_cancel_token, test_client,
 };
 use crate::config::SidecarRuntimeConfig;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -300,9 +302,116 @@ fn caller_cancellation_interrupts_active_rpc_over_authenticated_control_connecti
     assert_eq!(retry.code, "embedding_cancelled");
     assert_eq!(retry.retry_class, "none");
     assert!(transport.server_cancelled.load(Ordering::Acquire));
+    {
+        let state = transport
+            .blocking_state
+            .lock()
+            .expect("scripted blocking state");
+        assert!(
+            state.active_request_id.is_some() && state.active_cancel_token.is_some(),
+            "the scripted server must have recorded the admitted request's credentials"
+        );
+        assert_eq!(
+            state.rejected_cancels, 0,
+            "the client-sent cancel must authenticate against the recorded request"
+        );
+    }
     assert!(
         transport.connect_count.load(Ordering::Acquire) >= 2,
         "the watcher must use a separate authenticated control connection"
+    );
+
+    // Credential discrimination on the scripted server itself: a cancel naming
+    // the wrong request, or carrying a well-formed foreign token, is Released
+    // rather than Cancelled — matching server/connection.rs — and a malformed
+    // token fails closed as embedding_server_cancel_token_invalid.
+    let scripted_cancelled = Arc::new(AtomicBool::new(false));
+    let scripted_state = Arc::new(Mutex::new(BlockingScriptState::default()));
+    let mut scripted = ScriptStream::new(
+        ScriptOutcome::Blocking {
+            request_started: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::clone(&scripted_cancelled),
+            state: Arc::clone(&scripted_state),
+        },
+        EmbeddingCompatibility::current(true),
+    );
+    let compatibility = EmbeddingCompatibility::current(true);
+    scripted
+        .response_for_request(super::super::exchange::request(
+            "request-active",
+            compatibility.clone(),
+            EmbeddingOperation::EmbedQuery {
+                scope_id: "test-scope".into(),
+                deadline_ms: 1000,
+                retry_after_ms: 0,
+                cancel_token: Some(test_cancel_token()),
+                input: "x".into(),
+            },
+        ))
+        .expect("admit the scripted request");
+
+    let wrong_token = "00000000-0000-4000-8000-000000000001";
+    for (target_request_id, cancel_token, label) in [
+        ("request-active", wrong_token, "foreign token"),
+        (
+            "request-other",
+            test_cancel_token().as_str(),
+            "wrong target request",
+        ),
+        (
+            "request-active",
+            test_cancel_token().as_str(),
+            "correct credentials",
+        ),
+    ] {
+        let (response, _) = scripted
+            .response_for_request(super::super::exchange::request(
+                &format!("cancel-{label}"),
+                compatibility.clone(),
+                EmbeddingOperation::Cancel {
+                    target_request_id: target_request_id.into(),
+                    cancel_token: cancel_token.into(),
+                },
+            ))
+            .expect("scripted cancel response")
+            .expect("a cancel always earns a response");
+        let expected_cancelled = label == "correct credentials";
+        match &response.result {
+            Some(EmbeddingResult::Cancelled) => {
+                assert!(expected_cancelled, "{label} cancelled without credentials")
+            }
+            Some(EmbeddingResult::Released) => {
+                assert!(!expected_cancelled, "{label} released valid credentials")
+            }
+            other => panic!("{label}: unexpected cancel result {other:?}"),
+        }
+        assert_eq!(
+            scripted_cancelled.load(Ordering::Acquire),
+            expected_cancelled,
+            "{label} must {}the scripted request",
+            if expected_cancelled {
+                "end "
+            } else {
+                "not end "
+            }
+        );
+    }
+    assert_eq!(scripted_state.lock().expect("state").rejected_cancels, 2);
+
+    let (response, _) = scripted
+        .response_for_request(super::super::exchange::request(
+            "cancel-malformed",
+            compatibility,
+            EmbeddingOperation::Cancel {
+                target_request_id: "request-active".into(),
+                cancel_token: "not-a-token".into(),
+            },
+        ))
+        .expect("scripted cancel response")
+        .expect("a cancel always earns a response");
+    assert_eq!(
+        response.error.map(|error| error.code).as_deref(),
+        Some("embedding_server_cancel_token_invalid")
     );
 }
 

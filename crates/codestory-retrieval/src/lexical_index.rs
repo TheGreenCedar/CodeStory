@@ -2859,6 +2859,11 @@ fn query_exact_candidates(
     Ok(candidates)
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static DESCRIPTOR_FTS_BODY_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Prove descriptor token coverage without fail-open FTS-lane credit.
 ///
 /// 1. Path and symbol names are matched in memory.
@@ -2920,6 +2925,8 @@ fn populate_descriptor_token_matches_fail_closed(
             "SELECT rowid, lower(content) FROM lexical_fts WHERE rowid IN ({placeholders})"
         );
         let mut statement = connection.prepare_cached(&sql)?;
+        #[cfg(test)]
+        DESCRIPTOR_FTS_BODY_READS.set(DESCRIPTOR_FTS_BODY_READS.get() + 1);
         let rows = statement.query_map(params_from_iter(chunk.iter().copied()), |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })?;
@@ -5190,9 +5197,10 @@ mod tests {
             || Ok(()),
         )
         .expect("incremental shard");
-        let Some(work) = work else {
-            return;
-        };
+        let work = work.expect(
+            "a readable predecessor must take the incremental path; a silent full \
+             rebuild would bypass every parity assertion below",
+        );
         assert_eq!(work.retained, 1);
         assert_eq!(work.inserted, 2);
         assert_eq!(work.removed, 2);
@@ -6392,6 +6400,19 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_body_read_accounting_does_not_cross_threads() {
+        DESCRIPTOR_FTS_BODY_READS.set(0);
+        std::thread::spawn(descriptor_content_multi_token_admits_via_batched_body_proof)
+            .join()
+            .expect("independent descriptor query");
+        assert_eq!(
+            DESCRIPTOR_FTS_BODY_READS.get(),
+            0,
+            "another request's body reads must not contaminate this thread"
+        );
+    }
+
+    #[test]
     fn descriptor_path_symbol_multi_token_admits_without_fts_requery() {
         let project = TempDir::new().expect("project");
         std::fs::create_dir_all(project.path().join("src")).expect("src");
@@ -6407,7 +6428,7 @@ mod tests {
             "descriptor-path-symbol-admit",
             "input",
         );
-        let started = std::time::Instant::now();
+        DESCRIPTOR_FTS_BODY_READS.set(0);
         let descriptors = search_lexical_index_descriptors_with_cancel(
             &shard,
             "input",
@@ -6416,7 +6437,6 @@ mod tests {
             || false,
         )
         .expect("descriptor search");
-        let elapsed = started.elapsed();
         assert!(
             descriptors.iter().any(|hit| {
                 hit.path.contains("alpha_beta_handler")
@@ -6424,9 +6444,11 @@ mod tests {
             }),
             "path/symbol must honestly clear the two-of-three gate for alpha+beta: {descriptors:?}"
         );
-        assert!(
-            elapsed < std::time::Duration::from_millis(500),
-            "descriptor token coverage must not re-query FTS per token; elapsed={elapsed:?}"
+        assert_eq!(
+            DESCRIPTOR_FTS_BODY_READS.get(),
+            0,
+            "a path/symbol-covered candidate must not pay any FTS body re-read; \
+             per-token coverage re-query is the Keycloak-class cost this gate exists to avoid"
         );
     }
 
@@ -6438,6 +6460,14 @@ mod tests {
             "The control plane assumes the control plane role, and worker nodes use the worker node role.\n",
         )
         .expect("write content-only multi-token artifact");
+        // A second content-only candidate keeps the needs-content batch wider
+        // than one row so a per-row body requery is distinguishable from the
+        // single batched read.
+        std::fs::write(
+            project.path().join("NOTICE"),
+            "The control plane runs the scheduled reconcilers.\n",
+        )
+        .expect("write second content-only artifact");
         let data = TempDir::new().expect("data");
         let shard = build(
             project.path(),
@@ -6445,6 +6475,7 @@ mod tests {
             "descriptor-content-batched-proof",
             "input",
         );
+        DESCRIPTOR_FTS_BODY_READS.set(0);
         let descriptors = search_lexical_index_descriptors_with_cancel(
             &shard,
             "input",
@@ -6456,6 +6487,13 @@ mod tests {
         assert!(
             descriptors.iter().any(|hit| hit.path == "LICENSE"),
             "honest batched content proof must admit LICENSE without path/symbol tokens: {descriptors:?}"
+        );
+        assert_eq!(
+            DESCRIPTOR_FTS_BODY_READS.get(),
+            1,
+            "content coverage must be proven by one batched FTS body read, not a \
+             per-token or per-row requery; reads={}",
+            DESCRIPTOR_FTS_BODY_READS.get()
         );
     }
 
@@ -6917,24 +6955,38 @@ mod tests {
         assert!(search_lexical_index(&shard, "input", "handler", 4).is_err());
     }
 
+    /// The temporary-name allocation must skip names already occupied by
+    /// stale temporary files, never truncate them. Plant an occupied block
+    /// directly ahead of the process-global counter: the build's create-new
+    /// allocation collides through the whole block and lands past it, and
+    /// every planted file must survive with its exact bytes. Other tests may
+    /// consume counter values concurrently; only the occupied *names* matter,
+    /// so the proof holds under any interleaving.
     #[test]
     fn sqlite_build_skips_stale_temporary_file_collisions() {
         let project = TempDir::new().expect("project");
         std::fs::write(project.path().join("lib.rs"), "fn handler() {}").expect("source");
+        let fingerprint = lexical_input_fingerprint(project.path(), None).expect("fingerprint");
+        let temp_counter = |probe: PathBuf| -> u64 {
+            probe
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.rsplit('.').nth(1))
+                .and_then(|value| value.parse::<u64>().ok())
+                .expect("temp counter")
+        };
+        const PLANTED: u64 = 4096;
         let data = TempDir::new().expect("data");
-        let shard = shard_dir_for(data.path(), "collision");
-        std::fs::create_dir_all(&shard).expect("shard");
-        let index = shard.join(LEXICAL_INDEX_FILE);
-        let probe = codestory_workspace::atomic_file::atomic_temp_path(&index, "lexical-index");
-        let counter = probe
-            .file_name()
-            .and_then(|name| name.to_str())
-            .and_then(|name| name.rsplit('.').nth(1))
-            .and_then(|value| value.parse::<u64>().ok())
-            .expect("temp counter");
-        let stale = (counter + 1..=counter + 32)
+        let planted_shard = shard_dir_for(data.path(), "collision-planted");
+        std::fs::create_dir_all(&planted_shard).expect("planted shard");
+        let planted_index = planted_shard.join(LEXICAL_INDEX_FILE);
+        let before = temp_counter(codestory_workspace::atomic_file::atomic_temp_path(
+            &planted_index,
+            "lexical-index",
+        ));
+        let stale = (before + 1..=before + PLANTED)
             .map(|counter| {
-                index.with_file_name(format!(
+                planted_index.with_file_name(format!(
                     ".lexical-index.{}.{}.tmp",
                     std::process::id(),
                     counter
@@ -6944,21 +6996,37 @@ mod tests {
         for path in &stale {
             std::fs::write(path, b"stale").expect("stale temp");
         }
-        let fingerprint = lexical_input_fingerprint(project.path(), None).expect("fingerprint");
 
         build_lexical_shard(
             project.path(),
             None,
             data.path(),
-            "collision",
+            "collision-planted",
             &fingerprint,
             "input",
         )
         .expect("collision-safe build");
-
-        for path in stale {
-            assert_eq!(std::fs::read(path).expect("stale preserved"), b"stale");
+        assert!(
+            !search_lexical_index(&planted_shard, "input", "handler", 4)
+                .expect("search the built index")
+                .is_empty(),
+            "the published index must answer the same query shape the build produced"
+        );
+        for path in &stale {
+            assert_eq!(
+                std::fs::read(path).expect("stale preserved"),
+                b"stale",
+                "the build must skip, not overwrite, an occupied temporary name"
+            );
         }
+        let after = temp_counter(codestory_workspace::atomic_file::atomic_temp_path(
+            &planted_index,
+            "lexical-index",
+        ));
+        assert!(
+            after > before + PLANTED,
+            "the name counter must advance past the occupied block ({after} > {before} + {PLANTED})"
+        );
     }
 
     #[test]
@@ -7781,7 +7849,17 @@ mod tests {
             deep_validation_micros.sort_unstable();
             sqlite_micros.sort_unstable();
             jsonl_micros.sort_unstable();
-            assert_eq!(sqlite_top, jsonl_top);
+            let expected_top = format!("src/file_{:05}.rs", corpus_documents - 1);
+            assert_eq!(
+                sqlite_top.as_deref(),
+                Some(expected_top.as_str()),
+                "SQLite search must find the known corpus hit for {query}"
+            );
+            assert_eq!(
+                jsonl_top.as_deref(),
+                Some(expected_top.as_str()),
+                "JSONL scan must find the known corpus hit for {query}"
+            );
             reports.push(serde_json::json!({
                 "corpus_documents": documents.len(),
                 "jsonl_bytes": std::fs::metadata(jsonl_path).expect("JSONL metadata").len(),

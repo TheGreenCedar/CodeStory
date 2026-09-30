@@ -215,7 +215,6 @@ pub(crate) fn make_file_owner_writable(path: &Path) -> Result<()> {
 }
 
 pub(crate) fn publish_immutable_file_atomic(temp_path: &Path, destination: &Path) -> Result<()> {
-    make_file_immutable(temp_path)?;
     let previous = match std::fs::symlink_metadata(destination) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
@@ -236,17 +235,23 @@ pub(crate) fn publish_immutable_file_atomic(temp_path: &Path, destination: &Path
         Err(error) => return Err(error).context("inspect immutable component destination"),
     };
 
-    #[cfg(test)]
-    let publication = if PUBLICATION_DISABLED.get() {
-        Err(anyhow::anyhow!(
-            "simulated immutable component publication failure"
-        ))
-    } else {
+    // Windows ReplaceFileW rejects a read-only replacement, so a staged file
+    // that will replace an existing destination must be owner-writable there;
+    // a file linked from an immutable predecessor arrives read-only already.
+    // Preparation can fail too. Keep it inside the same restoration boundary
+    // as the rename so every exit re-seals the pinned predecessor inode.
+    let publication = (|| {
+        if cfg!(windows) && previous.is_some() {
+            make_file_owner_writable(temp_path)?;
+        } else {
+            make_file_immutable(temp_path)?;
+        }
+        #[cfg(test)]
+        if PUBLICATION_DISABLED.get() {
+            bail!("simulated immutable component publication failure");
+        }
         codestory_workspace::atomic_file::publish_existing_file_atomic(temp_path, destination)
-    };
-    #[cfg(not(test))]
-    let publication =
-        codestory_workspace::atomic_file::publish_existing_file_atomic(temp_path, destination);
+    })();
     let previous_restoration = previous.map_or(Ok(()), |handle| {
         let permissions = handle.metadata()?.permissions();
         handle
@@ -266,7 +271,9 @@ pub(crate) fn publish_immutable_file_atomic(temp_path: &Path, destination: &Path
                 ));
             }
             let _ = make_file_immutable(destination);
-            let _ = make_file_owner_writable(temp_path);
+            // A staged file may itself be hard-linked to a predecessor. An
+            // unsuccessful replacement must re-seal that inode too.
+            let _ = make_file_immutable(temp_path);
             Err(error)
         }
     }
@@ -462,29 +469,46 @@ mod tests {
         std::fs::write(&predecessor, b"old").expect("predecessor");
         make_file_immutable(&predecessor).expect("immutable predecessor");
         assert!(reference_file(&predecessor, &current).expect("current hard link"));
-        std::fs::write(&staged, b"new").expect("staged");
-
-        let error = with_publication_disabled(|| publish_immutable_file_atomic(&staged, &current))
-            .expect_err("injected publication must fail");
-
-        assert!(error.to_string().contains("simulated immutable component"));
-        assert_eq!(std::fs::read(&predecessor).unwrap(), b"old");
-        assert_eq!(std::fs::read(&current).unwrap(), b"old");
-        assert!(codestory_workspace::same_workspace_path(
-            &predecessor,
-            &current
-        ));
-        assert!(
-            std::fs::metadata(&predecessor)
-                .unwrap()
-                .permissions()
-                .readonly()
-        );
-        assert!(
-            std::fs::metadata(&current)
-                .unwrap()
-                .permissions()
-                .readonly()
-        );
+        // Exercise failures before the atomic publisher as well as in it:
+        // preparing the staged file must never leave the shared old inode writable.
+        for stage in ["missing", "directory", "publication", "linked"] {
+            match stage {
+                "directory" => std::fs::create_dir(&staged).expect("invalid stage"),
+                "publication" => std::fs::write(&staged, b"new").expect("staged"),
+                "linked" => {
+                    make_file_owner_writable(&staged).expect("permit removal of unshared stage");
+                    std::fs::remove_file(&staged).expect("remove prior stage");
+                    assert!(reference_file(&predecessor, &staged).expect("linked stage"));
+                }
+                _ => {}
+            }
+            let error =
+                with_publication_disabled(|| publish_immutable_file_atomic(&staged, &current))
+                    .expect_err("publication must fail");
+            if stage == "publication" {
+                assert!(error.to_string().contains("simulated immutable component"));
+            }
+            assert_eq!(std::fs::read(&predecessor).unwrap(), b"old");
+            assert_eq!(std::fs::read(&current).unwrap(), b"old");
+            assert!(codestory_workspace::same_workspace_path(
+                &predecessor,
+                &current
+            ));
+            assert!(
+                std::fs::metadata(&predecessor)
+                    .unwrap()
+                    .permissions()
+                    .readonly()
+            );
+            assert!(
+                std::fs::metadata(&current)
+                    .unwrap()
+                    .permissions()
+                    .readonly()
+            );
+            if stage == "directory" {
+                std::fs::remove_dir(&staged).expect("remove invalid stage");
+            }
+        }
     }
 }

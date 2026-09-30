@@ -1,6 +1,6 @@
 [package]
 name = "codestory-contracts"
-version = "0.17.6"
+version = "0.17.7"
 edition = "2024"
 
 [dependencies]
@@ -15,6 +15,12 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 serde_with = { workspace = true }
 specta = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

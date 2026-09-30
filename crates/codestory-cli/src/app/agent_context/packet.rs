@@ -110,6 +110,7 @@ pub(in crate::app) fn run_packet(cmd: PacketCommand) -> Result<()> {
         retrieval_publication: operation.retrieval_publication.clone(),
         operation_id: operation.operation_id.clone(),
         attempt: operation.attempt,
+        freshness: operation.freshness,
     };
     codestory_runtime::finalize_packet_projection_v3_for_representation(
         &mut operation.value.projection,
@@ -270,6 +271,7 @@ pub(in crate::app) fn enforce_packet_cli_json_output_budget(
         retrieval_publication: operation.retrieval_publication.clone(),
         operation_id: operation.operation_id.clone(),
         attempt: operation.attempt,
+        freshness: operation.freshness,
     };
     let _ = render_public_operation_json_content(&envelope, &operation.value)?;
     codestory_runtime::enforce_packet_output_budget_for_representation(

@@ -5,7 +5,8 @@ use super::super::{
     spawn_server_watchdog,
 };
 use super::{
-    TestClock, WatchdogTransport, test_qualification_control, test_server_state, test_snapshot,
+    GatedSleepClock, TestClock, WatchdogTransport, test_qualification_control, test_server_state,
+    test_server_state_with_clock, test_snapshot,
 };
 use std::fs;
 use std::sync::Arc;
@@ -215,6 +216,38 @@ fn a_stop_signal_ends_the_watchdog_sleep_without_waiting_out_the_cadence() {
         started.elapsed() < Duration::from_secs(1),
         "stopping must not wait out the cadence, waited {:?}",
         started.elapsed()
+    );
+
+    // The discriminating case: the server is still running when the wait
+    // begins, and the stop arrives after the first sleep slice has started. A
+    // single unsliced sleep would report the whole cadence as one slice and
+    // ignore the stop until it elapsed; the gated clock pins both halves of
+    // the contract.
+    let (gated_clock, slice_rx, release_tx) = GatedSleepClock::new();
+    let running = test_server_state_with_clock(gated_clock);
+    let sleeper = {
+        let running = Arc::clone(&running);
+        thread::spawn(move || sleep_until_stopped(&running, cadence))
+    };
+    let first_slice = slice_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the wait must enter its first sleep slice");
+    assert_eq!(
+        first_slice,
+        Duration::from_millis(100),
+        "the cadence must be sliced at the stop-check interval, not slept whole"
+    );
+    running.stopped.store(true, Ordering::Release);
+    release_tx.send(()).expect("release the first slice");
+    let interrupted = Instant::now();
+    assert!(
+        !sleeper.join().expect("sleep thread"),
+        "a stop arriving mid-sleep must end the wait"
+    );
+    assert!(
+        interrupted.elapsed() < Duration::from_secs(5),
+        "stopping must not wait out the cadence, waited {:?}",
+        interrupted.elapsed()
     );
 
     // A server that is still running consumes the whole cadence, so real polling is unchanged.

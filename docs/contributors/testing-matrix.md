@@ -58,6 +58,71 @@ cargo test --locked -p codestory-workspace
 cargo test --locked -p codestory-agent
 ```
 
+The workspace crate additionally owns one external-fixture lane,
+`helm-u08-fixture`. Its only test,
+`pinned_helm_u08_tree_inventory_is_complete_when_present`, is `#[ignore]`d in
+the default gate because it requires a real Helm checkout; run it explicitly:
+
+```bash
+CODESTORY_U08_HELM_PIN=/path/to/helm \
+    cargo test --locked -p codestory-workspace \
+    --lib tests::pinned_helm_u08_tree_inventory_is_complete_when_present -- --ignored --exact
+```
+
+The pinned tree must be a git checkout (`.git` present). Running the lane
+without the pin, or against a tree that is not a checkout, fails the test
+loudly. The default suite covers the same discovery shape — device-node and
+dangling-symlink fixtures in a Helm-U08-shaped repository — through the
+synthetic fixture in
+`broken_and_device_symlinks_do_not_demote_inventory_to_partial`; the named lane
+adds only real-tree scale and incidental shapes no synthetic fixture
+reproduces.
+
+The CLI crate owns one live-sidecar lane, `cli-live-sidecar-contracts`. The
+four `#[ignore]`d contracts in `tests/search_json_output.rs` exercise live
+full-sidecar behavior: `retrieval index --profile agent` must spawn the
+managed per-user embedding runtime, so the lane requires a prepared embedded
+model and an admissible embedding device:
+
+```bash
+export CODESTORY_EMBED_MODEL_SOURCE="$(node scripts/prepare-embedded-model.mjs)"
+CODESTORY_TEST_EMBED_ALLOW_CPU=1 \
+    cargo test --locked -p codestory-cli --test search_json_output -- --ignored --nocapture
+```
+
+The `--ignored` selection also runs `search_quality_eval`, whose owner lane is
+the search-quality runbook in `docs/testing/search-quality-eval.md`; pass an
+exact test name after `--` to select a single row.
+
+The `codestory-bench` proof-availability materializer owns one
+external-fixture lane, `proof-availability-frozen-checkouts`. Its only test,
+`frozen_source_receipts_match_the_exact_pinned_checkouts`, is `#[ignore]`d in
+the default gate because it requires the frozen cohort checkouts under
+`target/proof-availability/oracle-workspaces`. Produce them with the
+source-only materialize form documented in
+`docs/testing/proof-availability-v1.md` — it fetches the four pinned upstream
+commits (network access required) and all destinations are no-replace, so pick
+fresh paths for a rerun:
+
+```bash
+cargo run --locked -p codestory-bench --bin codestory-proof-availability -- \
+    materialize \
+    --corpus benchmarks/proof-availability/corpus-v1.json \
+    --workspace target/proof-availability/oracle-workspaces \
+    --cache-root target/proof-availability/unused-cache \
+    --out target/proof-availability/source-environment.json \
+    --verify-only
+
+cargo test --locked -p codestory-bench --bin codestory-proof-availability \
+    frozen_source_receipts_match_the_exact_pinned_checkouts -- --ignored --exact
+```
+
+The default suite covers the same receipt-file binding against a synthetic
+fixture in
+`oracle_source_verification_binds_steps_to_the_exact_full_file_bytes`; the
+named lane adds only the exact pinned upstream trees the frozen corpus
+references.
+
 ## Draft source checks
 
 Experiment-validity changes use the core-only exact-search cases in

@@ -3551,8 +3551,24 @@ impl WorkspaceIndexer {
             codestory_workspace::workspace_relative_path(root, &full_path)
                 .unwrap_or_else(|| path.to_path_buf());
         let language = structural::structural_language_name(&full_path);
-        let producer = structural::structural_producer(&full_path)
-            .expect("admitted structural paths have one producer");
+        let Some(producer) = structural::structural_producer(&full_path) else {
+            // An admitted path with no dispatch producer is a coverage gap,
+            // never a reason to abort the run.
+            return Err(incomplete_file_storage(
+                &full_path,
+                None,
+                language,
+                codestory_contracts::graph::ErrorInfo {
+                    message: format!("No structural producer accepted {:?}", path),
+                    file_id: None,
+                    line: None,
+                    column: None,
+                    is_fatal: false,
+                    index_step: codestory_contracts::graph::IndexStep::Collection,
+                    coverage_reason: Some(FileCoverageReason::CollectorFailure),
+                },
+            ));
+        };
         let structural_size = std::fs::metadata(&full_path)
             .map_err(|error| {
                 incomplete_file_storage(
@@ -17411,6 +17427,9 @@ mod proof_resolution_cache_tests {
         assert_eq!(file.file_id, new_file);
         assert_eq!(file.top_level_declarations[0].declaration, new_method);
         assert_eq!(file.inherent_methods[0].declaration, new_method);
+        // `owner` is populated on the input but was previously never asserted —
+        // a rebase that left the stale old owner id would pass everything above.
+        assert_eq!(file.inherent_methods[0].owner, Some(new_owner));
         assert_eq!(file.classes[0].declaration, new_owner);
         assert_eq!(file.classes[0].methods[0].declaration, new_method);
         assert_eq!(file.direct_exports[0].declaration, new_owner);

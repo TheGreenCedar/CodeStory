@@ -684,6 +684,22 @@ test("rejects debug-profile output even when the target name matches", () => {
   assert.throws(() => build(input), /not built with the release profile/u);
 });
 
+// Each release-profile predicate is an independent admission check: a row that
+// trips several at once cannot tell whether a dropped check would still fail.
+for (const [field, value] of [
+  ["opt_level", "0"],
+  ["debug_assertions", true],
+  ["overflow_checks", true],
+]) {
+  test(`rejects a release-directory executable whose only debug marker is profile.${field}`, () => {
+    const input = fixture();
+    input.messages[1].profile[field] = value;
+    input.jsonLines = input.messages.map((message) => JSON.stringify(message)).join("\n");
+
+    assert.throws(() => build(input), /not built with the release profile/u);
+  });
+}
+
 test("rejects a production binary actually built with the test profile", () => {
   const input = fixture();
   input.messages[1].profile.test = true;
@@ -810,6 +826,29 @@ test("rejects the release-root spelling where Cargo uses a normalized deps peer"
 test("rejects bytes changed after Cargo emitted the authenticated executable", () => {
   const { input, manifest } = build();
   fs.appendFileSync(input.artifacts[0].executable, "mutated");
+
+  assert.throws(
+    () =>
+      verifyCargoArtifactManifest({
+        exactSha: SOURCE_SHA,
+        exactTree: SOURCE_TREE,
+        manifest,
+        rustTarget: RUST_TARGET,
+        workspaceRoot: input.root,
+      }),
+    /no longer matches its authenticated build output/u,
+  );
+});
+
+test("rejects a same-length rewrite of the authenticated executable", () => {
+  const { input, manifest } = build();
+  // Appending drifts size and digest together, so a size check alone would
+  // still catch it. Flip bytes in place: size, inode and link count are
+  // unchanged and only the digest can expose the rewrite.
+  const executable = input.artifacts[0].executable;
+  const bytes = fs.readFileSync(executable);
+  bytes[0] = bytes[0] === 0 ? 1 : 0;
+  fs.writeFileSync(executable, bytes);
 
   assert.throws(
     () =>

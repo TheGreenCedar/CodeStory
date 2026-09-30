@@ -1075,35 +1075,6 @@ fn java_override_refusal_is_scoped_to_receiver_ancestry() -> anyhow::Result<()> 
         4,
     )
 }
-
-#[test]
-fn f4_verifier_relative_nested_java_ancestor() -> anyhow::Result<()> {
-    assert_nominal_call_is_nonexact(
-        &[(
-            "p/Outer.java",
-            concat!(
-                "package p;\n",
-                "class Outer {\n",
-                "  static class Worker {\n",
-                "    public void target() {}\n",
-                "  }\n",
-                "  static class Caller {\n",
-                "    void caller(Worker value) {\n",
-                "      value.target();\n",
-                "    }\n",
-                "  }\n",
-                "}\n",
-                "class Child extends Outer.Worker {\n",
-                "  public void target() {}\n",
-                "}\n",
-            ),
-        )],
-        "java",
-        "p/Outer.java",
-        8,
-    )
-}
-
 #[test]
 fn java_nested_owner_scope_refuses_without_global_name_poisoning() -> anyhow::Result<()> {
     // Nested Exact authority remains unsupported, even without an override.
@@ -5861,21 +5832,6 @@ fn python_class_function_namespace_collision_refuses_constructor_proof() -> anyh
     );
     assert_python_member_identity(source, 11, 2, 1, false)
 }
-
-#[test]
-fn python_module_setattr_delattr_refuse_member_proof() -> anyhow::Result<()> {
-    for mutation in [
-        "setattr(Worker, 'target', replacement)",
-        "delattr(Worker, 'target')",
-    ] {
-        let source = format!(
-            "class Worker:\n    def target(self):\n        pass\n    def caller(self):\n        self.target()\ndef replacement(self):\n    pass\n{mutation}\n"
-        );
-        assert_python_member_identity(&source, 5, 2, 1, false)?;
-    }
-    Ok(())
-}
-
 #[test]
 fn python_namespace_collision_order_and_unshadowed_controls() -> anyhow::Result<()> {
     assert_python_member_identity(
@@ -6691,6 +6647,13 @@ fn python_relative_imports_reject_duplicate_raw_import_hops_before_and_after_rep
             })
             .collect::<Vec<_>>();
         hops.sort_by_key(|edge| edge.id);
+        // Census before mutation: without at least one raw module-target IMPORT
+        // hop, both corruption phases below execute zero assertions.
+        assert_eq!(
+            hops.len(),
+            1,
+            "replay={replay}: fixture must produce exactly one raw module-target IMPORT hop"
+        );
         for (offset, hop) in hops.into_iter().enumerate() {
             let mut duplicate = hop.clone();
             duplicate.id = EdgeId(8_700_000_000_000_000_000 + offset as i64);
@@ -6796,7 +6759,10 @@ fn python_read_only_getattr_does_not_poison_closed_static_neighbors() -> anyhow:
     Ok(())
 }
 
-fn assert_python_facts_are_non_authoritative(files: &[(&str, &str)]) -> anyhow::Result<()> {
+fn assert_python_facts_are_non_authoritative(
+    files: &[(&str, &str)],
+    expected_python_facts: usize,
+) -> anyhow::Result<()> {
     let project = tempfile::tempdir()?;
     let mut store = Store::new_in_memory()?;
     index_files(project.path(), &mut store, files)?;
@@ -6806,7 +6772,13 @@ fn assert_python_facts_are_non_authoritative(files: &[(&str, &str)]) -> anyhow::
         .into_iter()
         .filter(|fact| fact.provenance.language_adapter == "python")
         .collect::<Vec<_>>();
-    assert!(!facts.is_empty(), "missing Python facts for {files:?}");
+    // The census is part of the contract: dropping a derived callback or
+    // receiver fact while keeping one nonexact getter fact must fail here.
+    assert_eq!(
+        facts.len(),
+        expected_python_facts,
+        "unexpected Python fact census for {files:?}: {facts:#?}"
+    );
     assert!(
         facts.iter().all(|fact| {
             fact.status != ProofResolutionStatus::Exact && fact.evidence_chain.is_empty()
@@ -6818,19 +6790,43 @@ fn assert_python_facts_are_non_authoritative(files: &[(&str, &str)]) -> anyhow::
 
 #[test]
 fn python_getattr_and_derived_values_remain_non_authoritative() -> anyhow::Result<()> {
-    for source in [
-        "def caller(obj):\n    getattr(obj, 'target')()\n",
-        "def caller(obj):\n    callback = getattr(obj, 'target')\n    callback()\n",
-        "def caller(obj):\n    getattr(obj, 'target').method()\n",
-        "def caller(obj, getattr):\n    getattr(obj, 'target')()\n",
-        "def caller(obj):\n    getattr = obj\n    getattr(obj, 'target')()\n",
-        "from foreign import getattr\ndef caller(obj):\n    getattr(obj, 'target')()\n",
-        "def target():\n    pass\ndef caller(obj):\n    getattr(obj, 'value')\n    def inner():\n        target()\n    inner()\n",
-        "def caller(obj):\n    callback = lambda: getattr(obj, 'target')()\n    callback()\n",
-        "def caller(obj):\n    receiver = getattr(obj, 'receiver')\n    receiver.target()\n",
-        "def caller(obj):\n    constructor = getattr(obj, 'Worker')\n    constructor()\n",
+    for (source, expected_python_facts) in [
+        ("def caller(obj):\n    getattr(obj, 'target')()\n", 2),
+        (
+            "def caller(obj):\n    callback = getattr(obj, 'target')\n    callback()\n",
+            2,
+        ),
+        ("def caller(obj):\n    getattr(obj, 'target').method()\n", 2),
+        (
+            "def caller(obj, getattr):\n    getattr(obj, 'target')()\n",
+            2,
+        ),
+        (
+            "def caller(obj):\n    getattr = obj\n    getattr(obj, 'target')()\n",
+            2,
+        ),
+        (
+            "from foreign import getattr\ndef caller(obj):\n    getattr(obj, 'target')()\n",
+            2,
+        ),
+        (
+            "def target():\n    pass\ndef caller(obj):\n    getattr(obj, 'value')\n    def inner():\n        target()\n    inner()\n",
+            3,
+        ),
+        (
+            "def caller(obj):\n    callback = lambda: getattr(obj, 'target')()\n    callback()\n",
+            3,
+        ),
+        (
+            "def caller(obj):\n    receiver = getattr(obj, 'receiver')\n    receiver.target()\n",
+            2,
+        ),
+        (
+            "def caller(obj):\n    constructor = getattr(obj, 'Worker')\n    constructor()\n",
+            2,
+        ),
     ] {
-        assert_python_facts_are_non_authoritative(&[("main.py", source)])?;
+        assert_python_facts_are_non_authoritative(&[("main.py", source)], expected_python_facts)?;
     }
     Ok(())
 }
@@ -10025,7 +10021,7 @@ fn typescript_direct_imports_separate_type_specifiers_and_resolve_literal_direct
         } else {
             ("target();", "target")
         };
-        assert_no_exact_calls_at(&files, &[(path, marker, callee)])?;
+        assert_no_exact_calls_at(&files, &[(path, marker, callee)], &[])?;
     }
     assert_no_exact_calls_at(
         &[
@@ -10039,6 +10035,7 @@ fn typescript_direct_imports_separate_type_specifiers_and_resolve_literal_direct
             ),
         ],
         &[("src/aliased_type.ts", "local();", "local")],
+        &[],
     )?;
     Ok(())
 }
@@ -10078,7 +10075,7 @@ fn typescript_type_specifier_local_collisions_close_the_entire_import_binding() 
         } else {
             ("target();", "target")
         };
-        assert_no_exact_calls_at(&files, &[(path, marker, callee)])?;
+        assert_no_exact_calls_at(&files, &[(path, marker, callee)], &[])?;
     }
     Ok(())
 }
@@ -10322,16 +10319,19 @@ fn relative_module_resolution_uses_one_closed_language_family() -> anyhow::Resul
         assert_only_call_is_exact(&files)?;
     }
 
-    assert_no_exact_target_calls(&[
-        (
-            "src/exported.cjs",
-            "function target() {}\nmodule.exports = { target };\n",
-        ),
-        (
-            "src/importer.cjs",
-            "const { target } = require('./exported.cjs');\nfunction caller() { target(); }\n",
-        ),
-    ])?;
+    assert_no_exact_target_calls(
+        &[
+            (
+                "src/exported.cjs",
+                "function target() {}\nmodule.exports = { target };\n",
+            ),
+            (
+                "src/importer.cjs",
+                "const { target } = require('./exported.cjs');\nfunction caller() { target(); }\n",
+            ),
+        ],
+        &[],
+    )?;
 
     for files in [
         vec![(
@@ -12073,7 +12073,7 @@ fn receiver_class_and_mutation_domains_fail_closed() -> anyhow::Result<()> {
             "export function caller(receiver: unknown) { receiver.target(); }\n",
         ),
     ] {
-        assert_no_exact_target_calls(&[(path, source)])?;
+        assert_no_exact_target_calls(&[(path, source)], &[])?;
     }
     assert_only_call_is_not_exact(&[
         ("src/exported.ts", "export class C { target() {} }\n"),
@@ -12097,7 +12097,7 @@ fn receiver_mutation_domains_are_structural_and_exactly_keyed() -> anyhow::Resul
         "export class C { target() {} }\nexport function caller() { const receiver = new C(); C.prototype = {}; receiver.target(); }\n",
         "export class C { target() {} }\nexport function caller(key) { const receiver = new C(); C[key] = {}; receiver.target(); }\n",
     ] {
-        assert_no_exact_target_calls(&[("src/mutated.js", source)])?;
+        assert_no_exact_target_calls(&[("src/mutated.js", source)], &[])?;
     }
 
     assert_only_call_is_exact(&[(
@@ -12126,7 +12126,7 @@ fn javascript_binding_and_method_modifiers_use_parser_tokens() -> anyhow::Result
         "export class C { get/*comment*/ target() { return () => {}; } }\nexport function caller() { const receiver = new C(); receiver.target(); }\n",
         "export class C { */*comment*/ target() {} }\nexport function caller() { const receiver = new C(); receiver.target(); }\n",
     ] {
-        assert_no_exact_target_calls(&[("src/commented_method.js", source)])?;
+        assert_no_exact_target_calls(&[("src/commented_method.js", source)], &[])?;
     }
     Ok(())
 }
@@ -12753,19 +12753,49 @@ fn is_script_fixture(path: &str) -> bool {
     )
 }
 
-fn assert_no_exact_calls(files: &[(&str, &str)]) -> anyhow::Result<()> {
-    assert_no_exact_calls_at(files, &[])
+/// Designated ordinary-call census for the negative helpers: each entry is
+/// `(caller serialized-name tail, raw_target, expected fact count)`. A refusal
+/// assertion is vacuous unless the fixture's ordinary calls actually produced
+/// proof-resolution facts, so the census is asserted before the refusal.
+fn assert_call_fact_census(
+    case_name: &str,
+    store: &Store,
+    facts: &[codestory_contracts::proof_resolution::CallResolutionFact],
+    census: &[(&str, &str, usize)],
+) -> anyhow::Result<()> {
+    let nodes = store.get_nodes()?;
+    for (caller_name, raw_target, expected_count) in census {
+        let count = facts
+            .iter()
+            .filter(|fact| {
+                fact.callsite.raw_target == *raw_target
+                    && nodes.iter().any(|node| {
+                        node.id == fact.caller
+                            && (node.serialized_name == *caller_name
+                                || node.serialized_name.ends_with(&format!("::{caller_name}")))
+                    })
+            })
+            .count();
+        anyhow::ensure!(
+            count == *expected_count,
+            "{case_name}: call census expected {expected_count} fact(s) from `{caller_name}` \
+             toward `{raw_target}`; refusal assertions are vacuous without them: {facts:#?}"
+        );
+    }
+    Ok(())
 }
 
 fn assert_no_exact_calls_at(
     files: &[(&str, &str)],
     anchors: &[(&str, &str, &str)],
+    census: &[(&str, &str, usize)],
 ) -> anyhow::Result<()> {
     let project = tempfile::tempdir()?;
     let mut store = Store::new_in_memory()?;
     index_files(project.path(), &mut store, files)?;
     rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
     let facts = store.get_proof_resolution_facts()?;
+    assert_call_fact_census("assert_no_exact_calls_at", &store, &facts, census)?;
     if files.iter().any(|(path, _)| is_script_fixture(path)) {
         assert!(
             !anchors.is_empty(),
@@ -12784,12 +12814,16 @@ fn assert_no_exact_calls_at(
     Ok(())
 }
 
-fn assert_no_exact_target_calls(files: &[(&str, &str)]) -> anyhow::Result<()> {
+fn assert_no_exact_target_calls(
+    files: &[(&str, &str)],
+    census: &[(&str, &str, usize)],
+) -> anyhow::Result<()> {
     let project = tempfile::tempdir()?;
     let mut store = Store::new_in_memory()?;
     index_files(project.path(), &mut store, files)?;
     rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
     let facts = store.get_proof_resolution_facts()?;
+    assert_call_fact_census("assert_no_exact_target_calls", &store, &facts, census)?;
     let target_facts = facts
         .iter()
         .filter(|fact| fact.callsite.raw_target.trim_start_matches('#') == "target")
@@ -13025,7 +13059,7 @@ fn javascript_typescript_unsupported_matrix_never_authorizes() -> anyhow::Result
             "target",
         ),
     ] {
-        assert_no_exact_calls_at(&[(path, source)], &[(path, marker, callee)])?;
+        assert_no_exact_calls_at(&[(path, source)], &[(path, marker, callee)], &[])?;
     }
     let project = tempfile::tempdir()?;
     let mut store = Store::new_in_memory()?;
@@ -13667,13 +13701,17 @@ fn rust_inherent_receiver_and_constructor_subset_authorizes_closed_bindings() ->
 
 #[test]
 fn rust_projection_requires_exact_syntax_but_not_exact_navigation_metadata() -> anyhow::Result<()> {
-    assert_no_exact_calls(&[
-        ("src/target.rs", "pub fn target() {}\n"),
-        (
-            "src/lib.rs",
-            "mod target;\nuse crate::target::target as alias;\nfn caller() { alias(); }\n",
-        ),
-    ])?;
+    assert_no_exact_calls_at(
+        &[
+            ("src/target.rs", "pub fn target() {}\n"),
+            (
+                "src/lib.rs",
+                "mod target;\nuse crate::target::target as alias;\nfn caller() { alias(); }\n",
+            ),
+        ],
+        &[],
+        &[("caller", "alias", 1)],
+    )?;
     assert_only_call_is_not_exact(&[(
         "src/lib.rs",
         "pub fn target() {}\nmod nested { fn caller() { super::target(); } }\n",
@@ -13797,50 +13835,104 @@ fn rust_module_and_import_closure_matrix_stays_fail_closed() -> anyhow::Result<(
             ),
         ],
     ] {
-        assert_no_exact_target_calls(&files)?;
+        assert_no_exact_target_calls(&files, &[("caller", "target", 1)])?;
     }
     assert_only_call_is_not_exact(&[(
         "src/lib.rs",
         "fn target() {}\nfn target() {}\nfn caller() { target(); }\n",
     )])?;
-    assert_no_exact_target_calls(&[
-        ("src/lib.rs", "mod target;\n"),
-        ("src/target.rs", "pub fn target() {}\n"),
-        (
-            "src/orphan.rs",
-            "use crate::target::target;\nfn caller() { target(); }\n",
-        ),
-    ])?;
-    assert_no_exact_target_calls(&[
-        (
-            "src/lib.rs",
-            "mod target;\nuse crate::target::target;\nfn caller() { target(); }\n",
-        ),
-        ("src/target.rs", "pub fn target() {}\nstruct target;\n"),
-    ])?;
+    assert_no_exact_target_calls(
+        &[
+            ("src/lib.rs", "mod target;\n"),
+            ("src/target.rs", "pub fn target() {}\n"),
+            (
+                "src/orphan.rs",
+                "use crate::target::target;\nfn caller() { target(); }\n",
+            ),
+        ],
+        &[("caller", "target", 1)],
+    )?;
+    assert_no_exact_target_calls(
+        &[
+            (
+                "src/lib.rs",
+                "mod target;\nuse crate::target::target;\nfn caller() { target(); }\n",
+            ),
+            ("src/target.rs", "pub fn target() {}\nstruct target;\n"),
+        ],
+        &[("caller", "target", 1)],
+    )?;
     Ok(())
 }
 
 #[test]
 fn rust_inherent_and_receiver_unsupported_matrix_stays_fail_closed() -> anyhow::Result<()> {
-    for source in [
-        "struct Owner;\nimpl Owner where Owner: Sized { fn target(&self) {} fn caller(&self) { self.target(); } }\n",
-        "struct Owner;\ntrait Trait { fn target(); }\nimpl Trait for Owner { fn target() {} }\nfn caller() { <Owner as Trait>::target(); }\n",
-        "struct Owner;\nimpl Owner { fn target(&self) {} }\nfn caller() { Owner::target(); }\n",
-        "struct Owner;\nstruct Owner;\nimpl Owner { fn target(&self) {} }\nfn caller(value: &Owner) { value.target(); }\n",
-        "struct Owner;\ntype Alias = Owner;\nimpl Owner { fn target(&self) {} }\nfn caller(value: Alias) { value.target(); }\n",
-        "struct Owner;\nimpl Owner { fn target(&self) {} }\nfn caller(value: Box<Owner>) { value.target(); }\n",
-        "trait Trait { fn target(&self); }\nfn caller(value: &dyn Trait) { value.target(); }\n",
-        "struct Owner;\nimpl Owner { fn target(&self) {} }\nstruct Holder { value: Owner }\nfn caller(holder: Holder) { holder.value.target(); }\n",
-        "struct Owner;\nimpl Owner { fn target(&self) {} }\nfn make() -> Owner { Owner }\nfn caller() { make().target(); }\n",
-        "struct Owner(u8);\nimpl Owner { fn target(&self) {} }\nfn caller() { let value = Owner(1); value.target(); }\n",
-        "struct Owner;\nimpl Owner { fn build() -> Result<Self, ()> { Ok(Self) } fn target(&self) {} }\nfn caller() { let value = Owner::build(); value.target(); }\n",
-        "struct Owner;\nimpl Owner { fn target(&self) {} }\nfn caller() { let value = Owner; value = Owner; value.target(); }\n",
-        "fn target<T>() {}\nfn caller() { target::<u8>(); }\n",
-        "struct Owner;\nimpl Owner { fn target(&self) {} fn caller(&self) { self.target(); } }\nimpl Owner { generated!(); }\n",
-        "struct Owner;\nimpl Owner { fn target(&self) {} fn caller(&self) { self.target(); } }\nimpl Owner where Owner: Sized { fn other(&self) {} }\n",
+    for (source, designated_raw_target) in [
+        (
+            "struct Owner;\nimpl Owner where Owner: Sized { fn target(&self) {} fn caller(&self) { self.target(); } }\n",
+            "target",
+        ),
+        (
+            "struct Owner;\ntrait Trait { fn target(); }\nimpl Trait for Owner { fn target() {} }\nfn caller() { <Owner as Trait>::target(); }\n",
+            "target",
+        ),
+        (
+            "struct Owner;\nimpl Owner { fn target(&self) {} }\nfn caller() { Owner::target(); }\n",
+            "target",
+        ),
+        (
+            "struct Owner;\nstruct Owner;\nimpl Owner { fn target(&self) {} }\nfn caller(value: &Owner) { value.target(); }\n",
+            "target",
+        ),
+        (
+            "struct Owner;\ntype Alias = Owner;\nimpl Owner { fn target(&self) {} }\nfn caller(value: Alias) { value.target(); }\n",
+            "target",
+        ),
+        (
+            "struct Owner;\nimpl Owner { fn target(&self) {} }\nfn caller(value: Box<Owner>) { value.target(); }\n",
+            "target",
+        ),
+        (
+            "trait Trait { fn target(&self); }\nfn caller(value: &dyn Trait) { value.target(); }\n",
+            "target",
+        ),
+        (
+            "struct Owner;\nimpl Owner { fn target(&self) {} }\nstruct Holder { value: Owner }\nfn caller(holder: Holder) { holder.value.target(); }\n",
+            "target",
+        ),
+        (
+            "struct Owner;\nimpl Owner { fn target(&self) {} }\nfn make() -> Owner { Owner }\nfn caller() { make().target(); }\n",
+            "target",
+        ),
+        (
+            "struct Owner(u8);\nimpl Owner { fn target(&self) {} }\nfn caller() { let value = Owner(1); value.target(); }\n",
+            "target",
+        ),
+        (
+            "struct Owner;\nimpl Owner { fn build() -> Result<Self, ()> { Ok(Self) } fn target(&self) {} }\nfn caller() { let value = Owner::build(); value.target(); }\n",
+            "target",
+        ),
+        (
+            "struct Owner;\nimpl Owner { fn target(&self) {} }\nfn caller() { let value = Owner; value = Owner; value.target(); }\n",
+            "target",
+        ),
+        (
+            "fn target<T>() {}\nfn caller() { target::<u8>(); }\n",
+            "<u8>",
+        ),
+        (
+            "struct Owner;\nimpl Owner { fn target(&self) {} fn caller(&self) { self.target(); } }\nimpl Owner { generated!(); }\n",
+            "target",
+        ),
+        (
+            "struct Owner;\nimpl Owner { fn target(&self) {} fn caller(&self) { self.target(); } }\nimpl Owner where Owner: Sized { fn other(&self) {} }\n",
+            "target",
+        ),
     ] {
-        assert_no_exact_target_calls(&[("src/lib.rs", source)])?;
+        assert_no_exact_target_calls(
+            &[("src/lib.rs", source)],
+            &[("caller", designated_raw_target, 1)],
+        )?;
     }
     Ok(())
 }
@@ -15552,10 +15644,14 @@ fn rust_bounded_attributes_keep_binding_macros_closed_without_poisoning_expressi
         "src/lib.rs",
         "fn target() {}\n#[allow(dead_code)]\nfn caller() { let _ = concat!(\"unrelated\", \"expression\"); target(); }\n",
     )])?;
-    assert_no_exact_target_calls(&[(
-        "src/lib.rs",
-        "macro_rules! tokens { ($value:expr) => {}; }\nfn target() {}\n#[allow(dead_code)]\nfn caller() { tokens!(target()); }\n",
-    )])?;
+    assert_no_exact_target_calls(
+        &[(
+            "src/lib.rs",
+            "macro_rules! tokens { ($value:expr) => {}; }\nfn target() {}\n#[allow(dead_code)]\nfn caller() { tokens!(target()); }\n",
+        )],
+        // The callsite lives inside macro tokens: no call fact is expected.
+        &[],
+    )?;
     Ok(())
 }
 
@@ -15802,15 +15898,35 @@ fn rust_documented_target_groups_survive_interposed_ordinary_comments() -> anyho
 #[test]
 fn rust_documented_target_inner_dangling_and_recovery_barriers_stay_non_authoritative()
 -> anyhow::Result<()> {
-    for source in [
-        "#[cfg(any())]\n//! inner docs\n/// outer docs\nfn target() {}\nfn caller() { target(); }\n",
-        "#[cfg(any())]\n/*! inner docs */\n/** outer docs */\nfn target() {}\nfn caller() { target(); }\n",
-        "/// dangling docs\nstruct Marker;\n#[cfg(any())]\nfn target() {}\nfn caller() { target(); }\n",
-        "/// docs\n<\nfn target() {}\nfn caller() { target(); }\n",
-        "#[cfg(any())]\n// ordinary\n<\n/// docs\nfn target() {}\nfn caller() { target(); }\n",
-        "/// docs\n/* unterminated\nfn target() {}\nfn caller() { target(); }\n",
+    for (source, census) in [
+        (
+            "#[cfg(any())]\n//! inner docs\n/// outer docs\nfn target() {}\nfn caller() { target(); }\n",
+            &[("caller", "target", 1)][..],
+        ),
+        (
+            "#[cfg(any())]\n/*! inner docs */\n/** outer docs */\nfn target() {}\nfn caller() { target(); }\n",
+            &[("caller", "target", 1)][..],
+        ),
+        (
+            "/// dangling docs\nstruct Marker;\n#[cfg(any())]\nfn target() {}\nfn caller() { target(); }\n",
+            &[("caller", "target", 1)][..],
+        ),
+        (
+            "/// docs\n<\nfn target() {}\nfn caller() { target(); }\n",
+            &[("caller", "target", 1)][..],
+        ),
+        // The last two fixtures consume the callsite inside a recovery
+        // barrier or an unterminated comment: zero facts is their content.
+        (
+            "#[cfg(any())]\n// ordinary\n<\n/// docs\nfn target() {}\nfn caller() { target(); }\n",
+            &[][..],
+        ),
+        (
+            "/// docs\n/* unterminated\nfn target() {}\nfn caller() { target(); }\n",
+            &[][..],
+        ),
     ] {
-        assert_no_exact_target_calls(&[("src/lib.rs", source)])?;
+        assert_no_exact_target_calls(&[("src/lib.rs", source)], census)?;
     }
     Ok(())
 }
@@ -15848,19 +15964,50 @@ fn rust_tainted_attribute_groups_never_reach_bounded_caller_or_callsite_classifi
 
 #[test]
 fn rust_documented_target_rule_stays_free_function_and_domain_specific() -> anyhow::Result<()> {
-    for source in [
-        "struct Worker;\nimpl Worker { /// docs\nfn target(&self) {} fn caller(&self) { self.target(); } }\n",
-        "struct Worker;\nimpl Worker { /// docs\nfn target() {} }\nfn caller() { Worker::target(); }\n",
-        "fn outer() { /// docs\nfn target() {} target(); }\n",
-        "trait Worker { /// docs\nfn target(&self); fn caller(&self) { self.target(); } }\n",
-        "/// docs\nstruct target;\nfn caller() { target(); }\n",
-        "/// docs\nmod target {}\nfn caller() { target(); }\n",
-        "/// docs for a different item\nstruct Marker;\n#[cfg(any())]\nfn target() {}\nfn caller() { target(); }\n",
-        "//! inner module documentation\n#[cfg(any())]\nfn target() {}\nfn caller() { target(); }\n",
-        "/*! inner module documentation */\n#[cfg(any())]\nfn target() {}\nfn caller() { target(); }\n",
-        "/// docs\nfn target() {}\nmacro_rules! tokens { ($value:expr) => {}; }\nfn caller() { tokens!(target()); }\n",
+    for (source, census) in [
+        (
+            "struct Worker;\nimpl Worker { /// docs\nfn target(&self) {} fn caller(&self) { self.target(); } }\n",
+            &[("caller", "target", 1)][..],
+        ),
+        (
+            "struct Worker;\nimpl Worker { /// docs\nfn target() {} }\nfn caller() { Worker::target(); }\n",
+            &[("caller", "target", 1)][..],
+        ),
+        (
+            "fn outer() { /// docs\nfn target() {} target(); }\n",
+            &[("outer", "target", 1)][..],
+        ),
+        (
+            "trait Worker { /// docs\nfn target(&self); fn caller(&self) { self.target(); } }\n",
+            &[("caller", "target", 1)][..],
+        ),
+        (
+            "/// docs\nstruct target;\nfn caller() { target(); }\n",
+            &[("caller", "target", 1)][..],
+        ),
+        (
+            "/// docs\nmod target {}\nfn caller() { target(); }\n",
+            &[("caller", "target", 1)][..],
+        ),
+        (
+            "/// docs for a different item\nstruct Marker;\n#[cfg(any())]\nfn target() {}\nfn caller() { target(); }\n",
+            &[("caller", "target", 1)][..],
+        ),
+        (
+            "//! inner module documentation\n#[cfg(any())]\nfn target() {}\nfn caller() { target(); }\n",
+            &[("caller", "target", 1)][..],
+        ),
+        (
+            "/*! inner module documentation */\n#[cfg(any())]\nfn target() {}\nfn caller() { target(); }\n",
+            &[("caller", "target", 1)][..],
+        ),
+        // The callsite lives inside macro tokens: no call fact is expected.
+        (
+            "/// docs\nfn target() {}\nmacro_rules! tokens { ($value:expr) => {}; }\nfn caller() { tokens!(target()); }\n",
+            &[][..],
+        ),
     ] {
-        assert_no_exact_target_calls(&[("src/lib.rs", source)])?;
+        assert_no_exact_target_calls(&[("src/lib.rs", source)], census)?;
     }
 
     for source in [

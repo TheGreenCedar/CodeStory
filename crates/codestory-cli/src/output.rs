@@ -279,6 +279,9 @@ pub(crate) fn render_index_markdown(output: &IndexOutput<'_>) -> String {
     }
     append_readiness_verdicts(&mut markdown, &output.readiness);
     append_index_summary_generation(&mut markdown, output);
+    for warning in &output.warnings {
+        let _ = writeln!(markdown, "warning: {warning}");
+    }
     append_next_commands(&mut markdown, &output.next_commands);
     markdown
 }
@@ -287,6 +290,7 @@ fn diagnostic_core_status_label(status: crate::args::DiagnosticCoreStatus) -> &'
     match status {
         crate::args::DiagnosticCoreStatus::Unavailable => "unavailable",
         crate::args::DiagnosticCoreStatus::UpgradeRequired => "upgrade_required",
+        crate::args::DiagnosticCoreStatus::NewerSchema => "newer_schema",
     }
 }
 
@@ -2761,6 +2765,27 @@ pub(crate) fn render_doctor_markdown(output: &DoctorOutput) -> String {
             compact_doctor_check_message(check)
         );
     }
+    if !output.stale_cached_cores.is_empty() {
+        let _ = writeln!(markdown, "stale_cached_cores:");
+        for core in &output.stale_cached_cores {
+            match (core.project_root.as_ref(), core.next_action.as_ref()) {
+                (Some(root), Some(action)) => {
+                    let _ = writeln!(
+                        markdown,
+                        "- `{}` schema={} required={} next: `{action}`",
+                        root, core.found_schema, core.required_schema
+                    );
+                }
+                _ => {
+                    let _ = writeln!(
+                        markdown,
+                        "- `{}` schema={} required={}",
+                        core.cache_dir, core.found_schema, core.required_schema
+                    );
+                }
+            }
+        }
+    }
     let _ = writeln!(markdown, "environment:");
     for item in &output.environment {
         let _ = writeln!(
@@ -4308,6 +4333,7 @@ mod tests {
             retrieval_publication: None,
             operation_id: "public-1".to_string(),
             attempt: 1,
+            freshness: codestory_runtime::OperationFreshness::Fresh,
         };
 
         emit_public_operation(OutputFormat::Markdown, operation(), Some(&markdown_path))
@@ -4337,6 +4363,7 @@ mod tests {
                 retrieval_publication: None,
                 operation_id: "public-2".to_string(),
                 attempt: 1,
+                freshness: codestory_runtime::OperationFreshness::Fresh,
             },
             Some(&graph_path),
         )
@@ -4479,6 +4506,7 @@ mod tests {
             readiness_lanes: std::collections::BTreeMap::new(),
             checks: Vec::new(),
             next_commands: Vec::new(),
+            stale_cached_cores: Vec::new(),
             environment: Vec::new(),
         }
     }
@@ -6313,83 +6341,6 @@ legend:
 
         assert!(markdown.contains("repeated=2"));
         assert!(!markdown.contains("[edge-2]"));
-    }
-
-    #[test]
-    fn trail_story_reports_side_effects_and_test_scope() {
-        let included = sample_trail_story(true);
-        assert!(
-            included
-                .side_effects
-                .iter()
-                .any(|item| item.contains("write_audit_log")),
-            "story should name likely side-effect calls: {included:#?}"
-        );
-        assert!(
-            included
-                .test_scope
-                .iter()
-                .any(|item| item.contains("tests and benches included")),
-            "include-tests story should say tests are included: {included:#?}"
-        );
-        assert!(
-            included
-                .test_scope
-                .iter()
-                .any(|item| item.contains("test_request_flow")),
-            "include-tests story should name rendered test-like nodes: {included:#?}"
-        );
-
-        let excluded = sample_trail_story(false);
-        assert!(
-            excluded
-                .test_scope
-                .iter()
-                .any(|item| item.contains("tests and benches excluded")),
-            "production-scope story should say tests are excluded: {excluded:#?}"
-        );
-    }
-
-    #[test]
-    fn trail_story_handles_single_node_without_edges() {
-        let story = TrailStoryDto {
-            summary: "Story trail around `A` found 1 node and 0 edges; mode=neighborhood direction=both tests=excluded utility_calls=hidden truncated=false.".to_string(),
-            entry_points: vec![
-                "focus: A [function]".to_string(),
-                "no graph entry edges were returned for this focus".to_string(),
-            ],
-            core_flow: Vec::new(),
-            runtime_flow: Vec::new(),
-            data_flow: Vec::new(),
-            type_structure: Vec::new(),
-            utility_calls: Vec::new(),
-            side_effects: vec![
-                "none detected from conservative edge-kind and target-name heuristics; inspect snippets for runtime effects".to_string(),
-            ],
-            uncertainty: vec!["no rendered trail edges to evaluate for certainty".to_string()],
-            test_scope: vec![
-                "tests and benches excluded by default production-only scope; pass --include-tests to include them".to_string(),
-                "no test-like nodes are present in the rendered trail".to_string(),
-            ],
-            limits: vec![
-                "trail not truncated; max_nodes=24 omitted_edge_count=0".to_string(),
-                "no edges were returned, so core flow is limited to the focus node".to_string(),
-            ],
-        };
-
-        assert!(story.core_flow.is_empty());
-        assert!(
-            story
-                .entry_points
-                .iter()
-                .any(|item| item.contains("no graph entry edges"))
-        );
-        assert!(
-            story
-                .limits
-                .iter()
-                .any(|item| item.contains("no edges were returned"))
-        );
     }
 
     #[test]

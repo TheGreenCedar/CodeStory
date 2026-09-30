@@ -5978,17 +5978,89 @@ mod tests {
         assert_eq!(shell_quote(r"/tmp/a\b'c"), r"'/tmp/a\b'\''c'");
     }
 
+    /// The production prefix must not construct a child process at all, under
+    /// any executable spelling — the behavioral probe below is the primary
+    /// proof; this keeps the contract alive for aliased or restructured code
+    /// on platforms the probe cannot shim.
     #[test]
-    fn production_hook_resolver_does_not_spawn_git() {
+    fn production_hook_resolver_source_never_constructs_a_child_process() {
         let source = include_str!("repository_hooks.rs");
         let production = source
             .split("#[cfg(test)]\nmod tests")
             .next()
             .expect("production source prefix");
-        let forbidden = ["Command::new(", "\"git\""].concat();
         assert!(
-            !production.contains(&forbidden),
-            "production hook resolution must not invoke Git"
+            !production.contains("Command::new") && !production.contains("process::Command"),
+            "production hook resolution must not construct a child process"
+        );
+    }
+
+    /// Behavioral proof: re-run this test in a child process whose PATH
+    /// contains only a recording `git` shim. Any Git spawn the production
+    /// resolver attempts — through any spelling or indirection — lands on the
+    /// shim and writes the invocation log. Windows cannot shim `git.exe`
+    /// without a native binary, so the probe is POSIX-only; the source-shape
+    /// guard above remains the second line there.
+    #[cfg(unix)]
+    #[test]
+    fn production_hook_resolver_does_not_spawn_git() {
+        const CHILD_FLAG: &str = "CS_U02_RESOLVER_PROBE_CHILD";
+
+        if std::env::var_os(CHILD_FLAG).is_some() {
+            // Child: `git` resolves only to the recording shim. Drive the
+            // production resolver through the complete action surface.
+            let fixture = repository_fixture();
+            let environment = isolated_environment(&fixture);
+            for action in [
+                RepositoryHookAction::Status,
+                RepositoryHookAction::Install,
+                RepositoryHookAction::Status,
+                RepositoryHookAction::Uninstall,
+                RepositoryHookAction::Status,
+            ] {
+                let report =
+                    manage_repository_hooks_inner(&request(&fixture, action), &environment)
+                        .unwrap_or_else(HookFailure::report);
+                assert_ne!(report.status, "hooks_config_unresolved", "{report:?}");
+            }
+            return;
+        }
+
+        let temp = tempdir().expect("probe tempdir");
+        let shim_bin = temp.path().join("shim-bin");
+        fs::create_dir_all(&shim_bin).expect("create shim bin");
+        let invocation_log = temp.path().join("git-invocations.log");
+        let shim = shim_bin.join("git");
+        fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"{}\"\nexit 0\n",
+                invocation_log.display()
+            ),
+        )
+        .expect("write git shim");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).expect("chmod shim");
+
+        let child = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--exact")
+            .arg("repository_hooks::tests::production_hook_resolver_does_not_spawn_git")
+            .env_clear()
+            .env(CHILD_FLAG, "1")
+            .env("PATH", &shim_bin)
+            .env("TMPDIR", temp.path())
+            .env("HOME", temp.path())
+            .output()
+            .expect("spawn resolver probe child");
+        assert!(
+            child.status.success(),
+            "probe child failed: {}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert!(
+            !invocation_log.exists(),
+            "production hook resolution spawned git: {}",
+            fs::read_to_string(&invocation_log).unwrap_or_default()
         );
     }
 

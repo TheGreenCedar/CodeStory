@@ -33,8 +33,9 @@ use crate::stdio_catalog::{
 };
 pub(crate) use artifacts::preflight_output_file;
 use resolution::{
-    StructuredCommandFailure, command_failure_envelope, command_failure_message,
-    emit_command_failure, generic_command_failure, json_output_requested, requested_output_file,
+    StructuredCommandFailure, command_failure_details_markdown, command_failure_envelope,
+    command_failure_message, emit_command_failure, generic_command_failure, json_output_requested,
+    render_command_failure_markdown, requested_output_file,
 };
 
 const MAX_DRILL_JOBS: usize = 8;
@@ -163,29 +164,34 @@ pub async fn run() -> ExitCode {
         Err(error) => {
             crate::diagnostics::record_command_failure(&error);
             let structured = error.downcast_ref::<StructuredCommandFailure>();
+            let envelope = structured
+                .map(|failure| failure.envelope.clone())
+                .or_else(|| {
+                    runtime::api_error_in_chain(&error)
+                        .cloned()
+                        .map(CommandFailureEnvelope::new)
+                })
+                .unwrap_or_else(|| generic_command_failure(&error));
+            let output_file = structured
+                .and_then(|failure| failure.output_file.as_deref())
+                .or_else(|| requested_output_file(&raw_args));
             if json {
-                let envelope = structured
-                    .map(|failure| failure.envelope.clone())
-                    .or_else(|| {
-                        runtime::api_error_in_chain(&error)
-                            .cloned()
-                            .map(CommandFailureEnvelope::new)
-                    })
-                    .unwrap_or_else(|| generic_command_failure(&error));
-                let output_file = structured
-                    .and_then(|failure| failure.output_file.as_deref())
-                    .or_else(|| requested_output_file(&raw_args));
                 emit_command_failure(&envelope, output_file);
             } else {
-                if let Some(failure) = structured
-                    && let (Some(path), Some(markdown)) =
-                        (failure.output_file.as_deref(), failure.markdown.as_deref())
-                    && let Err(write_error) = fs::write(path, markdown)
+                let markdown = structured
+                    .and_then(|failure| failure.markdown.as_deref())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| render_command_failure_markdown(&envelope));
+                if let Some(path) = output_file
+                    && let Err(write_error) = fs::write(path, &markdown)
                 {
                     eprintln!("Error: failed to write {}: {write_error}", path.display());
                     return ExitCode::FAILURE;
                 }
                 eprintln!("Error: {}", command_failure_message(&error));
+                // The default output owed the same evidence the JSON envelope
+                // carries: the causes chain and the typed next action.
+                eprint!("{}", command_failure_details_markdown(&envelope));
             }
             ExitCode::FAILURE
         }

@@ -87,8 +87,9 @@ def _flat_staging_test(root: Path) -> None:
     require(
         (
             version_root / "native-generations" / "generation-1" / "runtime-module.dll"
-        ).is_file(),
-        "staging did not copy the package root contents into the version root",
+        ).read_bytes()
+        == b"runtime-bytes",
+        "staging did not copy the native module bytes into the version root",
     )
     require(
         verify_flat_managed_layout(plugin_data, _VERSION, _TARGET) == launcher,

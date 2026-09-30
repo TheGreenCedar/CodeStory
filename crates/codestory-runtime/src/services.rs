@@ -244,6 +244,9 @@ pub(crate) fn active_public_operation_cancellation() -> Option<Arc<AtomicBool>> 
 #[serde(rename_all = "snake_case")]
 pub enum ActivationStage {
     Discovery,
+    /// The refresh found the index writer lock held by another process and
+    /// is inside its bounded, cancellable wait for the handoff.
+    WaitingForPeerWriter,
     CoreFreshness,
     SearchPreparation,
     DensePreparation,
@@ -255,6 +258,7 @@ pub enum ActivationStage {
 fn activation_stage_progress(stage: ActivationStage) -> u8 {
     match stage {
         ActivationStage::Discovery => 0,
+        ActivationStage::WaitingForPeerWriter => 10,
         ActivationStage::CoreFreshness => 20,
         ActivationStage::SearchPreparation => 40,
         ActivationStage::DensePreparation => 60,
@@ -316,13 +320,32 @@ pub struct ActivationSnapshot {
 
 impl ActivationSnapshot {
     pub fn allows_operation(&self, operation: &str) -> bool {
-        if operation_requires_retrieval(operation) {
-            self.capabilities.broad_search == ActivationCapabilityState::Ready
-        } else {
-            matches!(
+        match operation_read_class(operation) {
+            OperationReadClass::Retrieval => {
+                self.capabilities.broad_search == ActivationCapabilityState::Ready
+            }
+            OperationReadClass::GraphOnly => matches!(
                 self.capabilities.local_navigation,
                 ActivationCapabilityState::Ready | ActivationCapabilityState::Retained
-            )
+            ),
+            // Source-backed reads require a fresh complete core: a retained
+            // publication never admits them, and neither does a core that is
+            // still current only because its refresh is still running --
+            // `Ready` under a `Preparing`/`Updating` snapshot describes the
+            // pre-refresh generation, so the caller keeps waiting for the
+            // operation to finish (or fails with its causal error).
+            OperationReadClass::SourceBacked => {
+                self.capabilities.local_navigation == ActivationCapabilityState::Ready
+                    && !matches!(
+                        self.state,
+                        ActivationState::Preparing | ActivationState::Updating
+                    )
+            }
+            // Pinned observers read the committed publication deliberately;
+            // they bind it even while a refresh is in flight.
+            OperationReadClass::PinnedObserver => {
+                self.capabilities.local_navigation == ActivationCapabilityState::Ready
+            }
         }
     }
 }
@@ -534,6 +557,11 @@ enum CompleteCoreAdmission {
     Complete,
     Cold,
     Fenced,
+    /// The core exists but its durable schema is not the one this binary
+    /// serves. Activation rebuilds into a new generation, so callers that own
+    /// activation treat this like a cold read; non-activating callers surface
+    /// the typed failure.
+    StaleSchema(ApiError),
     Corrupt(ApiError),
 }
 
@@ -1022,7 +1050,9 @@ impl ActivationService {
         match self.classify_complete_core_admission(project_root, storage_path) {
             CompleteCoreAdmission::Complete => return Ok(()),
             CompleteCoreAdmission::Corrupt(error) => return Err(error),
-            CompleteCoreAdmission::Cold | CompleteCoreAdmission::Fenced => {}
+            CompleteCoreAdmission::Cold
+            | CompleteCoreAdmission::Fenced
+            | CompleteCoreAdmission::StaleSchema(_) => {}
         }
 
         match self.activate_with_goal(
@@ -1064,7 +1094,9 @@ impl ActivationService {
         }
         match self.classify_complete_core_admission(project_root, storage_path) {
             CompleteCoreAdmission::Complete => Ok(()),
-            CompleteCoreAdmission::Corrupt(error) => Err(error),
+            CompleteCoreAdmission::Corrupt(error) | CompleteCoreAdmission::StaleSchema(error) => {
+                Err(error)
+            }
             CompleteCoreAdmission::Cold => Err(ApiError::new(
                 "proof_semantic_projection_unavailable",
                 "no complete exact-proof core publication is available",
@@ -1092,6 +1124,18 @@ impl ActivationService {
         }
         let freshness = match Store::open_freshness_observational(storage_path) {
             Ok(storage) => storage,
+            Err(error @ codestory_store::StorageError::SchemaVersionMismatch { .. }) => {
+                let error = crate::index_incremental::core_schema_observation_error(
+                    project_root,
+                    "Failed to inspect storage admission state",
+                    error,
+                );
+                return if error.code == "core_schema_too_new" {
+                    CompleteCoreAdmission::Corrupt(error)
+                } else {
+                    CompleteCoreAdmission::StaleSchema(error)
+                };
+            }
             Err(error) => {
                 return CompleteCoreAdmission::Corrupt(ApiError::internal(format!(
                     "Failed to inspect storage admission state: {error}"
@@ -1115,6 +1159,9 @@ impl ActivationService {
         ) {
             Ok(Some(summary)) if summary.publication.is_some() => CompleteCoreAdmission::Complete,
             Ok(_) => CompleteCoreAdmission::Cold,
+            Err(error) if error.code == "core_schema_upgrade_required" => {
+                CompleteCoreAdmission::StaleSchema(error)
+            }
             Err(error) => CompleteCoreAdmission::Corrupt(error),
         }
     }
@@ -1184,6 +1231,26 @@ impl ActivationService {
         )
     }
 
+    /// Activate or join activation with an explicit goal inside one foreground
+    /// slice. Source-backed callers pass `CoreOnly`: they need the fresh core,
+    /// never the retrieval sidecars.
+    pub fn activate_project_with_foreground_budget_and_goal(
+        &self,
+        project_root: &Path,
+        storage_path: &Path,
+        request_cancelled: Arc<AtomicBool>,
+        foreground_budget: Duration,
+        goal: ActivationGoal,
+    ) -> Result<ActivationRun, ApiError> {
+        self.activate_with_goal(
+            project_root,
+            storage_path,
+            request_cancelled,
+            foreground_budget,
+            goal,
+        )
+    }
+
     fn activate_with_goal(
         &self,
         project_root: &Path,
@@ -1198,6 +1265,9 @@ impl ActivationService {
                 "request cancelled before project activation",
             ));
         }
+        let deadline = Instant::now()
+            .checked_add(foreground_budget)
+            .unwrap_or_else(Instant::now);
         let target = self.target_for_request(project_root, storage_path);
         let (operation_id, activation_cancelled) = loop {
             let ready_candidate = {
@@ -1218,7 +1288,17 @@ impl ActivationService {
                         ));
                     }
                     if !state.goal.satisfies(goal) {
-                        return Err(narrower_activation_in_flight());
+                        // A narrower-goal run is in flight: wait it out inside
+                        // the caller's budget, then re-drive so this request
+                        // pursues its own goal instead of inheriting a
+                        // core-only verdict.
+                        self.wait_out_narrower_activation(
+                            state,
+                            &target,
+                            request_cancelled.as_ref(),
+                            deadline.saturating_duration_since(Instant::now()),
+                        )?;
+                        continue;
                     }
                     let operation_id = state
                         .current
@@ -1235,7 +1315,7 @@ impl ActivationService {
                         &operation_id,
                         true,
                         request_cancelled.as_ref(),
-                        foreground_budget,
+                        deadline.saturating_duration_since(Instant::now()),
                         goal,
                     );
                 }
@@ -1287,7 +1367,17 @@ impl ActivationService {
                         ));
                     }
                     if !state.goal.satisfies(goal) {
-                        return Err(narrower_activation_in_flight());
+                        // A narrower-goal run is in flight: wait it out inside
+                        // the caller's budget, then re-drive so this request
+                        // pursues its own goal instead of inheriting a
+                        // core-only verdict.
+                        self.wait_out_narrower_activation(
+                            state,
+                            &target,
+                            request_cancelled.as_ref(),
+                            deadline.saturating_duration_since(Instant::now()),
+                        )?;
+                        continue;
                     }
                     let operation_id = state
                         .current
@@ -1304,7 +1394,7 @@ impl ActivationService {
                         &operation_id,
                         true,
                         request_cancelled.as_ref(),
-                        foreground_budget,
+                        deadline.saturating_duration_since(Instant::now()),
                         goal,
                     );
                 }
@@ -1363,7 +1453,17 @@ impl ActivationService {
                     ));
                 }
                 if !state.goal.satisfies(goal) {
-                    return Err(narrower_activation_in_flight());
+                    // A narrower-goal run is in flight: wait it out inside
+                    // the caller's budget, then re-drive so this request
+                    // pursues its own goal instead of inheriting a core-only
+                    // verdict.
+                    self.wait_out_narrower_activation(
+                        state,
+                        &target,
+                        request_cancelled.as_ref(),
+                        deadline.saturating_duration_since(Instant::now()),
+                    )?;
+                    continue;
                 }
                 let operation_id = state
                     .current
@@ -1380,7 +1480,7 @@ impl ActivationService {
                     &operation_id,
                     true,
                     request_cancelled.as_ref(),
-                    foreground_budget,
+                    deadline.saturating_duration_since(Instant::now()),
                     goal,
                 );
             }
@@ -1468,7 +1568,7 @@ impl ActivationService {
             &operation_id,
             false,
             request_cancelled.as_ref(),
-            foreground_budget,
+            deadline.saturating_duration_since(Instant::now()),
             goal,
         )
     }
@@ -1835,88 +1935,144 @@ impl ActivationService {
         // legacy flat cache can migrate it in place and hide the need to
         // rebuild parser artifacts. Recovery binds paths without opening the
         // predecessor; the full refresh stages and publishes its replacement.
-        let summary = match self
-            .controller
-            .ensure_incremental_refresh_compatible_at(&project_root, &storage_path)
-        {
-            Ok(()) => {
-                let layout =
-                    codestory_store::CorePublicationLayout::from_storage_path(&storage_path)
-                        .map_err(|error| {
-                            ApiError::internal(format!(
-                                "Failed to resolve core publication layout for activation: {error}"
-                            ))
-                        })?;
-                let has_generation_pointer =
-                    layout.read_pointer().is_ok_and(|pointer| pointer.is_some());
-                let retrieval_pointer_is_absent = matches!(
-                    std::fs::symlink_metadata(layout.retrieval_publication_path()),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
-                );
-                let summary = if has_generation_pointer && retrieval_pointer_is_absent {
-                    // A complete core may legitimately predate its first retrieval
-                    // publication. Full activation owns advancing that state, but
-                    // the ordinary summary remains a strict observational read.
-                    self.controller.open_core_read_only_with_storage_path(
-                        project_root.clone(),
-                        storage_path.clone(),
-                    )?
-                } else {
-                    self.controller.open_project_summary_with_storage_path(
-                        project_root.clone(),
-                        storage_path.clone(),
-                    )?
-                };
-                Some(summary)
-            }
-            Err(error)
-                if error.code == crate::index_incremental::FULL_REFRESH_REQUIRED_ERROR_CODE =>
-            {
-                self.controller
-                    .bind_project_paths_for_refresh(project_root.clone(), storage_path.clone())?;
-                None
-            }
-            Err(error) => return Err(error),
-        };
-        let has_complete_core = summary
-            .as_ref()
-            .is_some_and(|summary| summary.publication.is_some() && summary.stats.node_count > 0);
-        let mut precomputed_core_probe = has_complete_core
-            .then(|| self.controller.probe_incremental_plan_for_activation())
-            .transpose()?;
-        let complete_incremental_source_inventory = precomputed_core_probe
-            .as_ref()
-            .is_some_and(|probe| probe.has_complete_source_inventory());
-        // The incremental probe reports a missing search generation only after
-        // proving a complete inventory, an empty source plan, and a current
-        // complete core contract. Repair that derived generation against the
-        // exact immutable core. Source aliases still prevent an unsealed
-        // short-circuit and take the full retrieval freshness path below.
-        let search_repair_only = has_complete_core
-            && precomputed_core_probe.as_ref().is_some_and(|probe| {
-                probe.outcome == IncrementalPlanProbeOutcomeDto::SearchGenerationIncomplete
-                    && probe.files_to_index == 0
-                    && probe.files_to_remove == 0
-                    && probe.publication.as_ref().is_some_and(|publication| {
-                        let publication =
-                            crate::index_commit::index_publication_dto(publication.clone());
-                        summary
-                            .as_ref()
-                            .and_then(|summary| summary.publication.as_ref())
-                            == Some(&publication)
-                    })
-            });
-        let preflight_ms =
-            u64::try_from(activation_started.elapsed().as_millis()).unwrap_or(u64::MAX);
-
-        operation.set_stage(ActivationStage::CoreFreshness);
+        // The writer lock alone orders writers, including ones in other
+        // processes. A plan observed before holding it is stale by
+        // definition, so the observe/probe/write sequence repeats: after a
+        // peer releases the lock, freshly-opened storage decides whether the
+        // peer's publication already covers the work (adopt it) or a write
+        // is still required (exactly one attempt, under the held lock).
+        let mut held_writer: Option<crate::index_commit::IndexWriterGuard> = None;
         let core_refresh_started = Instant::now();
         let mut refreshed_core = None;
-        let core_stale = !has_complete_core
-            || precomputed_core_probe
+        let (
+            summary,
+            has_complete_core,
+            complete_incremental_source_inventory,
+            search_repair_only,
+            precomputed_core_probe,
+            preflight_ms,
+        ) = 'core_plan: loop {
+            // Inspect compatibility before opening the live database: opening a
+            // legacy flat cache can migrate it in place and hide the need to
+            // rebuild parser artifacts. Recovery binds paths without opening the
+            // predecessor; the full refresh stages and publishes its replacement.
+            let summary = match self
+                .controller
+                .ensure_incremental_refresh_compatible_at(&project_root, &storage_path)
+            {
+                Ok(()) => {
+                    let layout = codestory_store::CorePublicationLayout::from_storage_path(
+                        &storage_path,
+                    )
+                    .map_err(|error| {
+                        ApiError::internal(format!(
+                            "Failed to resolve core publication layout for activation: {error}"
+                        ))
+                    })?;
+                    let has_generation_pointer =
+                        layout.read_pointer().is_ok_and(|pointer| pointer.is_some());
+                    let retrieval_pointer_is_absent = matches!(
+                        std::fs::symlink_metadata(layout.retrieval_publication_path()),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                    );
+                    let summary = if has_generation_pointer && retrieval_pointer_is_absent {
+                        // A complete core may legitimately predate its first retrieval
+                        // publication. Full activation owns advancing that state, but
+                        // the ordinary summary remains a strict observational read.
+                        self.controller.open_core_read_only_with_storage_path(
+                            project_root.clone(),
+                            storage_path.clone(),
+                        )?
+                    } else {
+                        self.controller.open_project_summary_with_storage_path(
+                            project_root.clone(),
+                            storage_path.clone(),
+                        )?
+                    };
+                    Some(summary)
+                }
+                Err(error)
+                    if error.code == crate::index_incremental::FULL_REFRESH_REQUIRED_ERROR_CODE =>
+                {
+                    self.controller.bind_project_paths_for_refresh(
+                        project_root.clone(),
+                        storage_path.clone(),
+                    )?;
+                    None
+                }
+                Err(error) => return Err(error),
+            };
+            let has_complete_core = summary.as_ref().is_some_and(|summary| {
+                summary.publication.is_some() && summary.stats.node_count > 0
+            });
+            let mut precomputed_core_probe = has_complete_core
+                .then(|| self.controller.probe_incremental_plan_for_activation())
+                .transpose()?;
+            let complete_incremental_source_inventory = precomputed_core_probe
                 .as_ref()
-                .is_none_or(|probe| !probe.short_circuited() && !search_repair_only);
-        if core_stale {
+                .is_some_and(|probe| probe.has_complete_source_inventory());
+            // The incremental probe reports a missing search generation only after
+            // proving a complete inventory, an empty source plan, and a current
+            // complete core contract. Repair that derived generation against the
+            // exact immutable core. Source aliases still prevent an unsealed
+            // short-circuit and take the full retrieval freshness path below.
+            let search_repair_only = has_complete_core
+                && precomputed_core_probe.as_ref().is_some_and(|probe| {
+                    probe.outcome == IncrementalPlanProbeOutcomeDto::SearchGenerationIncomplete
+                        && probe.files_to_index == Some(0)
+                        && probe.files_to_remove == Some(0)
+                        && probe.publication.as_ref().is_some_and(|publication| {
+                            let publication =
+                                crate::index_commit::index_publication_dto(publication.clone());
+                            summary
+                                .as_ref()
+                                .and_then(|summary| summary.publication.as_ref())
+                                == Some(&publication)
+                        })
+                });
+            let preflight_ms =
+                u64::try_from(activation_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+            let core_stale = !has_complete_core
+                || precomputed_core_probe
+                    .as_ref()
+                    .is_none_or(|probe| !probe.short_circuited() && !search_repair_only);
+            if !core_stale {
+                operation.set_stage(ActivationStage::CoreFreshness);
+                break 'core_plan (
+                    summary,
+                    has_complete_core,
+                    complete_incremental_source_inventory,
+                    search_repair_only,
+                    precomputed_core_probe,
+                    preflight_ms,
+                );
+            }
+            let writer_guard = match held_writer.take() {
+                Some(guard) => guard,
+                None => match crate::index_commit::IndexWriterGuard::try_acquire(&storage_path) {
+                    Ok(guard) => guard,
+                    Err(error) if error.code == "cache_busy" => {
+                        // A peer process is publishing for this cache. Wait
+                        // out its writer lock — bounded, cancellable through
+                        // the activation flag, in slices no longer than the
+                        // bounded-lock poll step — then re-plan under the lock
+                        // this process now holds.
+                        operation.set_stage(ActivationStage::WaitingForPeerWriter);
+                        held_writer =
+                            Some(crate::index_commit::IndexWriterGuard::acquire_after_peer(
+                                &storage_path,
+                                codestory_contracts::bounded_locks::LockDeadline::after(
+                                    codestory_contracts::bounded_locks::PUBLICATION_LOCK_WAIT,
+                                ),
+                                Some(operation.cancelled.as_ref()),
+                            )?);
+                        continue 'core_plan;
+                    }
+                    Err(error) => return Err(error),
+                },
+            };
+            operation.set_stage(ActivationStage::CoreFreshness);
             let mode = if !has_complete_core {
                 IndexMode::Full
             } else {
@@ -1949,6 +2105,7 @@ impl ActivationService {
                         .then(|| precomputed_core_probe.take())
                         .flatten(),
                     failed_refresh_diagnostics.as_ref(),
+                    writer_guard,
                 );
             let evidence = match evidence_result {
                 Ok(evidence) => evidence,
@@ -1973,7 +2130,19 @@ impl ActivationService {
                 evidence.stats,
                 evidence.repository_tracking_digest,
             ));
-        }
+            break 'core_plan (
+                summary,
+                has_complete_core,
+                complete_incremental_source_inventory,
+                search_repair_only,
+                precomputed_core_probe,
+                preflight_ms,
+            );
+        };
+        // Adopted peer publications and completed writes alike stop holding
+        // the writer here: retrieval preparation re-acquires it under the
+        // ordinary single-attempt `cache_busy` contract.
+        drop(held_writer);
         let local_ready = match refreshed_core.as_ref() {
             Some((_, stats, _)) => stats.node_count > 0 && stats.fatal_error_count == 0,
             None => summary.as_ref().is_some_and(|summary| {
@@ -2054,8 +2223,20 @@ impl ActivationService {
                 &storage_path,
                 &self.controller.runtime_config,
                 operation.cancelled.as_ref(),
-            )
-            .map_err(map_activation_error)?;
+            );
+            // The finalize shared fence is released when the call above
+            // returns, on success or failure. Core GC taken under that fence
+            // is suppressed, so publications committed while a peer finalized
+            // keep one unpinned image each; this best-effort pass reclaims
+            // them without another index operation.
+            if let Err(error) = crate::activation_retrieval::apply_core_gc_for_runtime(
+                &self.controller.runtime_config,
+                &storage_path,
+                &|| operation.cancelled.load(Ordering::Relaxed),
+            ) {
+                tracing::warn!("Core retention after retrieval finalize deferred: {error}");
+            }
+            let outcome = outcome.map_err(map_activation_error)?;
             tracing::debug!(
                 target: "codestory::activation",
                 phase_timings = ?outcome.phase_timings,
@@ -2223,11 +2404,51 @@ pub fn search_operation_name(repo_text: SearchRepoTextMode) -> &'static str {
     }
 }
 
+/// How a public operation relates to the pinned core publication.
+///
+/// Every public operation is one of four read classes; the class decides what
+/// activation capability the operation waits for and whether a retained
+/// publication may answer it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationReadClass {
+    /// Pure graph reads. They may answer from a retained complete publication
+    /// while a refresh runs; the answer is labelled historical.
+    GraphOnly,
+    /// Reads that serve source bytes or freshness-bound core truth. They wait
+    /// for a fresh complete core and never fall back to a retained one.
+    SourceBacked,
+    /// Complete-core observers such as `affected` and the proof tool. They pin
+    /// one complete publication and report drift instead of blocking.
+    PinnedObserver,
+    /// Full-retrieval operations; unchanged readiness contract.
+    Retrieval,
+}
+
+/// The read class of one public operation name.
+///
+/// Operation names here are the runtime-visible names: `stdio` maps tool
+/// identities to these names before admission (`snippet` without a query
+/// becomes `source_snippet`), and `browser.rs` names each call directly.
+/// Anything not listed is a pure graph read.
+pub fn operation_read_class(operation: &str) -> OperationReadClass {
+    match operation {
+        // Retrieval readiness admits only operations whose results execute
+        // through the retrieval sidecars (`packet`, hybrid `search`, `context`,
+        // `drill`) or resolve evidence against a pinned retrieval generation
+        // (`resolution`, `graph_assisted`).
+        "packet" | "search" | "context" | "drill" | "resolution" | "graph_assisted" => {
+            OperationReadClass::Retrieval
+        }
+        "exact_search" | "source_snippet" => OperationReadClass::SourceBacked,
+        "affected" | crate::call_path_kernel::PROOF_DOMAIN => OperationReadClass::PinnedObserver,
+        _ => OperationReadClass::GraphOnly,
+    }
+}
+
+/// Whether execution pins the retrieval publication: exactly the operations
+/// whose admission also requires `broad_search` readiness.
 fn operation_requires_retrieval(operation: &str) -> bool {
-    matches!(
-        operation,
-        "packet" | "search" | "context" | "drill" | "resolution" | "graph_assisted"
-    )
+    operation_read_class(operation) == OperationReadClass::Retrieval
 }
 
 /// Whether a freshness observation permits serving an operation from the current publication.
@@ -2295,13 +2516,43 @@ fn snapshot_allows(snapshot: &ActivationSnapshot) -> bool {
     snapshot.allows_operation("packet")
 }
 
-/// A full request cannot borrow a core-only run's completion, because that run
-/// stops before retrieval. Retrying starts the full activation instead.
-fn narrower_activation_in_flight() -> ApiError {
-    ApiError::new(
-        "activation_retryable",
-        "a core-only activation is already running for this project; retry to start full activation",
-    )
+impl ActivationService {
+    /// Wait out a running activation whose goal cannot satisfy this request
+    /// (a `CoreOnly` run ahead of a `Full` caller), then let the caller
+    /// re-drive through `activate_with_goal` so the requester's own goal
+    /// owns the outcome. The running goal frames the wait's admit check so
+    /// the narrower run's completion never reports broad readiness. Only a
+    /// spent caller budget or an explicit cancel propagates; the narrower
+    /// run's own verdicts are superseded by the new attempt.
+    fn wait_out_narrower_activation(
+        &self,
+        running: std::sync::MutexGuard<'_, ActivationCoordinatorState>,
+        target: &ActivationTarget,
+        request_cancelled: &AtomicBool,
+        foreground_budget: Duration,
+    ) -> Result<(), ApiError> {
+        let running_goal = running.goal;
+        let operation_id = running
+            .current
+            .as_ref()
+            .expect("running activation has a snapshot")
+            .operation_id
+            .clone();
+        drop(running);
+        match self.wait_for_activation(
+            target,
+            &operation_id,
+            true,
+            request_cancelled,
+            foreground_budget,
+            running_goal,
+        ) {
+            Err(error) if matches!(error.code.as_str(), "cancelled" | "activation_preparing") => {
+                Err(error)
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 fn snapshot_error(snapshot: &ActivationSnapshot) -> ApiError {
@@ -2366,6 +2617,9 @@ fn map_activation_error(error: anyhow::Error) -> ApiError {
     if let Some(refusal) = crate::insufficient_space_api_error(&error) {
         return refusal;
     }
+    if let Some(refusal) = crate::peer_writer_api_error(&error) {
+        return refusal;
+    }
     if let Some(error) = embedding_api_error(&error) {
         return classify_activation_api_error(error);
     }
@@ -2402,9 +2656,11 @@ fn classify_activation_api_error(mut error: ApiError) -> ApiError {
             error.code = "activation_retryable".into();
             error
         }
-        "cancelled" | "activation_preparing" | "activation_retryable" | "insufficient_space" => {
-            error
-        }
+        "cancelled"
+        | "activation_preparing"
+        | "activation_retryable"
+        | "insufficient_space"
+        | "peer_writer_active" => error,
         "source_unreadable"
         | "source_malformed"
         | "source_binary"
@@ -2518,6 +2774,29 @@ pub struct ActivationOperation {
     cancelled: Arc<AtomicBool>,
 }
 
+/// Why a public operation answered from a retained publication instead of a
+/// fresh one. Serialized into `codestory_publication.freshness` on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoricalServedReason {
+    /// A refresh activation was in flight when the read was admitted.
+    RefreshInProgress,
+    /// The refresh could not publish because a peer process holds the writer.
+    PeerWriter,
+    /// A replacement publication failed and the previous generation was kept.
+    ReplacementFailed,
+    /// Source drift was observed with no clearer cause in the snapshot.
+    StaleSource,
+}
+
+/// Whether a public operation's result came from the fresh current source or
+/// from a retained publication a refresh is still replacing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationFreshness {
+    Fresh,
+    Historical(HistoricalServedReason),
+}
+
 #[derive(Debug, Clone)]
 pub struct PublicOperation<T> {
     pub value: T,
@@ -2525,6 +2804,9 @@ pub struct PublicOperation<T> {
     pub retrieval_publication: Option<EmbeddingVectorPublicationIdentityDto>,
     pub operation_id: String,
     pub attempt: u32,
+    /// `Historical` exactly when the freshness gate admitted this operation
+    /// from a retained publication; the adapter stamps it on the wire.
+    pub freshness: OperationFreshness,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2572,25 +2854,48 @@ impl PublicOperationService {
         )
     }
 
-    fn retained_core_allows(&self, operation: &str, publication: &IndexPublicationRecord) -> bool {
-        !operation_requires_retrieval(operation)
-            && self.activation.as_ref().is_some_and(|activation| {
-                let Some(project_root) = self.controller.require_project_root().ok() else {
-                    return false;
-                };
-                let Some(storage_path) = self.controller.require_storage_path().ok() else {
-                    return false;
-                };
-                activation
-                    .snapshot_for_target(&project_root, &storage_path)
-                    .is_some_and(|snapshot| {
-                        matches!(
-                            snapshot.capabilities.local_navigation,
-                            ActivationCapabilityState::Ready | ActivationCapabilityState::Retained
-                        ) && snapshot.retained_core_publication.as_ref()
-                            == Some(&crate::index_publication_dto(publication.clone()))
-                    })
-            })
+    /// Whether the operation may answer from a retained complete publication,
+    /// and why. Only `GraphOnly` operations have a retained escape; every
+    /// other class fails the freshness gate so a source-backed read can never
+    /// silently serve pre-refresh bytes. The reason is recorded for the
+    /// `historical` freshness metadata the adapter stamps on the result.
+    fn retained_core_admission(
+        &self,
+        operation: &str,
+        publication: &IndexPublicationRecord,
+    ) -> Option<HistoricalServedReason> {
+        if operation_read_class(operation) != OperationReadClass::GraphOnly {
+            return None;
+        }
+        let snapshot = self.activation.as_ref().and_then(|activation| {
+            let project_root = self.controller.require_project_root().ok()?;
+            let storage_path = self.controller.require_storage_path().ok()?;
+            activation.snapshot_for_target(&project_root, &storage_path)
+        })?;
+        if !matches!(
+            snapshot.capabilities.local_navigation,
+            ActivationCapabilityState::Ready | ActivationCapabilityState::Retained
+        ) || snapshot.retained_core_publication.as_ref()
+            != Some(&crate::index_publication_dto(publication.clone()))
+        {
+            return None;
+        }
+        let reason = if snapshot.stage == ActivationStage::WaitingForPeerWriter {
+            HistoricalServedReason::PeerWriter
+        } else if matches!(
+            snapshot.state,
+            ActivationState::Preparing | ActivationState::Updating
+        ) {
+            HistoricalServedReason::RefreshInProgress
+        } else if matches!(
+            snapshot.state,
+            ActivationState::Retryable | ActivationState::Unavailable
+        ) {
+            HistoricalServedReason::ReplacementFailed
+        } else {
+            HistoricalServedReason::StaleSource
+        };
+        Some(reason)
     }
 
     fn ensure_packet_latency_remaining(
@@ -2773,6 +3078,7 @@ impl PublicOperationService {
             let mut complete_core_span = crate::agent::packet_batch::observe_packet_operation_span(
                 crate::agent::packet_batch::PacketOperationObservationSpan::CompleteCoreSnapshot,
             );
+            let mut historical_reason = None;
             let result = self.controller.with_complete_core_snapshot(|publication| {
                 let mut freshness_span =
                     crate::agent::packet_batch::observe_packet_operation_span(
@@ -2802,11 +3108,14 @@ impl PublicOperationService {
                 let freshness = freshness?;
                 if !index_freshness_admits_operation(&freshness) {
                     codestory_workspace::invalidate_lease_memoized_values();
-                    if !self.retained_core_allows(operation, publication) {
-                        return Err(ApiError::new(
-                            "project_unavailable",
-                            index_freshness_block_message(operation, &freshness),
-                        ));
+                    match self.retained_core_admission(operation, publication) {
+                        Some(reason) => historical_reason = Some(reason),
+                        None => {
+                            return Err(ApiError::new(
+                                "project_unavailable",
+                                index_freshness_block_message(operation, &freshness),
+                            ));
+                        }
                     }
                 }
                 let mut run = || {
@@ -2864,11 +3173,14 @@ impl PublicOperationService {
                     let after = after?;
                     if !index_freshness_admits_operation(&after) {
                         codestory_workspace::invalidate_lease_memoized_values();
-                        if !self.retained_core_allows(operation, publication) {
-                            return Err(ApiError::new(
-                                "publication_changed",
-                                format!("source inputs changed while running {operation}"),
-                            ));
+                        match self.retained_core_admission(operation, publication) {
+                            Some(reason) => historical_reason = Some(reason),
+                            None => {
+                                return Err(ApiError::new(
+                                    "publication_changed",
+                                    format!("source inputs changed while running {operation}"),
+                                ));
+                            }
                         }
                     }
                     Ok(value)
@@ -2916,6 +3228,10 @@ impl PublicOperationService {
                         retrieval_publication,
                         operation_id,
                         attempt,
+                        freshness: match historical_reason {
+                            Some(reason) => OperationFreshness::Historical(reason),
+                            None => OperationFreshness::Fresh,
+                        },
                     });
                 }
                 Err(error)
@@ -2988,12 +3304,17 @@ impl PublicOperationService {
             });
             match result {
                 Ok((value, core_publication, retrieval_publication)) => {
+                    // Observational reads pin the committed complete
+                    // publication directly; they never take the retained
+                    // admission escape, so they are always `Fresh` here even
+                    // while a refresh is running.
                     return Ok(PublicOperation {
                         value,
                         core_publication: Some(core_publication),
                         retrieval_publication,
                         operation_id,
                         attempt,
+                        freshness: OperationFreshness::Fresh,
                     });
                 }
                 Err(error) if attempt == 1 && error.code == "publication_changed" => continue,
@@ -3329,9 +3650,11 @@ impl ProjectService {
 
     pub fn complete_index_publication_at(
         &self,
+        project_root: &std::path::Path,
         storage_path: &std::path::Path,
     ) -> Result<Option<IndexPublicationDto>, ApiError> {
-        self.controller.complete_index_publication_at(storage_path)
+        self.controller
+            .complete_index_publication_at(project_root, storage_path)
     }
 
     pub fn start_indexing(&self, req: StartIndexingRequest) -> Result<(), ApiError> {
@@ -4139,6 +4462,7 @@ pub(crate) mod activation_tests {
 
     fn complete_core_without_retrieval_pointer_fixture()
     -> (tempfile::TempDir, tempfile::TempDir, PathBuf, PathBuf) {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project = tempfile::tempdir().expect("project");
         let cache = tempfile::tempdir().expect("cache");
         let storage_path = cache.path().join("codestory.db");
@@ -4148,7 +4472,7 @@ pub(crate) mod activation_tests {
         )
         .expect("write retained-core fixture");
 
-        let seeding_runtime = Runtime::new();
+        let seeding_runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
         seeding_runtime
             .project_service()
             .open_project_summary_with_storage_path(
@@ -5953,7 +6277,8 @@ pub(crate) mod activation_tests {
         fs::write(linked.join("build/X.java"), "class X {}\n").expect("excluded source");
 
         let storage_path = parent.path().join("cache/codestory.db");
-        let runtime = Runtime::new();
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
         runtime
             .project_service()
             .open_project_summary_with_storage_path(linked.clone(), storage_path.clone())
@@ -5991,6 +6316,14 @@ pub(crate) mod activation_tests {
         assert!(
             !service.ready_lease_source_observer_unchanged(Some(&recorded)),
             "the runtime lease probe must reject state A after the linked index moves to B"
+        );
+        assert!(
+            process_cache
+                .path()
+                .join("retention")
+                .join("global_generation_gc.lock")
+                .is_file(),
+            "core publication must route its retention lock through the owned process cache"
         );
     }
 
@@ -6274,7 +6607,8 @@ pub(crate) mod activation_tests {
     fn full_activation_admits_complete_core_with_physically_missing_retrieval_pointer() {
         let (project, _cache, storage_path, retrieval_pointer) =
             complete_core_without_retrieval_pointer_fixture();
-        let runtime = Runtime::new();
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
         let service = runtime.activation_service();
         service.arm_preparation_seams_for_test();
 
@@ -6303,13 +6637,28 @@ pub(crate) mod activation_tests {
             !retrieval_pointer.exists(),
             "activation planning must not materialize a retrieval pointer"
         );
+        assert!(
+            process_cache
+                .path()
+                .read_dir()
+                .expect("read owned runtime cache root")
+                .next()
+                .is_none(),
+            "a seam-stopped activation must not write process defaults under the owned cache root"
+        );
+        assert_eq!(
+            runtime.test_owned_cache_root(),
+            process_cache.path(),
+            "activation must use the injected cache root, not ambient process defaults"
+        );
     }
 
     #[test]
     fn missing_retrieval_pointer_remains_an_observational_error() {
         let (project, _cache, storage_path, retrieval_pointer) =
             complete_core_without_retrieval_pointer_fixture();
-        let runtime = Runtime::new();
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
         runtime
             .project_service()
             .open_core_read_only_with_storage_path(
@@ -6334,6 +6683,20 @@ pub(crate) mod activation_tests {
             !retrieval_pointer.exists(),
             "ordinary observation must not materialize a retrieval pointer"
         );
+        assert!(
+            process_cache
+                .path()
+                .read_dir()
+                .expect("read owned runtime cache root")
+                .next()
+                .is_none(),
+            "an observational read must not write process defaults under the owned cache root"
+        );
+        assert_eq!(
+            runtime.test_owned_cache_root(),
+            process_cache.path(),
+            "observation must use the injected cache root, not ambient process defaults"
+        );
     }
 
     #[test]
@@ -6342,7 +6705,8 @@ pub(crate) mod activation_tests {
             complete_core_without_retrieval_pointer_fixture();
         let corrupt = b"not a retrieval publication database";
         fs::write(&retrieval_pointer, corrupt).expect("write corrupt retrieval pointer");
-        let runtime = Runtime::new();
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
         let service = runtime.activation_service();
         service.arm_preparation_seams_for_test();
 
@@ -6374,6 +6738,20 @@ pub(crate) mod activation_tests {
             corrupt,
             "failed activation must not repair or replace corrupt pointer bytes"
         );
+        assert!(
+            process_cache
+                .path()
+                .read_dir()
+                .expect("read owned runtime cache root")
+                .next()
+                .is_none(),
+            "a refused activation must not write process defaults under the owned cache root"
+        );
+        assert_eq!(
+            runtime.test_owned_cache_root(),
+            process_cache.path(),
+            "a refused activation must use the injected cache root, not ambient process defaults"
+        );
     }
 
     #[cfg(unix)]
@@ -6393,7 +6771,8 @@ pub(crate) mod activation_tests {
             fs::symlink_metadata(&retrieval_pointer).is_ok(),
             "nofollow metadata must still observe the hostile pointer entry"
         );
-        let runtime = Runtime::new();
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
         let service = runtime.activation_service();
         service.arm_preparation_seams_for_test();
 
@@ -6423,6 +6802,20 @@ pub(crate) mod activation_tests {
         assert!(
             fs::symlink_metadata(&retrieval_pointer).is_ok(),
             "failed activation must leave the dangling pointer entry unchanged"
+        );
+        assert!(
+            process_cache
+                .path()
+                .read_dir()
+                .expect("read owned runtime cache root")
+                .next()
+                .is_none(),
+            "a refused activation must not write process defaults under the owned cache root"
+        );
+        assert_eq!(
+            runtime.test_owned_cache_root(),
+            process_cache.path(),
+            "a refused activation must use the injected cache root, not ambient process defaults"
         );
     }
 
@@ -6494,10 +6887,12 @@ pub(crate) mod activation_tests {
 
     #[test]
     fn activation_target_reobserves_same_root_remote_change_and_no_remote_reinit() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project = tempfile::tempdir().expect("project");
         initialize_identifiable_git_project(project.path());
         let storage = project.path().join("cache").join("codestory.db");
-        let service = Runtime::new().activation_service();
+        let service =
+            crate::test_runtime_with_owned_cache_root(process_cache.path()).activation_service();
         let remote_a = ActivationTarget::new(project.path(), &storage);
         let snapshot = ActivationSnapshot {
             operation_id: "activation-logical-target-fixture".into(),
@@ -6623,9 +7018,10 @@ pub(crate) mod activation_tests {
 
     #[test]
     fn pre_cancelled_activation_does_not_start_shared_work() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project = tempfile::tempdir().expect("project");
         let storage_path = project.path().join("cache").join("codestory.db");
-        let runtime = Runtime::new();
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
         let cancelled = Arc::new(AtomicBool::new(true));
 
         let error = runtime
@@ -6640,6 +7036,7 @@ pub(crate) mod activation_tests {
 
     #[test]
     fn foreground_budget_returns_progress_while_one_shared_activation_continues() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project = tempfile::tempdir().expect("project");
         let storage_path = project.path().join("cache").join("codestory.db");
         fs::write(
@@ -6647,7 +7044,10 @@ pub(crate) mod activation_tests {
             "pub fn foreground_activation_fixture() {}\n",
         )
         .expect("write fixture");
-        let service = Runtime::new().activation_service();
+        let service =
+            crate::test_runtime_with_owned_cache_root(process_cache.path()).activation_service();
+        let worker_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        service.set_worker_start_gate_for_test(Some(Arc::clone(&worker_gate)));
 
         let first = service
             .activate_project_with_foreground_budget(
@@ -6658,6 +7058,15 @@ pub(crate) mod activation_tests {
             )
             .expect_err("zero foreground budget must return typed progress");
         assert_eq!(first.code, "activation_preparing");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while service.worker_start_count_for_test() == 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            service.worker_start_count_for_test(),
+            1,
+            "exactly one shared activation worker must be in flight"
+        );
         let first_snapshot = service.snapshot().expect("running snapshot");
         assert!(matches!(
             first_snapshot.state,
@@ -6677,15 +7086,173 @@ pub(crate) mod activation_tests {
         let joined_snapshot = service.snapshot().expect("joined snapshot");
         assert_eq!(joined_snapshot.operation_id, first_snapshot.operation_id);
         assert_eq!(joined_snapshot.attempt, 1);
+        assert_eq!(
+            service.worker_start_count_for_test(),
+            1,
+            "a joining caller must not spawn a second worker"
+        );
 
+        service.set_worker_start_gate_for_test(None);
+        let (released, changed) = worker_gate.as_ref();
+        *released
+            .lock()
+            .expect("activation worker test gate poisoned") = true;
+        changed.notify_all();
         service.cancel_and_wait();
         let terminal = service.snapshot().expect("terminal snapshot");
         assert_ne!(terminal.state, ActivationState::Ready);
     }
 
     #[test]
+    fn full_activation_keeps_one_budget_across_a_narrower_run() {
+        let process_cache = tempfile::tempdir().expect("owned cache");
+        let project = tempfile::tempdir().expect("project");
+        let storage_path = project.path().join("codestory.db");
+        let service =
+            crate::test_runtime_with_owned_cache_root(process_cache.path()).activation_service();
+        let target = service.target_for_request(project.path(), &storage_path);
+        {
+            let mut state = service.coordinator.state.lock().unwrap();
+            service.begin_activation_locked(&mut state, &target, None, ActivationGoal::CoreOnly);
+        }
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        service.set_worker_start_gate_for_test(Some(Arc::clone(&gate)));
+        let completing = service.clone();
+        let transition = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            let mut state = completing.coordinator.state.lock().unwrap();
+            state.running = false;
+            completing.coordinator.changed.notify_all();
+        });
+        let start = Instant::now();
+        let result = service.activate_project_with_foreground_budget_and_goal(
+            project.path(),
+            &storage_path,
+            Arc::new(AtomicBool::new(false)),
+            Duration::from_millis(500),
+            ActivationGoal::Full,
+        );
+        let elapsed = start.elapsed();
+        transition.join().expect("finish narrower run");
+        service.set_worker_start_gate_for_test(None);
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        service.cancel_and_wait();
+        assert_eq!(
+            result.expect_err("full worker remains parked").code,
+            "activation_preparing"
+        );
+        assert!(
+            elapsed < Duration::from_millis(650),
+            "one 500ms budget was renewed: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_full_request_waits_for_an_in_flight_core_only_run_then_pursues_full() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let project = tempfile::tempdir().expect("project");
+        let storage_path = project.path().join("cache").join("codestory.db");
+        fs::write(
+            project.path().join("fixture.rs"),
+            "pub fn core_only_upgrade_fixture() {}\n",
+        )
+        .expect("write fixture");
+        let service =
+            crate::test_runtime_with_owned_cache_root(process_cache.path()).activation_service();
+        let worker_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        service.set_worker_start_gate_for_test(Some(Arc::clone(&worker_gate)));
+
+        let core_only_service = service.clone();
+        let core_only_root = project.path().to_path_buf();
+        let core_only_storage = storage_path.clone();
+        let core_only = std::thread::spawn(move || {
+            core_only_service.activate_core_only(
+                &core_only_root,
+                &core_only_storage,
+                Arc::new(AtomicBool::new(false)),
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while service.worker_start_count_for_test() == 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(service.worker_start_count_for_test(), 1);
+
+        // The narrower run is in flight: a full caller waits inside its
+        // foreground budget rather than failing as activation_retryable.
+        let upgrade = service
+            .activate_project_with_foreground_budget_and_goal(
+                project.path(),
+                &storage_path,
+                Arc::new(AtomicBool::new(false)),
+                Duration::ZERO,
+                ActivationGoal::Full,
+            )
+            .expect_err("a parked core-only run cannot satisfy a full request");
+        assert_eq!(
+            upgrade.code, "activation_preparing",
+            "a full caller waits on the narrower run instead of a retryable refusal: {upgrade:?}"
+        );
+        assert_eq!(
+            service.worker_start_count_for_test(),
+            1,
+            "waiting on the narrower run must not spawn a second worker"
+        );
+
+        service.set_worker_start_gate_for_test(None);
+        let (released, changed) = worker_gate.as_ref();
+        *released
+            .lock()
+            .expect("activation worker test gate poisoned") = true;
+        changed.notify_all();
+        let _ = core_only.join().expect("join core-only activation caller");
+
+        // Once the narrower run ends, a full caller drives its own activation
+        // attempt: the completed core-only snapshot stays `Updating` with no
+        // broad readiness, so the full goal can neither join it nor borrow its
+        // verdict. Poll the call itself until the attempt advances; every
+        // interim answer must be `activation_preparing`, never
+        // `activation_retryable`.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let second = service.activate_project_with_foreground_budget_and_goal(
+                project.path(),
+                &storage_path,
+                Arc::new(AtomicBool::new(false)),
+                Duration::ZERO,
+                ActivationGoal::Full,
+            );
+            match second {
+                Err(error) => assert_eq!(
+                    error.code, "activation_preparing",
+                    "the full request must wait or start, never refuse: {error:?}"
+                ),
+                Ok(run) => assert_eq!(
+                    run.snapshot.capabilities.broad_search,
+                    ActivationCapabilityState::Ready,
+                    "a full request can only succeed with broad readiness: {:?}",
+                    run.snapshot
+                ),
+            }
+            let snapshot = service.snapshot().expect("activation snapshot");
+            if snapshot.attempt > 1 && service.worker_start_count_for_test() >= 2 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the core-only run ended but no full attempt started"
+            );
+            std::thread::yield_now();
+        }
+        service.cancel_and_wait();
+    }
+
+    #[test]
     fn bounded_cancel_returns_on_a_running_activation_it_cannot_stop() {
-        let service = Runtime::new().activation_service();
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let service =
+            crate::test_runtime_with_owned_cache_root(process_cache.path()).activation_service();
         let cancelled = Arc::new(AtomicBool::new(false));
         {
             let mut state = service
@@ -6738,7 +7305,9 @@ pub(crate) mod activation_tests {
 
     #[test]
     fn bounded_cancel_reads_through_a_poisoned_coordinator() {
-        let service = Runtime::new().activation_service();
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let service =
+            crate::test_runtime_with_owned_cache_root(process_cache.path()).activation_service();
         let cancelled = Arc::new(AtomicBool::new(false));
         {
             let mut state = service
@@ -6771,10 +7340,12 @@ pub(crate) mod activation_tests {
 
     #[test]
     fn serial_retries_keep_one_activation_identity_after_terminal_failure() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project = tempfile::tempdir().expect("project");
         let missing = project.path().join("missing");
         let storage_path = project.path().join("cache").join("codestory.db");
-        let service = Runtime::new().activation_service();
+        let service =
+            crate::test_runtime_with_owned_cache_root(process_cache.path()).activation_service();
 
         let first = service
             .activate_project(&missing, &storage_path, Arc::new(AtomicBool::new(false)))
@@ -6800,10 +7371,12 @@ pub(crate) mod activation_tests {
 
     #[test]
     fn disk_space_refusal_keeps_typed_snapshot_without_starting_a_hot_retry() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project = tempfile::tempdir().expect("project");
         let missing_project = project.path().join("missing");
         let storage_path = project.path().join("cache").join("codestory.db");
-        let service = Runtime::new().activation_service();
+        let service =
+            crate::test_runtime_with_owned_cache_root(process_cache.path()).activation_service();
         service.set_terminal_disk_space_for_test(&missing_project, &storage_path, 80_000_000, 0);
         let before = service.snapshot().expect("terminal disk snapshot");
         for _ in 0..2 {
@@ -6849,6 +7422,7 @@ pub(crate) mod activation_tests {
 
     #[test]
     fn cancelling_a_waiter_does_not_cancel_or_replace_shared_activation() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project = tempfile::tempdir().expect("project");
         let storage_path = project.path().join("cache").join("codestory.db");
         fs::write(
@@ -6856,7 +7430,10 @@ pub(crate) mod activation_tests {
             "pub fn shared_activation_fixture() {}\n",
         )
         .expect("write fixture");
-        let service = Runtime::new().activation_service();
+        let service =
+            crate::test_runtime_with_owned_cache_root(process_cache.path()).activation_service();
+        let worker_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        service.set_worker_start_gate_for_test(Some(Arc::clone(&worker_gate)));
 
         let first = service
             .activate_project_with_foreground_budget(
@@ -6867,6 +7444,15 @@ pub(crate) mod activation_tests {
             )
             .expect_err("zero foreground budget must return shared progress");
         assert_eq!(first.code, "activation_preparing");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while service.worker_start_count_for_test() == 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            service.worker_start_count_for_test(),
+            1,
+            "one shared activation worker must be in flight before the waiter is cancelled"
+        );
         let before = service.snapshot().expect("shared activation snapshot");
 
         let target = ActivationTarget::new(project.path(), &storage_path);
@@ -6887,6 +7473,17 @@ pub(crate) mod activation_tests {
 
         assert_eq!(after.operation_id, before.operation_id);
         assert_ne!(after.state, ActivationState::Cancelled);
+        assert_eq!(
+            service.worker_start_count_for_test(),
+            1,
+            "a cancelled waiter must not cancel or replace the shared worker"
+        );
+        service.set_worker_start_gate_for_test(None);
+        let (released, changed) = worker_gate.as_ref();
+        *released
+            .lock()
+            .expect("activation worker test gate poisoned") = true;
+        changed.notify_all();
         service.cancel_and_wait();
     }
 
@@ -6906,7 +7503,9 @@ pub(crate) mod activation_tests {
             "pub fn other_project() {}\n",
         )
         .expect("other source file");
-        let service = Runtime::new().activation_service();
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
+        let service = runtime.activation_service();
         let worker_gate = Arc::new((Mutex::new(false), Condvar::new()));
         service.set_worker_start_gate_for_test(Some(Arc::clone(&worker_gate)));
         let first = service
@@ -6969,7 +7568,8 @@ pub(crate) mod activation_tests {
             ActivationCapabilityState::Ready
         );
         assert_eq!(service.worker_start_count_for_test(), 1);
-        let different_project = Runtime::new().activation_service();
+        let different_runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
+        let different_project = different_runtime.activation_service();
         let different = different_project
             .activate_with_goal(
                 other_project.path(),
@@ -6986,14 +7586,34 @@ pub(crate) mod activation_tests {
         assert_eq!(different_project.worker_start_count_for_test(), 1);
         service.cancel_and_wait();
         different_project.cancel_and_wait();
+        assert!(
+            process_cache
+                .path()
+                .join("retention")
+                .join("global_generation_gc.lock")
+                .is_file(),
+            "core publication must route its retention lock through the owned process cache"
+        );
+        assert_eq!(
+            runtime.test_owned_cache_root(),
+            process_cache.path(),
+            "activation must use the injected cache root, not ambient process defaults"
+        );
+        assert_eq!(
+            different_runtime.test_owned_cache_root(),
+            process_cache.path(),
+            "the second runtime must use the injected cache root, not ambient process defaults"
+        );
     }
 
     #[test]
     fn panicking_activation_worker_finishes_waiters_and_allows_retry() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project = tempfile::tempdir().expect("project");
         let missing = project.path().join("missing");
         let storage_path = project.path().join("cache").join("codestory.db");
-        let service = Runtime::new().activation_service();
+        let service =
+            crate::test_runtime_with_owned_cache_root(process_cache.path()).activation_service();
         let target = ActivationTarget::new(&missing, &storage_path);
         let operation_id = "activation-panic-fixture".to_string();
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -7074,7 +7694,8 @@ pub(crate) mod activation_tests {
         )
         .expect("write fixture");
 
-        let seeding_runtime = Runtime::new();
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let seeding_runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
         seeding_runtime
             .project_service()
             .open_project_summary_with_storage_path(
@@ -7095,7 +7716,7 @@ pub(crate) mod activation_tests {
             r#"{"members":["src","missing"]}"#,
         )
         .expect("write incomplete synthetic workspace");
-        let runtime = Runtime::new();
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
         assert_eq!(
             runtime
                 .activation_service()
@@ -7204,14 +7825,23 @@ pub(crate) mod activation_tests {
             .public_operation_service()
             .run_with_cancel("ground", Arc::new(AtomicBool::new(false)), || Ok(()))
             .expect("ground admits the exact post-publication retained core");
+        assert!(
+            process_cache
+                .path()
+                .join("retention")
+                .join("global_generation_gc.lock")
+                .is_file(),
+            "core publication must route its retention lock through the owned process cache"
+        );
     }
 
     #[test]
     fn activation_error_is_unavailable_instead_of_ready() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project = tempfile::tempdir().expect("project");
         let missing = project.path().join("missing");
         let storage_path = project.path().join("cache").join("codestory.db");
-        let runtime = Runtime::new();
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
 
         let error = runtime
             .activation_service()
@@ -7238,7 +7868,8 @@ pub(crate) mod activation_tests {
         )
         .expect("write fixture");
 
-        let seeding_runtime = Runtime::new();
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let seeding_runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
         seeding_runtime
             .project_service()
             .open_project_summary_with_storage_path(
@@ -7257,7 +7888,7 @@ pub(crate) mod activation_tests {
             .expect("search generation path");
         fs::remove_dir_all(&previous_search).expect("remove completed search generation");
 
-        let runtime = Runtime::new();
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
         let error = runtime
             .activation_service()
             .activate_project(
@@ -7290,6 +7921,14 @@ pub(crate) mod activation_tests {
             .project_service()
             .open_project_with_storage_path(project.path().to_path_buf(), storage_path)
             .expect("the strict reader must admit the repaired generation");
+        assert!(
+            process_cache
+                .path()
+                .join("retention")
+                .join("global_generation_gc.lock")
+                .is_file(),
+            "core publication must route its retention lock through the owned process cache"
+        );
     }
 
     #[cfg(unix)]
@@ -7328,7 +7967,8 @@ pub(crate) mod activation_tests {
         )
         .expect("write project manifest");
 
-        let seeding_runtime = Runtime::new();
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let seeding_runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
         seeding_runtime
             .project_service()
             .open_project_summary_with_storage_path(
@@ -7355,7 +7995,7 @@ pub(crate) mod activation_tests {
             .expect("search generation path");
         fs::remove_dir_all(&previous_search).expect("remove completed search generation");
 
-        let runtime = Runtime::new();
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
         let error = runtime
             .activation_service()
             .activate_project(
@@ -7392,6 +8032,14 @@ pub(crate) mod activation_tests {
             read_search_generation_completion(&previous_search, &previous.generation_id).is_some(),
             "activation must publish search completion for the unchanged core generation"
         );
+        assert!(
+            process_cache
+                .path()
+                .join("retention")
+                .join("global_generation_gc.lock")
+                .is_file(),
+            "core publication must route its retention lock through the owned process cache"
+        );
     }
 
     #[test]
@@ -7405,7 +8053,8 @@ pub(crate) mod activation_tests {
         )
         .expect("write fixture");
 
-        let seeding_runtime = Runtime::new();
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let seeding_runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
         seeding_runtime
             .project_service()
             .open_project_summary_with_storage_path(
@@ -7425,15 +8074,17 @@ pub(crate) mod activation_tests {
         fs::remove_dir_all(previous_search).expect("remove completed search generation");
         mutate_active_generation_sql(&storage_path, "DELETE FROM dense_anchor_publication;");
 
-        let runtime = Runtime::new();
-        runtime
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
+        let error = runtime
             .activation_service()
-            .activate_project(
+            .activate_project_with_foreground_budget(
                 project.path(),
                 &storage_path,
                 Arc::new(AtomicBool::new(false)),
+                Duration::from_secs(30),
             )
             .expect_err("the unit-test runtime has no managed embedding server");
+        assert_eq!(error.code, "project_unavailable", "{error:?}");
 
         let current = Store::database_index_publication(&storage_path)
             .expect("read repaired publication")
@@ -7453,14 +8104,32 @@ pub(crate) mod activation_tests {
         storage
             .validate_dense_anchor_publication(&current)
             .expect("incremental migration must republish dense anchors");
+        assert!(
+            process_cache
+                .path()
+                .join("retention")
+                .join("global_generation_gc.lock")
+                .is_file(),
+            "core publication must route its retention lock through the owned process cache"
+        );
     }
 
     #[test]
     fn activation_state_is_not_reused_across_project_targets() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project_a = tempfile::tempdir().expect("project a");
         let project_b = tempfile::tempdir().expect("project b");
-        let service = Runtime::new().activation_service();
+        let service =
+            crate::test_runtime_with_owned_cache_root(process_cache.path()).activation_service();
+        let hold_until_started = |service: &ActivationService| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while service.worker_start_count_for_test() == 0 && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+        };
 
+        let worker_gate_a = Arc::new((Mutex::new(false), Condvar::new()));
+        service.set_worker_start_gate_for_test(Some(Arc::clone(&worker_gate_a)));
         service
             .activate_project_with_foreground_budget(
                 project_a.path(),
@@ -7469,9 +8138,23 @@ pub(crate) mod activation_tests {
                 Duration::ZERO,
             )
             .expect_err("project a should continue outside the foreground budget");
+        hold_until_started(&service);
+        assert_eq!(
+            service.worker_start_count_for_test(),
+            1,
+            "project a activation must hold one in-flight worker"
+        );
         let first = service.snapshot().expect("first state");
+        service.set_worker_start_gate_for_test(None);
+        let (released, changed) = worker_gate_a.as_ref();
+        *released
+            .lock()
+            .expect("activation worker test gate poisoned") = true;
+        changed.notify_all();
         service.cancel_and_wait();
 
+        let worker_gate_b = Arc::new((Mutex::new(false), Condvar::new()));
+        service.set_worker_start_gate_for_test(Some(Arc::clone(&worker_gate_b)));
         service
             .activate_project_with_foreground_budget(
                 project_b.path(),
@@ -7480,7 +8163,22 @@ pub(crate) mod activation_tests {
                 Duration::ZERO,
             )
             .expect_err("project b should continue outside the foreground budget");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while service.worker_start_count_for_test() < 2 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            service.worker_start_count_for_test(),
+            2,
+            "project b must start a distinct second worker"
+        );
         let second = service.snapshot().expect("second state");
+        service.set_worker_start_gate_for_test(None);
+        let (released, changed) = worker_gate_b.as_ref();
+        *released
+            .lock()
+            .expect("activation worker test gate poisoned") = true;
+        changed.notify_all();
         service.cancel_and_wait();
 
         assert_ne!(first.operation_id, second.operation_id);
@@ -7507,7 +8205,10 @@ pub(crate) mod activation_tests {
         let caches = (0..3)
             .map(|_| tempfile::tempdir().expect("cache"))
             .collect::<Vec<_>>();
-        let runtimes = (0..3).map(|_| Runtime::new()).collect::<Vec<_>>();
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let runtimes = (0..3)
+            .map(|_| crate::test_runtime_with_owned_cache_root(process_cache.path()))
+            .collect::<Vec<_>>();
         let barrier = Arc::new(std::sync::Barrier::new(3));
 
         let workers = (0..3)
@@ -7558,13 +8259,21 @@ pub(crate) mod activation_tests {
             );
             runtime.activation_service().cancel_and_wait();
         }
+        for runtime in &runtimes {
+            assert_eq!(
+                runtime.test_owned_cache_root(),
+                process_cache.path(),
+                "a cancelled activation must use the injected cache root, not ambient process defaults"
+            );
+        }
     }
 
     #[test]
     fn observational_summary_does_not_create_storage_parent() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project = tempfile::tempdir().expect("project");
         let storage_path = project.path().join("cold-cache").join("codestory.db");
-        let runtime = Runtime::new();
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
 
         let summary = runtime
             .project_service()
@@ -7580,7 +8289,8 @@ pub(crate) mod activation_tests {
 
     #[test]
     fn cancelled_public_operation_never_enters_response_builder() {
-        let runtime = Runtime::new();
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
         let cancelled = Arc::new(AtomicBool::new(true));
         let mut entered = false;
 
@@ -7600,9 +8310,12 @@ pub(crate) mod activation_tests {
     fn observational_admission_preserves_an_existing_stale_complete_publication() {
         let project = tempfile::tempdir().expect("project");
         let storage_path = project.path().join("cache").join("codestory.db");
-        let source = project.path().join("fixture.rs");
+        let source = project.path().join("src").join("lib.rs");
+        fs::create_dir_all(source.parent().expect("source parent"))
+            .expect("create source directory");
         fs::write(&source, "pub fn fixture() -> u32 { 1 }\n").expect("write fixture");
-        let runtime = Runtime::new();
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
         runtime
             .project_service()
             .open_project_summary_with_storage_path(
@@ -7616,7 +8329,7 @@ pub(crate) mod activation_tests {
             .expect("publish complete core");
         let before = runtime
             .project_service()
-            .complete_index_publication_at(&storage_path)
+            .complete_index_publication_at(project.path(), &storage_path)
             .expect("read publication")
             .expect("complete publication");
 
@@ -7647,6 +8360,222 @@ pub(crate) mod activation_tests {
             runtime.activation_service().snapshot().is_none(),
             "existing complete state must not start managed activation"
         );
+        assert!(
+            process_cache
+                .path()
+                .join("retention")
+                .join("global_generation_gc.lock")
+                .is_file(),
+            "core publication must route its retention lock through the owned process cache"
+        );
+
+        // With a failed replacement retaining the stale generation, only
+        // graph-only reads may answer from it; a source-backed read must be
+        // refused instead of serving pre-refresh bytes.
+        fs::write(
+            project.path().join("codestory_workspace.json"),
+            r#"{"members":["src","missing"]}"#,
+        )
+        .expect("fence the replacement with an incomplete workspace");
+        let error = runtime
+            .activation_service()
+            .activate_project(
+                project.path(),
+                &storage_path,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .expect_err("incomplete replacement inventory must fail closed");
+        assert_eq!(error.code, "source_discovery_incomplete");
+        let graph = runtime
+            .public_operation_service()
+            .run_with_cancel("ground", Arc::new(AtomicBool::new(false)), || Ok(()))
+            .expect("graph-only reads may answer from the retained core");
+        assert_eq!(
+            graph.freshness,
+            OperationFreshness::Historical(HistoricalServedReason::ReplacementFailed),
+            "the retained answer must be labelled historical: {graph:?}"
+        );
+        let mut entered_source_response = false;
+        let source = runtime
+            .public_operation_service()
+            .run_with_cancel("source_snippet", Arc::new(AtomicBool::new(false)), || {
+                entered_source_response = true;
+                Ok(())
+            })
+            .expect_err("a source-backed read must never serve the retained core");
+        assert_eq!(source.code, "project_unavailable");
+        assert!(!entered_source_response);
+    }
+
+    #[test]
+    fn newer_core_schema_refuses_observation_and_automatic_rebuild() {
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("owned cache");
+        let storage_path = project.path().join("cache/codestory.db");
+        fs::write(project.path().join("fixture.rs"), "pub fn fixture() {}\n").unwrap();
+        let runtime = crate::test_runtime_with_owned_cache_root(cache.path());
+        runtime
+            .project_service()
+            .open_project_summary_with_storage_path(
+                project.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .unwrap();
+        runtime
+            .index_service()
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .unwrap();
+        mutate_active_generation_sql(
+            &storage_path,
+            &format!(
+                "PRAGMA user_version = {};",
+                codestory_store::CURRENT_SCHEMA_VERSION + 1
+            ),
+        );
+        let database = codestory_store::resolve_core_database_path(&storage_path).unwrap();
+        let before = fs::read(&database).unwrap();
+        let results = [
+            runtime
+                .project_service()
+                .complete_index_publication_at(project.path(), &storage_path)
+                .map(|_| ()),
+            runtime
+                .project_service()
+                .inspect_project_summary_with_storage_path(
+                    project.path().to_path_buf(),
+                    storage_path.clone(),
+                )
+                .map(|_| ()),
+            runtime
+                .activation_service()
+                .bind_existing_complete_core_for_observation(
+                    project.path(),
+                    &storage_path,
+                    Arc::new(AtomicBool::new(false)),
+                ),
+            runtime
+                .activation_service()
+                .ensure_complete_core_for_observation(
+                    project.path(),
+                    &storage_path,
+                    Arc::new(AtomicBool::new(false)),
+                ),
+        ];
+        for result in results {
+            let error = result.expect_err("newer schema requires explicit recovery");
+            assert_eq!(error.code, "core_schema_too_new", "{error:?}");
+            assert!(
+                error
+                    .details
+                    .as_ref()
+                    .unwrap()
+                    .next_commands
+                    .iter()
+                    .any(|command| command.contains("cache reset")
+                        && command.contains("--derived-only")),
+                "{error:?}"
+            );
+        }
+        assert_eq!(fs::read(database).unwrap(), before);
+        assert!(runtime.activation_service().snapshot().is_none());
+    }
+
+    /// A core published by the previous release (schema 35 under the current
+    /// 36) must read as a typed stale-schema failure on observational paths and
+    /// rebuild into a new immutable generation on activation-owned paths.
+    #[test]
+    fn stale_core_schema_observation_is_typed_and_activation_rebuilds() {
+        let project = tempfile::tempdir().expect("project");
+        let storage_path = project.path().join("cache").join("codestory.db");
+        let source = project.path().join("src").join("lib.rs");
+        fs::create_dir_all(source.parent().expect("source parent"))
+            .expect("create source directory");
+        fs::write(&source, "pub fn fixture() -> u32 { 1 }\n").expect("write fixture");
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
+        runtime
+            .project_service()
+            .open_project_summary_with_storage_path(
+                project.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+        runtime
+            .index_service()
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish complete core");
+        let generation_db = codestory_store::resolve_core_database_path(&storage_path)
+            .expect("resolve active immutable generation");
+
+        // Downgrade the sealed image to the previous release's durable schema
+        // (0.17.6 wrote user_version 35; this binary serves 36).
+        mutate_active_generation_sql(&storage_path, "PRAGMA user_version = 35;");
+        let generation_before = fs::read(&generation_db).expect("read sealed generation");
+
+        // Observational admission surfaces the typed failure and the exact
+        // managed-refresh command; it must not activate or mutate the core.
+        let error = runtime
+            .activation_service()
+            .bind_existing_complete_core_for_observation(
+                project.path(),
+                &storage_path,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .expect_err("a stale core must refuse observational admission");
+        assert_eq!(error.code, "core_schema_upgrade_required", "{error:?}");
+        let next_commands = error
+            .details
+            .as_deref()
+            .map(|details| details.next_commands.clone())
+            .unwrap_or_default();
+        let refresh = next_commands
+            .iter()
+            .find(|command| command.contains("codestory-cli index --project"))
+            .unwrap_or_else(|| {
+                panic!("stale-schema error must name the refresh command: {error:?}")
+            });
+        assert!(
+            refresh.contains("--refresh full")
+                && refresh.contains(&*project.path().to_string_lossy()),
+            "refresh command must target this project: {refresh}"
+        );
+        assert_eq!(
+            fs::read(&generation_db).expect("reread sealed generation"),
+            generation_before,
+            "observing a stale core must not mutate the sealed generation"
+        );
+        assert!(
+            runtime.activation_service().snapshot().is_none(),
+            "observational admission must not start managed activation"
+        );
+
+        // The activation-owned call treats the stale core like cold state and
+        // publishes a replacement generation, leaving the old image intact.
+        runtime
+            .activation_service()
+            .ensure_complete_core_for_observation(
+                project.path(),
+                &storage_path,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .expect("activation rebuilds a stale core");
+        let summary = runtime
+            .project_service()
+            .inspect_project_summary_with_storage_path(
+                project.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("inspect rebuilt project")
+            .expect("rebuilt project summary");
+        assert!(
+            summary.publication.is_some(),
+            "rebuilt publication: {summary:?}"
+        );
+        assert_eq!(
+            fs::read(&generation_db).expect("reread old generation"),
+            generation_before,
+            "rebuild must preserve the previous generation as an immutable rollback"
+        );
     }
 
     #[test]
@@ -7655,7 +8584,8 @@ pub(crate) mod activation_tests {
         let storage_path = project.path().join("cache").join("codestory.db");
         fs::write(project.path().join("fixture.rs"), "pub fn fixture() {}\n")
             .expect("write fixture");
-        let runtime = Runtime::new();
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
         runtime
             .project_service()
             .open_project_summary_with_storage_path(
@@ -7700,15 +8630,24 @@ pub(crate) mod activation_tests {
             "managed core recovery must clear the durable incomplete fence"
         );
         runtime.activation_service().cancel_and_wait();
+        assert!(
+            process_cache
+                .path()
+                .join("retention")
+                .join("global_generation_gc.lock")
+                .is_file(),
+            "core publication must route its retention lock through the owned process cache"
+        );
     }
 
     #[test]
     fn observational_admission_propagates_corrupt_storage_instead_of_treating_it_as_cold() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project = tempfile::tempdir().expect("project");
         let storage_path = project.path().join("cache").join("codestory.db");
         fs::create_dir_all(storage_path.parent().expect("cache parent")).expect("create cache");
         fs::write(&storage_path, b"not a sqlite database").expect("write corrupt storage");
-        let runtime = Runtime::new();
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
 
         let error = runtime
             .activation_service()
@@ -7729,9 +8668,10 @@ pub(crate) mod activation_tests {
 
     #[test]
     fn pre_cancelled_observational_admission_does_not_create_cold_storage() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project = tempfile::tempdir().expect("project");
         let storage_path = project.path().join("cache").join("codestory.db");
-        let runtime = Runtime::new();
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
 
         let error = runtime
             .activation_service()
@@ -7905,6 +8845,45 @@ pub(crate) mod activation_tests {
     }
 
     #[test]
+    fn peer_writer_timeout_survives_activation_mapping_with_holder_diagnostics() {
+        let source = anyhow::Error::new(codestory_retrieval::PeerWriterActive {
+            scope_id: "writer-project-one".into(),
+            lock_path: PathBuf::from("/cache/retention/writer-project-one.lock"),
+            waited_ms: 250,
+            holder: Some(codestory_retrieval::PeerWriterHolder {
+                pid: 4242,
+                operation: "writer-project-one".into(),
+                project_id: Some("project-one".into()),
+                since_epoch_ms: 1_700_000_000_000,
+                alive: true,
+            }),
+        })
+        .context("retrieval index finalize");
+
+        let mapped = map_activation_error(source);
+
+        assert_eq!(mapped.code, "peer_writer_active");
+        let details = mapped.details.as_deref().expect("error details");
+        assert_eq!(details.cause_code.as_deref(), Some("lock_wait_timeout"));
+        let peer = details.peer_writer.as_ref().expect("peer diagnostics");
+        match &peer.holder {
+            codestory_contracts::api::PeerWriterHolderDto::Recorded(record) => {
+                assert_eq!(record.pid, 4242);
+                assert!(record.alive);
+                assert_eq!(record.operation, "writer-project-one");
+                assert_eq!(record.project_id.as_deref(), Some("project-one"));
+            }
+            other => panic!("the holder record must be reported: {other:?}"),
+        }
+        assert!(
+            peer.next_action.contains("4242")
+                && peer.next_action.contains("Never delete the lock file"),
+            "next_action must name the holder and forbid lock deletion: {}",
+            peer.next_action
+        );
+    }
+
+    #[test]
     fn terminal_source_failure_survives_activation_snapshot_round_trip() {
         let diagnostic = codestory_contracts::api::FileCoverageDiagnosticDto {
             path: "src/large.ts".to_string(),
@@ -8070,6 +9049,39 @@ pub(crate) mod activation_tests {
         assert!(snapshot.allows_operation("ground"));
         assert!(!snapshot.allows_operation("packet"));
         assert_ne!(snapshot.state, ActivationState::Ready);
+    }
+
+    #[test]
+    fn read_class_admission_keeps_retrieval_distinct_from_source_backed() {
+        // A fresh complete core with broad retrieval unavailable: source-backed
+        // and graph-only reads are admitted, while retrieval-class operations
+        // keep waiting on `broad_search` instead of being admitted on the core
+        // alone and then failing at the retrieval pin.
+        let snapshot = ActivationSnapshot {
+            operation_id: "read-class-fixture".into(),
+            revision: 1,
+            state: ActivationState::Ready,
+            stage: ActivationStage::Ready,
+            progress: activation_stage_progress(ActivationStage::Ready),
+            attempt: 1,
+            retry_after_ms: None,
+            embedding_capacity: None,
+            embedding_retry: None,
+            failure_code: None,
+            failure: None,
+            failure_details: None,
+            retained_core_publication: None,
+            capabilities: ActivationCapabilities {
+                local_navigation: ActivationCapabilityState::Ready,
+                broad_search: ActivationCapabilityState::Unavailable,
+            },
+        };
+        assert!(snapshot.allows_operation("source_snippet"));
+        assert!(snapshot.allows_operation("exact_search"));
+        assert!(snapshot.allows_operation("ground"));
+        assert!(!snapshot.allows_operation("graph_assisted"));
+        assert!(!snapshot.allows_operation("resolution"));
+        assert!(!snapshot.allows_operation("packet"));
     }
 }
 

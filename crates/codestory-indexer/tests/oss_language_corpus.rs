@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use codestory_contracts::events::EventBus;
+use codestory_contracts::graph::NodeKind;
 use codestory_indexer::{
     IncrementalIndexingStats, WorkspaceIndexer, language_support_profile_for_ext,
     language_support_profile_for_language_name,
@@ -50,6 +51,7 @@ struct CorpusReport {
     incomplete_files: usize,
     incomplete_file_samples: Vec<String>,
     nodes: usize,
+    symbol_nodes: usize,
     edges: usize,
     errors: usize,
     fatal_errors: usize,
@@ -536,6 +538,12 @@ fn run_case(case: &OssCorpusCase, cache_root: &Path) -> Result<CorpusReport> {
         incomplete_files,
         incomplete_file_samples,
         nodes: nodes.len(),
+        // FILE nodes alone could meet the node floor without a single
+        // language-specific symbol; count only real symbol nodes.
+        symbol_nodes: nodes
+            .iter()
+            .filter(|node| node.kind != NodeKind::FILE)
+            .count(),
         edges: edges.len(),
         errors: errors.len(),
         fatal_errors,
@@ -697,6 +705,20 @@ fn assert_codestory_thresholds(case: &OssCorpusCase, report: &CorpusReport) -> R
             case.min_nodes
         );
     }
+    if report.symbol_nodes < case.min_nodes {
+        bail!(
+            "{} CodeStory emitted {} non-FILE symbol nodes, below threshold {}              (FILE nodes alone cannot satisfy the floor)",
+            case.language,
+            report.symbol_nodes,
+            case.min_nodes
+        );
+    }
+    if report.edges == 0 {
+        bail!(
+            "{} CodeStory emitted no edges; the corpus must show              language-specific relationship evidence",
+            case.language
+        );
+    }
     if report.errors > case.max_errors {
         bail!(
             "{} CodeStory emitted {} errors, above threshold {}; samples: {:?}",
@@ -835,6 +857,20 @@ fn ensure_checkout(case: &OssCorpusCase, cache_root: &Path) -> Result<PathBuf> {
         );
     }
 
+    // HEAD equality alone does not authenticate the tree: a cached checkout
+    // with dirty tracked files or untracked additions would index content that
+    // does not belong to the pinned commit.
+    let status = git_stdout(&checkout_root, &["status", "--porcelain"])?;
+    if !status.trim().is_empty() {
+        bail!(
+            "{} checkout is dirty under the pinned commit {}; refusing to index \
+             cached modifications:\n{}",
+            case.repo_name,
+            case.commit,
+            status.trim()
+        );
+    }
+
     Ok(checkout_root)
 }
 
@@ -926,6 +962,7 @@ fn report_json(report: &CorpusReport) -> serde_json::Value {
             "incomplete_files": report.incomplete_files,
             "incomplete_file_samples": report.incomplete_file_samples,
             "nodes": report.nodes,
+            "symbol_nodes": report.symbol_nodes,
             "edges": report.edges,
             "errors": report.errors,
             "fatal_errors": report.fatal_errors,

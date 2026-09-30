@@ -48,12 +48,19 @@ fn no_crate_source_approaches_the_oversized_source_cap() {
     rust_sources(&crate_src(), &mut files);
     assert!(!files.is_empty(), "found no crate sources to measure");
 
+    // An enumerated source that cannot be stat'd must fail loudly; `.ok()?`
+    // silently dropped it and the headroom was never actually measured.
     let mut crowded = files
         .iter()
-        .filter_map(|path| {
-            let bytes = fs::metadata(path).ok()?.len();
-            (bytes > warn_at).then(|| (bytes, path.clone()))
+        .map(|path| {
+            let bytes = fs::metadata(path)
+                .unwrap_or_else(|error| {
+                    panic!("cannot stat enumerated source {}: {error}", path.display())
+                })
+                .len();
+            (bytes, path.clone())
         })
+        .filter(|(bytes, _)| *bytes > warn_at)
         .collect::<Vec<_>>();
     crowded.sort_by_key(|(size, _)| std::cmp::Reverse(*size));
 

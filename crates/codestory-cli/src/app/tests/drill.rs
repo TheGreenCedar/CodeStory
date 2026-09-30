@@ -133,6 +133,7 @@ fn legacy_supported_cannot_change_public_v3_drill_decisions() {
         retrieval_publication: None,
         operation_id: "legacy-authority-regression".to_string(),
         attempt: 1,
+        freshness: codestory_runtime::OperationFreshness::Fresh,
     };
     let supported_dir = tempdir().expect("supported output dir");
     write_drill_outputs(
@@ -176,6 +177,7 @@ fn legacy_supported_cannot_change_public_v3_drill_decisions() {
         retrieval_publication: None,
         operation_id: "legacy-authority-regression".to_string(),
         attempt: 1,
+        freshness: codestory_runtime::OperationFreshness::Fresh,
     };
     let mutated_dir = tempdir().expect("mutated output dir");
     write_drill_outputs(
@@ -327,6 +329,7 @@ fn drill_retained_fields_match_pre_adapter_fixture() {
         retrieval_publication: None,
         operation_id: "test-drill".to_string(),
         attempt: 1,
+        freshness: codestory_runtime::OperationFreshness::Fresh,
     };
     write_drill_outputs(args::OutputFormat::Json, output_dir.path(), &operation)
         .expect("write drill fixtures");

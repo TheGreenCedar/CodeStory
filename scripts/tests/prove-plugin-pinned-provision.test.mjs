@@ -687,6 +687,36 @@ test("the gate refuses --timeout-ms with no value at all", async () => {
   assert.match(outcome.stderr, /::error::--timeout-ms needs a positive number/u);
 });
 
+// Refusal tests must prove the launcher never started, not only that the
+// exit code and message look right — a reordered spawn followed by the same
+// error would pass a message-only check. The proof script spawns the plugin
+// launcher through process.execPath, so a NODE_OPTIONS preload on the child
+// fires inside any launcher process that does start.
+function launcherSentinelEnv() {
+  const dir = scratchDir();
+  const sentinelScript = path.join(dir, "launcher-sentinel.cjs");
+  const marker = path.join(dir, "launcher-started.txt");
+  fs.writeFileSync(
+    sentinelScript,
+    [
+      "const fs = require('node:fs');",
+      "const argv1 = process.argv[1] || '';",
+      "if (argv1.endsWith('codestory-mcp.cjs')) {",
+      "  fs.writeFileSync(process.env.PROVISION_SENTINEL, 'launcher-started\\n');",
+      "}",
+    ].join("\n"),
+    "utf8",
+  );
+  return {
+    env: {
+      ...process.env,
+      NODE_OPTIONS: `--require "${sentinelScript}"`,
+      PROVISION_SENTINEL: marker,
+    },
+    marker,
+  };
+}
+
 // The lane arguments have to be refused by the SCRIPT, not just by the parser the script imports:
 // the release lanes invoke this file, and an argument error that only the unit test sees would
 // still let a badly invoked native dispatch run the plugin lane's assertion.
@@ -710,13 +740,20 @@ for (const [name, argv, expected] of [
   ["an unknown argument", ["--nope", "1"], /::error::unknown argument --nope/u],
 ]) {
   test(`the gate refuses ${name} before it provisions anything`, async () => {
-    const outcome = await runNode([proofScript, ...argv]);
+    const { env, marker } = launcherSentinelEnv();
+    const outcome = await runNode([proofScript, ...argv], { env });
     assert.equal(outcome.code, 1, `the gate did not fail closed: ${JSON.stringify(outcome)}`);
     assert.match(outcome.stderr, expected);
+    assert.equal(
+      fs.existsSync(marker),
+      false,
+      `refusal spawned the plugin launcher: ${JSON.stringify(outcome)}`,
+    );
   });
 }
 
 test("the gate refuses a staged release manifest it cannot use", async () => {
+  const { env, marker } = launcherSentinelEnv();
   const manifestPath = path.join(scratchDir(), "release-manifest.json");
   fs.writeFileSync(manifestPath, JSON.stringify({ domain: "codestory.release-manifest" }), "utf8");
   const outcome = await runNode([
@@ -727,7 +764,12 @@ test("the gate refuses a staged release manifest it cannot use", async () => {
     "explicit_package",
     "--release-manifest",
     manifestPath,
-  ]);
+  ], { env });
   assert.equal(outcome.code, 1, `the gate did not fail closed: ${JSON.stringify(outcome)}`);
   assert.match(outcome.stderr, /::error::could not use .*release-manifest\.json: release manifest schema_version/u);
+  assert.equal(
+    fs.existsSync(marker),
+    false,
+    `refusal spawned the plugin launcher: ${JSON.stringify(outcome)}`,
+  );
 });

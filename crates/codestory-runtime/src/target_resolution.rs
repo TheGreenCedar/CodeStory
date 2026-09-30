@@ -1550,37 +1550,40 @@ mod tests {
 
     #[test]
     fn inexact_resolution_prefers_production_over_non_primary_roles() {
+        // Every candidate carries the same inexact display name, so exact-name
+        // and terminal-name buckets cannot decide; only the source-truth role
+        // can keep the production row ahead of the higher-scored competitors.
         let production = hit(
             "production",
-            "resolve_context_target",
+            "resolve_context_target_runner",
             NodeKind::FUNCTION,
             0.60,
             "crates/codestory-cli/src/runtime.rs",
         );
         let generated = hit(
             "generated",
-            "resolve_context_target_generated",
+            "resolve_context_target_runner",
             NodeKind::FUNCTION,
             0.95,
             "target/generated/runtime.rs",
         );
         let docs = hit(
             "docs",
-            "resolve_context_target_docs",
+            "resolve_context_target_runner",
             NodeKind::FUNCTION,
             0.95,
             "docs/runtime.md",
         );
         let bench = hit(
             "bench",
-            "resolve_context_target_bench",
+            "resolve_context_target_runner",
             NodeKind::FUNCTION,
             0.95,
             "benches/runtime.rs",
         );
         let vendor = hit(
             "vendor",
-            "resolve_context_target_vendor",
+            "resolve_context_target_runner",
             NodeKind::FUNCTION,
             0.95,
             "vendor/runtime.rs",

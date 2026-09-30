@@ -923,14 +923,14 @@ fn http_smoke_keeps_existing_routes_and_default_semantics_against_indexed_repo()
         );
     }
     assert!(
-        search["_meta"]["codestory_publication"]["schema_version"] == 3
+        search["_meta"]["codestory_publication"]["schema_version"] == 4
             && search["_meta"]["codestory_publication"]["minimum_compatible_schema_version"] == 3
             && search["_meta"]["codestory_publication"]["served_from"] == "complete_publication"
             && search["_meta"]["codestory_publication"]["core_publication"]["mode"] == "full"
             && search["_meta"]["codestory_publication"]["core_publication"].is_object()
             && search["_meta"]["codestory_publication"]["retrieval_publication"].is_object()
             && search["_meta"]["codestory_publication"]["operation"]["operation_id"].is_string(),
-        "/search success metadata must retain schema 3 and the complete core and retrieval publications plus operation identity: {search}"
+        "/search success metadata must retain schema 4 and the complete core and retrieval publications plus operation identity: {search}"
     );
     required_nonempty_string(&search, "/publication/core/project_id");
     let public_core_generation_id =

@@ -4,11 +4,11 @@
 //! [`PacketCompilationInputV1`]. Selection itself lives in
 //! `codestory-agent` and cannot see the question.
 
+use crate::AppController;
 use crate::agent::packet_candidate::PacketProofSession;
 use crate::agent::packet_coverage::PacketCoverageInput;
 use crate::agent::packet_freshness::PacketFreshnessInput;
 use crate::agent::packet_scoring::packet_display_path;
-use crate::{AppController, BoundedSnippetRangeOptions};
 use codestory_agent::evidence_compiler::{
     RepositoryDerivedCompilationV1, compile_repository_evidence,
 };
@@ -343,19 +343,21 @@ fn hydrate_admitted_node_source(
     }
     let (start_line, end_line) = valid_source_bounds(node.start_line, node.end_line)
         .ok_or(PacketAdmissionGapKindV1::SourceBoundMissing)?;
-    let (_, bounded) = controller
-        .bounded_file_snippet_range(
-            &file.path.to_string_lossy(),
-            BoundedSnippetRangeOptions {
-                focus_line: start_line,
-                start_line,
-                end_line,
-                context_lines: 0,
-                max_bytes: source_byte_cap(admission),
-                truncation_suffix: COMPILER_SOURCE_TRUNCATION_SUFFIX,
-            },
-        )
+    let project_root = controller
+        .require_project_root()
         .map_err(|_| PacketAdmissionGapKindV1::SourceUnavailable)?;
+    let source = crate::search_evidence::verified_file_checked(storage, Some(&project_root), &file)
+        .map_err(|_| PacketAdmissionGapKindV1::SourceUnavailable)?;
+    let bounded = crate::snippets::bounded_markdown_snippet_range_from_text(
+        &source.content,
+        start_line,
+        start_line,
+        end_line,
+        0,
+        source_byte_cap(admission),
+        COMPILER_SOURCE_TRUNCATION_SUFFIX,
+    )
+    .map_err(|_| PacketAdmissionGapKindV1::SourceUnavailable)?;
     hydrated_source(
         admission,
         &file.path.to_string_lossy(),
@@ -531,7 +533,7 @@ fn source_receipt_line_range(markdown: &str) -> Option<(u32, u32)> {
     start.zip(end)
 }
 
-fn observe_admitted_source_coverage(
+pub(crate) fn observe_admitted_source_coverage(
     controller: &AppController,
     storage: &Store,
     paths: &[String],
@@ -558,6 +560,26 @@ fn observe_one_admitted_source_coverage(
     project_root: &Path,
     path: &str,
 ) -> Result<SourceCoverageObservationDto, codestory_store::StorageError> {
+    // Policy exclusions carry no `file` row (excluded sources are never
+    // registered as parser-backed coverage), so the exclusion table is
+    // consulted on the normalized relative spelling before the file lookup.
+    for candidate in admitted_file_lookup_paths(project_root, path) {
+        let relative_path = codestory_workspace::workspace_relative_path(project_root, &candidate)
+            .unwrap_or_else(|| candidate.clone())
+            .to_string_lossy()
+            .replace('\\', "/");
+        if storage.has_source_policy_exclusion_path(&relative_path)? {
+            return Ok(SourceCoverageObservationDto {
+                path: path.to_string(),
+                status: SourceCoverageStatusDto::PolicyExcluded,
+                reason: None,
+                not_established_cause: None,
+                observed_size: None,
+                byte_cap: None,
+            });
+        }
+    }
+
     let mut file = None;
     for candidate in admitted_file_lookup_paths(project_root, path) {
         if let Some(found) = storage.get_file_by_path(&candidate)? {
@@ -568,20 +590,6 @@ fn observe_one_admitted_source_coverage(
     let Some(file) = file else {
         return Ok(source_coverage_not_established(path));
     };
-    let relative_path = codestory_workspace::workspace_relative_path(project_root, &file.path)
-        .unwrap_or_else(|| file.path.clone())
-        .to_string_lossy()
-        .replace('\\', "/");
-    if storage.has_source_policy_exclusion_path(&relative_path)? {
-        return Ok(SourceCoverageObservationDto {
-            path: path.to_string(),
-            status: SourceCoverageStatusDto::PolicyExcluded,
-            reason: None,
-            not_established_cause: None,
-            observed_size: None,
-            byte_cap: None,
-        });
-    }
 
     let verified_source = storage.get_file_content_hash(file.id)?.is_some();
     let structural_projection = if file.language == "openapi" {
@@ -918,6 +926,7 @@ mod tests {
 
     #[test]
     fn frozen_public_packet_keeps_only_admitted_sources_and_induced_relations() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         use crate::agent::packet_candidate::PacketAdmissionDecision;
         use codestory_contracts::packet_projection_v3::{EvidenceKindV3Dto, PacketProjectionV3Dto};
         use codestory_store::{IndexPublicationMode, IndexPublicationRecord};
@@ -1071,7 +1080,7 @@ mod tests {
         assert_eq!(storage.get_edges().unwrap().len(), 56);
         drop(storage);
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         {
             let mut state = controller.state.lock();
             state.project_root = Some(project.path().to_path_buf());
@@ -1324,8 +1333,9 @@ mod tests {
 
     #[test]
     fn file_admission_retains_only_complete_pinned_source_or_navigation() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project = tempfile::tempdir().expect("project");
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller.state.lock().project_root = Some(project.path().to_path_buf());
         let storage = Store::new_in_memory().expect("store");
         let path = project.path().join("settings.rs");
@@ -1456,8 +1466,9 @@ mod tests {
 
     #[test]
     fn packet_file_admissions_distinguish_verified_budget_from_source_drift() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project = tempfile::tempdir().expect("project");
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller.state.lock().project_root = Some(project.path().to_path_buf());
         let mut storage = Store::new_in_memory().expect("store");
         let path = project.path().join("large.rs");
@@ -1615,17 +1626,130 @@ mod tests {
         assert!(decoded[0].structural_reason.is_some());
     }
 
+    fn test_admission(
+        packet_ordinal: u32,
+        stable_identity: &str,
+        node_id: i64,
+    ) -> AuthenticatedPacketAdmissionV1 {
+        AuthenticatedPacketAdmissionV1 {
+            receipt: PacketAdmissionReceiptV1 {
+                packet_ordinal,
+                stable_identity: stable_identity.into(),
+                score_version: "test".into(),
+                reserved_source_bytes: 1,
+                origin: PacketAdmissionOriginV1::Retrieval,
+            },
+            core_node_id: CoreNodeId(node_id),
+        }
+    }
+
     #[test]
     fn uncertain_relation_is_not_compiler_evidence() {
         assert_eq!(
             relation_certainty(Some(ResolutionCertainty::Uncertain)),
             PacketRelationCertaintyV1::Uncertain
         );
+
+        let mut storage = Store::new_in_memory().expect("store");
+        storage
+            .insert_nodes_batch(&[
+                CoreNode {
+                    id: CoreNodeId(1),
+                    kind: CoreNodeKind::FILE,
+                    serialized_name: "src/a.rs".into(),
+                    ..Default::default()
+                },
+                CoreNode {
+                    id: CoreNodeId(2),
+                    kind: CoreNodeKind::FUNCTION,
+                    serialized_name: "crate::run".into(),
+                    ..Default::default()
+                },
+            ])
+            .expect("insert nodes");
+        storage
+            .insert_edges_batch(&[
+                CoreEdge {
+                    id: CoreEdgeId(10),
+                    source: CoreNodeId(1),
+                    target: CoreNodeId(2),
+                    kind: CoreEdgeKind::MEMBER,
+                    certainty: Some(ResolutionCertainty::Certain),
+                    ..Default::default()
+                },
+                CoreEdge {
+                    id: CoreEdgeId(11),
+                    source: CoreNodeId(1),
+                    target: CoreNodeId(2),
+                    kind: CoreEdgeKind::CALL,
+                    certainty: Some(ResolutionCertainty::Uncertain),
+                    ..Default::default()
+                },
+            ])
+            .expect("insert edges");
+        let admissions = [
+            test_admission(0, "path:src/a.rs", 1),
+            test_admission(1, "node:2", 2),
+        ];
+
+        let relations = hydrate_induced_relations(&storage, &admissions).expect("relations");
+
+        assert_eq!(relations.len(), 1);
+        assert_eq!(relations[0].relation_id, "10");
+        assert_eq!(relations[0].certainty, PacketRelationCertaintyV1::Certain);
     }
 
     #[test]
     fn numeric_confidence_cannot_upgrade_missing_certainty() {
         assert_eq!(relation_certainty(None), PacketRelationCertaintyV1::Unknown);
+
+        let mut storage = Store::new_in_memory().expect("store");
+        storage
+            .insert_nodes_batch(&[
+                CoreNode {
+                    id: CoreNodeId(1),
+                    kind: CoreNodeKind::FILE,
+                    serialized_name: "src/a.rs".into(),
+                    ..Default::default()
+                },
+                CoreNode {
+                    id: CoreNodeId(2),
+                    kind: CoreNodeKind::FUNCTION,
+                    serialized_name: "crate::run".into(),
+                    ..Default::default()
+                },
+            ])
+            .expect("insert nodes");
+        storage
+            .insert_edges_batch(&[
+                CoreEdge {
+                    id: CoreEdgeId(10),
+                    source: CoreNodeId(1),
+                    target: CoreNodeId(2),
+                    kind: CoreEdgeKind::MEMBER,
+                    certainty: Some(ResolutionCertainty::Certain),
+                    ..Default::default()
+                },
+                CoreEdge {
+                    id: CoreEdgeId(11),
+                    source: CoreNodeId(1),
+                    target: CoreNodeId(2),
+                    kind: CoreEdgeKind::CALL,
+                    confidence: Some(0.99),
+                    certainty: None,
+                    ..Default::default()
+                },
+            ])
+            .expect("insert edges");
+        let admissions = [
+            test_admission(0, "path:src/a.rs", 1),
+            test_admission(1, "node:2", 2),
+        ];
+
+        let relations = hydrate_induced_relations(&storage, &admissions).expect("relations");
+
+        assert_eq!(relations.len(), 1);
+        assert_eq!(relations[0].relation_id, "10");
     }
 
     #[test]

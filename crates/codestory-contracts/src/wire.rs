@@ -30,7 +30,10 @@ use serde::{Deserialize, Serialize};
 ///   echoing whatever the client asked for.
 /// * **v3** — packet, context, and search publish closed evidence projections;
 ///   packet truth dispositions and its evidence opt-out are no longer public.
-pub const PUBLICATION_STAMP_SCHEMA_VERSION: u32 = 3;
+/// * **v4** — additive: `freshness` reports whether the response came from the
+///   fresh current source or a retained publication during a refresh, and
+///   `served_from` now derives from that runtime decision.
+pub const PUBLICATION_STAMP_SCHEMA_VERSION: u32 = 4;
 
 /// Oldest reader schema version that can still interpret a payload stamped with
 /// [`PUBLICATION_STAMP_SCHEMA_VERSION`] without misreading it.
@@ -292,8 +295,8 @@ mod tests {
     #[test]
     fn published_stamp_bounds_are_the_documented_values() {
         assert_eq!(
-            PUBLICATION_STAMP_SCHEMA_VERSION, 3,
-            "the evidence-only v3 contract publishes stamp schema 3"
+            PUBLICATION_STAMP_SCHEMA_VERSION, 4,
+            "the additive freshness field publishes stamp schema 4"
         );
         assert_eq!(MINIMUM_COMPATIBLE_PUBLICATION_STAMP_SCHEMA_VERSION, 3);
         assert_eq!(LEGACY_PUBLICATION_STAMP_SCHEMA_VERSION, 0);

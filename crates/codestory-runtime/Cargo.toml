@@ -1,6 +1,6 @@
 [package]
 name = "codestory-runtime"
-version = "0.17.6"
+version = "0.17.7"
 edition = "2024"
 
 [features]
@@ -31,7 +31,6 @@ serde_json_canonicalizer = { workspace = true }
 sha2 = { workspace = true }
 tantivy = { workspace = true }
 tracing = { workspace = true }
-ureq = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]

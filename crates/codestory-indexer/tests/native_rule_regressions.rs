@@ -94,6 +94,37 @@ fn edge_between(
         })
 }
 
+/// Like `edge_between`, but requires the *resolved* endpoints: a wrong
+/// `resolved_source`/`resolved_target` cannot hide behind a correct raw
+/// endpoint the way the OR-semantics helper permits.
+fn resolved_edge_between(
+    nodes: &[Node],
+    edges: &[Edge],
+    kind: EdgeKind,
+    source: &str,
+    target: &str,
+) -> bool {
+    let source_ids = nodes
+        .iter()
+        .filter(|node| matches_name(&node.serialized_name, source))
+        .map(|node| node.id)
+        .collect::<Vec<_>>();
+    let target_ids = nodes
+        .iter()
+        .filter(|node| matches_name(&node.serialized_name, target))
+        .map(|node| node.id)
+        .collect::<Vec<_>>();
+    edges.iter().any(|edge| {
+        edge.kind == kind
+            && source_ids
+                .iter()
+                .any(|source_id| edge.resolved_source == Some(*source_id))
+            && target_ids
+                .iter()
+                .any(|target_id| edge.resolved_target == Some(*target_id))
+    })
+}
+
 fn find_node_by_name_and_kind<'a>(
     nodes: &'a [Node],
     name: &str,
@@ -1432,7 +1463,7 @@ class Child extends Base {
 "#,
     )])?;
     assert!(
-        edge_between(
+        resolved_edge_between(
             &nodes,
             &edges,
             EdgeKind::OVERRIDE,
@@ -1482,7 +1513,7 @@ class View extends BaseView {
     )])?;
 
     assert!(
-        edge_between(
+        resolved_edge_between(
             &nodes,
             &edges,
             EdgeKind::OVERRIDE,

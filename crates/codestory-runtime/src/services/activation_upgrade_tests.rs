@@ -1,5 +1,4 @@
 use super::*;
-use crate::Runtime;
 use flate2::{Decompress, FlushDecompress, Status};
 use std::collections::BTreeSet;
 use std::fs;
@@ -52,6 +51,7 @@ fn decode_seed_parser_artifact(blob: &[u8]) -> serde_json::Value {
 }
 
 fn legacy_activation_fixture() -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let project = tempfile::tempdir().expect("project");
     let seed_cache = tempfile::tempdir().expect("seed cache");
     let cache = tempfile::tempdir().expect("legacy cache");
@@ -61,7 +61,7 @@ fn legacy_activation_fixture() -> (tempfile::TempDir, tempfile::TempDir, PathBuf
     )
     .expect("write source");
     let seed_path = seed_cache.path().join("codestory.db");
-    let runtime = Runtime::new();
+    let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
     runtime
         .project_service()
         .open_project_summary_with_storage_path(project.path().to_path_buf(), seed_path.clone())
@@ -137,6 +137,7 @@ fn legacy_activation_fixture() -> (tempfile::TempDir, tempfile::TempDir, PathBuf
 
 #[test]
 fn activation_rebuilds_legacy_cache_before_opening_it() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let (project, _cache, storage_path) = legacy_activation_fixture();
     let before = fs::read(&storage_path).unwrap();
     let annotations_path =
@@ -153,7 +154,7 @@ fn activation_rebuilds_legacy_cache_before_opening_it() {
     drop(annotations);
     let annotation_identity = codestory_workspace::workspace_path_identity_token(&annotations_path)
         .expect("observe annotation native identity");
-    let runtime = Runtime::new();
+    let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
     runtime
         .activation_service()
         .activate_core_only(
@@ -212,7 +213,7 @@ fn activation_rebuilds_legacy_cache_before_opening_it() {
         .validate_structural_text_unit_publication(&publication)
         .unwrap();
     drop(store);
-    Runtime::new()
+    crate::test_runtime_with_owned_cache_root(process_cache.path())
         .activation_service()
         .activate_core_only(
             project.path(),
@@ -229,6 +230,7 @@ fn activation_rebuilds_legacy_cache_before_opening_it() {
 #[cfg(windows)]
 #[test]
 fn legacy_retirement_retries_after_a_real_windows_sharing_violation() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     use std::os::windows::fs::OpenOptionsExt as _;
     // Win32 FILE_SHARE_READ | FILE_SHARE_WRITE deliberately excludes delete sharing.
     const SHARE_WITHOUT_DELETE: u32 = 0x0000_0001 | 0x0000_0002;
@@ -239,7 +241,7 @@ fn legacy_retirement_retries_after_a_real_windows_sharing_violation() {
         .share_mode(SHARE_WITHOUT_DELETE)
         .open(&storage_path)
         .expect("hold legacy database without delete sharing");
-    let runtime = Runtime::new();
+    let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
     let activation = runtime.activation_service();
     activation
         .activate_core_only(
@@ -272,6 +274,7 @@ fn legacy_retirement_retries_after_a_real_windows_sharing_violation() {
 
 #[test]
 fn activation_rebuilds_release_java_visibility_projection() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let project = tempfile::tempdir().expect("project");
     let seed_cache = tempfile::tempdir().expect("seed cache");
     let cache = tempfile::tempdir().expect("legacy cache");
@@ -282,7 +285,7 @@ fn activation_rebuilds_release_java_visibility_projection() {
     .expect("write Java source");
 
     let seed_path = seed_cache.path().join("codestory.db");
-    let runtime = Runtime::new();
+    let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
     runtime
         .project_service()
         .open_project_summary_with_storage_path(project.path().to_path_buf(), seed_path.clone())
@@ -327,7 +330,7 @@ fn activation_rebuilds_release_java_visibility_projection() {
     assert_eq!(predecessor_access_count, 0);
     drop(connection);
 
-    Runtime::new()
+    crate::test_runtime_with_owned_cache_root(process_cache.path())
         .activation_service()
         .activate_core_only(
             project.path(),
@@ -393,6 +396,7 @@ fn activation_rebuilds_release_java_visibility_projection() {
 
 #[test]
 fn activation_publishes_complete_terraform_structural_artifacts() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let project = tempfile::tempdir().expect("project");
     let cache = tempfile::tempdir().expect("cache");
     let source = concat!(
@@ -404,7 +408,7 @@ fn activation_publishes_complete_terraform_structural_artifacts() {
     fs::write(project.path().join("main.tf"), source).expect("write Terraform source");
     let storage_path = cache.path().join("codestory.db");
 
-    Runtime::new()
+    crate::test_runtime_with_owned_cache_root(process_cache.path())
         .activation_service()
         .activate_core_only(
             project.path(),
@@ -477,13 +481,15 @@ fn activation_publishes_complete_terraform_structural_artifacts() {
 
 #[test]
 fn activation_failed_legacy_rebuild_preserves_original_database() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     for action in [
         crate::PublicationTestAction::Fail,
         crate::PublicationTestAction::Cancel,
     ] {
         let (project, _cache, storage_path) = legacy_activation_fixture();
         let before = fs::read(&storage_path).unwrap();
-        let service = Runtime::new().activation_service();
+        let service =
+            crate::test_runtime_with_owned_cache_root(process_cache.path()).activation_service();
         let operation = ActivationOperation {
             service: service.clone(),
             operation_id: "legacy-rebuild-fault".to_string(),

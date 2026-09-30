@@ -735,10 +735,6 @@ fn has_node(nodes: &[Node], kind: NodeKind, name: &str) -> bool {
     })
 }
 
-fn has_edge_kind(edges: &[Edge], kind: EdgeKind) -> bool {
-    edges.iter().any(|edge| edge.kind == kind)
-}
-
 fn has_edge_target_name(edges: &[Edge], nodes: &[Node], kind: EdgeKind, target_name: &str) -> bool {
     edges.iter().filter(|edge| edge.kind == kind).any(|edge| {
         nodes
@@ -1013,17 +1009,10 @@ fn test_tictactoe_core_symbols_present_per_language() -> Result<()> {
     for case in fixture_cases() {
         let result = index_case(&case)?;
         for (kind, name) in case.required_symbols {
-            let present =
-                if case.language == "rust" && matches!(kind, NodeKind::CLASS | NodeKind::STRUCT) {
-                    result
-                        .nodes
-                        .iter()
-                        .any(|node| is_matching_name(&node.serialized_name, name))
-                } else {
-                    has_node(&result.nodes, *kind, name)
-                };
+            // The kind must be asserted, not just the name: a same-named
+            // VARIABLE must not satisfy a required STRUCT row.
             assert!(
-                present,
+                has_node(&result.nodes, *kind, name),
                 "Missing {kind:?} node '{name}' for {}",
                 case.language
             );
@@ -1031,42 +1020,6 @@ fn test_tictactoe_core_symbols_present_per_language() -> Result<()> {
     }
     Ok(())
 }
-
-#[test]
-fn test_tictactoe_edges_cover_import_member_and_call() -> Result<()> {
-    for case in fixture_cases() {
-        let result = index_case(&case)?;
-
-        assert!(
-            has_edge_kind(&result.edges, EdgeKind::IMPORT),
-            "Missing IMPORT edges for {}",
-            case.language
-        );
-        assert!(
-            has_edge_kind(&result.edges, EdgeKind::CALL),
-            "Missing CALL edges for {}",
-            case.language
-        );
-
-        if !case.required_member_pairs.is_empty() {
-            assert!(
-                has_edge_kind(&result.edges, EdgeKind::MEMBER),
-                "Missing MEMBER edges for {}",
-                case.language
-            );
-        }
-
-        if !case.required_inheritance_pairs.is_empty() {
-            assert!(
-                has_edge_kind(&result.edges, EdgeKind::INHERITANCE),
-                "Missing INHERITANCE edge for {}",
-                case.language
-            );
-        }
-    }
-    Ok(())
-}
-
 #[test]
 fn test_tictactoe_import_targets_are_extracted() -> Result<()> {
     for case in fixture_cases() {

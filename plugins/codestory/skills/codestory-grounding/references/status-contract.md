@@ -17,7 +17,10 @@ across repositories.
 
 `current_operation` is the runtime-owned activation snapshot. When present it
 contains one stable `operation_id`, monotonic `revision`, `stage`, `attempt`,
-and `progress`, plus retry delay and failure. Concurrent and serial retries for
+and `progress`, plus retry delay and failure. A `stage` of
+`waiting_for_peer_writer` means this runtime is waiting for another session's
+indexing run to release the writer lock; keep waiting rather than starting
+repair. Concurrent and serial retries for
 the same native project/configuration key join that operation; they do not
 start another refresh or repair flow. A `retained` local-navigation capability
 names the exact complete core publication still usable for observational local
@@ -43,6 +46,16 @@ it as `after_ms`.
 `ground`, `files`, and `affected` can build or refresh the bounded local map as
 part of the call. Once a complete publication exists, local graph tools keep
 using it during refresh and never read a half-published generation.
+
+Tool results carry `_meta.codestory_publication.freshness` describing what the
+runtime actually served: `state` is `fresh` when the answer came from the
+current source, and `historical` when a graph-only tool answered from the
+retained publication while a refresh was still running or after a failed
+replacement. The `reason` and `served_generation` fields name why and which
+generation. Source-backed reads (`snippet` by symbol id, `search` with
+`repo_text=off`) never return historical bytes: they wait for the fresh
+complete index inside the call's deadline and return `preparing` if it cannot
+converge.
 
 ## Diagnostic status
 

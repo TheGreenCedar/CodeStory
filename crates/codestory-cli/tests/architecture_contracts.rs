@@ -918,9 +918,15 @@ fn public_exact_verifier_compiles_without_qualification_support() {
             "the inert launcher discovery session lost Rust's {revision} revision"
         );
     }
+    // LIVE-L2 bumped the publication stamp to schema 4 (the launcher exposes
+    // it as `publicationSchemaVersion`; minimum-compatible stays 3).
     assert!(
-        launcher.contains("publicationSchemaVersion: 3"),
+        launcher.contains("publicationStampSchemaVersion = 4"),
         "the inert launcher discovery session must preserve the Rust discovery schema"
+    );
+    assert!(
+        launcher.contains("minimumCompatiblePublicationStampSchemaVersion = 3"),
+        "the inert launcher must keep schema-3 producers readable"
     );
 }
 
@@ -959,7 +965,8 @@ process.stdout.write(JSON.stringify(
         session["discoveryContractSha256"], contracts["2025-06-18"],
         "the launcher must retain Rust's discovery digest without substituting one"
     );
-    assert_eq!(session["publicationSchemaVersion"], 3);
+    // LIVE-L2 bumped the publication stamp to schema 4.
+    assert_eq!(session["publicationSchemaVersion"], 4);
 }
 
 #[test]
@@ -2020,8 +2027,12 @@ fn production_source_never_spawns_git() {
         {
             continue;
         }
+        // `test_git.rs` compiles only under `#[cfg(test)]` (the `mod` gate
+        // lives in the workspace lib.rs) — it is the isolated fixture git
+        // builder, never product code.
         if path.starts_with(&benchmark_root)
             || path == repo_root().join("crates/codestory-runtime/src/test_support.rs")
+            || path == repo_root().join("crates/codestory-workspace/src/test_git.rs")
         {
             continue;
         }
@@ -2063,6 +2074,9 @@ fn crate_source_git_spawns_are_limited_to_named_non_product_boundaries() {
         "crates/codestory-bench/src/bin/codestory_proof_availability/multilingual_contract.rs"
             .to_owned(),
         "crates/codestory-runtime/src/test_support.rs".to_owned(),
+        // `#[cfg(test)]`-gated isolated fixture git builder (the `mod` gate is
+        // in codestory-workspace's lib.rs, invisible to this file scanner).
+        "crates/codestory-workspace/src/test_git.rs".to_owned(),
     ]);
 
     assert_eq!(
@@ -3418,14 +3432,14 @@ fn retrieval_annotations_are_classified_by_typed_kind_not_by_prose() {
 ///
 /// READY-C (#1654) shipped `validation_receipts` documenting that "replacement,
 /// truncation, in-place rewriting ... all break the seal", and two tests
-/// asserting exactly that. Neither statement holds on Windows: `std::fs`
-/// reports no device/inode pair and no inode-change instant there, so a
-/// same-length rewrite that restores the modification time produces an
-/// identical observation and is answered from the receipt. Nothing contradicted
-/// the claim because `codestory-contracts` tests run only on Linux and macOS —
-/// the Windows lanes in `source-proof.yml` build `codestory-workspace` and
-/// `codestory-llama-sys` test targets only. The limit is therefore stated, in
-/// the contract and in the docs, and this is what keeps it stated.
+/// asserting exactly that. Windows contradicted both while `std::fs` reported
+/// no device/inode pair and no inode-change instant there, and nothing pinned
+/// it because `codestory-contracts` tests ran only on Linux and macOS. Windows
+/// now observes the same native identity through a bounded handle query
+/// (volume serial, file index, NTFS ChangeTime); what remains is the fallback
+/// case — a platform or filesystem that reports none of that, including a
+/// Windows file whose query fails — and that weaker case must stay named in
+/// the contract and the docs, which is what this keeps pinned.
 #[test]
 fn the_sealed_receipt_states_its_windows_limit_in_the_contract_and_the_docs() {
     let receipts = read("crates/codestory-contracts/src/validation_receipts.rs");

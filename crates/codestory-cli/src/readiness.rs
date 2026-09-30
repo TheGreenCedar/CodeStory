@@ -182,6 +182,30 @@ pub(crate) fn freshness_requires_refresh(freshness: &IndexFreshnessDto) -> bool 
     }
 }
 
+/// User-facing guidance when the freshness scan stopped at the bounded
+/// inventory cap. A bounded scan is a scale signal, not a defect: the
+/// publication stays usable, but drift detection did not cover the whole
+/// inventory. Every surface that reports index state uses this one message so
+/// `index` and `doctor` cannot drift apart.
+pub(crate) fn bounded_inventory_freshness_warning(freshness: &IndexFreshnessDto) -> Option<String> {
+    if freshness.status != IndexFreshnessStatusDto::NotChecked
+        || freshness.not_checked_cause != Some(IndexFreshnessNotCheckedCauseDto::BoundedInventory)
+    {
+        return None;
+    }
+    let detail = freshness
+        .reason
+        .as_deref()
+        .map(|reason| format!(" ({reason})"))
+        .unwrap_or_default();
+    Some(format!(
+        "The indexed file inventory exceeds the supported freshness-scan \
+         envelope{detail}. The index remains usable, but freshness drift is \
+         not checked beyond that bound; narrow the indexed scope or accept \
+         bounded freshness checks."
+    ))
+}
+
 pub(crate) fn status_label(status: ReadinessStatusDto) -> &'static str {
     match status {
         ReadinessStatusDto::Ready => "ready",
@@ -1219,5 +1243,26 @@ mod tests {
                 "retrieval activation should expose one canonical command: {verdict:?}"
             );
         }
+    }
+
+    #[test]
+    fn bounded_inventory_warning_fires_only_on_the_scale_cap_cause() {
+        let mut observed = freshness(IndexFreshnessStatusDto::NotChecked);
+        observed.not_checked_cause = Some(IndexFreshnessNotCheckedCauseDto::BoundedInventory);
+        observed.reason = Some(
+            "indexed file inventory exceeds bounded freshness cap (30000 > 25000)".to_string(),
+        );
+
+        let warning = bounded_inventory_freshness_warning(&observed)
+            .expect("a bounded inventory must carry scale-envelope guidance");
+        assert!(warning.contains("30000 > 25000"), "{warning}");
+        assert!(warning.contains("remains usable"), "{warning}");
+
+        observed.not_checked_cause = Some(IndexFreshnessNotCheckedCauseDto::InventoryUnavailable);
+        assert_eq!(bounded_inventory_freshness_warning(&observed), None);
+
+        observed.status = IndexFreshnessStatusDto::Stale;
+        observed.not_checked_cause = Some(IndexFreshnessNotCheckedCauseDto::BoundedInventory);
+        assert_eq!(bounded_inventory_freshness_warning(&observed), None);
     }
 }

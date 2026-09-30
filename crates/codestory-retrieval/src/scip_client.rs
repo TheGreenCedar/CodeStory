@@ -1342,6 +1342,13 @@ mod tests {
             ScipClient::expand_reference_adjacency(&layout, "generation-b", &[client_anchor()], 1)
                 .expect("reverse order");
 
+        // The deterministic sort breaks the equal-score tie on symbol name, so
+        // the same single neighbour must win whichever order the artifact
+        // serialized its proofs in.
+        assert_eq!(first_order.len(), 1, "the expansion must not be empty");
+        assert_eq!(first_order[0].node_id.as_deref(), Some("3"));
+        assert_eq!(first_order[0].symbol_name.as_deref(), Some("ClientConfig"));
+        assert!(first_order[0].score > 0.0);
         assert_eq!(
             first_order
                 .iter()
@@ -1390,6 +1397,19 @@ mod tests {
 
         assert!(wide_target.score < narrow_target.score);
         assert_eq!(wide_target.graph_evidence.as_ref().unwrap().fanout, 2);
+
+        // Fanout counts the anchor's distinct eligible neighbours before the
+        // result window truncates: with a limit below the neighbour count the
+        // survivor must still report the full fanout.
+        let truncated =
+            ScipClient::expand_reference_adjacency(&layout, "generation-b", &[client_anchor()], 1)
+                .expect("truncated expansion");
+        assert_eq!(truncated.len(), 1);
+        assert_eq!(
+            truncated[0].graph_evidence.as_ref().unwrap().fanout,
+            2,
+            "a fanout computed only over the kept window would undercount to 1"
+        );
     }
 
     #[test]

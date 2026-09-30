@@ -117,9 +117,19 @@ def _run_shared_deadline_leg() -> None:
             pass
         else:
             raise ProofFailure("search_until_ready did not fail on a host that never converged")
+    # Equality, not just the bound: an early failure would pass "<=" while never
+    # exercising the shared deadline, and a nested per-poll budget overshoots it.
     require(
-        clock.now <= _TIMEOUT_SECS,
+        clock.now == _TIMEOUT_SECS,
         f"search_until_ready waited {clock.now}s against its {_TIMEOUT_SECS}s bound",
+    )
+    # The degraded answer must reach the second poll under the same deadline. If
+    # a poll minted a fresh budget, the first poll would burn the whole window
+    # and this request id would never exist.
+    require(
+        host.tool_attempt_counts.get("search-degraded-2") == 2,
+        "a nested per-poll deadline never reached the post-degradation poll:"
+        f" {host.tool_attempt_counts}",
     )
 
 

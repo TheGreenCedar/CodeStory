@@ -35,6 +35,46 @@ pub struct ApiErrorDetails {
     pub disk_space: Option<DiskSpacePressureDto>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub coverage_gaps: Vec<FileCoverageDiagnosticDto>,
+    /// Present on `peer_writer_active`: the recorded owner of the contended
+    /// writer lock, or `unknown` when no owner record could be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_writer: Option<PeerWriterDiagnosticsDto>,
+}
+
+/// Diagnostics attached to a writer-scope `lock_wait_timeout`. The holder is
+/// the owner record the locking peer published beside the lock file, or the
+/// string `unknown` when no record could be read. `next_action` always tells
+/// the operator to wait for or stop that process and never delete the lock.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct PeerWriterDiagnosticsDto {
+    pub holder: PeerWriterHolderDto,
+    pub next_action: String,
+}
+
+/// The recorded owner of a contended writer lock. `Unknown` serializes as the
+/// string `unknown` so a missing owner record is distinguishable from a peer
+/// whose diagnostics were never published.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum PeerWriterHolderDto {
+    Recorded(PeerWriterHolderRecordDto),
+    Unknown(String),
+}
+
+/// The observed fields of a live or stale lock owner record.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct PeerWriterHolderRecordDto {
+    pub pid: u32,
+    pub operation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    /// `acquired_at_epoch_ms` from the owner record: when the holder took the
+    /// lock.
+    pub since_epoch_ms: i64,
+    /// `true` only when the recorded PID still exists and its process start
+    /// identity matches the record, so a stale record from a dead process
+    /// reads `alive: false`.
+    pub alive: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
@@ -111,6 +151,7 @@ impl ApiErrorDetails {
             embedding_retry: None,
             disk_space: None,
             coverage_gaps: Vec::new(),
+            peer_writer: None,
         }
     }
 
@@ -128,6 +169,7 @@ impl ApiErrorDetails {
             embedding_retry: None,
             disk_space: None,
             coverage_gaps: Vec::new(),
+            peer_writer: None,
         }
     }
 
@@ -158,6 +200,7 @@ impl ApiErrorDetails {
             embedding_retry: None,
             disk_space: None,
             coverage_gaps,
+            peer_writer: None,
         }
     }
 }
@@ -223,6 +266,7 @@ impl ApiError {
                     retry_condition: "after_space_available".into(),
                 }),
                 coverage_gaps: Vec::new(),
+                peer_writer: None,
             },
         )
     }
@@ -276,6 +320,7 @@ impl ApiError {
                 }),
                 disk_space: None,
                 coverage_gaps: Vec::new(),
+                peer_writer: None,
             },
         )
     }
@@ -300,6 +345,7 @@ impl ApiError {
                 embedding_retry: Some(retry),
                 disk_space: None,
                 coverage_gaps: Vec::new(),
+                peer_writer: None,
             },
         )
     }
@@ -353,6 +399,22 @@ mod tests {
 
         assert_eq!(decoded, envelope);
         assert_eq!(decoded.schema_version, COMMAND_FAILURE_SCHEMA_VERSION);
+
+        // The shared CLI error envelope is a wire contract; pin the literal
+        // spellings a derive round-trip cannot catch.
+        let value: serde_json::Value =
+            serde_json::from_str(&json).expect("parse envelope as value");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "schema_version": COMMAND_FAILURE_SCHEMA_VERSION,
+                "error": {
+                    "code": "invalid_argument",
+                    "message": "bad input",
+                },
+                "context": {"argument": "--format"},
+            })
+        );
     }
 
     #[test]

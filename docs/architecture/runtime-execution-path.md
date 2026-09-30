@@ -38,7 +38,8 @@ refresh a project, initialize the engine, or mutate status state.
 | Class | Examples | May activate work | Required state |
 | --- | --- | --- | --- |
 | Observational | `status`, `doctor`, retrieval-engine diagnostics | No | readable current state |
-| Local graph | `ground`, `files`, `symbol`, `callers`, `trail`, `snippet`, explicit `search --repo-text off` | bounded local refresh | current core publication for the requested surface |
+| Graph-only | `ground`, `files`, `symbol`, `callers`, `trail` | bounded local refresh | current or retained core publication for the requested surface |
+| Source-backed | `snippet` by symbol id, explicit `search --repo-text off` | bounded local refresh | a fresh complete core publication |
 | Broad retrieval | `packet`, ordinary `search`, broad query-based `context` | local refresh, engine init, retrieval finalization | coherent retrieval publication and live policy-compliant engine |
 | Exact target | definition/reference/node and focused context calls | only what the selected operation needs | resolved target plus its declared readiness |
 
@@ -50,6 +51,29 @@ gap. Explicit `search --repo-text off` instead searches the complete core symbol
 projection and truthfully reports symbolic retrieval without initializing or
 claiming semantic readiness. There is no user-facing sidecar setup or repair
 decision.
+
+While a refresh is in flight, the read classes diverge. A source-backed read
+waits for the fresh complete core inside the call's deadline and returns
+`preparing` with resume arguments when the deadline expires; it never serves
+retained bytes. A graph-only read may answer from the retained complete
+publication, and the runtime labels that answer
+`_meta.codestory_publication.freshness.state = "historical"` with the derived
+`reason` (`refresh_in_progress`, `replacement_failed`, `peer_writer`, or
+`stale_source`) and `served_generation`. `affected` and the proof tools are
+pinned complete-core observers: they bind the committed publication and report
+drift against it rather than waiting or falling back. `resources/read` stays
+observational — it never activates or waits, so a `codestory://snippet/` read
+against drifted bytes reports `source_stale` from the pinned generation.
+
+The writer lock coordinates refreshes across processes. An activation that
+finds the index-writer lock held by another session reports stage
+`waiting_for_peer_writer` and waits — bounded and cancellable — for the peer to
+release it. On release it re-opens committed storage and re-plans: if the peer
+published a satisfying core, the waiter adopts it without a second write;
+otherwise it performs exactly one refresh under the lock it now holds. If the
+peer died without publishing, the OS releases the lock and the waiter does the
+work itself. The previous complete publication stays readable throughout, and
+graph-only answers from it carry freshness reason `peer_writer`.
 
 ## Core indexing
 

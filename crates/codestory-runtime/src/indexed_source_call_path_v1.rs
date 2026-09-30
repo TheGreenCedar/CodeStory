@@ -4755,7 +4755,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Horizon A: published generations are immutable; in-place WAL poison is not a supported observer path"]
     fn active_snapshot_poison_restored_before_current_observation_cannot_prove() {
         let project = tempfile::tempdir().unwrap();
         let source_path = project.path().join("src/lib.rs");
@@ -4766,7 +4765,10 @@ mod tests {
         )
         .unwrap();
         let storage_path = project.path().join(".codestory-test/codestory.db");
-        let controller = AppController::new_with_config(crate::test_sidecar_runtime_from_env());
+        let process_cache = tempfile::tempdir().unwrap();
+        let controller = AppController::new_with_config(
+            crate::test_sidecar_runtime_with_cache_root(process_cache.path()),
+        );
         controller
             .open_project_summary_with_storage_path(
                 project.path().to_path_buf(),
@@ -4801,12 +4803,21 @@ mod tests {
         let poisoned = seal_call_resolution_fact(poisoned).unwrap();
         mutate_published_core(
             &storage_path,
+            "UPDATE proof_resolution_provenance
+                 SET parser_fingerprint = ?1
+                 WHERE provenance_id = (
+                     SELECT provenance_id FROM proof_resolution_fact
+                     WHERE fact_id = ?2
+                 )",
+            (&poisoned.provenance.parser_fingerprint, &original.fact_id),
+        );
+        mutate_published_core(
+            &storage_path,
             "UPDATE proof_resolution_fact
-                 SET fact_id = ?1, parser_fingerprint = ?2, evidence_digest = ?3
-                 WHERE fact_id = ?4",
+                 SET fact_id = ?1, evidence_digest = ?2
+                 WHERE fact_id = ?3",
             (
                 &poisoned.fact_id,
-                &poisoned.provenance.parser_fingerprint,
                 &poisoned.provenance.evidence_sha256,
                 &original.fact_id,
             ),
@@ -4831,12 +4842,21 @@ mod tests {
 
         mutate_published_core(
             &storage_path,
+            "UPDATE proof_resolution_provenance
+                 SET parser_fingerprint = ?1
+                 WHERE provenance_id = (
+                     SELECT provenance_id FROM proof_resolution_fact
+                     WHERE fact_id = ?2
+                 )",
+            (&original.provenance.parser_fingerprint, &poisoned.fact_id),
+        );
+        mutate_published_core(
+            &storage_path,
             "UPDATE proof_resolution_fact
-                 SET fact_id = ?1, parser_fingerprint = ?2, evidence_digest = ?3
-                 WHERE fact_id = ?4",
+                 SET fact_id = ?1, evidence_digest = ?2
+                 WHERE fact_id = ?3",
             (
                 &original.fact_id,
-                &original.provenance.parser_fingerprint,
                 &original.provenance.evidence_sha256,
                 &poisoned.fact_id,
             ),
@@ -4854,9 +4874,15 @@ mod tests {
         let validation = controller
             .validate_proof_publication_for_active_snapshot(&publication, active_snapshot.storage())
             .unwrap();
+        // Sealed generations cannot host a persistent WAL observer, so no
+        // prepared receipt exists and validation is a fresh Direct check on
+        // the pinned snapshot. The poisoned facts must fail it, leaving proof
+        // projection unavailable even though the live image was restored.
         assert!(matches!(
             &validation,
-            &ProofPublicationValidationUse::Unavailable
+            &ProofPublicationValidationUse::Direct {
+                proof_projection_available: false,
+            }
         ));
         assert_eq!(full_proof_publication_validation_count(), 1);
         let observed = build_from_store_observed_with_validation(

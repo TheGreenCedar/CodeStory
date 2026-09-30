@@ -14,11 +14,11 @@
     "source_path": "crates/codestory-indexer/tests/fixtures/call_resolution_comprehensive/rust_workflow.rs",
     "source_sha256": "afb4d70c9aa27943c68c7ee4b5161fcc049f5e0a11004f0f4540dfe156cb8c03",
     "edge_contract_path": "crates/codestory-indexer/tests/call_resolution_common_methods.rs",
-    "edge_contract_sha256": "c741ba539dec194a55a82f25700c619c07416671e5433c1650ae344682f1b506",
+    "edge_contract_sha256": "83bf8f29408193a2e26c4110a9a4e77b29809c1ac6a49e6564d530a2114412f1",
     "transformation_id": "rust-public-owner-anchors-v1",
     "materialized_sha256": "32a6401044352f49756099694ddb2872075e83e5aee697c3020838bd9146a24a",
     "disjointness_manifest_path": "benchmarks/tasks/language-expansion-holdout/language-support-ab.task.json",
-    "disjointness_manifest_sha256": "0ab74fcbcc16e2bd4449b0a13146dd38b3bee7a4e63cd2c62d6bfa0ae047933b"
+    "disjointness_manifest_sha256": "da79d57c7f8aab4d94162e6ffb265801679bc818e70c094a0371d796ab014f0b"
   },
   "selection_contract": {
     "baseline_relative_percent": 50,

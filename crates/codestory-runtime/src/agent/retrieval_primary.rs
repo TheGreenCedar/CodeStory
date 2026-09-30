@@ -3861,7 +3861,8 @@ mod tests {
 
     #[test]
     fn detached_sidecar_query_cache_does_not_hold_mutex_during_work() {
-        let controller = AppController::new();
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         let first = retrieval_cache_key_for_test("first");
         let second = retrieval_cache_key_for_test("second");
         controller.sidecar_query_cache.lock().insert(
@@ -3903,7 +3904,8 @@ mod tests {
 
     #[test]
     fn detached_sidecar_query_cache_skips_merge_after_invalidation() {
-        let controller = AppController::new();
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         let first = retrieval_cache_key_for_test("first");
         let second = retrieval_cache_key_for_test("second");
         controller.sidecar_query_cache.lock().insert(
@@ -4170,6 +4172,62 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Moved from tests/retrieval_primary_rejection.rs: phantom-only results
+    /// must hit the runtime's typed refusal path, and a real file must reach
+    /// the ordinary resolution path instead.
+    #[test]
+    fn phantom_only_candidates_are_detected() {
+        let phantoms = vec![
+            CandidateHit::with_source(
+                "lexical:handler",
+                Some("handler".into()),
+                0.5,
+                CandidateSource::Lexical,
+            ),
+            CandidateHit::with_source(
+                "semantic:handler",
+                Some("handler".into()),
+                0.55,
+                CandidateSource::Semantic,
+            ),
+        ];
+        assert!(codestory_retrieval::phantom_sidecar_candidates_only(
+            &phantoms
+        ));
+
+        let node_names = HashMap::new();
+        for phantom in &phantoms {
+            assert_eq!(
+                candidate_resolution_label(None, None, &node_names, phantom),
+                "phantom_hit",
+                "phantom candidates must be refused before any path or storage work"
+            );
+        }
+        let ordered = ordered_sidecar_candidates(&phantoms, |_| {
+            panic!("phantom hits must be filtered before path resolution")
+        });
+        assert!(ordered.is_empty());
+
+        // Real-file control: an existing source file is not a phantom, reaches
+        // path resolution, and then proceeds into node lookup.
+        let temp = tempfile::tempdir().expect("project root");
+        let source = temp.path().join("src/lib.rs");
+        std::fs::create_dir_all(source.parent().expect("src parent")).expect("mkdir src");
+        std::fs::write(&source, "fn lib() {}\n").expect("write source");
+        let real = CandidateHit::lexical_stub("src/lib.rs", 0.9);
+        assert!(!codestory_retrieval::phantom_sidecar_candidates_only(
+            std::slice::from_ref(&real)
+        ));
+
+        let storage = Store::new_in_memory().expect("storage");
+        assert_eq!(
+            candidate_resolution_label(Some(temp.path()), Some(&storage), &node_names, &real),
+            "node_unresolved",
+            "a real resolvable file must reach node lookup, not the phantom refusal"
+        );
+        assert_eq!(ordered_sidecar_candidates(&[real], |_| true).len(), 1);
     }
 
     #[test]
@@ -6305,6 +6363,7 @@ mod tests {
 
     #[test]
     fn packet_batch_marks_only_deadlines_retryable_and_rejects_cancellation() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         use codestory_retrieval::classify_query;
 
         let query_result = |cancel_reason: Option<&str>| QueryResult {
@@ -6332,7 +6391,7 @@ mod tests {
                 unindexed_lexical_artifacts_only: false,
             })
         };
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         let queries = vec![("handler".to_string(), 5)];
 
         let empty = build_sidecar_packet_batch_outcome(
@@ -7340,6 +7399,7 @@ mod tests {
 
     #[test]
     fn packet_sidecar_query_diagnostic_ignores_candidates_skipped_by_result_cap() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         use codestory_retrieval::{CandidateSource, classify_query};
         use codestory_store::{FileInfo, FileRole};
 
@@ -7388,7 +7448,7 @@ mod tests {
                 .expect("insert nodes");
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(temp.path().to_path_buf(), storage_path)
             .expect("open project");
@@ -7506,13 +7566,14 @@ mod tests {
 
     #[test]
     fn packet_batch_reports_unresolved_full_mode_candidates_without_rejecting() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         use codestory_retrieval::CandidateSource;
 
         let temp = tempfile::tempdir().expect("tempdir");
         let storage_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(storage_path.parent().expect("storage parent"))
             .expect("create storage parent");
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(temp.path().to_path_buf(), storage_path)
             .expect("open project");
@@ -7572,13 +7633,14 @@ mod tests {
 
     #[test]
     fn packet_batch_divides_request_budget_across_queries() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         use codestory_retrieval::classify_query;
 
         let temp = tempfile::tempdir().expect("tempdir");
         let storage_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(storage_path.parent().expect("storage parent"))
             .expect("create storage parent");
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(temp.path().to_path_buf(), storage_path)
             .expect("open project");
@@ -7627,11 +7689,12 @@ mod tests {
 
     #[test]
     fn packet_batch_rejects_candidate_resolution_errors() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         use codestory_retrieval::CandidateSource;
 
         let temp = tempfile::tempdir().expect("tempdir");
         let storage_path = temp.path().join("cache").join("codestory.db");
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(temp.path().to_path_buf(), storage_path.clone())
             .expect("open project");
@@ -7683,11 +7746,12 @@ mod tests {
 
     #[test]
     fn sidecar_primary_search_reports_candidate_resolution_errors() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         use codestory_retrieval::CandidateSource;
 
         let temp = tempfile::tempdir().expect("tempdir");
         let storage_path = temp.path().join("cache").join("codestory.db");
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(temp.path().to_path_buf(), storage_path.clone())
             .expect("open project");
@@ -7729,6 +7793,7 @@ mod tests {
 
     #[test]
     fn sidecar_primary_search_serves_cancelled_full_trace_with_resolved_hits() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         use codestory_retrieval::CandidateSource;
         use codestory_store::{FileInfo, FileRole, Store};
 
@@ -7777,7 +7842,7 @@ mod tests {
                 .expect("insert nodes");
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(temp.path().to_path_buf(), storage_path)
             .expect("open project");

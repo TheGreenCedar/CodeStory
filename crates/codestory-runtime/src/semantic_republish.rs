@@ -1,6 +1,7 @@
 use crate::index_commit::next_index_publication;
 use crate::index_timings::{
-    IndexingRunSummary, core_promotion_timings, database_snapshot_copy_timings,
+    IndexingRunSummary, core_promotion_timings, core_retention_outcome,
+    database_snapshot_copy_timings,
 };
 #[cfg(test)]
 use crate::publication::{
@@ -518,13 +519,14 @@ pub(super) fn semantic_projection_republish_for_runtime(
             prepared_search_state,
             cancel_token,
         )?;
-        crate::activation_retrieval::apply_core_gc_after_publication(
+        let core_retention = crate::activation_retrieval::apply_core_gc_after_publication(
             runtime,
             storage_path,
             cancel_token,
         );
-        let phase_timings =
+        let mut phase_timings =
             semantic_projection_phase_timings(&prepared, publish_stats, publish_duration);
+        phase_timings.core_retention = core_retention.as_ref().map(core_retention_outcome);
         Ok((
             IndexingRunSummary {
                 phase_timings,

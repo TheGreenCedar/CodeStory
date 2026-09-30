@@ -588,9 +588,10 @@ mod tests {
 
     #[test]
     fn bare_filenames_are_path_like_for_every_registered_extension() {
-        for query in ["worker.py", "Worker.java", "worker.go", "worker.rs"] {
+        for extension in codestory_contracts::language_support::supported_extensions() {
+            let query = format!("worker.{extension}");
             assert_eq!(
-                classify_query(query).shape,
+                classify_query(&query).shape,
                 QueryShape::PathLike,
                 "{query} is a bare filename of a supported language"
             );

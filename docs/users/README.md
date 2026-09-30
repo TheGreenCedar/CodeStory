@@ -35,6 +35,41 @@ project-scoped MCP runtime with the adapter setup described in their guides.
 
 Codex is the most automatic install, not the product ICP.
 
+## Other MCP hosts
+
+Any host that can launch a stdio MCP server can run the same project-scoped
+runtime. Point the host's MCP configuration at the packaged launcher script:
+
+```json
+{
+  "mcpServers": {
+    "codestory": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["<plugin-root>/scripts/codestory-mcp.cjs"],
+      "cwd": "<plugin-root>",
+      "env": { "CODESTORY_CLI": "/absolute/path/to/codestory-cli" }
+    }
+  }
+}
+```
+
+- `CODESTORY_CLI` takes an absolute path to a `codestory-cli` executable and
+  selects it instead of the provisioned runtime. Status labels this path
+  `local_dev_override`.
+- Keep the executable in a stable location you own. If you relocate it with a
+  link, use a hard link or a real copy: the launcher's containment check
+  rejects a managed path whose real location escapes its version directory
+  (`manifest_path_escape`).
+- Never point a host directly into the revision-hashed plugin cache
+  (`<plugin-data>/codestory-cli/<version>/`). Those paths are the plugin's
+  private, verified storage and move on upgrade.
+- Without `CODESTORY_CLI`, the launcher fetches and verifies the matching CLI
+  itself; the override exists for local development and custom installs.
+
+Every tool call still carries an absolute `project` root. There is no ambient
+"current repository" for the host to configure.
+
 For existing installations and custom integrations, read the
 [0.17.6 upgrade guide](upgrading.md) before switching versions.
 

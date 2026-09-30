@@ -450,9 +450,11 @@ fn validate_yaml_syntax(source: &str) -> Result<(), StructuralCollectionError> {
 }
 
 fn structural_extension(path: &Path) -> Option<String> {
+    // Admission normalizes through the shared contracts helper; dispatch must
+    // agree or an admitted path has no producer.
     path.extension()
         .and_then(|ext| ext.to_str())
-        .map(|ext| ext.to_ascii_lowercase())
+        .map(codestory_contracts::language_support::normalize_extension)
 }
 
 fn file_modification_time(path: &Path) -> i64 {
@@ -1541,6 +1543,10 @@ mod tests {
         }
         let first = index_structural_file(&first_path).expect("index first markdown");
         let second = index_structural_file(&second_path).expect("index second markdown");
+        assert!(
+            !first.structural_text_units.is_empty() && !second.structural_text_units.is_empty(),
+            "an empty unit set would make the identity comparison vacuous"
+        );
         let mut first_content = first
             .structural_text_units
             .iter()
@@ -1612,6 +1618,10 @@ mod tests {
 
             let first = index_structural_file(&first_path).expect("index first fixture");
             let second = index_structural_file(&second_path).expect("index second fixture");
+            assert!(
+                !first.structural_text_units.is_empty() && !second.structural_text_units.is_empty(),
+                "{label}: an empty unit set would make the identity comparison vacuous"
+            );
             let mut first_content = first
                 .structural_text_units
                 .iter()

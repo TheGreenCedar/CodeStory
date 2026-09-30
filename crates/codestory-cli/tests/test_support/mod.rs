@@ -82,3 +82,51 @@ fn thread_name() -> String {
 fn install_id() -> String {
     format!("integration-{}-{}", std::process::id(), thread_name())
 }
+
+/// Downgrade the published core's durable `user_version` in place, emulating a
+/// core written by an older release. Returns the generation database path so
+/// callers can prove the image is untouched afterward. The same fixture shape
+/// backs the I2 #3c probe-stage case, so keep it a schema downgrade of a real
+/// published generation rather than a hand-built database.
+pub fn set_active_core_schema_version(cache_dir: &std::path::Path, version: u32) -> PathBuf {
+    let pointer: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(cache_dir.join("core/publication.json")).expect("committed core pointer"),
+    )
+    .expect("core pointer json");
+    let generation = pointer["active"]["generation_id"]
+        .as_str()
+        .expect("active generation id")
+        .to_string();
+    let database = cache_dir
+        .join("core")
+        .join("generations")
+        .join(generation)
+        .join("codestory.db");
+    let metadata = std::fs::metadata(&database).expect("generation metadata");
+    let mut permissions = metadata.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        permissions.set_mode(permissions.mode() | 0o200);
+    }
+    #[cfg(not(unix))]
+    {
+        permissions.set_readonly(false);
+    }
+    std::fs::set_permissions(&database, permissions).expect("unseal generation image");
+    {
+        let connection = rusqlite::Connection::open(&database).expect("open generation image");
+        connection
+            .pragma_update(None, "user_version", version)
+            .expect("downgrade durable schema version");
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint schema downgrade");
+    }
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut sidecar = database.as_os_str().to_owned();
+        sidecar.push(suffix);
+        let _ = std::fs::remove_file(PathBuf::from(sidecar));
+    }
+    database
+}

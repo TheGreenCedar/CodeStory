@@ -15,11 +15,14 @@ use client_transports::{
 use identities::{
     begin_test_request, encode_test_frame, serve_mismatched_peer_hello, test_cancel_token,
     test_client, test_engine_identity, test_executable, test_hello_operation,
-    test_qualification_control, test_qualification_event, test_server_state, test_snapshot,
-    test_transport_identity,
+    test_qualification_control, test_qualification_event, test_server_state,
+    test_server_state_with_clock, test_snapshot, test_transport_identity,
 };
 use server_fixtures::{PollingStream, WatchdogTransport};
-use transport_fixtures::{MemoryStream, TestClock, TricklePeerStream};
+use transport_fixtures::{
+    BlockingScriptState, GatedSleepClock, MemoryStream, ScriptOutcome, ScriptStream, TestClock,
+    TricklePeerStream,
+};
 
 mod lazy_transport {
     use super::super::client::LazyClientTransport;

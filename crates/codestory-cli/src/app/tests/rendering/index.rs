@@ -77,6 +77,7 @@ fn render_index_markdown_includes_rich_timing_breakdown_when_available() {
         retrieval: &retrieval,
         phase_timings: Some(&timings),
         summary_generation: None,
+        warnings: Vec::new(),
         readiness: Vec::new(),
         next_commands: Vec::new(),
     };
@@ -164,4 +165,66 @@ fn render_index_markdown_includes_rich_timing_breakdown_when_available() {
     assert!(markdown.contains(
             "resolution_semantic_requests: call_rows=36 call_unique=37 call_skipped=38 import_rows=39 import_unique=40 import_skipped=41"
         ));
+}
+
+#[test]
+fn index_output_carries_the_bounded_inventory_warning_in_json_and_markdown() {
+    // #2531#6: a repository past the freshness-scan envelope must surface a
+    // visible warning, not silently succeed. The warning text comes from the
+    // shared readiness helper so markdown, JSON and doctor cannot diverge.
+    let mut summary = summary_with_files(3);
+    summary.freshness = Some(codestory_contracts::api::IndexFreshnessDto {
+        status: codestory_contracts::api::IndexFreshnessStatusDto::NotChecked,
+        changed_file_count: 0,
+        new_file_count: 0,
+        removed_file_count: 0,
+        checked_file_count: 0,
+        indexed_file_count: 30_000,
+        duration_ms: 0,
+        reason: Some(
+            "indexed file inventory exceeds bounded freshness cap (30000 > 25000)".to_string(),
+        ),
+        not_checked_cause: Some(
+            codestory_contracts::api::IndexFreshnessNotCheckedCauseDto::BoundedInventory,
+        ),
+        samples: Vec::new(),
+    });
+    let retrieval = sample_retrieval();
+    let warnings = summary
+        .freshness
+        .as_ref()
+        .and_then(crate::readiness::bounded_inventory_freshness_warning)
+        .into_iter()
+        .collect();
+    let output = IndexOutput {
+        project: &summary.root,
+        storage_path: "C:/repo/.cache/index.sqlite",
+        refresh: "full",
+        refresh_reason: None,
+        summary: &summary,
+        retrieval: &retrieval,
+        phase_timings: None,
+        summary_generation: None,
+        warnings,
+        readiness: Vec::new(),
+        next_commands: Vec::new(),
+    };
+
+    let json = serde_json::to_value(&output).expect("serialize index output");
+    let json_warnings = json["warnings"].as_array().expect("warnings array");
+    assert_eq!(json_warnings.len(), 1);
+    assert!(
+        json_warnings[0]
+            .as_str()
+            .expect("warning text")
+            .contains("freshness-scan envelope"),
+        "{json_warnings:?}"
+    );
+
+    let markdown = render_index_markdown(&output);
+    assert!(
+        markdown.contains("warning: The indexed file inventory exceeds"),
+        "{markdown}"
+    );
+    assert!(markdown.contains("30000 > 25000"), "{markdown}");
 }

@@ -660,7 +660,10 @@ fn temporary_cache_root_name() -> String {
 /// downstream writes fail on a path an attacker cannot have staged instead of
 /// succeeding into one they can read.
 fn temporary_cache_root() -> PathBuf {
-    let temporary = std::env::temp_dir();
+    temporary_cache_root_in(&std::env::temp_dir())
+}
+
+fn temporary_cache_root_in(temporary: &Path) -> PathBuf {
     let shared = temporary.join(temporary_cache_root_name());
     if private_cache_directory(&shared).is_ok() {
         return shared;
@@ -767,7 +770,10 @@ fn test_cache_root_override() -> Option<PathBuf> {
     if explicit.is_some() {
         return explicit;
     }
-    #[cfg(feature = "test-support")]
+    // The opt-in flag gates only downstream test-support consumers: the
+    // crate's own cfg(test) unit tests must always take the automatic
+    // per-thread root, or they fall through to the ambient user cache.
+    #[cfg(all(feature = "test-support", not(test)))]
     if !AUTOMATIC_TEST_CACHE_ROOT_ENABLED.load(std::sync::atomic::Ordering::Acquire) {
         return None;
     }
@@ -910,12 +916,15 @@ mod tests {
     /// The fallback name must be per-user on the shared Unix temporary
     /// directory, and the root it hands back must always be a directory this
     /// process created privately — never the bare `<temp>/codestory/cache`.
+    /// Runs inside a caller-owned temporary directory so it never touches the
+    /// real OS fallback the next indexing run would share.
     #[test]
     fn temporary_cache_root_is_per_user_and_privately_created() {
-        let root = temporary_cache_root();
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let root = temporary_cache_root_in(temporary.path());
 
-        assert!(root.starts_with(std::env::temp_dir()));
-        assert_ne!(root, std::env::temp_dir().join("codestory").join("cache"));
+        assert!(root.starts_with(temporary.path()));
+        assert_ne!(root, temporary.path().join("codestory").join("cache"));
         assert!(root.is_dir(), "{} should exist", root.display());
         private_cache_directory(&root).expect("returned root is privately owned");
         #[cfg(unix)]
@@ -925,6 +934,37 @@ mod tests {
                 .is_some_and(|name| name
                     .starts_with(&format!("codestory-cache-{}", unsafe { libc::geteuid() }))),
             "{} should carry the effective uid",
+            root.display()
+        );
+    }
+
+    /// An already-occupied untrusted fallback name must never be adopted: the
+    /// caller gets an unpredictable private directory beside it instead.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_cache_root_refuses_a_staged_shared_name() {
+        use std::os::unix::fs::PermissionsExt;
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let staged = temporary.path().join(temporary_cache_root_name());
+        std::fs::create_dir(&staged).expect("staged directory");
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o777))
+            .expect("stage a world-writable directory");
+
+        let root = temporary_cache_root_in(temporary.path());
+
+        assert!(root.starts_with(temporary.path()));
+        assert_ne!(
+            root, staged,
+            "a name this process did not create privately must not be reused"
+        );
+        assert!(root.is_dir(), "{} should exist", root.display());
+        private_cache_directory(&root).expect("fallback root is privately owned");
+        assert!(
+            root.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name
+                    .starts_with(&format!("codestory-cache-{}", unsafe { libc::geteuid() }))),
+            "{} should still carry the effective uid",
             root.display()
         );
     }

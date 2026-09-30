@@ -1052,8 +1052,8 @@ fn fnv1a_path_hex(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_git::git;
     use std::fs;
-    use std::process::Command;
     use tempfile::tempdir;
 
     #[test]
@@ -1188,9 +1188,7 @@ mod tests {
 
     #[test]
     fn repository_v2_never_guesses_a_legacy_alias_without_provenance() {
-        let Some(project) = git_project() else {
-            return;
-        };
+        let project = git_project();
         for remote in [
             "https://example.com/team/repo.git",
             "https://example.com/Team/Repo.git",
@@ -1240,9 +1238,7 @@ mod tests {
 
     #[test]
     fn project_id_is_stable_across_dirty_transitions() {
-        let Some(project) = git_project() else {
-            return;
-        };
+        let project = git_project();
 
         let clean = project_identity_v3(project.path());
         fs::write(project.path().join("lib.rs"), "pub fn dirty() {}\n").expect("dirty source");
@@ -1305,9 +1301,7 @@ mod tests {
 
     #[test]
     fn bounded_logical_identity_never_walks_metadata_and_ignores_dirty_or_commit_state() {
-        let Some(project) = git_project() else {
-            return;
-        };
+        let project = git_project();
 
         let ((clean, dirty, committed, remote_b), traversals) =
             crate::with_repository_metadata_tree_traversal_count_for_test(|| {
@@ -1350,9 +1344,7 @@ mod tests {
 
     #[test]
     fn bounded_logical_identity_tracks_no_remote_metadata_recreation() {
-        let Some(project) = git_project() else {
-            return;
-        };
+        let project = git_project();
 
         let remote = observe_logical_project_identity_v3(project.path());
         fs::rename(
@@ -1371,9 +1363,7 @@ mod tests {
 
     #[test]
     fn bounded_logical_identity_tracks_same_remote_metadata_recreation() {
-        let Some(project) = git_project() else {
-            return;
-        };
+        let project = git_project();
 
         let original = observe_logical_project_identity_v3(project.path());
         fs::rename(
@@ -1400,9 +1390,7 @@ mod tests {
 
     #[test]
     fn bounded_logical_identity_fails_closed_on_local_config_toctou() {
-        let Some(project) = git_project() else {
-            return;
-        };
+        let project = git_project();
 
         let original = observe_logical_project_identity_v3(project.path());
         let config = project.path().join(".git/config");
@@ -1431,9 +1419,7 @@ mod tests {
 
     #[test]
     fn bounded_logical_identity_fails_closed_on_native_metadata_directory_replacement() {
-        let Some(project) = git_project() else {
-            return;
-        };
+        let project = git_project();
 
         let original = observe_logical_project_identity_v3(project.path());
         let git_dir = project.path().join(".git");
@@ -1462,12 +1448,8 @@ mod tests {
 
     #[test]
     fn bounded_logical_identity_fails_closed_on_gitdir_pointer_toctou() {
-        let Some(project) = git_project() else {
-            return;
-        };
-        let Some(alternate) = git_project() else {
-            return;
-        };
+        let project = git_project();
+        let alternate = git_project();
         let worktree_parent = tempdir().expect("worktree parent");
         let worktree = worktree_parent.path().join("linked-worktree");
         git(
@@ -1534,9 +1516,7 @@ mod tests {
 
     #[test]
     fn worktrees_share_project_id_but_not_workspace_id() {
-        let Some(project) = git_project() else {
-            return;
-        };
+        let project = git_project();
         let worktree_parent = tempdir().expect("worktree parent");
         let worktree = worktree_parent.path().join("linked-worktree");
         git(
@@ -1558,11 +1538,41 @@ mod tests {
         assert_eq!(first.artifact_scope_id, second.artifact_scope_id);
     }
 
+    /// Test-owned FNV-1a-64 used to check the production hash contract
+    /// independently of the production implementation.
+    fn reference_fnv1a_64(bytes: &[u8]) -> String {
+        let mut hash = 0xcbf29ce484222325_u64;
+        for &byte in bytes {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        format!("{hash:016x}")
+    }
+
     #[test]
     fn workspace_id_matches_existing_canonical_root_fnv_contract() {
+        // Published FNV-1a-64 vectors pin the reference implementation itself.
+        assert_eq!(reference_fnv1a_64(b""), "cbf29ce484222325");
+        assert_eq!(reference_fnv1a_64(b"a"), "af63dc4c8601ec8c");
+        assert_eq!(reference_fnv1a_64(b"foobar"), "85944171f73967e8");
+
         let project = tempdir().expect("project");
         let canonical = fs::canonicalize(project.path()).expect("canonical project root");
-        let expected = fnv1a_path_hex(&canonical);
+        #[cfg(unix)]
+        let path_bytes: Vec<u8> = {
+            use std::os::unix::ffi::OsStrExt;
+            canonical.as_os_str().as_bytes().to_vec()
+        };
+        #[cfg(windows)]
+        let path_bytes: Vec<u8> = {
+            use std::os::windows::ffi::OsStrExt;
+            canonical
+                .as_os_str()
+                .encode_wide()
+                .flat_map(u16::to_le_bytes)
+                .collect()
+        };
+        let expected = reference_fnv1a_64(&path_bytes);
 
         assert_eq!(workspace_id_v3_for_root(project.path()), expected);
         assert_eq!(project_identity_v3(project.path()).workspace_id, expected);
@@ -1794,9 +1804,7 @@ mod tests {
 
     #[test]
     fn artifact_scope_fails_closed_when_worktree_becomes_dirty() {
-        let Some(project) = git_project() else {
-            return;
-        };
+        let project = git_project();
 
         let clean = project_identity_v3(project.path());
         fs::write(project.path().join("lib.rs"), "pub fn dirty() {}\n").expect("dirty source");
@@ -1813,9 +1821,7 @@ mod tests {
     fn hostile_fsmonitor_hook_never_executes_during_identity_inspection() {
         use std::os::unix::fs::PermissionsExt;
 
-        let Some(project) = git_project() else {
-            return;
-        };
+        let project = git_project();
 
         let marker = project.path().join("fsmonitor-executed");
         let hook = project.path().join("fsmonitor-hook.sh");
@@ -1832,16 +1838,15 @@ mod tests {
             &["config", "core.fsmonitor", &hook.display().to_string()],
         );
 
-        // Prove the sentinel is live first: an unconstrained `git status` in
-        // this repository executes the configured hook. Without that, a git
-        // version that ignores `core.fsmonitor` would make the containment
-        // assertion below pass vacuously.
-        let unconstrained = Command::new("git")
-            .arg("-C")
-            .arg(project.path())
-            .args(["status", "--porcelain"])
-            .output()
-            .expect("run unconstrained git status");
+        // Prove the sentinel is live first: `core.fsmonitor` is not a hooksPath
+        // hook, so even an isolated `git status` in this repository executes
+        // the configured command. Without that, a git version that ignores
+        // `core.fsmonitor` would make the containment assertion below pass
+        // vacuously.
+        let unconstrained =
+            crate::test_git::git_command(project.path(), &["status", "--porcelain"])
+                .output()
+                .expect("run fsmonitor-probing git status");
         assert!(unconstrained.status.success());
         assert!(
             marker.exists(),
@@ -1857,44 +1862,7 @@ mod tests {
         );
     }
 
-    fn git_project() -> Option<tempfile::TempDir> {
-        if Command::new("git").arg("--version").output().is_err() {
-            return None;
-        }
-        let project = tempdir().expect("project");
-        git(project.path(), &["init"]);
-        git(
-            project.path(),
-            &["config", "user.email", "codestory@example.invalid"],
-        );
-        git(project.path(), &["config", "user.name", "CodeStory Test"]);
-        git(
-            project.path(),
-            &[
-                "remote",
-                "add",
-                "origin",
-                "https://github.com/TheGreenCedar/CodeStory.git",
-            ],
-        );
-        fs::write(project.path().join("lib.rs"), "pub fn run() {}\n").expect("write source");
-        git(project.path(), &["add", "."]);
-        git(project.path(), &["commit", "-m", "init"]);
-        Some(project)
-    }
-
-    fn git(project: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(project)
-            .args(args)
-            .output()
-            .expect("run git");
-        assert!(
-            output.status.success(),
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr)
-        );
+    fn git_project() -> tempfile::TempDir {
+        crate::test_git::git_project("https://github.com/TheGreenCedar/CodeStory.git")
     }
 }

@@ -3,7 +3,7 @@
 use crate::config::{SidecarLayout, SidecarProfile, SidecarRuntimeConfig};
 use anyhow::{Context, Result, bail};
 use codestory_contracts::bounded_locks::{
-    self, FileLockKind, LockDeadline, PUBLICATION_LOCK_WAIT, acquire_with_deadline,
+    self, FileLockError, FileLockKind, LockDeadline, PUBLICATION_LOCK_WAIT, acquire_with_deadline,
 };
 use codestory_store::{RetrievalIndexManifest, RetrievalIndexRollbackRecord, Store};
 use codestory_workspace::owned_deletion::OwnedDeletionRoot;
@@ -12,6 +12,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
+use std::time::SystemTime;
+
+use crate::process_identity::{
+    ProcessOwnerState, ProcessStartProbe, probe_process_start_identity, process_owner_state,
+};
 
 /// Marker schema 1: no workspace registration, so its roots can never be
 /// proven retired. Still read so a peer running an older binary keeps pinning
@@ -181,9 +186,216 @@ impl MarkerRetirement {
     }
 }
 
+/// Every exclusive retention/writer acquisition publishes this record beside
+/// the lock file so a waiter can see *who* holds it. It is diagnostics only:
+/// no code path may read it to acquire, skip, reap, or reorder a lock, and it
+/// is never an identity input — flock remains the exclusion mechanism.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetentionLockOwnerRecord {
+    pub pid: u32,
+    /// The platform process-start identity; `None` when the holder could not
+    /// probe itself. A stale record's start identity never matches a reused
+    /// PID, which is what makes `alive` trustworthy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_start_time: Option<String>,
+    pub executable_basename: String,
+    /// The lock scope the holder took (for example `writer-<project>`).
+    pub operation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    pub acquired_at_epoch_ms: i64,
+}
+
+/// What a writer-scope `lock_wait_timeout` observed about the peer that held
+/// the lock for the whole budget. Downcastable from the anyhow chain so the
+/// CLI can render the typed `peer_writer_active` failure.
+#[derive(Debug)]
+pub struct PeerWriterActive {
+    pub scope_id: String,
+    pub lock_path: PathBuf,
+    pub waited_ms: u64,
+    pub holder: Option<PeerWriterHolder>,
+}
+
+/// One observed owner record plus whether the recorded process is still the
+/// same live process.
+#[derive(Debug, Clone)]
+pub struct PeerWriterHolder {
+    pub pid: u32,
+    pub operation: String,
+    pub project_id: Option<String>,
+    pub since_epoch_ms: i64,
+    /// `true` only when the PID exists *and* its process start identity still
+    /// matches the record — a dead or PID-reused holder reads `false`.
+    pub alive: bool,
+}
+
+impl PeerWriterActive {
+    fn observe(lock_path: &Path, scope_id: &str, waited: std::time::Duration) -> Self {
+        let holder = read_lock_owner_record(lock_path).map(|record| PeerWriterHolder {
+            alive: matches!(
+                process_owner_state(
+                    &probe_process_start_identity(record.pid),
+                    record.process_start_time.as_deref(),
+                ),
+                ProcessOwnerState::Matching
+            ),
+            pid: record.pid,
+            operation: record.operation,
+            project_id: record.project_id,
+            since_epoch_ms: record.acquired_at_epoch_ms,
+        });
+        Self {
+            scope_id: scope_id.to_string(),
+            lock_path: lock_path.to_path_buf(),
+            waited_ms: waited.as_millis().min(u128::from(u64::MAX)) as u64,
+            holder,
+        }
+    }
+}
+
+impl PeerWriterActive {
+    /// The stable operator-facing recovery instruction: wait for the recorded
+    /// holder or stop it. The lock file itself must never be deleted — a new
+    /// process locking a fresh inode while the old holder keeps the unlinked
+    /// one is how mutual exclusion breaks.
+    pub fn next_action(&self) -> String {
+        match &self.holder {
+            Some(holder) if holder.alive => format!(
+                "Wait for process {} ({}) to finish, or stop it if it is no longer needed. Never delete the lock file at {}.",
+                holder.pid,
+                holder.operation,
+                self.lock_path.display()
+            ),
+            Some(holder) => format!(
+                "The recorded holder pid {} is not running; retry the operation. Never delete the lock file at {}.",
+                holder.pid,
+                self.lock_path.display()
+            ),
+            None => format!(
+                "Retry the operation; a peer held the writer lock for the whole budget. Never delete the lock file at {}.",
+                self.lock_path.display()
+            ),
+        }
+    }
+
+    /// The diagnostics envelope for `peer_writer_active` details.
+    pub fn diagnostics(&self) -> codestory_contracts::api::PeerWriterDiagnosticsDto {
+        use codestory_contracts::api::{PeerWriterHolderDto, PeerWriterHolderRecordDto};
+        codestory_contracts::api::PeerWriterDiagnosticsDto {
+            holder: self
+                .holder
+                .clone()
+                .map(|holder| {
+                    PeerWriterHolderDto::Recorded(PeerWriterHolderRecordDto {
+                        pid: holder.pid,
+                        operation: holder.operation,
+                        project_id: holder.project_id,
+                        since_epoch_ms: holder.since_epoch_ms,
+                        alive: holder.alive,
+                    })
+                })
+                .unwrap_or_else(|| PeerWriterHolderDto::Unknown("unknown".into())),
+            next_action: self.next_action(),
+        }
+    }
+}
+
+impl std::fmt::Display for PeerWriterActive {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.holder {
+            Some(holder) => write!(
+                formatter,
+                "peer_writer_active: the writer lock at {} is held by process {} ({}) for the whole {} ms budget",
+                self.lock_path.display(),
+                holder.pid,
+                holder.operation,
+                self.waited_ms,
+            ),
+            None => write!(
+                formatter,
+                "peer_writer_active: a peer process held the writer lock at {} for the whole {} ms budget",
+                self.lock_path.display(),
+                self.waited_ms,
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PeerWriterActive {}
+
+/// The scope prefix whose timeouts report `peer_writer_active`: per-project
+/// writer locks taken for a retrieval finalize.
+const WRITER_LOCK_SCOPE_PREFIX: &str = "writer-";
+
+/// The owner record lives beside the lock file it describes.
+fn lock_owner_record_path(lock_path: &Path) -> PathBuf {
+    lock_path.with_file_name(format!(
+        "{}.owner.json",
+        lock_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "lock".into())
+    ))
+}
+
+/// Read the owner record a locking peer published, if any. Never used to
+/// decide locking — only to describe the holder in a timeout diagnostic.
+fn read_lock_owner_record(lock_path: &Path) -> Option<RetentionLockOwnerRecord> {
+    let bytes = std::fs::read(lock_owner_record_path(lock_path)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Publish this process as the current owner of `lock_path`. Best-effort: a
+/// failed write never fails an acquisition that already holds the lock.
+fn write_lock_owner_record(lock_path: &Path, scope_id: &str) -> Option<PathBuf> {
+    let pid = std::process::id();
+    let record = RetentionLockOwnerRecord {
+        pid,
+        process_start_time: match probe_process_start_identity(pid) {
+            ProcessStartProbe::Running { start_identity } => Some(start_identity),
+            _ => None,
+        },
+        executable_basename: std::env::current_exe()
+            .ok()
+            .and_then(|exe| {
+                exe.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .unwrap_or_default(),
+        operation: scope_id.to_string(),
+        project_id: scope_id
+            .strip_prefix(WRITER_LOCK_SCOPE_PREFIX)
+            .map(str::to_owned),
+        acquired_at_epoch_ms: SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis().min(i64::MAX as u128) as i64)
+            .unwrap_or(0),
+    };
+    let path = lock_owner_record_path(lock_path);
+    let bytes = serde_json::to_vec_pretty(&record).ok()?;
+    codestory_workspace::atomic_file::write_bytes_atomic(&path, "retention-lock-owner", &bytes)
+        .ok()?;
+    Some(path)
+}
+
+/// Remove the owner record this process wrote, best-effort. The PID guard
+/// keeps a slow drop from deleting a record a successor wrote after this
+/// lock's file was replaced.
+fn remove_lock_owner_record_if_current(path: &Path) {
+    let removable = std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<RetentionLockOwnerRecord>(&bytes).ok())
+        .is_some_and(|record| record.pid == std::process::id());
+    if removable {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 #[derive(Debug)]
 pub struct GenerationRetentionLock {
     file: File,
+    owner_record_path: Option<PathBuf>,
 }
 
 impl GenerationRetentionLock {
@@ -235,7 +447,10 @@ impl GenerationRetentionLock {
     pub fn try_acquire_shared(state_file: &Path, scope_id: &str) -> Result<Option<Self>> {
         let (path, file) = Self::open_lock_file(state_file, scope_id)?;
         match bounded_locks::try_acquire(&file, FileLockKind::Shared) {
-            Ok(true) => Ok(Some(Self { file })),
+            Ok(true) => Ok(Some(Self {
+                file,
+                owner_record_path: None,
+            })),
             Ok(false) => Ok(None),
             Err(error) => Err(anyhow::Error::new(error)).with_context(|| {
                 format!("try lock shared generation retention {}", path.display())
@@ -248,7 +463,10 @@ impl GenerationRetentionLock {
     pub fn try_acquire(state_file: &Path, scope_id: &str) -> Result<Option<Self>> {
         let (path, file) = Self::open_lock_file(state_file, scope_id)?;
         match bounded_locks::try_acquire(&file, FileLockKind::Exclusive) {
-            Ok(true) => Ok(Some(Self { file })),
+            Ok(true) => Ok(Some(Self {
+                file,
+                owner_record_path: write_lock_owner_record(&path, scope_id),
+            })),
             Ok(false) => Ok(None),
             Err(error) => Err(anyhow::Error::new(error)).with_context(|| {
                 format!("try lock exclusive generation retention {}", path.display())
@@ -276,7 +494,10 @@ impl GenerationRetentionLock {
             }
         };
         match bounded_locks::try_acquire(&file, FileLockKind::Shared) {
-            Ok(true) => Ok(ObservedRetentionLock::Acquired(Self { file })),
+            Ok(true) => Ok(ObservedRetentionLock::Acquired(Self {
+                file,
+                owner_record_path: None,
+            })),
             Ok(false) => Ok(ObservedRetentionLock::Contended),
             Err(error) => Err(anyhow::Error::new(error)).with_context(|| {
                 format!("try lock shared generation retention {}", path.display())
@@ -296,13 +517,33 @@ impl GenerationRetentionLock {
         cancel: Option<&AtomicBool>,
     ) -> Result<Self> {
         let (path, file) = Self::open_lock_file(state_file, scope_id)?;
-        acquire_with_deadline(&file, kind, deadline, cancel).map_err(|error| {
-            anyhow::Error::new(error).context(format!(
+        acquire_with_deadline(&file, kind, deadline, cancel).map_err(|error| match error {
+            // A writer-scope timeout always means a live peer held the lock for
+            // the whole budget — flock releases on process exit, so there is
+            // no stale file to reap. Report who holds it instead of offering a
+            // deletion that would break mutual exclusion.
+            FileLockError::Timeout { waited, .. }
+                if kind == FileLockKind::Exclusive
+                    && scope_id.starts_with(WRITER_LOCK_SCOPE_PREFIX) =>
+            {
+                anyhow::Error::new(PeerWriterActive::observe(&path, scope_id, waited)).context(
+                    format!("acquire {kind} generation retention {}", path.display()),
+                )
+            }
+            error => anyhow::Error::new(error).context(format!(
                 "acquire {kind} generation retention {}",
                 path.display()
-            ))
+            )),
         })?;
-        Ok(Self { file })
+        // Exclusive acquisitions publish who owns the lock for waiters that
+        // time out later. Diagnostics only; never an identity input.
+        let owner_record_path = (kind == FileLockKind::Exclusive)
+            .then(|| write_lock_owner_record(&path, scope_id))
+            .flatten();
+        Ok(Self {
+            file,
+            owner_record_path,
+        })
     }
 
     fn open_lock_file(state_file: &Path, scope_id: &str) -> Result<(PathBuf, File)> {
@@ -322,6 +563,9 @@ impl GenerationRetentionLock {
 impl Drop for GenerationRetentionLock {
     fn drop(&mut self) {
         let _ = bounded_locks::release(&self.file);
+        if let Some(owner_record_path) = self.owner_record_path.take() {
+            remove_lock_owner_record_if_current(&owner_record_path);
+        }
     }
 }
 
@@ -1064,6 +1308,11 @@ pub(crate) fn classify_retention_entry(path: &Path) -> RetentionDirEntry {
     // crashed writer can leave one behind. Hidden files are likewise not
     // retention evidence.
     if name.starts_with('.') {
+        return RetentionDirEntry::Ignorable;
+    }
+    // `<lock>.owner.json` is peer-holder diagnostics, never protection
+    // evidence: it must not parse as a marker nor count as unrecognized.
+    if name.ends_with(".owner.json") {
         return RetentionDirEntry::Ignorable;
     }
     match path.extension().and_then(|value| value.to_str()) {
@@ -1879,7 +2128,13 @@ mod tests {
         let root = tempdir().expect("root");
         let layout = layout(root.path());
         let project = "repo-v1-project";
+        // An authoritative active generation makes the stale bundle genuinely
+        // reclaimable, so malformed-entry suppression is the only reason
+        // deletion is withheld — without an active generation the
+        // missing-active rule alone would suppress the same plan.
+        let active = "aaaaaaaaaaaaaaaa";
         let stale = "cccccccccccccccc";
+        write_bundle(&layout, project, active, [1, 1, 1]);
         write_bundle(&layout, project, stale, [2, 3, 4]);
         std::fs::create_dir_all(
             layout
@@ -1887,14 +2142,19 @@ mod tests {
                 .join(format!("{project}-malformed")),
         )
         .expect("malformed");
+        let protection = RetentionProtectionScan {
+            authoritative_active: vec![manifest(project, active, 1)],
+            ..RetentionProtectionScan::default()
+        };
 
-        let plan = plan_generation_retention(&layout, project, &RetentionProtectionScan::default());
+        let plan = plan_generation_retention(&layout, project, &protection);
         let mut remover = TestRemover::default();
         let report = apply_generation_retention(&plan, &mut remover);
 
         assert!(plan.pruning_suppressed);
-        assert_eq!(plan.building_bytes, 9);
         assert_eq!(plan.reclaimable_bytes, 0);
+        assert_eq!(plan.active_bytes, 3);
+        assert_eq!(plan.blocked.len(), 1);
         assert!(report.pruning_suppressed);
         assert_eq!(report.removed_bytes, 0);
         assert!(remover.removed_paths.is_empty());
@@ -2182,6 +2442,216 @@ mod tests {
         );
 
         holder.wait().expect("holder process exits");
+    }
+
+    /// Exclusive acquisitions publish an owner record beside the lock file so
+    /// a waiter can identify the holder; shared acquisitions publish none;
+    /// drop removes our own record.
+    #[test]
+    fn exclusive_acquisition_publishes_and_removes_its_owner_record() {
+        let root = tempdir().expect("root");
+        let state_file = root.path().join("retrieval-sidecars.json");
+        let scope = "writer-test-project";
+        let lock_path = retention_lock_path(&state_file, scope).expect("lock path");
+        let owner_path = lock_owner_record_path(&lock_path);
+
+        let lock = GenerationRetentionLock::acquire(&state_file, scope).expect("acquire");
+        let record = read_lock_owner_record(&lock_path).expect("owner record published");
+        assert_eq!(record.pid, std::process::id());
+        assert_eq!(record.operation, scope);
+        assert_eq!(record.project_id.as_deref(), Some("test-project"));
+        assert!(!record.executable_basename.is_empty());
+        assert!(record.acquired_at_epoch_ms > 0);
+        assert!(
+            record.process_start_time.is_some(),
+            "this process can always probe its own start identity"
+        );
+        drop(lock);
+        assert!(
+            !owner_path.exists(),
+            "drop removes the owner record this process wrote"
+        );
+
+        let shared = GenerationRetentionLock::acquire_shared(&state_file, scope)
+            .expect("shared acquisition");
+        assert!(
+            !owner_path.exists(),
+            "a shared hold never publishes an owner record"
+        );
+        drop(shared);
+        assert!(!owner_path.exists());
+    }
+
+    /// A stale owner record from a dead process reads `alive: false` and never
+    /// blocks the next acquisition.
+    #[test]
+    fn a_stale_owner_record_reports_dead_and_never_blocks_acquisition() {
+        let root = tempdir().expect("root");
+        let state_file = root.path().join("retrieval-sidecars.json");
+        let scope = "writer-stale-project";
+        let lock_path = retention_lock_path(&state_file, scope).expect("lock path");
+
+        // Forge the record a crashed holder would leave: a pid that either
+        // does not exist or was started before this process existed.
+        let stale = RetentionLockOwnerRecord {
+            pid: u32::MAX - 1,
+            process_start_time: Some("0".into()),
+            executable_basename: "dead-process".into(),
+            operation: scope.into(),
+            project_id: Some("stale-project".into()),
+            acquired_at_epoch_ms: 1,
+        };
+        ensure_retention_dir(&state_file).expect("retention dir");
+        std::fs::write(
+            lock_owner_record_path(&lock_path),
+            serde_json::to_vec_pretty(&stale).expect("serialize stale record"),
+        )
+        .expect("leave a stale owner record");
+
+        let observed = PeerWriterActive::observe(&lock_path, scope, Duration::ZERO);
+        let holder = observed.holder.expect("stale record is still reported");
+        assert_eq!(holder.pid, stale.pid);
+        assert!(
+            !holder.alive,
+            "a record whose pid is gone must read alive:false"
+        );
+
+        let lock = GenerationRetentionLock::acquire(&state_file, scope)
+            .expect("stale diagnostics must not affect acquisition");
+        let current = read_lock_owner_record(&lock_path).expect("record rewritten");
+        assert_eq!(current.pid, std::process::id());
+        drop(lock);
+    }
+
+    /// Two-process proof: a live holder is reported by `peer_writer_active`
+    /// with its real pid and `alive: true`; killing the holder (SIGKILL /
+    /// TerminateProcess via `Child::kill`) frees the lock immediately, the
+    /// lock file is never deleted, and its stale owner record reports
+    /// `alive: false` without affecting acquisition.
+    #[test]
+    fn writer_lock_timeout_names_the_live_holder_and_survives_its_death() {
+        const HOLD_ENV: &str = "CODESTORY_TEST_HOLD_WRITER_LOCK";
+        const HOLD_MS_ENV: &str = "CODESTORY_TEST_HOLD_WRITER_LOCK_MS";
+        const READY_ENV: &str = "CODESTORY_TEST_HOLD_WRITER_LOCK_READY";
+        const SCOPE: &str = "writer-test-project";
+
+        if let Some(state_file) = std::env::var_os(HOLD_ENV) {
+            let state_file = PathBuf::from(state_file);
+            let lock = GenerationRetentionLock::acquire(&state_file, SCOPE)
+                .expect("child acquires the writer scope");
+            std::fs::write(
+                PathBuf::from(std::env::var_os(READY_ENV).expect("ready marker path")),
+                b"held",
+            )
+            .expect("publish holder readiness");
+            let hold_ms: u64 = std::env::var(HOLD_MS_ENV)
+                .expect("hold budget")
+                .parse()
+                .expect("numeric hold budget");
+            std::thread::sleep(Duration::from_millis(hold_ms));
+            drop(lock);
+            return;
+        }
+
+        let root = tempdir().expect("root");
+        let state_file = root.path().join("retrieval-sidecars.json");
+        let ready = root.path().join("holder.ready");
+        let lock_path = retention_lock_path(&state_file, SCOPE).expect("lock path");
+        let mut holder = std::process::Command::new(
+            std::env::current_exe().expect("current test executable"),
+        )
+        .arg("--exact")
+        .arg("retention::tests::writer_lock_timeout_names_the_live_holder_and_survives_its_death")
+        .arg("--nocapture")
+        .env(HOLD_ENV, &state_file)
+        .env(READY_ENV, &ready)
+        .env(HOLD_MS_ENV, "60000")
+        .spawn()
+        .expect("spawn holder process");
+
+        let holder_deadline = Instant::now() + Duration::from_secs(20);
+        while !ready.exists() && Instant::now() < holder_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready.exists(), "the holder process never took the lock");
+        let child_pid = holder.id();
+
+        let error = GenerationRetentionLock::acquire_bounded(
+            &state_file,
+            SCOPE,
+            FileLockKind::Exclusive,
+            LockDeadline::after(Duration::from_millis(250)),
+            None,
+        )
+        .expect_err("a live holder must exhaust the wait budget");
+        let peer = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<PeerWriterActive>())
+            .expect("writer-scope timeouts must carry peer_writer_active: {error:#}");
+        let peer_holder = peer.holder.as_ref().expect("the holder is recorded");
+        assert_eq!(peer_holder.pid, child_pid);
+        assert!(peer_holder.alive, "a live holder reports alive: true");
+        assert_eq!(peer_holder.operation, SCOPE);
+        assert_eq!(peer_holder.project_id.as_deref(), Some("test-project"));
+        assert!(peer_holder.since_epoch_ms > 0);
+        assert!(
+            peer.next_action().contains(&child_pid.to_string())
+                && peer.next_action().contains("Never delete the lock file"),
+            "next_action must name the holder and forbid deletion: {}",
+            peer.next_action()
+        );
+        // Mutual exclusion binds to the lock inode, not its name: the holder's
+        // flock must still refuse a second writer after our timeout. A waiter
+        // that unlinked the lock file would let this acquire a fresh inode
+        // while the child still holds the old one — two concurrent holders.
+        assert!(
+            GenerationRetentionLock::try_acquire(&state_file, SCOPE)
+                .expect("try acquire")
+                .is_none(),
+            "a live holder must still exclude a second writer after our timeout"
+        );
+        assert!(lock_path.is_file(), "the lock file exists while held");
+
+        holder
+            .kill()
+            .expect("kill the holder (SIGKILL/TerminateProcess)");
+        holder.wait().expect("reap holder");
+
+        // The stale record the dead child left reports not-alive and does not
+        // affect the next acquisition.
+        let stale = PeerWriterActive::observe(&lock_path, SCOPE, Duration::ZERO)
+            .holder
+            .expect("the dead child's owner record remains readable");
+        assert_eq!(stale.pid, child_pid);
+        assert!(
+            !stale.alive,
+            "a killed holder's record must report alive: false"
+        );
+
+        let started = Instant::now();
+        let acquired = GenerationRetentionLock::acquire_bounded(
+            &state_file,
+            SCOPE,
+            FileLockKind::Exclusive,
+            LockDeadline::after(Duration::from_millis(250)),
+            None,
+        )
+        .expect("the OS released the dead holder's lock; acquisition succeeds at once");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "acquisition after the holder died must be immediate"
+        );
+        assert!(
+            lock_path.is_file(),
+            "the lock file is never deleted — the OS released the dead holder's flock"
+        );
+        let ours = read_lock_owner_record(&lock_path).expect("our owner record");
+        assert_eq!(ours.pid, std::process::id());
+        drop(acquired);
+        assert!(
+            !lock_owner_record_path(&lock_path).exists(),
+            "dropping our lock removes our owner record"
+        );
     }
 
     /// A publication pass routinely holds this lock longer than

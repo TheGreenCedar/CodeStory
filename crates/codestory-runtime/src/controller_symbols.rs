@@ -4,8 +4,6 @@ use crate::route_coverage::{
     route_endpoint_metadata_from_canonical, route_endpoint_metadata_from_openapi_label,
 };
 use crate::search::engine::search_core_symbol_names_with_scores;
-#[cfg(test)]
-use crate::search_scoring::HybridSearchInstrumentation;
 use crate::support::node_display_name;
 use crate::symbol_query::compare_search_hits_with_project_root;
 use crate::{AppController, Storage, agent, graph_builders, member_access_dto};
@@ -500,12 +498,6 @@ impl AppController {
 
     pub fn begin_packet_retrieval(&self) {
         let _ = self;
-    }
-
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(crate) fn take_hybrid_instrumentation(&self) -> Option<HybridSearchInstrumentation> {
-        self.state.lock().last_hybrid_instrumentation.take()
     }
 
     /// Build one bounded, source-backed evidence packet with typed diagnostics.

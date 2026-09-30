@@ -1911,6 +1911,37 @@ fn transient_incomplete_schema_fence_requires_marker() -> Result<(), StorageErro
 }
 
 #[test]
+fn interrupted_incremental_run_regains_proof_fk_indexes_without_clearing_fence()
+-> Result<(), StorageError> {
+    let path = unique_temp_db_path("incomplete-incremental-proof-fk-indexes");
+    {
+        let storage = Storage::open(&path)?;
+        storage
+            .conn
+            .execute_batch("DROP INDEX idx_proof_resolution_target")?;
+        storage.begin_incremental_run()?;
+    }
+
+    let storage = Storage::open(&path)?;
+    assert_eq!(
+        Storage::database_schema_version(&path)?,
+        INCOMPLETE_INCREMENTAL_SCHEMA_VERSION
+    );
+    assert!(storage.has_incomplete_incremental_run()?);
+    assert!(sqlite_index_exists(
+        &storage,
+        "idx_proof_resolution_target"
+    )?);
+    storage.finish_incremental_run()?;
+    assert_eq!(Storage::database_schema_version(&path)?, SCHEMA_VERSION);
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    Ok(())
+}
+
+#[test]
 fn interrupted_v19_run_migrates_manifest_column_without_clearing_fence() -> Result<(), StorageError>
 {
     let path = unique_temp_db_path("interrupted-v19-manifest-migration");
@@ -6739,37 +6770,76 @@ fn live_open_preserves_correct_v18_manifest_precise_semantic_values() -> Result<
     let db_path = unique_temp_db_path("v18-precise-semantic-manifest-preserve");
     let _ = std::fs::remove_file(&db_path);
     {
-        let mut storage = Storage::open(&db_path)?;
-        storage.upsert_retrieval_index_manifest(&RetrievalIndexManifest {
-            project_id: "proj".into(),
-            lexical_version: "legacy-v1".into(),
-            semantic_generation: "collection".into(),
-            scip_revision: None,
-            built_at_epoch_ms: 1,
-            disk_bytes: None,
-            degraded_modes_json: "[]".into(),
-            embedding_backend: None,
-            embedding_dim: None,
-            sidecar_schema_version: Some(1),
-            sidecar_input_hash: Some("input".into()),
-            sidecar_generation: Some("generation".into()),
-            projection_count: Some(2),
-            symbol_doc_count: Some(3),
-            dense_projection_count: Some(4),
-            semantic_policy_version: Some("graph_first_v1".into()),
-            graph_artifact_hash: Some("graph".into()),
-            dense_reason_counts_json: Some("{\"public_api\":4}".into()),
-            precise_semantic_import_status: Some("fresh".into()),
-            precise_semantic_import_reason: None,
-            precise_semantic_import_revision: Some("rev".into()),
-            precise_semantic_import_producer: Some("producer".into()),
-        })?;
+        let conn = rusqlite::Connection::open(&db_path)?;
+        // The v14-era manifest CREATE already carried the precise-semantic
+        // import columns; at schema 18 the lexical column was still named
+        // `zoekt_version` (renamed by the v21 migration). A database that
+        // actually lived at schema 18 therefore has this shape on disk —
+        // current-schema upserts would never exercise that history.
+        conn.execute_batch(
+            "CREATE TABLE retrieval_index_manifest (
+                project_id TEXT PRIMARY KEY,
+                zoekt_version TEXT NOT NULL,
+                semantic_generation TEXT NOT NULL,
+                scip_revision TEXT,
+                built_at_epoch_ms INTEGER NOT NULL,
+                disk_bytes INTEGER,
+                degraded_modes_json TEXT NOT NULL DEFAULT '[]',
+                precise_semantic_import_status TEXT,
+                precise_semantic_import_reason TEXT,
+                precise_semantic_import_revision TEXT,
+                precise_semantic_import_producer TEXT,
+                embedding_backend TEXT,
+                embedding_dim INTEGER,
+                sidecar_schema_version INTEGER,
+                sidecar_input_hash TEXT,
+                sidecar_generation TEXT,
+                projection_count INTEGER
+            );
+            INSERT INTO retrieval_index_manifest (
+                project_id,
+                zoekt_version,
+                semantic_generation,
+                built_at_epoch_ms,
+                degraded_modes_json,
+                precise_semantic_import_status,
+                precise_semantic_import_revision,
+                precise_semantic_import_producer,
+                embedding_backend,
+                embedding_dim,
+                sidecar_generation
+            ) VALUES ('proj', 'legacy-v1', 'collection', 1, '[]', 'fresh', 'rev',
+                      'producer', 'fastembed', 384, 'generation-7');
+            PRAGMA user_version = 18;",
+        )?;
+        let columns = conn
+            .prepare("PRAGMA table_info(retrieval_index_manifest)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(
+            columns.iter().any(|column| column == "zoekt_version"),
+            "the schema-18 fixture must carry the legacy zoekt_version column"
+        );
+        assert!(
+            !columns.iter().any(|column| column == "lexical_version"),
+            "lexical_version is created by the migration under test"
+        );
     }
 
     let storage = Storage::open(&db_path)?;
+    assert_eq!(
+        storage.schema_version()?,
+        SCHEMA_VERSION,
+        "a schema-18 manifest must migrate to the current schema"
+    );
     let manifest = storage
         .get_retrieval_index_manifest("proj")?
         .expect("manifest remains present");
+    assert_eq!(manifest.lexical_version, "legacy-v1");
+    assert_eq!(manifest.semantic_generation, "collection");
+    assert_eq!(manifest.embedding_backend, Some("fastembed".into()));
+    assert_eq!(manifest.embedding_dim, Some(384));
+    assert_eq!(manifest.sidecar_generation, Some("generation-7".into()));
     assert_eq!(
         manifest.precise_semantic_import_status,
         Some("fresh".into())
@@ -6875,7 +6945,17 @@ fn test_promote_staged_snapshot_replaces_live_db_while_live_reader_is_open()
         let live_reader_files = live
             .get_files()
             .map_err(|error| StorageError::Other(format!("read pinned legacy handle: {error}")))?;
+        // The already-open reader is pinned to the pre-promotion generation:
+        // it must keep the original row identity, not just the row count.
         assert_eq!(live_reader_files.len(), 1);
+        assert_eq!(live_reader_files[0].id, 1);
+        assert_eq!(live_reader_files[0].path, PathBuf::from("live.rs"));
+        let pinned_publication = live
+            .get_index_publication()
+            .map_err(|error| StorageError::Other(format!("read pinned publication: {error}")))?
+            .expect("pinned reader sees the live publication");
+        assert_eq!(pinned_publication.generation_id, "live-generation");
+        assert_eq!(pinned_publication.run_id, "live-run");
     }
 
     let promoted = Storage::open(&live_path)
@@ -7275,6 +7355,105 @@ fn seed_schema31_promotion_file(path: &Path, id: i64, name: &str) -> Result<(), 
             [],
         )?;
     }
+    legacy.execute_batch("DETACH DATABASE seed; PRAGMA wal_checkpoint(TRUNCATE)")?;
+    drop(legacy);
+    cleanup_sqlite_sidecars(&current)?;
+    Ok(())
+}
+
+/// Assert the fixture really is the schema-28 durable layout before open
+/// migrates it: the version stamp plus the columns and constraints that did
+/// not exist yet at schema 28.
+fn assert_schema28_fixture_shape(path: &Path) {
+    let conn = Connection::open(path).expect("open schema-28 fixture");
+    let version: i64 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .expect("read fixture schema version");
+    assert_eq!(version, 28, "fixture must carry the schema-28 stamp");
+    let policy_columns: Vec<String> = conn
+        .prepare("PRAGMA table_info(source_policy_exclusion_publication)")
+        .expect("inspect source policy publication")
+        .query_map([], |row| row.get::<_, String>(1))
+        .expect("list source policy publication columns")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read source policy publication columns");
+    assert!(
+        !policy_columns
+            .iter()
+            .any(|column| column == "structural_unit_cap"),
+        "schema 28 predates the structural unit cap column"
+    );
+    let publication_sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name = 'index_publication'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read index_publication DDL");
+    assert!(
+        !publication_sql.contains("semantic_projection"),
+        "schema 28 predates the semantic-projection publication mode"
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'proof_resolution_publication')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("check proof publication table"),
+        0,
+        "schema 28 predates proof-resolution publication"
+    );
+}
+
+fn seed_schema28_promotion_file(path: &Path, id: i64, name: &str) -> Result<(), StorageError> {
+    let current = path.with_extension("current-seed.db");
+    seed_promotion_file(&current, id, name)?;
+    publish_bound_test_structural_cache(&current)?;
+    let legacy = Connection::open(path)?;
+    // This DDL is the schema-28 durable layout frozen at the last schema-28
+    // commit, so the fixture crosses the actual schema-28 disk layout — a
+    // `source_policy_exclusion_publication` without `structural_unit_cap`,
+    // an `index_publication` CHECK without `semantic_projection`, and no
+    // post-v28 tables — rather than restamping a current-schema database.
+    legacy.execute_batch(include_str!("../../../tests/fixtures/v28_schema.sql"))?;
+    legacy.execute(
+        "ATTACH DATABASE ?1 AS seed",
+        [current.to_string_lossy().as_ref()],
+    )?;
+    let table_names = legacy
+        .prepare(
+            "SELECT name FROM main.sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+        )?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for table in table_names {
+        let columns = legacy
+            .prepare(&format!("PRAGMA main.table_info(\"{table}\")"))?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let columns = columns
+            .iter()
+            .map(|column| format!("\"{column}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        legacy.execute(
+            &format!("INSERT OR REPLACE INTO main.\"{table}\" ({columns}) SELECT {columns} FROM seed.\"{table}\""),
+            [],
+        )?;
+    }
+    // A schema-28-era writer stamped the pre-structural source-policy
+    // publication format and its digest; carry the copied rows into that
+    // format so the fixture matches what the era left on disk.
+    let legacy_exclusions = read_legacy_source_policy_exclusions(&legacy)?;
+    legacy.execute(
+        "UPDATE source_policy_exclusion_publication
+         SET schema_version = ?1, exclusion_digest = ?2",
+        params![
+            LEGACY_SOURCE_POLICY_EXCLUSION_PUBLICATION_SCHEMA_VERSION as i64,
+            legacy_source_policy_exclusion_digest(&legacy_exclusions)
+        ],
+    )?;
     legacy.execute_batch("DETACH DATABASE seed; PRAGMA wal_checkpoint(TRUNCATE)")?;
     drop(legacy);
     cleanup_sqlite_sidecars(&current)?;
@@ -8253,16 +8432,19 @@ fn schema_21_legacy_backup_recovers_before_migration() {
 fn schema_28_journal_less_backup_requires_complete_auxiliary_publications() {
     let live_path = unique_temp_db_path("schema28-journal-less-valid-live");
     let backup_path = live_path.with_extension("sqlite.backup");
-    seed_promotion_file(&backup_path, 1, "old.rs").expect("seed schema 28 backup");
-    publish_bound_test_structural_cache(&backup_path).expect("bind schema 28 structural cache");
+    seed_schema28_promotion_file(&backup_path, 1, "old.rs").expect("seed schema 28 backup");
+    assert_schema28_fixture_shape(&backup_path);
 
     let recovered = Storage::open(&live_path).expect("recover valid schema 28 backup");
     let publication = recovered
         .get_complete_index_publication()
         .expect("read recovered publication")
         .expect("complete recovered publication");
+    // The backup's source-policy publication is the authentic v1 format a
+    // schema-28 writer stamped; post-migration validation must use the
+    // legacy-format entry point.
     recovered
-        .validate_source_policy_exclusion_publication(
+        .validate_legacy_v1_source_policy_exclusion_publication(
             &publication,
             "test-project",
             "test-workspace",
@@ -8300,9 +8482,9 @@ fn schema_28_journal_less_backup_protects_against_invalid_live_auxiliary_state()
             publish_bound_test_structural_cache(&live_path)
                 .expect("bind newer live structural cache");
         }
-        seed_promotion_file(&backup_path, 1, "old.rs").expect("seed valid schema 28 backup");
-        publish_bound_test_structural_cache(&backup_path)
-            .expect("bind valid backup structural cache");
+        seed_schema28_promotion_file(&backup_path, 1, "old.rs")
+            .expect("seed valid schema 28 backup");
+        assert_schema28_fixture_shape(&backup_path);
         if live_state == "same-corrupt" {
             copy_promotion_database_fixture(&backup_path, &live_path)
                 .expect("copy same-identity live fixture");
@@ -8374,8 +8556,8 @@ fn schema_28_journal_less_backup_rejects_missing_or_corrupt_auxiliary_state() {
     ] {
         let live_path = unique_temp_db_path(&format!("schema28-journal-less-{corruption}-live"));
         let backup_path = live_path.with_extension("sqlite.backup");
-        seed_promotion_file(&backup_path, 1, "old.rs").expect("seed schema 28 backup");
-        publish_bound_test_structural_cache(&backup_path).expect("bind schema 28 structural cache");
+        seed_schema28_promotion_file(&backup_path, 1, "old.rs").expect("seed schema 28 backup");
+        assert_schema28_fixture_shape(&backup_path);
         let connection = Connection::open(&backup_path).expect("open schema 28 backup");
         match corruption {
             "source-policy-missing" => connection
@@ -11384,6 +11566,496 @@ fn test_delete_file_projection_preserves_cross_file_edges_and_clears_resolution(
     Ok(())
 }
 
+/// File ids for the proof-FK deletion fixture: one removable file and one
+/// unrelated survivor that owns the bulk proof-fact rows.
+const PROOF_FK_REMOVED_FILE: i64 = 7_001;
+const PROOF_FK_SURVIVOR_FILE: i64 = 8_001;
+const PROOF_FK_SURVIVOR_CALLER: i64 = 80_001;
+const PROOF_FK_SURVIVOR_PLACEHOLDER: i64 = 80_002;
+const PROOF_FK_SURVIVOR_EDGE: i64 = 90_001;
+const PROOF_FK_SURVIVOR_PROVENANCE: i64 = 81;
+const PROOF_FK_REMOVED_PROVENANCE: i64 = 71;
+
+#[allow(clippy::too_many_arguments)]
+fn insert_proof_fact(
+    storage: &Storage,
+    ordinal: i64,
+    file_id: i64,
+    provenance_id: i64,
+    status: &str,
+    caller_node_id: i64,
+    edge_id: Option<i64>,
+    raw_edge_target_id: Option<i64>,
+    target_node_id: Option<i64>,
+) -> Result<(), StorageError> {
+    let (reason, callsite, domain_complete): (&str, Option<&str>, i64) = match status {
+        "exact" => ("exact_resolution", Some("callsite"), 1),
+        "ambiguous" => ("multiple_bindings", None, 1),
+        "unsupported" => ("unsupported_construct", None, 0),
+        _ => ("missing_binding", None, 1),
+    };
+    storage.conn.execute(
+        "INSERT INTO proof_resolution_fact (
+            fact_id, edge_id, raw_edge_target_id, raw_callsite_identity,
+            file_id, provenance_id, start_byte, end_byte_exclusive,
+            line, column, callee_form, raw_target, caller_node_id,
+            target_node_id, status, reason, evidence_json,
+            lookup_domain_complete, producer, fact_schema_version, algorithm,
+            language_adapter, language_adapter_version, evidence_digest
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, 1,
+            'identifier', 'callee', ?9, ?10, ?11, ?12,
+            '[]', ?13, 'codestory-internal', 1,
+            'exact-call-resolution-v1', 'rust', 'test', ?14)",
+        params![
+            format!("{ordinal:064x}"),
+            edge_id,
+            raw_edge_target_id,
+            callsite,
+            file_id,
+            provenance_id,
+            1_000 + ordinal * 2,
+            1_001 + ordinal * 2,
+            caller_node_id,
+            target_node_id,
+            status,
+            reason,
+            domain_complete,
+            format!("{:064x}", ordinal + 1),
+        ],
+    )?;
+    Ok(())
+}
+
+/// One removable file with `removed_nodes` function nodes and `removed_edges`
+/// call edges, plus an unrelated survivor file owning `surviving_facts` proof
+/// facts (mixed exact/ambiguous/missing_binding statuses), a raw call edge
+/// resolved into the removed file, and three facts whose edge/target/raw-target
+/// columns point into the removed file so every proof_resolution_fact foreign
+/// key a node or edge delete validates is exercised. The caller must keep
+/// `removed_nodes >= 2` and `removed_edges >= 1`.
+fn proof_fk_deletion_fixture(
+    removed_nodes: i64,
+    removed_edges: i64,
+    surviving_facts: i64,
+) -> Result<Storage, StorageError> {
+    assert!(removed_nodes >= 2 && removed_edges >= 1);
+    let mut storage = Storage::new_in_memory()?;
+    for (id, path) in [
+        (PROOF_FK_REMOVED_FILE, "src/removed.rs"),
+        (PROOF_FK_SURVIVOR_FILE, "src/survivor.rs"),
+    ] {
+        storage.insert_file(&FileInfo {
+            id,
+            path: PathBuf::from(path),
+            language: "rust".to_string(),
+            modification_time: 1,
+            indexed: true,
+            complete: true,
+            line_count: 100,
+            file_role: FileRole::Source,
+        })?;
+    }
+
+    let mut nodes = vec![
+        Node {
+            id: NodeId(PROOF_FK_REMOVED_FILE),
+            kind: NodeKind::FILE,
+            serialized_name: "src/removed.rs".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(PROOF_FK_SURVIVOR_FILE),
+            kind: NodeKind::FILE,
+            serialized_name: "src/survivor.rs".to_string(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(PROOF_FK_SURVIVOR_CALLER),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "survivor_caller".to_string(),
+            file_node_id: Some(NodeId(PROOF_FK_SURVIVOR_FILE)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(PROOF_FK_SURVIVOR_PLACEHOLDER),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "survivor_placeholder".to_string(),
+            file_node_id: Some(NodeId(PROOF_FK_SURVIVOR_FILE)),
+            ..Default::default()
+        },
+    ];
+    for index in 0..removed_nodes {
+        nodes.push(Node {
+            id: NodeId(70_001 + index),
+            kind: NodeKind::FUNCTION,
+            serialized_name: format!("removed_{index}"),
+            file_node_id: Some(NodeId(PROOF_FK_REMOVED_FILE)),
+            ..Default::default()
+        });
+    }
+    storage.insert_nodes_batch(&nodes)?;
+
+    // One dedicated survivor edge per exact fact: the partial unique index
+    // idx_proof_resolution_exact_edge admits one exact fact per edge_id.
+    let exact_fact_edges = surviving_facts / 5 + 2;
+    let mut edges = vec![Edge {
+        id: EdgeId(PROOF_FK_SURVIVOR_EDGE),
+        source: NodeId(PROOF_FK_SURVIVOR_CALLER),
+        target: NodeId(PROOF_FK_SURVIVOR_PLACEHOLDER),
+        kind: EdgeKind::CALL,
+        file_node_id: Some(NodeId(PROOF_FK_SURVIVOR_FILE)),
+        resolved_target: Some(NodeId(70_001)),
+        confidence: Some(0.9),
+        certainty: Some(codestory_contracts::graph::ResolutionCertainty::Certain),
+        candidate_targets: vec![NodeId(70_001)],
+        ..Default::default()
+    }];
+    for index in 0..exact_fact_edges {
+        edges.push(Edge {
+            id: EdgeId(91_000 + index),
+            source: NodeId(PROOF_FK_SURVIVOR_CALLER),
+            target: NodeId(PROOF_FK_SURVIVOR_PLACEHOLDER),
+            kind: EdgeKind::CALL,
+            file_node_id: Some(NodeId(PROOF_FK_SURVIVOR_FILE)),
+            ..Default::default()
+        });
+    }
+    for index in 0..removed_edges {
+        edges.push(Edge {
+            id: EdgeId(60_001 + index),
+            source: NodeId(70_001 + index % removed_nodes),
+            target: NodeId(70_001 + (index + 1) % removed_nodes),
+            kind: EdgeKind::CALL,
+            file_node_id: Some(NodeId(PROOF_FK_REMOVED_FILE)),
+            ..Default::default()
+        });
+    }
+    storage.insert_edges_batch(&edges)?;
+
+    for (provenance_id, file_id, sha) in [
+        (
+            PROOF_FK_REMOVED_PROVENANCE,
+            PROOF_FK_REMOVED_FILE,
+            "7".repeat(64),
+        ),
+        (
+            PROOF_FK_SURVIVOR_PROVENANCE,
+            PROOF_FK_SURVIVOR_FILE,
+            "8".repeat(64),
+        ),
+    ] {
+        storage.conn.execute(
+            "INSERT INTO proof_resolution_provenance (
+                provenance_id, file_id, source_sha256, parser_fingerprint, dependency_json
+             ) VALUES (?1, ?2, ?3, 'test-parser', '[]')",
+            params![provenance_id, file_id, sha],
+        )?;
+    }
+
+    // Facts owned by the removed file.
+    for ordinal in 1..=3_i64 {
+        insert_proof_fact(
+            &storage,
+            ordinal,
+            PROOF_FK_REMOVED_FILE,
+            PROOF_FK_REMOVED_PROVENANCE,
+            "missing_binding",
+            70_001,
+            None,
+            None,
+            None,
+        )?;
+    }
+    // Bulk survivor facts: every fifth is exact and holds a dedicated edge;
+    // non-exact rows carry no resolved keys.
+    let non_exact_statuses = [
+        "ambiguous",
+        "unsupported",
+        "missing_binding",
+        "incomplete_domain",
+    ];
+    let mut exact_edge = 0_i64;
+    for index in 0..surviving_facts {
+        let (status, edge_id, raw_target, target) = if index % 5 == 0 {
+            let edge_id = 91_000 + exact_edge;
+            exact_edge += 1;
+            (
+                "exact",
+                Some(edge_id),
+                Some(PROOF_FK_SURVIVOR_PLACEHOLDER),
+                Some(PROOF_FK_SURVIVOR_PLACEHOLDER),
+            )
+        } else {
+            (non_exact_statuses[(index % 4) as usize], None, None, None)
+        };
+        insert_proof_fact(
+            &storage,
+            10_000 + index,
+            PROOF_FK_SURVIVOR_FILE,
+            PROOF_FK_SURVIVOR_PROVENANCE,
+            status,
+            PROOF_FK_SURVIVOR_CALLER,
+            edge_id,
+            raw_target,
+            target,
+        )?;
+    }
+    // Three survivor-owned facts pointing into the removed file through each
+    // FK column; the explicit cleanup must delete them before the node and
+    // edge deletes run. Each holds a distinct edge for the exact-status
+    // uniqueness constraint.
+    insert_proof_fact(
+        &storage,
+        50_001,
+        PROOF_FK_SURVIVOR_FILE,
+        PROOF_FK_SURVIVOR_PROVENANCE,
+        "exact",
+        PROOF_FK_SURVIVOR_CALLER,
+        Some(PROOF_FK_SURVIVOR_EDGE),
+        Some(PROOF_FK_SURVIVOR_PLACEHOLDER),
+        Some(70_001),
+    )?;
+    insert_proof_fact(
+        &storage,
+        50_002,
+        PROOF_FK_SURVIVOR_FILE,
+        PROOF_FK_SURVIVOR_PROVENANCE,
+        "exact",
+        PROOF_FK_SURVIVOR_CALLER,
+        Some(91_000 + exact_edge),
+        Some(70_002),
+        Some(PROOF_FK_SURVIVOR_PLACEHOLDER),
+    )?;
+    insert_proof_fact(
+        &storage,
+        50_003,
+        PROOF_FK_SURVIVOR_FILE,
+        PROOF_FK_SURVIVOR_PROVENANCE,
+        "exact",
+        PROOF_FK_SURVIVOR_CALLER,
+        Some(60_001),
+        Some(70_001),
+        Some(70_001),
+    )?;
+
+    Ok(storage)
+}
+
+/// Count VM steps (progress callbacks at interval 1) around a
+/// delete_file_projection call on a fresh fixture. The statement-level
+/// counters cannot be reached without restructuring the production delete, so
+/// this measures the whole cleanup transaction; the FK-lookup plans are
+/// pinned separately by EXPLAIN in the sibling test.
+fn measure_proof_fk_deletion_vm_steps(
+    surviving_facts: i64,
+    drop_target_index: bool,
+) -> Result<(u64, FileProjectionRemovalSummary), StorageError> {
+    let mut storage = proof_fk_deletion_fixture(12, 6, surviving_facts)?;
+    if drop_target_index {
+        storage
+            .conn
+            .execute_batch("DROP INDEX idx_proof_resolution_target")?;
+    }
+    let steps = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counter = std::sync::Arc::clone(&steps);
+    storage.conn.progress_handler(
+        1,
+        Some(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            false
+        }),
+    )?;
+    let summary = storage.delete_file_projection(PROOF_FK_REMOVED_FILE)?;
+    storage.conn.progress_handler(0, None::<fn() -> bool>)?;
+    Ok((steps.load(std::sync::atomic::Ordering::Relaxed), summary))
+}
+
+#[test]
+fn delete_file_projection_proof_fk_lookups_use_leading_indexes() -> Result<(), StorageError> {
+    let storage = proof_fk_deletion_fixture(4, 2, 60)?;
+    for (index, predicate) in [
+        ("idx_proof_resolution_target", "target_node_id = 0"),
+        ("idx_proof_resolution_raw_target", "raw_edge_target_id = 0"),
+        ("idx_proof_resolution_edge", "edge_id = 0"),
+    ] {
+        assert!(sqlite_index_exists(&storage, index)?);
+        let mut statement = storage.conn.prepare(&format!(
+            "EXPLAIN QUERY PLAN SELECT 1 FROM proof_resolution_fact WHERE {predicate}"
+        ))?;
+        let plan = statement
+            .query_map([], |row| row.get::<_, String>(3))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("SEARCH proof_resolution_fact") && line.contains(index)),
+            "{predicate} lookup did not use {index}: {plan:?}"
+        );
+    }
+    // The partial exact-status index stays unique but can never serve the
+    // unconditional foreign-key child check on edge_id.
+    assert!(sqlite_index_exists(
+        &storage,
+        "idx_proof_resolution_exact_edge"
+    )?);
+    Ok(())
+}
+
+#[test]
+fn delete_file_projection_cost_is_independent_of_surviving_proof_facts() -> Result<(), StorageError>
+{
+    const SMALL_FACTS: i64 = 200;
+    const LARGE_FACTS: i64 = 2_000;
+    let (small_steps, small_summary) = measure_proof_fk_deletion_vm_steps(SMALL_FACTS, false)?;
+    let (large_steps, large_summary) = measure_proof_fk_deletion_vm_steps(LARGE_FACTS, false)?;
+    assert_eq!(small_summary.removed_node_count, 13);
+    assert_eq!(small_summary.removed_edge_count, 6);
+    assert_eq!(large_summary.removed_node_count, 13);
+    assert_eq!(large_summary.removed_edge_count, 6);
+    // Scaling the retained fact table tenfold must not scale deletion work:
+    // every foreign-key child probe is an index seek, not a scan.
+    assert!(
+        large_steps < small_steps.saturating_mul(4),
+        "deletion VM steps scaled with surviving facts: \
+         {SMALL_FACTS} facts -> {small_steps} steps, {LARGE_FACTS} facts -> {large_steps} steps"
+    );
+    Ok(())
+}
+
+#[test]
+fn delete_file_projection_without_target_index_rescans_surviving_facts() -> Result<(), StorageError>
+{
+    const SMALL_FACTS: i64 = 200;
+    const LARGE_FACTS: i64 = 2_000;
+    let (small_steps, _) = measure_proof_fk_deletion_vm_steps(SMALL_FACTS, true)?;
+    let (large_steps, _) = measure_proof_fk_deletion_vm_steps(LARGE_FACTS, true)?;
+    // With idx_proof_resolution_target dropped, every deleted node rescans
+    // the retained fact table, so deletion work tracks the fact count.
+    assert!(
+        large_steps > small_steps.saturating_mul(4),
+        "missing target index did not rescale deletion work: \
+         {SMALL_FACTS} facts -> {small_steps} steps, {LARGE_FACTS} facts -> {large_steps} steps"
+    );
+    Ok(())
+}
+
+#[test]
+fn delete_file_projection_removes_removed_facts_and_preserves_survivors() -> Result<(), StorageError>
+{
+    const SURVIVING_FACTS: i64 = 30;
+    let mut storage = proof_fk_deletion_fixture(12, 6, SURVIVING_FACTS)?;
+
+    let summary = storage.delete_file_projection(PROOF_FK_REMOVED_FILE)?;
+    assert_eq!(summary.removed_node_count, 13);
+    assert_eq!(summary.removed_edge_count, 6);
+    assert_eq!(
+        summary.affected_caller_file_ids,
+        vec![PROOF_FK_SURVIVOR_FILE]
+    );
+
+    // Removed file's nodes, edges, facts and provenance are gone.
+    assert!(storage.get_node(NodeId(PROOF_FK_REMOVED_FILE))?.is_none());
+    assert!(storage.get_node(NodeId(70_001))?.is_none());
+    let removed_facts: i64 = storage.conn.query_row(
+        "SELECT COUNT(*) FROM proof_resolution_fact WHERE file_id = ?1",
+        params![PROOF_FK_REMOVED_FILE],
+        |row| row.get(0),
+    )?;
+    assert_eq!(removed_facts, 0);
+    let removed_provenance: i64 = storage.conn.query_row(
+        "SELECT COUNT(*) FROM proof_resolution_provenance WHERE file_id = ?1",
+        params![PROOF_FK_REMOVED_FILE],
+        |row| row.get(0),
+    )?;
+    assert_eq!(removed_provenance, 0);
+
+    // Survivor facts survive; the three that pointed into the removed file
+    // were cleaned before the node and edge deletes.
+    let surviving_facts: i64 = storage.conn.query_row(
+        "SELECT COUNT(*) FROM proof_resolution_fact WHERE file_id = ?1",
+        params![PROOF_FK_SURVIVOR_FILE],
+        |row| row.get(0),
+    )?;
+    assert_eq!(surviving_facts, SURVIVING_FACTS);
+    let dangling_facts: i64 = storage.conn.query_row(
+        "SELECT COUNT(*) FROM proof_resolution_fact
+         WHERE target_node_id = 70001 OR raw_edge_target_id = 70002 OR edge_id = 60001",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(dangling_facts, 0);
+    let survivor_provenance: i64 = storage.conn.query_row(
+        "SELECT COUNT(*) FROM proof_resolution_provenance WHERE file_id = ?1",
+        params![PROOF_FK_SURVIVOR_FILE],
+        |row| row.get(0),
+    )?;
+    assert_eq!(survivor_provenance, 1);
+
+    // The cross-file edge row stays; its resolved pointer into the removed
+    // file is cleared.
+    let resolved_target: Option<i64> = storage.conn.query_row(
+        "SELECT resolved_target_node_id FROM edge WHERE id = ?1",
+        params![PROOF_FK_SURVIVOR_EDGE],
+        |row| row.get(0),
+    )?;
+    assert_eq!(resolved_target, None);
+
+    Ok(())
+}
+
+#[test]
+fn delete_file_projection_rolls_back_when_cleanup_fails() -> Result<(), StorageError> {
+    let mut storage = proof_fk_deletion_fixture(4, 2, 20)?;
+    let fact_count_before: i64 =
+        storage
+            .conn
+            .query_row("SELECT COUNT(*) FROM proof_resolution_fact", [], |row| {
+                row.get(0)
+            })?;
+    let node_count_before: i64 =
+        storage
+            .conn
+            .query_row("SELECT COUNT(*) FROM node", [], |row| row.get(0))?;
+    let edge_count_before: i64 =
+        storage
+            .conn
+            .query_row("SELECT COUNT(*) FROM edge", [], |row| row.get(0))?;
+
+    // Fail mid-cleanup: proof facts have already been deleted in the same
+    // transaction when the edge delete aborts, so a partial commit would leak
+    // fact loss.
+    storage.conn.execute_batch(
+        "CREATE TRIGGER fail_edge_cleanup
+         BEFORE DELETE ON edge BEGIN
+             SELECT RAISE(ABORT, 'injected cleanup failure');
+         END;",
+    )?;
+    assert!(
+        storage
+            .delete_file_projection(PROOF_FK_REMOVED_FILE)
+            .is_err()
+    );
+    storage
+        .conn
+        .execute_batch("DROP TRIGGER fail_edge_cleanup")?;
+
+    let fact_count_after: i64 =
+        storage
+            .conn
+            .query_row("SELECT COUNT(*) FROM proof_resolution_fact", [], |row| {
+                row.get(0)
+            })?;
+    let node_count_after: i64 = storage
+        .conn
+        .query_row("SELECT COUNT(*) FROM node", [], |row| row.get(0))?;
+    let edge_count_after: i64 = storage
+        .conn
+        .query_row("SELECT COUNT(*) FROM edge", [], |row| row.get(0))?;
+    assert_eq!(fact_count_after, fact_count_before);
+    assert_eq!(node_count_after, node_count_before);
+    assert_eq!(edge_count_after, edge_count_before);
+    Ok(())
+}
+
 /// File ids used by the deletion-scope fixture below.
 const REMOVAL_FIXTURE_CALLER_FILE: i64 = 1_001;
 const REMOVAL_FIXTURE_PREFERRED_FILE: i64 = 2_001;
@@ -13780,75 +14452,217 @@ fn structural_content_scan_rejects_units_without_an_owning_projection() -> Resul
     Ok(())
 }
 
+/// Build a complete immutable core candidate under the live path's staging
+/// layout: durable build seal plus the minted validation receipt the receipted
+/// publisher requires.
+fn minted_staged_candidate(
+    live_path: &Path,
+    generation: u64,
+    file_name: &str,
+) -> Result<(PathBuf, CoreCandidateReceipt), StorageError> {
+    let staged_path = crate::CorePublicationLayout::from_storage_path(live_path)?
+        .create_staging_database_path()?;
+    let receipt = {
+        let mut store = Storage::open_disposable_full_build(&staged_path)?;
+        let file = FileInfo {
+            id: 1,
+            path: PathBuf::from(file_name),
+            language: "rust".to_string(),
+            modification_time: 1,
+            indexed: true,
+            complete: true,
+            line_count: 1,
+            file_role: FileRole::Source,
+        };
+        let source_hash = format!("{:064x}", file.id);
+        store.flush_projection_batch(ProjectionBatch {
+            files: std::slice::from_ref(&file),
+            file_content_hashes: &[FileContentHash {
+                file_id: file.id,
+                content_hash: source_hash.clone(),
+            }],
+            nodes: &[],
+            structural_text_units: &[],
+            structural_text_projections: &[StructuralTextProjection {
+                file_id: file.id,
+                source_content_hash: source_hash,
+                descriptor_version: STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION,
+                producer: "test_structural_collector".to_string(),
+                language: file.language.clone(),
+                file_role: file.file_role,
+                unit_count: 0,
+                unit_digest: structural_text_unit_digest(&[]),
+            }],
+            structural_text_cache_writes: &[StructuralTextArtifactCacheWrite {
+                path: &file.path,
+                file_id: file.id,
+                cache_key: "v1:test",
+                artifact_blob: b"verified structural cache",
+            }],
+            edges: &[],
+            occurrences: &[],
+            component_access: &[],
+            callable_projection_states: &[],
+            file_errors: &[],
+        })?;
+        let publication = IndexPublicationRecord {
+            generation,
+            generation_id: format!("generation-{generation}"),
+            run_id: format!("run-{generation}"),
+            mode: IndexPublicationMode::Full,
+            published_at_epoch_ms: generation as i64,
+        };
+        store.put_index_publication(&publication)?;
+        store.publish_structural_text_unit_generation(&publication)?;
+        store.publish_source_policy_exclusion_generation(
+            &publication,
+            "test-project",
+            "test-workspace",
+            source_policy_identity(
+                OVERSIZED_SOURCE_POLICY_VERSION,
+                DEFAULT_SOURCE_FILE_BYTE_CAP,
+                codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
+            ),
+            &[],
+        )?;
+        store.replace_proof_resolution_projection(
+            &publication,
+            &codestory_contracts::proof_resolution::ProofResolutionProjection {
+                adapter_roster: vec![
+                    codestory_contracts::proof_resolution::ProofResolutionAdapter {
+                        language: "rust".to_string(),
+                        adapter_version: "test".to_string(),
+                    },
+                ],
+                facts: Vec::new(),
+                funnel: Vec::new(),
+            },
+        )?;
+        store.publish_dense_anchor_generation(&publication, "dense-anchor-policy-v1")?;
+        store.write_grounding_snapshot_states(
+            GroundingSnapshotState::Ready,
+            GroundingSnapshotState::Ready,
+            Some(1),
+            Some(1),
+        )?;
+        store.seal_disposable_full_build()?;
+        let receipt = store.mint_core_candidate_receipt()?;
+        drop(store);
+        receipt
+    };
+    Ok((staged_path, receipt))
+}
+
+/// Seal a minted candidate exactly as `publish_receipted_with_stats` does:
+/// the artifact seal binds the closed image to its validation receipt.
+fn sealed_staged_candidate(
+    live_path: &Path,
+    generation: u64,
+    file_name: &str,
+) -> Result<(PathBuf, SealedCoreCandidateReceipt), StorageError> {
+    let (staged_path, receipt) = minted_staged_candidate(live_path, generation, file_name)?;
+    let sealed = seal_core_candidate_receipt(&staged_path, receipt)?;
+    Ok((staged_path, sealed))
+}
+
 #[test]
 fn promotion_database_image_covers_content_and_ignores_only_sqlite_bookkeeping()
 -> Result<(), StorageError> {
-    let staged_path = unique_temp_db_path("promotion-image-source");
-    let live_path = unique_temp_db_path("promotion-image-destination");
-    seed_structural_promotion_corpus(&staged_path, 11)?;
-    seed_structural_promotion_corpus(&live_path, 12)?;
+    // The live seal binds the published generation to the *whole* sealed
+    // image — file identity, length, and the immutable bit — so there are no
+    // exempt slots: the bookkeeping fields the retired masked-image helper
+    // ignored (the change counter, the schema cookie, the version-valid-for
+    // counter) cannot drift on an immutable file either.
+    for (label, offset) in [
+        ("change-counter", 24_usize),
+        ("schema-cookie", 40),
+        ("version-valid-for", 92),
+        ("page-size", 16),
+        ("payload", usize::MAX),
+    ] {
+        let live_path = unique_temp_db_path(&format!("sealed-drift-{label}-live"));
+        let _ = cleanup_sqlite_sidecars(&live_path);
+        let (staged_path, sealed) = sealed_staged_candidate(&live_path, 1, "one.rs")?;
+        let mut bytes = fs::read(&staged_path).expect("read staged candidate");
+        let offset = if offset == usize::MAX {
+            bytes.len() / 2
+        } else {
+            offset
+        };
+        bytes[offset] ^= 0xff;
+        crate::core_generation::make_file_owner_writable(&staged_path)?;
+        fs::write(&staged_path, &bytes).expect("write drifted candidate");
+        crate::core_generation::make_file_immutable(&staged_path)?;
+        let error = Storage::promote_staged_snapshot_with_receipt(
+            &staged_path,
+            &live_path,
+            sealed,
+            &|| false,
+        )
+        .expect_err("a candidate that drifted after sealing must not publish");
+        assert!(
+            error
+                .to_string()
+                .contains("changed after its validation receipt was sealed"),
+            "{label} drift: {error}"
+        );
+        let layout = crate::CorePublicationLayout::from_storage_path(&live_path)?;
+        assert!(
+            layout.read_pointer()?.is_none(),
+            "{label} drift must not commit a pointer"
+        );
+        let _ = Storage::discard_staged_snapshot(&staged_path);
+        cleanup_sqlite_sidecars(&live_path)?;
+    }
 
-    let staged_image = promotion_database_image(&staged_path)?.expect("staged image is provable");
-    assert_ne!(
-        promotion_database_image(&live_path)?.expect("live image is provable"),
-        staged_image,
-        "two different databases must not share an image"
+    // A different database under the receipted path — same length class,
+    // different content — is byte drift too, even when the file still reads
+    // back as a valid store.
+    let live_path = unique_temp_db_path("sealed-foreign-live");
+    let _ = cleanup_sqlite_sidecars(&live_path);
+    let (staged_path, sealed) = sealed_staged_candidate(&live_path, 1, "one.rs")?;
+    let foreign_path = unique_temp_db_path("sealed-foreign-source");
+    seed_structural_promotion_corpus(&foreign_path, 99)?;
+    crate::core_generation::make_file_owner_writable(&staged_path)?;
+    fs::write(
+        &staged_path,
+        fs::read(&foreign_path).expect("read foreign candidate bytes"),
+    )
+    .expect("swap candidate bytes");
+    crate::core_generation::make_file_immutable(&staged_path)?;
+    let error =
+        Storage::promote_staged_snapshot_with_receipt(&staged_path, &live_path, sealed, &|| false)
+            .expect_err("foreign bytes must not reuse the sealed receipt");
+    assert!(
+        error
+            .to_string()
+            .contains("changed after its validation receipt was sealed"),
+        "foreign image: {error}"
     );
+    let _ = Storage::discard_staged_snapshot(&staged_path);
+    cleanup_sqlite_sidecars(&foreign_path)?;
+    cleanup_sqlite_sidecars(&live_path)?;
 
-    let mut live_conn = Connection::open(sqlite_path::open_path(&live_path))?;
-    live_conn.restore(
-        MAIN_DB,
-        sqlite_path::open_path(&staged_path),
-        None::<fn(rusqlite::backup::Progress)>,
-    )?;
-    drop(live_conn);
-
-    assert_ne!(
-        fs::read(&staged_path).expect("read staged bytes"),
-        fs::read(&live_path).expect("read live bytes"),
-        "a restore leaves SQLite's own header counters different, which is why \
-         the image masks exactly those slots"
-    );
+    // Control: the undisturbed sealed candidate publishes and reuses its
+    // validation receipt.
+    let live_path = unique_temp_db_path("sealed-control-live");
+    let _ = cleanup_sqlite_sidecars(&live_path);
+    let (staged_path, sealed) = sealed_staged_candidate(&live_path, 1, "one.rs")?;
+    let stats =
+        Storage::promote_staged_snapshot_with_receipt(&staged_path, &live_path, sealed, &|| false)?;
     assert_eq!(
-        promotion_database_image(&live_path)?.expect("restored image is provable"),
-        staged_image,
-        "a faithful page-level restore carries the candidate's content"
+        stats.promoted_validation,
+        PromotedValidation::ReusedCandidateReceipt
     );
-
-    let restored = fs::read(&live_path).expect("read live bytes");
-    let reimage = |mutate: &dyn Fn(&mut Vec<u8>)| -> Result<PromotionDatabaseImage, StorageError> {
-        let mut bytes = restored.clone();
-        mutate(&mut bytes);
-        fs::write(&live_path, &bytes).expect("write mutated live bytes");
-        Ok(promotion_database_image(&live_path)?.expect("mutated image is provable"))
-    };
-
-    // Only the three bookkeeping slots are outside the image.
-    for (start, end) in SQLITE_VOLATILE_HEADER_SLOTS {
-        assert_eq!(
-            reimage(&|bytes| bytes[start..end].iter_mut().for_each(|byte| *byte ^= 0xff))?,
-            staged_image,
-            "header slot {start}..{end} is SQLite bookkeeping, not content"
-        );
-    }
-    // Every other header byte is content: the page size, the text encoding, the
-    // freelist head, the user version and the application id all participate.
-    for offset in [16, 28, 32, 44, 56, 60, 68, 96] {
-        assert_ne!(
-            reimage(&|bytes| bytes[offset] ^= 0xff)?,
-            staged_image,
-            "header byte {offset} must participate in the image"
-        );
-    }
-    // And so does one byte of page content well past the header.
-    let content_offset = restored.len() / 2;
-    assert_ne!(
-        reimage(&|bytes| bytes[content_offset] ^= 0xff)?,
-        staged_image,
-        "byte drift in the pages must break the image"
+    let layout = crate::CorePublicationLayout::from_storage_path(&live_path)?;
+    assert_eq!(
+        layout
+            .read_pointer()?
+            .expect("published pointer")
+            .active
+            .generation_id,
+        "generation-1"
     );
-
-    cleanup_sqlite_sidecars(&staged_path)?;
     cleanup_sqlite_sidecars(&live_path)?;
     Ok(())
 }
@@ -13856,110 +14670,84 @@ fn promotion_database_image_covers_content_and_ignores_only_sqlite_bookkeeping()
 #[test]
 fn promotion_database_image_is_unprovable_when_content_sits_outside_the_main_file()
 -> Result<(), StorageError> {
-    let path = unique_temp_db_path("promotion-image-hot-sidecar");
-    seed_structural_promotion_corpus(&path, 13)?;
-    let sealed = promotion_database_image(&path)?.expect("sealed image is provable");
-
+    // A non-empty `-wal` or `-journal` means the candidate's durable bytes are
+    // split across files; the seal boundary must refuse such a candidate.
     for suffix in ["-wal", "-journal"] {
-        let sidecar = sqlite_sidecar_path(&path, suffix);
+        let live_path = unique_temp_db_path(&format!("sealed-sidecar{suffix}-live"));
+        let _ = cleanup_sqlite_sidecars(&live_path);
+        let (staged_path, receipt) = minted_staged_candidate(&live_path, 1, "one.rs")?;
+        let sidecar = sqlite_sidecar_path(&staged_path, suffix);
         fs::write(&sidecar, b"pending frames").expect("stage a hot sidecar");
-        assert_eq!(
-            promotion_database_image(&path)?,
-            None,
-            "{suffix} content outside the main file must leave the image unprovable"
+        let error = seal_core_candidate_receipt(&staged_path, receipt.clone())
+            .expect_err("content in a sidecar must leave the candidate unprovable");
+        assert!(
+            error.to_string().contains("retains SQLite content"),
+            "{suffix} content: {error}"
         );
-        fs::remove_file(&sidecar).expect("remove the hot sidecar");
-    }
-    assert_eq!(
-        promotion_database_image(&path)?,
-        Some(sealed),
-        "removing the sidecars restores the same image"
-    );
 
-    cleanup_sqlite_sidecars(&path)?;
+        fs::remove_file(&sidecar).expect("remove the hot sidecar");
+        let sealed = seal_core_candidate_receipt(&staged_path, receipt)
+            .expect("clearing the sidecar restores provability");
+        let stats = Storage::promote_staged_snapshot_with_receipt(
+            &staged_path,
+            &live_path,
+            sealed,
+            &|| false,
+        )?;
+        assert_eq!(
+            stats.promoted_validation,
+            PromotedValidation::ReusedCandidateReceipt,
+            "{suffix}: a standalone candidate publishes with its sealed receipt"
+        );
+        let _ = Storage::discard_staged_snapshot(&staged_path);
+        cleanup_sqlite_sidecars(&live_path)?;
+    }
     Ok(())
 }
 
 #[test]
 fn promoted_receipt_reuse_is_sealed_to_the_restored_bytes() -> Result<(), StorageError> {
-    let staged_path = unique_temp_db_path("promoted-receipt-staged");
-    let live_path = unique_temp_db_path("promoted-receipt-live");
-    seed_structural_promotion_corpus(&staged_path, 21)?;
-    seed_structural_promotion_corpus(&live_path, 22)?;
-
-    let candidate =
-        require_complete_promotion_database_identity(&staged_path, "Staged promotion candidate")?;
-    let candidate_source_policy =
-        read_source_policy_exclusion_rollback_identity(&staged_path, &candidate)?;
-    let candidate_structural_text =
-        read_structural_text_unit_rollback_identity(&staged_path, &candidate)?;
-    let candidate_proof_resolution =
-        read_proof_resolution_rollback_identity(&staged_path, &candidate)?;
-    let candidate_image = promotion_database_image(&staged_path)?.expect("candidate image");
-
-    let mut live_conn = Connection::open(sqlite_path::open_path(&live_path))?;
-    live_conn.restore(
-        MAIN_DB,
-        sqlite_path::open_path(&staged_path),
-        None::<fn(rusqlite::backup::Progress)>,
-    )?;
-    drop(live_conn);
-
-    assert_eq!(
-        validate_promoted_live_database(
-            &live_path,
-            &staged_path,
-            &candidate,
-            &candidate_source_policy,
-            &candidate_structural_text,
-            &candidate_proof_resolution,
-            Some(candidate_image),
-        )?,
-        PromotedValidation::ReusedCandidateReceipt,
-        "a restore proven byte-identical to the validated candidate reuses its receipt"
+    // A receipt minted against the candidate's bytes may not be replayed after
+    // those bytes drift: the installed generation must be the validated image.
+    let live_path = unique_temp_db_path("promoted-receipt-drift-live");
+    let _ = cleanup_sqlite_sidecars(&live_path);
+    let (staged_path, sealed) = sealed_staged_candidate(&live_path, 1, "one.rs")?;
+    crate::core_generation::make_file_owner_writable(&staged_path)?;
+    corrupt_test_structural_cache(&staged_path, "blob")?;
+    crate::core_generation::make_file_immutable(&staged_path)?;
+    let error =
+        Storage::promote_staged_snapshot_with_receipt(&staged_path, &live_path, sealed, &|| false)
+            .expect_err("content drift after sealing must refuse receipt reuse");
+    assert!(
+        error
+            .to_string()
+            .contains("changed after its validation receipt was sealed"),
+        "receipt-reuse fence: {error}"
     );
-    assert_eq!(
-        validate_promoted_live_database(
-            &live_path,
-            &staged_path,
-            &candidate,
-            &candidate_source_policy,
-            &candidate_structural_text,
-            &candidate_proof_resolution,
-            None,
-        )?,
-        PromotedValidation::Revalidated,
-        "without a candidate image the promoted copy is validated in full"
+    let layout = crate::CorePublicationLayout::from_storage_path(&live_path)?;
+    assert!(
+        layout.read_pointer()?.is_none(),
+        "a drifted candidate must not commit a pointer"
     );
+    let _ = Storage::discard_staged_snapshot(&staged_path);
+    cleanup_sqlite_sidecars(&live_path)?;
 
-    // In-place corruption after the restore leaves the publication identity
-    // untouched, so only the deep validation can catch it. The receipt must not
-    // be reusable here.
-    corrupt_test_structural_cache(&live_path, "blob")?;
-    assert_ne!(
-        promotion_database_image(&live_path)?.expect("corrupted image"),
-        candidate_image,
-        "in-place corruption must break the seal"
-    );
-    let error = validate_promoted_live_database(
-        &live_path,
-        &staged_path,
-        &candidate,
-        &candidate_source_policy,
-        &candidate_structural_text,
-        &candidate_proof_resolution,
-        Some(candidate_image),
-    )
-    .expect_err("a corrupted restore must fail the post-restore fence");
+    // When no receipt is presented, promotion re-runs the deep validations and
+    // the same content corruption fails there instead of at the seal check.
+    let live_path = unique_temp_db_path("promoted-revalidation-live");
+    let _ = cleanup_sqlite_sidecars(&live_path);
+    let (staged_path, _receipt) = minted_staged_candidate(&live_path, 1, "one.rs")?;
+    corrupt_test_structural_cache(&staged_path, "blob")?;
+    let error = Storage::promote_staged_snapshot(&staged_path, &live_path)
+        .expect_err("a corrupted candidate must fail full validation");
     assert!(
         error
             .to_string()
             .to_ascii_lowercase()
             .contains("structural artifact cache"),
-        "unexpected fence error: {error}"
+        "full-validation fence: {error}"
     );
-
-    cleanup_sqlite_sidecars(&staged_path)?;
+    let _ = Storage::discard_staged_snapshot(&staged_path);
     cleanup_sqlite_sidecars(&live_path)?;
     Ok(())
 }

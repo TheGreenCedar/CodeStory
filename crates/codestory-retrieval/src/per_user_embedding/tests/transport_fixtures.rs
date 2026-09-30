@@ -50,6 +50,65 @@ impl AwakeMonotonicClock for TestClock {
     }
 }
 
+/// A clock whose `sleep` reports the requested slice and parks the caller
+/// until released, so a test can inject a stop signal while a wait is
+/// genuinely in progress and observe the slice it was cut into.
+pub(super) struct GatedSleepClock {
+    now: AtomicU64,
+    slice_tx: std::sync::mpsc::SyncSender<Duration>,
+    release_rx: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl GatedSleepClock {
+    pub(super) fn new() -> (
+        Arc<Self>,
+        std::sync::mpsc::Receiver<Duration>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (slice_tx, slice_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        (
+            Arc::new(Self {
+                now: AtomicU64::new(1),
+                slice_tx,
+                release_rx: Mutex::new(release_rx),
+            }),
+            slice_rx,
+            release_tx,
+        )
+    }
+}
+
+impl AwakeMonotonicClock for GatedSleepClock {
+    fn now_ns(&self) -> u64 {
+        self.now.load(Ordering::Acquire)
+    }
+
+    fn sleep(&self, duration: Duration) {
+        if self.slice_tx.send(duration).is_err() {
+            return;
+        }
+        let _ = self
+            .release_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recv();
+        self.now.fetch_add(
+            duration.as_nanos().max(1).min(u128::from(u64::MAX)) as u64,
+            Ordering::AcqRel,
+        );
+    }
+
+    fn snapshot(&self) -> EmbeddingServerClockSnapshot {
+        EmbeddingServerClockSnapshot {
+            domain: "awake_monotonic".into(),
+            api: "gated_sleep_clock".into(),
+            boot_id: "test-boot".into(),
+            resolution_ns: 1,
+        }
+    }
+}
+
 pub(super) struct MemoryStream {
     pub(super) identity: EmbeddingTransportIdentity,
     pub(super) input: Cursor<Vec<u8>>,
@@ -270,7 +329,19 @@ pub(super) enum ScriptOutcome {
     Blocking {
         request_started: Arc<AtomicBool>,
         cancelled: Arc<AtomicBool>,
+        state: Arc<Mutex<BlockingScriptState>>,
     },
+}
+
+/// What the scripted server recorded about the in-flight request: a `Cancel`
+/// frame must reproduce the admitted request id and its cancel token before
+/// the scripted request is allowed to end — the correlation the real server
+/// authenticates in `server/state.rs`.
+#[derive(Default)]
+pub(super) struct BlockingScriptState {
+    pub(super) active_request_id: Option<String>,
+    pub(super) active_cancel_token: Option<String>,
+    pub(super) rejected_cancels: usize,
 }
 
 pub(super) struct ScriptStream {
@@ -338,14 +409,19 @@ impl ScriptStream {
                 self.hello_completed = true;
                 response
             }
-            EmbeddingOperation::EmbedQuery { .. } => self.query_response(&request_id),
+            EmbeddingOperation::EmbedQuery { cancel_token, .. } => {
+                self.query_response(&request_id, cancel_token)
+            }
             EmbeddingOperation::EmbedQueries { inputs, .. } => {
                 self.documents_response(&request_id, inputs.len())
             }
             EmbeddingOperation::EmbedDocuments { inputs, .. } => {
                 self.documents_response(&request_id, inputs.len())
             }
-            EmbeddingOperation::Cancel { .. } => self.cancel_response(&request_id),
+            EmbeddingOperation::Cancel {
+                target_request_id,
+                cancel_token,
+            } => self.cancel_response(&request_id, &target_request_id, &cancel_token),
             EmbeddingOperation::Snapshot => Ok(Some((
                 success_response(
                     &request_id,
@@ -423,6 +499,7 @@ impl ScriptStream {
     pub(super) fn query_response(
         &mut self,
         request_id: &str,
+        cancel_token: Option<String>,
     ) -> io::Result<Option<(EmbeddingProtocolResponse, Vec<u8>)>> {
         match self.outcome.clone() {
             ScriptOutcome::Loss => Ok(None),
@@ -460,7 +537,14 @@ impl ScriptStream {
             ScriptOutcome::Blocking {
                 request_started,
                 cancelled,
+                state,
             } => {
+                let mut state = state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.active_request_id = Some(request_id.to_owned());
+                state.active_cancel_token = cancel_token;
+                drop(state);
                 request_started.store(true, Ordering::Release);
                 self.read_gate = Some(cancelled);
                 Ok(Some((
@@ -531,16 +615,53 @@ impl ScriptStream {
         )))
     }
 
+    /// Mirrors `server/connection.rs`: a malformed token fails closed, and a
+    /// cancel that does not name the admitted request id with its recorded
+    /// token is `Released`, never `Cancelled`.
     pub(super) fn cancel_response(
-        &self,
+        &mut self,
         request_id: &str,
+        target_request_id: &str,
+        cancel_token: &str,
     ) -> io::Result<Option<(EmbeddingProtocolResponse, Vec<u8>)>> {
-        let ScriptOutcome::Blocking { cancelled, .. } = self.outcome.clone() else {
+        let ScriptOutcome::Blocking {
+            cancelled, state, ..
+        } = self.outcome.clone()
+        else {
             return Err(io::Error::other("unexpected cancellation request"));
         };
-        cancelled.store(true, Ordering::Release);
+        if !super::super::server::valid_cancel_token(cancel_token) {
+            return Ok(Some((
+                failure_response(
+                    request_id,
+                    protocol_error(
+                        "embedding_server_cancel_token_invalid",
+                        "embedding cancellation requires an unguessable token",
+                    ),
+                ),
+                Vec::new(),
+            )));
+        }
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let authenticated = state.active_request_id.as_deref() == Some(target_request_id)
+            && state.active_cancel_token.as_deref() == Some(cancel_token);
+        if authenticated {
+            cancelled.store(true, Ordering::Release);
+        } else {
+            state.rejected_cancels += 1;
+        }
+        drop(state);
         Ok(Some((
-            success_response(request_id, EmbeddingResult::Cancelled),
+            success_response(
+                request_id,
+                if authenticated {
+                    EmbeddingResult::Cancelled
+                } else {
+                    EmbeddingResult::Released
+                },
+            ),
             Vec::new(),
         )))
     }

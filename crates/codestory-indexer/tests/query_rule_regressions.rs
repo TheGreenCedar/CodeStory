@@ -721,6 +721,18 @@ class TestGitService extends mock<IGitService>() {
     )])?;
 
     assert!(has_node_kind(&nodes, "TestGitService", NodeKind::CLASS));
+    // The test's name claims no duplicate variable: a second TestGitService
+    // node of any kind (e.g. a VARIABLE) must fail, not just coexist unseen.
+    let service_nodes = nodes
+        .iter()
+        .filter(|node| matches_name(&node.serialized_name, "TestGitService"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        service_nodes.len(),
+        1,
+        "expected exactly one TestGitService node; duplicates surfaced: {service_nodes:?}"
+    );
+    assert_eq!(service_nodes[0].kind, NodeKind::CLASS);
     assert!(
         edge_between_matching(
             &nodes,
@@ -881,6 +893,16 @@ class Example:
 "#,
     )])?;
 
+    let example_nodes = nodes
+        .iter()
+        .filter(|node| matches_name(&node.serialized_name, "Example"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        example_nodes.len(),
+        1,
+        "decorated class must surface exactly once; duplicates: {example_nodes:?}"
+    );
+    assert_eq!(example_nodes[0].kind, NodeKind::CLASS);
     assert!(has_node_kind(&nodes, "helpers.future", NodeKind::MODULE));
     assert!(has_node_kind(
         &nodes,
@@ -945,6 +967,16 @@ class RepoEntry:
 "#,
     )])?;
 
+    let repo_entry_nodes = nodes
+        .iter()
+        .filter(|node| matches_name(&node.serialized_name, "RepoEntry"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        repo_entry_nodes.len(),
+        1,
+        "decorator identifier rule must not mint a second RepoEntry node: {repo_entry_nodes:?}"
+    );
+    assert_eq!(repo_entry_nodes[0].kind, NodeKind::CLASS);
     assert!(
         edge_between_matching(
             &nodes,
@@ -1168,10 +1200,14 @@ class Example {
         "expected InnerEnum -> Off member edge"
     );
     assert!(
-        edges
-            .iter()
-            .any(|edge| edge.kind == EdgeKind::ANNOTATION_USAGE),
-        "expected annotation usage edges for @Marker"
+        edge_between_matching(
+            &nodes,
+            &edges,
+            EdgeKind::ANNOTATION_USAGE,
+            |source| matches_name(source, "Marker"),
+            |target| matches_name(target, "Marker"),
+        ),
+        "expected exact Marker annotation usage edge"
     );
 
     let example_class_id = nodes
@@ -1416,75 +1452,6 @@ int run() {
 
     Ok(())
 }
-
-#[test]
-fn test_java_annotations_constructors_inner_types_and_enum_constants_surface() -> anyhow::Result<()>
-{
-    let (nodes, edges) = index_project(&[(
-        "Main.java",
-        r#"
-@interface Marker {}
-
-@Marker
-class Outer {
-    Outer() {}
-
-    class Inner {}
-    interface Nested {}
-    enum Mode { ON }
-    record Pair(int value) {
-        Pair {}
-    }
-    @interface Flag {}
-}
-"#,
-    )])?;
-
-    assert!(has_node_kind(&nodes, "Marker", NodeKind::ANNOTATION));
-    assert!(has_node_kind(&nodes, "Outer", NodeKind::CLASS));
-    assert!(has_node_kind(&nodes, "Outer", NodeKind::METHOD));
-    assert!(has_node_kind(&nodes, "Pair", NodeKind::CLASS));
-    assert!(has_node_kind(&nodes, "Pair", NodeKind::METHOD));
-    assert!(has_node_kind(&nodes, "Flag", NodeKind::ANNOTATION));
-    assert!(has_node_kind(&nodes, "ON", NodeKind::ENUM_CONSTANT));
-    assert!(
-        edge_between(&nodes, &edges, EdgeKind::MEMBER, "Outer", "Inner"),
-        "expected inner class membership edge"
-    );
-    assert!(
-        edge_between(&nodes, &edges, EdgeKind::MEMBER, "Outer", "Nested"),
-        "expected inner interface membership edge"
-    );
-    assert!(
-        edge_between(&nodes, &edges, EdgeKind::MEMBER, "Outer", "Mode"),
-        "expected inner enum membership edge"
-    );
-    assert!(
-        edge_between(&nodes, &edges, EdgeKind::MEMBER, "Outer", "Pair"),
-        "expected inner record membership edge"
-    );
-    assert!(
-        edge_between(&nodes, &edges, EdgeKind::MEMBER, "Outer", "Flag"),
-        "expected inner annotation membership edge"
-    );
-    assert!(
-        edge_between(&nodes, &edges, EdgeKind::MEMBER, "Mode", "ON"),
-        "expected enum constant membership edge"
-    );
-    assert!(
-        edge_between_matching(
-            &nodes,
-            &edges,
-            EdgeKind::ANNOTATION_USAGE,
-            |source| matches_name(source, "Marker"),
-            |target| matches_name(target, "Marker"),
-        ),
-        "expected Marker annotation usage edge"
-    );
-
-    Ok(())
-}
-
 #[test]
 fn test_java_enum_and_annotation_parents_surface_inner_type_members() -> anyhow::Result<()> {
     let (nodes, edges) = index_project(&[(

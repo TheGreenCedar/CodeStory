@@ -1008,7 +1008,7 @@ impl AppController {
         &self,
         budget: GroundingBudgetDto,
     ) -> Result<GroundingSnapshotDto, ApiError> {
-        self.ensure_consistent_read_state("Grounding")?;
+        self.ensure_graph_only_read_state("Grounding")?;
         let root = self.require_project_root()?;
         let storage = self.open_storage_read_only()?;
         if matches!(budget, GroundingBudgetDto::Max)
@@ -1454,28 +1454,27 @@ impl AppController {
         context_lines: usize,
     ) -> Result<SnippetContextDto, ApiError> {
         let node = self.node_details(NodeDetailsRequest { id: node_id })?;
-        let path = node
-            .file_path
-            .clone()
-            .ok_or_else(|| {
-                ApiError::invalid_argument(
-                    "Symbol has no source file; use symbol/trail children or occurrences to choose a path-backed anchor.",
-                )
-            })?;
-        let line = node
-            .start_line
-            .ok_or_else(|| {
-                ApiError::invalid_argument(
-                    "Symbol has no source line; use occurrences or a child method before requesting a snippet.",
-                )
-            })?;
-        let (path, bounded) = self.bounded_file_snippet(
-            &path,
-            line,
+        if node.file_path.is_none() {
+            return Err(ApiError::invalid_argument(
+                "Symbol has no source file; use symbol/trail children or occurrences to choose a path-backed anchor.",
+            ));
+        }
+        if node.start_line.is_none() {
+            return Err(ApiError::invalid_argument(
+                "Symbol has no source line; use occurrences or a child method before requesting a snippet.",
+            ));
+        }
+        let source = self.verified_node_source(&node)?;
+        let bounded = crate::snippets::bounded_markdown_snippet_from_text(
+            &source.content,
+            source.start_line,
             context_lines,
             crate::DIRECT_SNIPPET_MAX_BYTES,
             crate::DIRECT_SNIPPET_TRUNCATION_SUFFIX,
-        )?;
+        )
+        .map_err(|_| ApiError::internal("Verified source snippet could not be rendered."))?;
+        let path = source.path.to_string_lossy().into_owned();
+        let line = source.start_line;
 
         Ok(SnippetContextDto {
             node,
@@ -1498,29 +1497,27 @@ impl AppController {
         context_lines: usize,
     ) -> Result<SnippetContextDto, ApiError> {
         let node = self.node_details(NodeDetailsRequest { id: node_id })?;
-        let path = node
-            .file_path
-            .clone()
-            .ok_or_else(|| {
-                ApiError::invalid_argument(
-                    "Symbol has no source file; use symbol/trail children or occurrences to choose a path-backed anchor.",
-                )
-            })?;
-        let line = node
-            .start_line
-            .ok_or_else(|| {
-                ApiError::invalid_argument(
-                    "Symbol has no source line; use occurrences or a child method before requesting a snippet.",
-                )
-            })?;
-        let range = match node.end_line.filter(|end| *end >= line) {
+        if node.file_path.is_none() {
+            return Err(ApiError::invalid_argument(
+                "Symbol has no source file; use symbol/trail children or occurrences to choose a path-backed anchor.",
+            ));
+        }
+        if node.start_line.is_none() {
+            return Err(ApiError::invalid_argument(
+                "Symbol has no source line; use occurrences or a child method before requesting a snippet.",
+            ));
+        }
+        let source = self.verified_node_source(&node)?;
+        let path = source.path.to_string_lossy().into_owned();
+        let line = source.start_line;
+        let range = match source.end_line.filter(|end| *end >= line) {
             Some(end_line) if end_line > line => Some(FunctionBodyRange {
                 end_line,
                 range_source: "indexed_symbol_range",
                 fallback_reason: None,
             }),
             Some(end_line) => {
-                match self.brace_balanced_function_body_end_line(&path, line)? {
+                match brace_balanced_function_body_end_line(&path, &source.content, line) {
                     Some(fallback_end_line) if fallback_end_line > end_line => {
                         Some(FunctionBodyRange {
                             end_line: fallback_end_line,
@@ -1538,9 +1535,8 @@ impl AppController {
                     None => None,
                 }
             }
-            None => self
-                .brace_balanced_function_body_end_line(&path, line)?
-                .map(|end_line| FunctionBodyRange {
+            None => brace_balanced_function_body_end_line(&path, &source.content, line).map(
+                |end_line| FunctionBodyRange {
                     end_line,
                     range_source: "brace_balanced_fallback",
                     fallback_reason: Some(
@@ -1558,17 +1554,16 @@ impl AppController {
             context.range_source = Some("line_context".to_string());
             return Ok(context);
         };
-        let (path, bounded) = self.bounded_file_snippet_range(
-            &path,
-            crate::BoundedSnippetRangeOptions {
-                focus_line: line,
-                start_line: line,
-                end_line: range.end_line,
-                context_lines,
-                max_bytes: crate::DIRECT_SNIPPET_MAX_BYTES,
-                truncation_suffix: crate::DIRECT_SNIPPET_TRUNCATION_SUFFIX,
-            },
-        )?;
+        let bounded = crate::snippets::bounded_markdown_snippet_range_from_text(
+            &source.content,
+            line,
+            line,
+            range.end_line,
+            context_lines,
+            crate::DIRECT_SNIPPET_MAX_BYTES,
+            crate::DIRECT_SNIPPET_TRUNCATION_SUFFIX,
+        )
+        .map_err(|_| ApiError::internal("Verified source snippet could not be rendered."))?;
 
         Ok(SnippetContextDto {
             node,
@@ -1584,27 +1579,26 @@ impl AppController {
             truncation_guidance: snippet_truncation_guidance(bounded.truncated, context_lines),
         })
     }
+}
 
-    fn brace_balanced_function_body_end_line(
-        &self,
-        path: &str,
-        start_line: u32,
-    ) -> Result<Option<u32>, ApiError> {
-        if !path_supports_brace_balanced_function_fallback(path) {
-            return Ok(None);
-        }
-        let source = self.read_file_text(codestory_contracts::api::ReadFileTextRequest {
-            path: path.to_string(),
-        })?;
-        Ok(brace_balanced_body_end_line(
-            &source.text,
-            start_line,
-            Path::new(path)
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("rs")),
-        ))
+/// Expand a function-body range over already verified source text. The caller
+/// passes the verified buffer, so this never performs a second path read.
+fn brace_balanced_function_body_end_line(
+    path: &str,
+    content: &str,
+    start_line: u32,
+) -> Option<u32> {
+    if !path_supports_brace_balanced_function_fallback(path) {
+        return None;
     }
+    brace_balanced_body_end_line(
+        content,
+        start_line,
+        Path::new(path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("rs")),
+    )
 }
 
 struct FunctionBodyRange {
@@ -1888,6 +1882,8 @@ mod tests {
         Edge, EdgeId, EdgeKind, Node, NodeId as CoreNodeId, NodeKind, Occurrence, OccurrenceKind,
         SourceLocation,
     };
+    use sha2::Digest;
+    use std::path::PathBuf;
     use tempfile::tempdir;
 
     /// The inferred function body must end at the real closing brace, not at
@@ -1983,7 +1979,7 @@ mod tests {
         language: &str,
         child: Node,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        storage.insert_file(&FileInfo {
+        let file = FileInfo {
             id: file_id,
             path: path.to_path_buf(),
             language: language.to_string(),
@@ -1992,7 +1988,17 @@ mod tests {
             complete: true,
             line_count: 10,
             file_role,
-        })?;
+        };
+        storage.insert_file(&file)?;
+        // Symbol-identified reads verify the indexed content hash, so record
+        // the hash of any on-disk fixture bytes. Virtual paths (no file) leave
+        // the hash unset, matching a publication that never saw the content.
+        if let Ok(bytes) = std::fs::read(path) {
+            let hash = format!("{:x}", sha2::Sha256::digest(&bytes));
+            storage
+                .update_file_metadata(&file, Some(hash.as_str()))
+                .expect("bind fixture content hash");
+        }
         storage.insert_nodes_batch(&[
             Node {
                 id: CoreNodeId(file_id),
@@ -2246,6 +2252,9 @@ mod tests {
             display_name: name.to_string(),
             file_path: Some(root.join("src/service.ts")),
         };
+        // Adverse fixture: the leaf's name sorts first on every earlier key
+        // (lexical order, no helper-name hints), so only the call topology can
+        // keep the referenced subsystem root ahead of it.
         let degrees = [
             (
                 CoreNodeId(1),
@@ -2257,8 +2266,8 @@ mod tests {
             (
                 CoreNodeId(2),
                 CallDegrees {
-                    production_in_calls: 0,
-                    out_calls: 0,
+                    production_in_calls: 4,
+                    out_calls: 1,
                 },
             ),
         ]
@@ -2266,7 +2275,7 @@ mod tests {
         .collect::<HashMap<_, _>>();
 
         let ordered = diversify_grounding_root_records(
-            vec![record(2, "zzHelperAlias"), record(1, "aaSubsystemRoot")],
+            vec![record(1, "zzSubstrateRoot"), record(2, "aaaDispatchLeaf")],
             root,
             &roles,
             &HashMap::new(),
@@ -2278,7 +2287,7 @@ mod tests {
                 .iter()
                 .map(|record| record.display_name.as_str())
                 .collect::<Vec<_>>(),
-            ["aaSubsystemRoot", "zzHelperAlias"]
+            ["zzSubstrateRoot", "aaaDispatchLeaf"]
         );
     }
 
@@ -2546,6 +2555,7 @@ mod tests {
 
     #[test]
     fn large_member_rich_mixed_project_diversifies_entrypoints_into_architecture_breadth() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let project_root = temp.path().join("target/acceptance/project");
         let db_path = temp.path().join("cache/codestory.db");
@@ -2849,7 +2859,7 @@ mod tests {
                 .expect("refresh detail snapshot");
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(project_root, db_path)
             .expect("open project");
@@ -3101,6 +3111,7 @@ mod tests {
 
     #[test]
     fn grounding_snapshot_represents_all_files() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -3142,7 +3153,7 @@ mod tests {
             .expect("insert second");
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
             .expect("open project");
@@ -3159,6 +3170,7 @@ mod tests {
 
     #[test]
     fn grounding_snapshot_publishes_structural_text_metadata_without_graph_claims() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -3187,7 +3199,7 @@ mod tests {
                 .expect("insert verified manifest projection");
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
             .expect("open project");
@@ -3217,6 +3229,7 @@ mod tests {
 
     #[test]
     fn grounding_snapshot_preserves_openapi_endpoint_source_identity() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -3242,7 +3255,7 @@ mod tests {
             .expect("insert OpenAPI endpoint node");
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
             .expect("open project");
@@ -3272,6 +3285,7 @@ mod tests {
 
     #[test]
     fn function_body_snippet_uses_symbol_range_when_available() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -3302,7 +3316,7 @@ mod tests {
             .expect("insert function");
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
             .expect("open project");
@@ -3323,6 +3337,7 @@ mod tests {
 
     #[test]
     fn function_body_snippet_keeps_single_line_rust_body() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -3352,7 +3367,7 @@ mod tests {
             .expect("insert function");
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
             .expect("open project");
@@ -3375,6 +3390,7 @@ mod tests {
 
     #[test]
     fn function_body_snippet_uses_brace_balanced_fallback_when_range_is_missing() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -3412,7 +3428,7 @@ mod tests {
             .expect("insert function");
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
             .expect("open project");
@@ -3441,6 +3457,7 @@ mod tests {
 
     #[test]
     fn function_body_snippet_reports_line_context_fallback_when_body_is_unavailable() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -3471,7 +3488,7 @@ mod tests {
             .expect("insert function");
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
             .expect("open project");
@@ -3494,8 +3511,310 @@ mod tests {
         assert!(snippet.snippet.contains("payload.create"));
     }
 
+    /// One-function project fixture. `insert_file_node` binds the indexed
+    /// content hash and publication row, so symbol-identified source reads have
+    /// a hash to verify against.
+    fn snippet_source_fixture(
+        content: &str,
+        start_line: u32,
+        end_line: Option<u32>,
+    ) -> (tempfile::TempDir, AppController, PathBuf) {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let temp = tempdir().expect("temp dir");
+        let db_path = temp.path().join("cache").join("codestory.db");
+        std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+        let source_path = temp.path().join("src").join("lib.rs");
+        std::fs::create_dir_all(source_path.parent().expect("src parent")).expect("create src");
+        std::fs::write(&source_path, content).expect("write source");
+        {
+            let mut storage = Storage::open(&db_path).expect("open storage");
+            insert_file_node(
+                &mut storage,
+                11,
+                &source_path,
+                Node {
+                    id: CoreNodeId(101),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "route_handler".to_string(),
+                    file_node_id: Some(CoreNodeId(11)),
+                    start_line: Some(start_line),
+                    end_line,
+                    ..Default::default()
+                },
+            )
+            .expect("insert function");
+        }
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
+        controller
+            .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
+            .expect("open project");
+        (temp, controller, source_path)
+    }
+
+    fn snippet_node_id() -> codestory_contracts::api::NodeId {
+        codestory_contracts::api::NodeId("101".to_string())
+    }
+
+    /// Inserting lines above the node leaves the indexed line naming a
+    /// different expression. The symbol-identified read must refuse with
+    /// `source_stale` rather than serve bytes the index never saw.
+    #[test]
+    fn snippet_context_reports_source_stale_after_source_shift() {
+        let (_temp, controller, source_path) = snippet_source_fixture(
+            "fn before() {}\n\nfn route_handler() {\n    payload.create();\n}\n",
+            3,
+            Some(5),
+        );
+        std::fs::write(
+            &source_path,
+            "fn before() {}\n\nlet inserted_binding = compute();\n\nfn route_handler() {\n    payload.create();\n}\n",
+        )
+        .expect("shift source lines");
+
+        let error = controller
+            .snippet_context(snippet_node_id(), 0)
+            .expect_err("shifted source must not be served under the indexed id");
+        assert_eq!(error.code, "source_stale");
+        assert!(
+            !error.message.contains("inserted_binding") && !error.message.contains("route_handler"),
+            "a stale-source error carries no snippet or node-labelled text: {}",
+            error.message
+        );
+    }
+
+    /// Metadata shortcuts cannot soften the check: identical length and mtime
+    /// still fail the indexed content hash.
+    #[test]
+    fn snippet_context_reports_source_stale_for_same_length_same_mtime_edit() {
+        let (_temp, controller, source_path) = snippet_source_fixture(
+            "fn route_handler() {\n    payload.create();\n}\n",
+            1,
+            Some(3),
+        );
+        let modified = std::fs::metadata(&source_path)
+            .expect("metadata")
+            .modified()
+            .expect("mtime");
+        std::fs::write(
+            &source_path,
+            "fn route_handler() {\n    payload.update();\n}\n",
+        )
+        .expect("same-length edit");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&source_path)
+            .expect("open source")
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .expect("restore mtime");
+
+        let error = controller
+            .snippet_context(snippet_node_id(), 0)
+            .expect_err("same-mtime byte change must not be served");
+        assert_eq!(error.code, "source_stale");
+    }
+
+    /// The stale-source refusal applies identically to function-body reads,
+    /// whether the node carries an indexed end line or needs the brace-balanced
+    /// fallback: the verification runs before any range is derived.
+    #[test]
+    fn snippet_function_body_reports_source_stale_after_source_shift() {
+        let content = "fn before() {}\n\nfn route_handler() {\n    payload.create();\n}\n";
+        let shifted = "fn before() {}\n\nlet inserted_binding = compute();\n\nfn route_handler() {\n    payload.create();\n}\n";
+        for end_line in [Some(5), None] {
+            let (_temp, controller, source_path) = snippet_source_fixture(content, 3, end_line);
+            std::fs::write(&source_path, shifted).expect("shift source lines");
+            let error = controller
+                .snippet_function_body_context(snippet_node_id(), 0)
+                .expect_err("function body must not read shifted source");
+            assert_eq!(error.code, "source_stale", "end_line {end_line:?}");
+        }
+    }
+
+    /// Only the target file's hash gates its read; mutating an unrelated file
+    /// must not deny a byte-identical target.
+    #[test]
+    fn snippet_context_succeeds_when_only_an_unrelated_file_changes() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let temp = tempdir().expect("temp dir");
+        let db_path = temp.path().join("cache").join("codestory.db");
+        std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+        let src_dir = temp.path().join("src");
+        std::fs::create_dir_all(&src_dir).expect("create src");
+        let source_path = src_dir.join("lib.rs");
+        let other_path = src_dir.join("other.rs");
+        std::fs::write(
+            &source_path,
+            "fn route_handler() {\n    payload.create();\n}\n",
+        )
+        .expect("write source");
+        std::fs::write(&other_path, "pub fn other() {}\n").expect("write other");
+        {
+            let mut storage = Storage::open(&db_path).expect("open storage");
+            insert_file_node(
+                &mut storage,
+                11,
+                &source_path,
+                Node {
+                    id: CoreNodeId(101),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "route_handler".to_string(),
+                    file_node_id: Some(CoreNodeId(11)),
+                    start_line: Some(1),
+                    end_line: Some(3),
+                    ..Default::default()
+                },
+            )
+            .expect("insert function");
+            insert_file_node(
+                &mut storage,
+                12,
+                &other_path,
+                Node {
+                    id: CoreNodeId(102),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "other".to_string(),
+                    file_node_id: Some(CoreNodeId(12)),
+                    start_line: Some(1),
+                    end_line: Some(1),
+                    ..Default::default()
+                },
+            )
+            .expect("insert other");
+        }
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
+        controller
+            .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
+            .expect("open project");
+
+        std::fs::write(&other_path, "pub fn other() { panic!() }\n").expect("mutate other");
+
+        let snippet = controller
+            .snippet_context(snippet_node_id(), 2)
+            .expect("byte-identical target stays readable");
+        assert_eq!(snippet.line, 1);
+        assert!(snippet.snippet.contains("route_handler"));
+        assert!(snippet.snippet.contains("payload.create"));
+        assert!(!snippet.snippet.contains("panic"));
+    }
+
+    /// A real republish rebinds the same stable id: after the stored hash and
+    /// node lines are updated for shifted content, the read serves the new line
+    /// and the new bytes.
+    #[test]
+    fn snippet_context_serves_republished_source_for_the_same_node_id() {
+        let (_temp, controller, source_path) = snippet_source_fixture(
+            "fn before() {}\n\nfn route_handler() {\n    payload.create();\n}\n",
+            3,
+            Some(5),
+        );
+        let republished = "fn before() {}\n\nlet inserted_binding = compute();\n\nfn route_handler() {\n    payload.create();\n}\n";
+        std::fs::write(&source_path, republished).expect("shift source lines");
+
+        let db_path = controller.require_storage_path().expect("storage path");
+        let mut storage = Storage::open(&db_path).expect("reopen storage");
+        let file = storage
+            .get_file_by_id(11)
+            .expect("file query")
+            .expect("file");
+        let hash = format!("{:x}", sha2::Sha256::digest(republished.as_bytes()));
+        storage
+            .update_file_metadata(&file, Some(hash.as_str()))
+            .expect("republish content hash");
+        storage
+            .insert_nodes_batch(&[Node {
+                id: CoreNodeId(101),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "route_handler".to_string(),
+                file_node_id: Some(CoreNodeId(11)),
+                start_line: Some(5),
+                end_line: Some(7),
+                ..Default::default()
+            }])
+            .expect("republish node lines");
+        drop(storage);
+
+        let snippet = controller
+            .snippet_context(snippet_node_id(), 2)
+            .expect("republished source is served under the same id");
+        assert_eq!(snippet.line, 5);
+        assert!(snippet.snippet.contains("route_handler"));
+        assert!(snippet.snippet.contains("inserted_binding"));
+    }
+
+    #[test]
+    fn snippet_context_reports_source_unavailable_when_target_is_deleted() {
+        let (_temp, controller, source_path) = snippet_source_fixture(
+            "fn route_handler() {\n    payload.create();\n}\n",
+            1,
+            Some(3),
+        );
+        std::fs::remove_file(&source_path).expect("delete source");
+
+        let error = controller
+            .snippet_context(snippet_node_id(), 0)
+            .expect_err("deleted source is unavailable");
+        assert_eq!(error.code, "source_unavailable");
+    }
+
+    /// A symlink at the indexed path that escapes the project is unavailable,
+    /// not stale: containment fails before any byte is read.
+    #[cfg(unix)]
+    #[test]
+    fn snippet_context_reports_source_unavailable_for_symlink_escape() {
+        let outside = tempdir().expect("outside dir");
+        let outside_path = outside.path().join("escaped.rs");
+        std::fs::write(&outside_path, "fn escaped() {}\n").expect("write outside");
+        let (_temp, controller, source_path) = snippet_source_fixture(
+            "fn route_handler() {\n    payload.create();\n}\n",
+            1,
+            Some(3),
+        );
+        std::fs::remove_file(&source_path).expect("remove target");
+        std::os::unix::fs::symlink(&outside_path, &source_path).expect("symlink escape");
+
+        let error = controller
+            .snippet_context(snippet_node_id(), 0)
+            .expect_err("escaping symlink is unavailable");
+        assert_eq!(error.code, "source_unavailable");
+    }
+
+    /// Rendering consumes the verified in-memory buffer, never the path: bytes
+    /// written between verification and render cannot leak into the snippet.
+    #[test]
+    fn verified_node_source_retains_indexed_bytes_for_later_render() {
+        let (_temp, controller, source_path) = snippet_source_fixture(
+            "fn before() {}\n\nfn route_handler() {\n    payload.create();\n}\n",
+            3,
+            Some(5),
+        );
+        let node = controller
+            .node_details(NodeDetailsRequest {
+                id: snippet_node_id(),
+            })
+            .expect("node details");
+        let source = controller
+            .verified_node_source(&node)
+            .expect("verified node source");
+
+        std::fs::write(&source_path, "fn compromised() { exfiltrate(); }\n")
+            .expect("post-verification edit");
+
+        let rendered = crate::snippets::bounded_markdown_snippet_from_text(
+            &source.content,
+            source.start_line,
+            2,
+            crate::DIRECT_SNIPPET_MAX_BYTES,
+            crate::DIRECT_SNIPPET_TRUNCATION_SUFFIX,
+        )
+        .expect("render verified buffer");
+        assert!(rendered.markdown.contains("route_handler"));
+        assert!(rendered.markdown.contains("payload.create"));
+        assert!(!rendered.markdown.contains("compromised"));
+    }
+
     #[test]
     fn declaration_only_range_is_not_reported_as_a_function_body() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -3526,7 +3845,7 @@ mod tests {
             .expect("insert function");
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
             .expect("open project");
@@ -3551,6 +3870,7 @@ mod tests {
 
     #[test]
     fn grounding_snapshot_caps_detailed_files_and_adds_coverage_buckets() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -3578,7 +3898,7 @@ mod tests {
             }
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
             .expect("open project");
@@ -3602,6 +3922,7 @@ mod tests {
 
     #[test]
     fn grounding_snapshot_deprioritizes_import_like_root_symbols() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -3639,9 +3960,12 @@ mod tests {
                         start_line: Some(1),
                         ..Default::default()
                     },
+                    // Same kind as the import-like module and a later line, so
+                    // kind precedence and position cannot decide this; only
+                    // the import demotion keeps Widget ahead.
                     Node {
                         id: CoreNodeId(102),
-                        kind: NodeKind::CLASS,
+                        kind: NodeKind::MODULE,
                         serialized_name: "Widget".to_string(),
                         file_node_id: Some(CoreNodeId(11)),
                         start_line: Some(2),
@@ -3651,7 +3975,7 @@ mod tests {
                 .expect("insert nodes");
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
             .expect("open project");
@@ -3670,6 +3994,7 @@ mod tests {
 
     #[test]
     fn grounding_snapshot_prefers_production_and_diversifies_fixture_roots() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -3792,7 +4117,7 @@ mod tests {
                 .expect("refresh detail snapshot");
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
             .expect("open project");
@@ -3899,6 +4224,7 @@ mod tests {
 
     #[test]
     fn grounding_snapshot_ranks_cross_language_architecture_and_reports_orientation() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -4065,7 +4391,7 @@ mod tests {
                 .expect("refresh detail snapshot");
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
             .expect("open project");
@@ -4139,6 +4465,7 @@ mod tests {
 
     #[test]
     fn grounding_snapshot_reports_weak_orientation_without_entrypoint_evidence() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -4164,7 +4491,7 @@ mod tests {
             }
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
             .expect("open project");
@@ -4188,6 +4515,7 @@ mod tests {
 
     #[test]
     fn grounding_snapshot_keeps_diversified_fixture_fallback_without_production_roots() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -4225,7 +4553,7 @@ mod tests {
             }
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
             .expect("open project");
@@ -4260,6 +4588,7 @@ mod tests {
 
     #[test]
     fn grounding_snapshot_represented_symbols_is_monotonic_across_budgets() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -4350,7 +4679,7 @@ mod tests {
                 .expect("refresh detail snapshot");
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
             .expect("open project");
@@ -4364,6 +4693,29 @@ mod tests {
         let max = controller
             .grounding_snapshot(GroundingBudgetDto::Max)
             .expect("max snapshot");
+
+        // Fixture truth is independent of the returned shape: 24 files with 5
+        // symbols each were seeded, and every file and symbol must be
+        // represented either as a digest or inside a coverage bucket.
+        for snapshot in [&strict, &balanced, &max] {
+            assert_eq!(snapshot.coverage.total_files, 24);
+            assert_eq!(snapshot.coverage.represented_files, 24);
+            assert_eq!(snapshot.coverage.total_symbols, 120);
+            assert!(snapshot.coverage.represented_symbols > 0);
+        }
+
+        assert_eq!(strict.files.len(), 8, "strict budget detail cap");
+        assert!(
+            strict
+                .files
+                .iter()
+                .all(|file| file.symbol_count == 5 && file.represented_symbol_count > 0),
+            "strict digests must carry the fixture's per-file symbol counts"
+        );
+        assert!(
+            !strict.coverage_buckets.is_empty(),
+            "strict budget must bucket the undetailed files"
+        );
 
         assert!(strict.coverage.represented_symbols <= balanced.coverage.represented_symbols);
         assert!(balanced.coverage.represented_symbols <= max.coverage.represented_symbols);
@@ -4384,11 +4736,17 @@ mod tests {
                         .sum::<u32>(),
                 );
             assert_eq!(snapshot.coverage.represented_symbols, surfaced_symbols);
+            for bucket in &snapshot.coverage_buckets {
+                assert!(!bucket.label.is_empty(), "bucket must carry an identity");
+                assert!(bucket.file_count > 0);
+                assert!(bucket.symbol_count > 0);
+            }
         }
     }
 
     #[test]
     fn grounding_snapshot_batches_member_counts_line_fallbacks_and_edge_digests() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -4466,7 +4824,7 @@ mod tests {
                 .expect("insert occurrences");
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_with_storage_path(temp.path().to_path_buf(), db_path)
             .expect("open project");
@@ -4487,6 +4845,7 @@ mod tests {
 
     #[test]
     fn grounding_snapshot_uses_materialized_snapshot_after_summary_open() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -4554,7 +4913,21 @@ mod tests {
             );
         }
 
-        let controller = AppController::new();
+        // Diverge the live node table from the materialized snapshot without
+        // refreshing: a read path that bypasses the snapshot would surface the
+        // live-only name instead of the materialized one.
+        {
+            let storage = Storage::open(&db_path).expect("reopen for live divergence");
+            storage
+                .get_connection()
+                .execute(
+                    "UPDATE node SET serialized_name = 'live_only_helper' WHERE id = 102",
+                    [],
+                )
+                .expect("diverge live node table");
+        }
+
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_summary_with_storage_path(temp.path().to_path_buf(), db_path)
             .expect("open project summary");
@@ -4572,10 +4945,25 @@ mod tests {
                 .any(|symbol| symbol.label.starts_with("Controller")),
             "expected materialized root symbol to be surfaced"
         );
+        assert!(
+            snapshot
+                .root_symbols
+                .iter()
+                .any(|symbol| symbol.label.starts_with("helper")),
+            "materialized snapshot must serve the pre-divergence label"
+        );
+        assert!(
+            !snapshot
+                .root_symbols
+                .iter()
+                .any(|symbol| symbol.label.contains("live_only_helper")),
+            "summary-open grounding must not read the divergent live node table"
+        );
     }
 
     #[test]
     fn balanced_grounding_falls_back_to_live_detail_queries_when_detail_tier_is_dirty() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -4671,7 +5059,7 @@ mod tests {
             );
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_summary_with_storage_path(temp.path().to_path_buf(), db_path.clone())
             .expect("open project summary");
@@ -4700,6 +5088,7 @@ mod tests {
 
     #[test]
     fn max_grounding_does_not_mutate_an_incomplete_publication() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -4768,7 +5157,7 @@ mod tests {
                 .expect("refresh summary snapshots");
         }
 
-        let controller = AppController::new();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_summary_with_storage_path(temp.path().to_path_buf(), db_path.clone())
             .expect("open project summary");

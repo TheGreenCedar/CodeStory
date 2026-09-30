@@ -5,8 +5,9 @@ use codestory_retrieval::semantic_calibration_support::{
     CALIBRATION_FIXTURE_PATH, CALIBRATION_FIXTURE_TRANSFORMATION, CalibrationCandidate,
     CalibrationCaptureIdentity, CalibrationExpectedCall, CalibrationFixtureIdentity,
     CalibrationMetrics, CalibrationPolicy, CalibrationQuery, CalibrationSelection,
-    CalibrationSelectionContract, SemanticCalibrationCorpus, development_queries, hex_bytes,
-    load_attested_corpus, materialize_public_owner_fixture, query_vector_bytes, select_policy,
+    CalibrationSelectionContract, SemanticCalibrationCorpus, development_queries,
+    evaluate_corpus_under_product_policy, hex_bytes, load_attested_corpus,
+    materialize_public_owner_fixture, product_abstention_policy, query_vector_bytes, select_policy,
     sha256_bytes, validate_attested_repository_inputs, validate_holdout_disjointness,
 };
 use std::path::{Path, PathBuf};
@@ -148,12 +149,14 @@ fn checked_in_semantic_calibration_replays_the_product_policy() {
         CALIBRATION_HOLDOUT_MANIFEST_PATH,
     )
     .expect("checked-in semantic calibration evidence");
+    // The attested pair must be the product's own constants, and replaying the
+    // recorded raw scores through the shipped abstention rule must reproduce
+    // the recorded metrics — an unshared literal can no longer drift silently.
+    assert_eq!(corpus.selection.policy, product_abstention_policy());
     assert_eq!(
-        corpus.selection.policy,
-        CalibrationPolicy {
-            absolute_floor_hundredths: 30,
-            additive_margin_hundredths: 10,
-        }
+        evaluate_corpus_under_product_policy(&corpus).expect("product policy replay"),
+        corpus.selection.metrics,
+        "the shipped abstention rule admits a different set than the attested selection"
     );
     assert_eq!(corpus.selection.metrics.relevant_at_10, 9);
     assert_eq!(corpus.selection.metrics.relevant_total, 9);

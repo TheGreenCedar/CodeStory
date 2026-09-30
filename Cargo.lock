@@ -522,7 +522,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-agent"
-version = "0.17.6"
+version = "0.17.7"
 dependencies = [
  "codestory-contracts",
  "serde",
@@ -533,7 +533,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-bench"
-version = "0.17.6"
+version = "0.17.7"
 dependencies = [
  "anyhow",
  "clap",
@@ -557,7 +557,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-cli"
-version = "0.17.6"
+version = "0.17.7"
 dependencies = [
  "anyhow",
  "clap",
@@ -589,7 +589,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-contracts"
-version = "0.17.6"
+version = "0.17.7"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -603,11 +603,12 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "uuid",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
 name = "codestory-indexer"
-version = "0.17.6"
+version = "0.17.7"
 dependencies = [
  "anyhow",
  "codestory-contracts",
@@ -652,7 +653,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-llama-sys"
-version = "0.17.6"
+version = "0.17.7"
 dependencies = [
  "codestory-contracts",
  "crossbeam-channel",
@@ -667,7 +668,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-retrieval"
-version = "0.17.6"
+version = "0.17.7"
 dependencies = [
  "anyhow",
  "chrono",
@@ -692,7 +693,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-runtime"
-version = "0.17.6"
+version = "0.17.7"
 dependencies = [
  "anyhow",
  "codestory-agent",
@@ -714,13 +715,12 @@ dependencies = [
  "tantivy",
  "tempfile",
  "tracing",
- "ureq",
  "uuid",
 ]
 
 [[package]]
 name = "codestory-store"
-version = "0.17.6"
+version = "0.17.7"
 dependencies = [
  "anyhow",
  "codestory-contracts",
@@ -740,7 +740,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-workspace"
-version = "0.17.6"
+version = "0.17.7"
 dependencies = [
  "anyhow",
  "codestory-contracts",

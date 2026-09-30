@@ -380,6 +380,7 @@ pub(crate) fn config_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
 mod tests {
     use super::*;
     use anyhow::Result;
+    use serde_json::{Value, json};
     use std::ffi::OsString;
     use tempfile::tempdir;
 
@@ -728,11 +729,72 @@ summary_model = "trusted/model"
 
         let mut startup = isolated_startup();
         startup.user_home = Some(home.path().to_path_buf());
-        let (_, warnings) = load_config_report(project.path(), &startup)?;
+        let (config, warnings) = load_config_report(project.path(), &startup)?;
 
         assert!(
             warnings.is_empty(),
             "registered keys must not be reported as unknown: {warnings:?}"
+        );
+
+        // Registry completeness alone is not enough: a registered key that no
+        // CliConfig field claims produces no warning, so each key must prove
+        // the literal nondefault value it wrote actually landed.
+        for entry in codestory_contracts::config_registry::CONFIG_FILE_KEYS {
+            let written = match entry.kind {
+                codestory_contracts::config_registry::SettingKind::Boolean => json!(true),
+                codestory_contracts::config_registry::SettingKind::Integer => json!(1),
+                _ => json!("value"),
+            };
+            let loaded = match entry.key {
+                codestory_contracts::config_registry::CONFIG_SCHEMA_VERSION_KEY => {
+                    // Consumed by the version gate itself, not a CliConfig field.
+                    Some(written.clone())
+                }
+                "cache_dir" => config
+                    .cache_dir
+                    .as_ref()
+                    .map(|path| json!(path.to_string_lossy())),
+                "hybrid_retrieval_enabled" => config.hybrid_retrieval_enabled.map(Value::from),
+                "semantic_doc_alias_mode" => config
+                    .semantic_doc_alias_mode
+                    .as_ref()
+                    .map(|value| json!(value)),
+                "semantic_doc_scope" => {
+                    config.semantic_doc_scope.as_ref().map(|value| json!(value))
+                }
+                "summary_endpoint" => config.summary_endpoint.as_ref().map(|value| json!(value)),
+                "summary_model" => config.summary_model.as_ref().map(|value| json!(value)),
+                other => panic!("registry key {other} has no proven CliConfig mapping"),
+            };
+            assert_eq!(
+                loaded.as_ref(),
+                Some(&written),
+                "registered key {} did not load its written value",
+                entry.key
+            );
+        }
+
+        // The runtime overrides carry the retrieval-facing subset verbatim.
+        let overrides = config.runtime_overrides();
+        assert_eq!(
+            overrides.hybrid_retrieval_enabled,
+            config.hybrid_retrieval_enabled
+        );
+        assert_eq!(
+            overrides.semantic_doc_scope.as_deref(),
+            config.semantic_doc_scope.as_deref()
+        );
+        assert_eq!(
+            overrides.semantic_doc_alias_mode.as_deref(),
+            config.semantic_doc_alias_mode.as_deref()
+        );
+        assert_eq!(
+            overrides.summary_endpoint.as_deref(),
+            config.summary_endpoint.as_deref()
+        );
+        assert_eq!(
+            overrides.summary_model.as_deref(),
+            config.summary_model.as_deref()
         );
 
         Ok(())

@@ -2092,8 +2092,26 @@ mod tests {
 
     #[test]
     fn executor_resolve_mode_probes_live_sidecar_layout_instead_of_env_default() {
-        let layout = SidecarLayout::from_env();
+        let project = tempfile::TempDir::new().expect("project");
+        std::fs::write(project.path().join("lib.rs"), "pub fn alpha() {}").expect("write source");
+        let data = tempfile::TempDir::new().expect("sidecar data root");
+        let mut layout = SidecarLayout::from_env();
+        layout.lexical_data_dir = data.path().join("lexical");
+        layout.semantic_data_dir = data.path().join("semantic");
+        layout.scip_artifacts_root = data.path().join("scip");
         let manifest = retrieval_manifest_fixture("testproj", "cafebabedeadbeef");
+        let generation = manifest.sidecar_generation.as_deref().expect("generation");
+        let fingerprint = crate::lexical_index::lexical_input_fingerprint(project.path(), None)
+            .expect("fingerprint");
+        crate::lexical_index::build_lexical_shard(
+            project.path(),
+            None,
+            &layout.lexical_data_dir,
+            generation,
+            &fingerprint,
+            manifest.sidecar_input_hash.as_deref().expect("input hash"),
+        )
+        .expect("build lexical shard");
         let sidecars = Arc::new(TrackingSidecars {
             layout,
             layout_calls: AtomicUsize::new(0),
@@ -2111,8 +2129,14 @@ mod tests {
         let (mode, reason) = executor.resolve_mode(CandidatePayloadMode::Full);
 
         assert_eq!(sidecars.layout_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(mode, RetrievalDegradedMode::Unavailable);
-        assert_eq!(reason.as_deref(), Some("lexical_shard_unavailable"));
+        // The supplied layout carries a valid lexical shard; an env-default
+        // probe would still report the lexical lane unavailable.
+        assert_ne!(reason.as_deref(), Some("lexical_shard_unavailable"));
+        assert_ne!(
+            mode,
+            RetrievalDegradedMode::Unavailable,
+            "probing the supplied layout must not report Unavailable: {reason:?}"
+        );
     }
 
     #[test]
@@ -3075,11 +3099,24 @@ mod tests {
 
     #[test]
     fn cancellation_after_last_stage_marks_result_and_suppresses_cache_write() {
-        struct CancelOnReturn {
+        // `enrich_candidates` runs after each stage's completed result is
+        // accepted. Flipping the request flag only once the last stage
+        // (Stage2ScipExpand) has run lands the cancellation strictly after
+        // final-stage completion, exercising the post-sequence marking and
+        // cache-write suppression rather than an in-stage cancel.
+        struct CancelAfterLastStage {
             cancelled: Arc<AtomicBool>,
+            last_stage_ran: AtomicBool,
         }
 
-        impl SidecarSearch for CancelOnReturn {
+        impl SidecarSearch for CancelAfterLastStage {
+            fn enrich_candidates(&self, _candidates: &mut [CandidateHit]) -> Result<()> {
+                if self.last_stage_ran.load(Ordering::Acquire) {
+                    self.cancelled.store(true, Ordering::Release);
+                }
+                Ok(())
+            }
+
             fn lexical_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
                 Ok(Vec::new())
             }
@@ -3089,7 +3126,6 @@ mod tests {
             }
 
             fn scip_anchor(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
-                self.cancelled.store(true, Ordering::Release);
                 Ok(vec![CandidateHit::with_source(
                     "src/late.rs",
                     Some("EventProcessor".into()),
@@ -3103,16 +3139,19 @@ mod tests {
                 _anchors: &[CandidateHit],
                 _limit: usize,
             ) -> Result<Vec<CandidateHit>> {
+                self.last_stage_ran.store(true, Ordering::Release);
                 Ok(Vec::new())
             }
         }
 
         let cancelled = cancellation_flag();
+        let sidecars = Arc::new(CancelAfterLastStage {
+            cancelled: Arc::clone(&cancelled),
+            last_stage_ran: AtomicBool::new(false),
+        });
         let mut cache = RetrievalCache::new();
         let mut executor = QueryExecutor {
-            sidecars: Arc::new(CancelOnReturn {
-                cancelled: Arc::clone(&cancelled),
-            }),
+            sidecars: sidecars.clone(),
             cache: &mut cache,
             manifest: Some(sample_manifest()),
             file_roles: Arc::new(HashMap::new()),
@@ -3124,10 +3163,23 @@ mod tests {
             .execute("EventProcessor", Some(500))
             .expect("query");
 
+        assert!(
+            sidecars.last_stage_ran.load(Ordering::Acquire),
+            "the fixture must observe the last stage run"
+        );
+        assert!(
+            result
+                .trace
+                .stages
+                .iter()
+                .all(|stage| stage.completion_status == StageCompletionStatus::Completed),
+            "cancellation must land after every stage completed: {:?}",
+            result.trace.stages
+        );
         assert_eq!(result.trace.cancel_reason.as_deref(), Some("cancelled"));
         assert!(
-            result.hits.is_empty(),
-            "cancelled stage hits must be discarded"
+            !result.hits.is_empty(),
+            "assembled hits remain with the cancellation marked"
         );
         assert!(cache.is_empty());
     }
