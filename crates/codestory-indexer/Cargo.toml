@@ -14,6 +14,7 @@ codestory-store = { workspace = true }
 codestory-workspace = { workspace = true }
 crossbeam-channel = { workspace = true }
 flate2 = "=1.1.9"
+finl_unicode = "=1.4.0"
 ignore = { workspace = true }
 jsonc-parser = { workspace = true }
 parking_lot = { workspace = true }

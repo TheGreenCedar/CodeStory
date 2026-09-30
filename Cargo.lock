@@ -615,6 +615,7 @@ dependencies = [
  "codestory-store",
  "codestory-workspace",
  "crossbeam-channel",
+ "finl_unicode",
  "flate2",
  "ignore",
  "jsonc-parser",

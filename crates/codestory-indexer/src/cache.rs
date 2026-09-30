@@ -757,6 +757,7 @@ pub(crate) fn build_index_artifact_cache_key(
     }
     if language_config.language_name == "go" {
         mix_str(&mut state, "go-method-receiver-capture-v1");
+        mix_str(&mut state, "go-member-export-access-v1");
     }
     if FRAMEWORK_ROUTE_LANGUAGE_NAMES.contains(&language_config.language_name) {
         mix_str(&mut state, "framework-route-declaration-identity-v1");
@@ -1167,6 +1168,9 @@ mod tests {
             mix_str(&mut previous, config.language_name);
             mix_str(&mut previous, config.graph_query);
             mix_optional_str(&mut previous, config.tags_query);
+            if config.language_name == "go" {
+                mix_str(&mut previous, "go-member-export-access-v1");
+            }
             if matches!(
                 config.language_name,
                 "c" | "cpp" | "javascript" | "typescript"
@@ -1185,6 +1189,45 @@ mod tests {
             )
             .expect("cache key");
 
+            assert_eq!(current != previous, extension == "go", "{extension}");
+        }
+    }
+
+    #[test]
+    fn go_member_export_access_invalidates_only_previous_go_artifacts() {
+        for extension in ["go", "rs", "py", "c", "cpp", "js", "ts", "tsx"] {
+            let config = crate::get_language_for_ext(extension).expect("parser config");
+            let root = Path::new("project");
+            let cache_path = Path::new("source");
+            let source = b"unchanged source";
+            let mut previous = FNV_OFFSET_BASIS;
+            mix_str(&mut previous, "index-artifact");
+            mix_u32(&mut previous, INDEX_ARTIFACT_CACHE_VERSION);
+            mix_path(&mut previous, cache_path).expect("portable path");
+            mix_bytes(&mut previous, source);
+            mix_str(&mut previous, config.language_name);
+            mix_str(&mut previous, config.graph_query);
+            mix_optional_str(&mut previous, config.tags_query);
+            if matches!(
+                config.language_name,
+                "c" | "cpp" | "javascript" | "typescript"
+            ) {
+                mix_str(&mut previous, "callable-identity-and-scope-v3");
+            }
+            if config.language_name == "go" {
+                mix_str(&mut previous, "go-method-receiver-capture-v1");
+            }
+            if FRAMEWORK_ROUTE_LANGUAGE_NAMES.contains(&config.language_name) {
+                mix_str(&mut previous, "framework-route-declaration-identity-v1");
+            }
+            mix_bool(&mut previous, false);
+            mix_bool(&mut previous, true);
+            mix_compilation_info(&mut previous, root, None).expect("portable config");
+            let previous = format!("v{INDEX_ARTIFACT_CACHE_VERSION}:{previous:016x}");
+            let current = build_index_artifact_cache_key(
+                root, cache_path, source, &config, None, false, true,
+            )
+            .expect("cache key");
             assert_eq!(current != previous, extension == "go", "{extension}");
         }
     }
@@ -1217,6 +1260,7 @@ mod tests {
             }
             if config.language_name == "go" {
                 mix_str(&mut previous, "go-method-receiver-capture-v1");
+                mix_str(&mut previous, "go-member-export-access-v1");
             }
             mix_bool(&mut previous, false);
             mix_bool(&mut previous, true);
