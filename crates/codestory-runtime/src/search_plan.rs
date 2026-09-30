@@ -1962,7 +1962,7 @@ impl AppController {
         // cannot see them. The scan itself is the same one the non-sidecar path already
         // runs, deduplicated against the indexed hits so repo text only ever adds evidence.
         let repo_text_enabled = repo_text_mode != SearchRepoTextMode::Off;
-        let repo_text_hits = if repo_text_enabled {
+        let (repo_text_hits, repo_text_stats) = if repo_text_enabled {
             let scan = Self::collect_repo_text_hits(
                 &storage,
                 Some(project_root.as_path()),
@@ -1973,9 +1973,9 @@ impl AppController {
             )?;
             let mut hits = scan.hits;
             annotate_search_hit_match_quality(&query, &mut hits);
-            hits
+            (hits, Some(scan.stats))
         } else {
-            Vec::new()
+            (Vec::new(), None)
         };
         let mut suggestions = Vec::new();
         let query_assessment = search_query_assessment(
@@ -2103,7 +2103,7 @@ impl AppController {
             repo_text_enabled,
             query_assessment: Some(query_assessment),
             search_plan,
-            repo_text_stats: None,
+            repo_text_stats,
             suggestions,
             indexed_symbol_hits,
             repo_text_hits,

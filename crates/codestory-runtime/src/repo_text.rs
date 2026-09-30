@@ -20,7 +20,6 @@ pub(super) const REPO_TEXT_MAX_FILE_BYTES: u64 =
 #[derive(Debug, Clone)]
 pub(super) struct RepoTextScan {
     pub(super) hits: Vec<SearchHit>,
-    #[cfg(test)]
     pub(super) stats: RepoTextScanStatsDto,
 }
 
@@ -105,7 +104,6 @@ impl AppController {
         if query.trim().is_empty() || limit == 0 {
             return Ok(RepoTextScan {
                 hits: Vec::new(),
-                #[cfg(test)]
                 stats,
             });
         }
@@ -205,11 +203,7 @@ impl AppController {
         });
         hits.truncate(limit);
         stats.duration_ms = clamp_u128_to_u32(started_at.elapsed().as_millis());
-        Ok(RepoTextScan {
-            hits,
-            #[cfg(test)]
-            stats,
-        })
+        Ok(RepoTextScan { hits, stats })
     }
 
     pub(super) fn repo_text_scan_should_stop(

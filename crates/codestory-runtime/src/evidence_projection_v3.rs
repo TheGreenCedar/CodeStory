@@ -578,6 +578,20 @@ pub fn project_search_v3(
             Some("Additional search rows were omitted from the bounded public projection."),
         )?);
     }
+    if results.repo_text_enabled
+        && results
+            .repo_text_stats
+            .as_ref()
+            .is_some_and(|stats| stats.truncated || stats.skipped_large_file_count > 0)
+    {
+        gaps.push(gap_row(
+            "search-repo-text-incomplete",
+            GapKindV3Dto::EvidenceMissing,
+            Some(
+                "Repository-text search did not inspect all files within its scan budget. Additional matches may exist in unscanned files.",
+            ),
+        )?);
+    }
     if results.retrieval_publication.is_none() && !symbolic {
         gaps.push(gap_row(
             "search-retrieval-unavailable",
@@ -1065,12 +1079,31 @@ mod tests {
         crate::AppController,
         crate::services::PublicOperationService,
     ) {
+        indexed_search_fixture_with_files(1)
+    }
+
+    fn indexed_search_fixture_with_files(
+        file_count: usize,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        crate::AppController,
+        crate::services::PublicOperationService,
+    ) {
         let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project = tempfile::tempdir().expect("project");
         let state = tempfile::tempdir().expect("isolated cache");
         let source = project.path().join("src/layout.css");
         fs::create_dir_all(source.parent().expect("source parent")).expect("source directory");
         fs::write(&source, "/* REPO_TEXT_TOKEN */\nbody { color: red; }\n").expect("source");
+        for index in 1..file_count {
+            fs::write(
+                project.path().join(format!("src/file_{index:04}.css")),
+                "body { color: blue; }\n",
+            )
+            .expect("additional source");
+        }
         let controller = crate::AppController::new_with_owned_cache_root(process_cache.path());
         controller
             .open_project_summary_with_storage_path(
@@ -1093,6 +1126,87 @@ mod tests {
             expand_search_plan: false,
             hybrid_weights: None,
             hybrid_limits: None,
+        }
+    }
+
+    #[test]
+    fn search_projection_discloses_real_bounded_repo_text_scan() {
+        for file_count in [1, crate::repo_text::REPO_TEXT_SCAN_FILE_CAP + 3] {
+            let (project, _state, _process_cache, controller, service) =
+                indexed_search_fixture_with_files(file_count);
+            let projected = service
+                .run_observational_with_cancel("search", Arc::new(AtomicBool::new(false)), || {
+                    let mut results =
+                        controller.search_results(core_search_request("ABSENT_TOKEN"))?;
+                    let storage = controller.open_storage_read_only()?;
+                    let scan = crate::AppController::collect_repo_text_hits(
+                        &storage,
+                        Some(project.path()),
+                        &codestory_workspace::SourceIndexPolicy::default(),
+                        "ABSENT_TOKEN",
+                        10,
+                        &HashSet::new(),
+                    )?;
+                    assert!(scan.hits.is_empty());
+                    assert_eq!(scan.stats.truncated, file_count > 1);
+                    results.repo_text_hits = scan.hits;
+                    results.repo_text_stats = Some(scan.stats);
+                    results.repo_text_mode = SearchRepoTextMode::On;
+                    results.repo_text_enabled = true;
+                    project_search_v3(&service, "test", &results)
+                })
+                .expect("schema-3 projection")
+                .value;
+            assert_eq!(
+                projected.gaps.as_slice().iter().any(|gap| {
+                    gap.identity.gap_id.as_str() == "search-repo-text-incomplete"
+                        && gap.kind == GapKindV3Dto::EvidenceMissing
+                }),
+                file_count > 1,
+                "an empty bounded scan cannot establish source absence: {projected:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_projection_discloses_skipped_files_only_for_requested_text_lane() {
+        let (_project, _state, _process_cache, controller, service) = indexed_search_fixture();
+        for (enabled, truncated, expected_gap) in [(true, false, true), (false, true, false)] {
+            let projected = service
+                .run_observational_with_cancel("search", Arc::new(AtomicBool::new(false)), || {
+                    let mut results =
+                        controller.search_results(core_search_request("layout.css"))?;
+                    results.repo_text_enabled = enabled;
+                    results.repo_text_stats =
+                        Some(codestory_contracts::api::RepoTextScanStatsDto {
+                            scanned_file_count: 1,
+                            scanned_byte_count: 0,
+                            skipped_large_file_count: 1,
+                            file_cap: 2_000,
+                            byte_cap: 32 * 1024 * 1024,
+                            time_cap_ms: 500,
+                            duration_ms: 0,
+                            truncated,
+                            reason: None,
+                            action: None,
+                        });
+                    project_search_v3(&service, "test", &results)
+                })
+                .expect("schema-3 projection")
+                .value;
+            assert_eq!(
+                projected
+                    .gaps
+                    .as_slice()
+                    .iter()
+                    .any(|gap| { gap.identity.gap_id.as_str() == "search-repo-text-incomplete" }),
+                expected_gap,
+                "skipped files limit requested text evidence, not core-only search"
+            );
+            assert!(
+                !projected.evidence.as_slice().is_empty(),
+                "retain located source"
+            );
         }
     }
 
