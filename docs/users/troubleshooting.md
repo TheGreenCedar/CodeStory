@@ -80,8 +80,8 @@ when the running CLI includes the fix.
 
 Install matching CLI and plugin versions, restart the host, then rebuild each
 Go project's core map with the full-refresh command above. New indexes already
-use the corrected parser. This rebuild has an indexing cost; it does not claim
-that broad search is ready.
+use the corrected parser. Allow time for reindexing. For packet/search, check
+[broad-search readiness](#broad-search-is-preparing-or-unavailable) separately.
 
 ## Broad search is preparing or unavailable
 
