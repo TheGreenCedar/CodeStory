@@ -60,8 +60,8 @@ codestory-cli index --project <repo> --refresh auto --format json
 codestory-cli doctor --project <repo>
 ```
 
-Use a full rebuild only when diagnostics identify cache, schema, or publication
-uncertainty:
+Use a full rebuild when diagnostics identify cache, schema, or publication
+uncertainty, or release notes require reindexing after a parser correction:
 
 ```sh
 codestory-cli index --project <repo> --refresh full --format json
@@ -70,6 +70,18 @@ codestory-cli index --project <repo> --refresh full --format json
 Moving a project cache aside is a last-resort diagnostic. Get its exact path
 from `doctor`, verify it is under the active CodeStory cache root, preserve the
 old directory, and rebuild before removing anything.
+
+### Parser corrections after an upgrade
+
+When upgrading to a version that corrects Go method visibility, existing Go
+indexes need a full core refresh to apply the correction. An incremental refresh
+can reuse unchanged published files and retain their old access labels, even
+when the running CLI includes the fix.
+
+Install matching CLI and plugin versions, restart the host, then rebuild each
+Go project's core map with the full-refresh command above. New indexes already
+use the corrected parser. This rebuild has an indexing cost; it does not claim
+that broad search is ready.
 
 ## Broad search is preparing or unavailable
 
