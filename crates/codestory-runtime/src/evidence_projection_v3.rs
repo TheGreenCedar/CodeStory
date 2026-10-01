@@ -592,6 +592,26 @@ pub fn project_search_v3(
             ),
         )?);
     }
+    if !symbolic
+        && results.retrieval_shadow.as_ref().is_some_and(|shadow| {
+            shadow.retrieval_mode == "full"
+                && (matches!(
+                    shadow.cancel_reason.as_deref(),
+                    Some("deadline" | "stage_deadline" | "cancelled")
+                ) || shadow.stage_timings.iter().any(|stage| {
+                    matches!(
+                        stage.completion_status.as_str(),
+                        "pending_after_deadline" | "cancelled_before_start"
+                    )
+                }))
+        })
+    {
+        gaps.push(gap_row(
+            "search-retrieval-interrupted",
+            GapKindV3Dto::EvidenceMissing,
+            Some("Retrieval reported a deadline or cancellation. Additional matches may exist."),
+        )?);
+    }
     if results.retrieval_publication.is_none() && !symbolic {
         gaps.push(gap_row(
             "search-retrieval-unavailable",
@@ -1126,6 +1146,262 @@ mod tests {
             expand_search_plan: false,
             hybrid_weights: None,
             hybrid_limits: None,
+        }
+    }
+
+    #[test]
+    fn search_projection_discloses_interrupted_retrieval_without_changing_availability() {
+        use codestory_contracts::api::{RetrievalModeDto, RetrievalShadowDto};
+        use codestory_contracts::packet_projection_v3::{
+            EvidenceAvailabilityV3Dto, SearchProjectionKindV3Dto,
+        };
+
+        let fixture = crate::services::activation_tests::ready_activation_fixture();
+        let service = fixture.runtime.public_operation_service();
+        let browser = fixture.runtime.browser_service();
+        let mut results = service
+            .run_with_cancel("exact_search", Arc::new(AtomicBool::new(false)), || {
+                browser.search_results(core_search_request("metadata.rs"))
+            })
+            .expect("located core search evidence")
+            .value;
+
+        for query in [
+            "TF_VAR",
+            "decode module settings",
+            "src/layout.css",
+            "Handler::Load",
+        ] {
+            results.query = query.into();
+            let baseline = service
+                .run_with_cancel("search", Arc::new(AtomicBool::new(false)), || {
+                    let mut admitted = results.clone();
+                    admitted.retrieval.mode = RetrievalModeDto::Hybrid;
+                    admitted.retrieval_publication = service
+                        .active_publication()
+                        .expect("full search owns a publication snapshot")
+                        .retrieval_publication;
+                    assert!(admitted.retrieval_publication.is_some());
+                    project_search_v3(&service, "test", &admitted)
+                })
+                .expect("complete search projection")
+                .value;
+            assert!(!baseline.evidence.as_slice().is_empty());
+            assert_eq!(baseline.retrieval.state, RetrievalStateV3Dto::Full);
+
+            for (name, aggregate_stop, stage_status, stage_stop, full, expected_gap) in [
+                ("completed", None, Some("completed"), None, true, false),
+                (
+                    "witnessed lexical deadline",
+                    Some("stage_deadline"),
+                    Some("pending_after_deadline"),
+                    Some("stage_deadline"),
+                    true,
+                    true,
+                ),
+                (
+                    "unfinished stage without aggregate stop",
+                    None,
+                    Some("pending_after_deadline"),
+                    None,
+                    true,
+                    true,
+                ),
+                (
+                    "cancelled before execution",
+                    None,
+                    Some("cancelled_before_start"),
+                    Some("cancelled"),
+                    true,
+                    true,
+                ),
+                (
+                    "early request deadline",
+                    Some("deadline"),
+                    None,
+                    None,
+                    true,
+                    true,
+                ),
+                (
+                    "cancelled without stage rows",
+                    Some("cancelled"),
+                    None,
+                    None,
+                    true,
+                    true,
+                ),
+                (
+                    "all stages completed before cancellation",
+                    Some("cancelled"),
+                    Some("completed"),
+                    None,
+                    true,
+                    true,
+                ),
+                (
+                    "completed late",
+                    None,
+                    Some("completed_late"),
+                    None,
+                    true,
+                    false,
+                ),
+                (
+                    "exact definition skips broad lane",
+                    None,
+                    Some("skipped"),
+                    Some("unique_exact_definition"),
+                    true,
+                    false,
+                ),
+                (
+                    "empty dense lane skipped",
+                    None,
+                    Some("skipped"),
+                    Some("zero_dense_anchors"),
+                    true,
+                    false,
+                ),
+                (
+                    "normal marginal gain stop",
+                    Some("marginal_gain"),
+                    Some("completed"),
+                    None,
+                    true,
+                    false,
+                ),
+                (
+                    "opaque stop reason",
+                    Some("unknown_internal_reason"),
+                    Some("completed"),
+                    None,
+                    true,
+                    false,
+                ),
+                (
+                    "core-only ignores foreign shadow",
+                    Some("stage_deadline"),
+                    Some("pending_after_deadline"),
+                    Some("stage_deadline"),
+                    false,
+                    false,
+                ),
+            ] {
+                let mut case = results.clone();
+                let stages = stage_status
+                    .map(|status| {
+                        vec![json!({
+                            "stage": "stage1_lexical",
+                            "deadline_ms": 96,
+                            "elapsed_ms": 97,
+                            "queue_wait_ms": 0,
+                            "candidates_added": 0,
+                            "cancel_reason": stage_stop,
+                            "completion_status": status,
+                            "cache_hit": false,
+                        })]
+                    })
+                    .unwrap_or_default();
+                case.retrieval_shadow = Some(
+                    serde_json::from_value::<RetrievalShadowDto>(json!({
+                        "retrieval_mode": "full",
+                        "retrieval_total_ms": 4754,
+                        "total_budget_ms": 420,
+                        "cancel_reason": aggregate_stop,
+                        "cache_hit": false,
+                        "stage_timings": stages,
+                    }))
+                    .expect("existing execution shadow contract"),
+                );
+                let projected = service
+                    .run_with_cancel(
+                        if full { "search" } else { "exact_search" },
+                        Arc::new(AtomicBool::new(false)),
+                        || {
+                            let mut admitted = case.clone();
+                            admitted.retrieval.mode = if full {
+                                RetrievalModeDto::Hybrid
+                            } else {
+                                RetrievalModeDto::Symbolic
+                            };
+                            admitted.retrieval_publication = service
+                                .active_publication()
+                                .expect("search owns a publication snapshot")
+                                .retrieval_publication;
+                            assert_eq!(admitted.retrieval_publication.is_some(), full);
+                            project_search_v3(&service, "test", &admitted)
+                        },
+                    )
+                    .expect("search projection")
+                    .value;
+                let interruption_gaps: Vec<_> = projected
+                    .gaps
+                    .as_slice()
+                    .iter()
+                    .filter(|gap| gap.identity.gap_id.as_str() == "search-retrieval-interrupted")
+                    .collect();
+                assert_eq!(
+                    interruption_gaps.len(),
+                    usize::from(expected_gap),
+                    "{name}; query={query}"
+                );
+                for gap in interruption_gaps {
+                    assert_eq!(gap.kind, GapKindV3Dto::EvidenceMissing);
+                    let summary = gap
+                        .message
+                        .as_ref()
+                        .expect("factual interruption disclosure")
+                        .as_str();
+                    assert!(
+                        summary.contains("deadline") && summary.contains("cancellation"),
+                        "{name}: {summary}"
+                    );
+                    assert!(
+                        !summary.contains("publication"),
+                        "a query stop is not a partial publication"
+                    );
+                    assert!(
+                        !summary.contains("lexical"),
+                        "aggregate stops do not identify a failed stage"
+                    );
+                }
+                assert_eq!(
+                    projected.evidence, baseline.evidence,
+                    "retain admitted locations: {name}"
+                );
+                assert_eq!(
+                    projected.publication.core, baseline.publication.core,
+                    "retain pinned core: {name}"
+                );
+                assert_eq!(
+                    projected.status,
+                    EvidenceAvailabilityV3Dto::Available,
+                    "{name}"
+                );
+                assert_eq!(
+                    projected.kind,
+                    SearchProjectionKindV3Dto::Complete,
+                    "{name}"
+                );
+                assert_eq!(
+                    projected.diagnostics,
+                    DiagnosticsCapabilityV3Dto::Unavailable,
+                    "{name}"
+                );
+                if full {
+                    assert_eq!(
+                        projected.publication, baseline.publication,
+                        "retain retrieval publication: {name}"
+                    );
+                    assert_eq!(
+                        projected.retrieval, baseline.retrieval,
+                        "retain publication eligibility: {name}"
+                    );
+                } else {
+                    assert_eq!(projected.retrieval.state, RetrievalStateV3Dto::Symbolic);
+                }
+            }
         }
     }
 
