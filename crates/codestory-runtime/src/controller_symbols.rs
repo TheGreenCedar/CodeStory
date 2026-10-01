@@ -482,7 +482,8 @@ impl AppController {
         children.sort_by_cached_key(node_display_name);
 
         let labels_by_id = self.cached_labels(children.iter().map(|node| node.id));
-        children = Self::dedupe_symbol_nodes(children, &labels_by_id);
+        let mut seen = HashSet::new();
+        children.retain(|node| seen.insert(node.id));
         Self::symbol_summaries_for_nodes(&storage, &labels_by_id, children)
     }
 
