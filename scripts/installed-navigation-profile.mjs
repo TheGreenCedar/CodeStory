@@ -10,6 +10,7 @@ const sha = bytes => createHash('sha256').update(bytes).digest('hex');
 const save = (file, value) => writeFile(file, `${JSON.stringify(value, null, 2)}\n`);
 const requireThat = (condition, message) => { if (!condition) throw new Error(message); };
 const safeId = value => typeof value === 'string' && /^[a-zA-Z0-9_-]+$/.test(value);
+const NAVIGATION_MODEL = Object.freeze({ name: 'gpt-6.1-sol', reasoning_effort: 'low' });
 const HOST_ENVIRONMENT = ['HOME', 'USERPROFILE', 'TMPDIR', 'CODEX_HOME', 'XDG_CACHE_HOME', 'XDG_CONFIG_HOME',
   'CODESTORY_PLUGIN_DATA', 'CODESTORY_PLUGIN_RELEASE_DIR', 'CODESTORY_CACHE_ROOT', 'CODESTORY_STDIO_CACHE_ROOT',
   'CODESTORY_EMBED_ALLOW_CPU', 'CODESTORY_EMBED_QUALIFICATION_DIR', 'CODESTORY_EMBED_QUALIFICATION_NONCE'];
@@ -108,7 +109,7 @@ export function auditParticipantRuntime(events, arm) {
 
 export function validateManifest(manifest) {
   requireThat(manifest.schema_version === 1, 'unsupported navigation manifest');
-  requireThat(manifest.model?.name === 'gpt-5.6-terra' && manifest.model?.reasoning_effort === 'low', 'navigation model must be Terra low');
+  requireThat(manifest.model?.name === NAVIGATION_MODEL.name && manifest.model?.reasoning_effort === NAVIGATION_MODEL.reasoning_effort, 'navigation model must be Sol 6.1 low');
   requireThat(Array.isArray(manifest.repositories) && Array.isArray(manifest.tasks) && Array.isArray(manifest.sessions), 'manifest needs repositories, tasks and sessions');
   const repos = new Map(manifest.repositories.map(repo => [repo.id, repo]));
   const tasks = new Map(manifest.tasks.map(task => [task.id, task]));
@@ -186,7 +187,7 @@ export function navigationCommand(codex, project, output, temporary, effectMode)
   requireThat(['read_only', 'change'].includes(effectMode), 'participant needs a declared task effect mode');
   const sandbox = effectMode === 'read_only' ? 'read-only' : 'workspace-write';
   return { command: codex, sandbox,
-    args: ['exec', '--disable', 'remote_plugin', '--model', 'gpt-5.6-terra', '--config', 'model_reasoning_effort="low"', '--sandbox', sandbox, '--cd', project, '--add-dir', temporary, '--json', '--output-last-message', output, '-'] };
+    args: ['exec', '--disable', 'remote_plugin', '--model', NAVIGATION_MODEL.name, '--config', `model_reasoning_effort="${NAVIGATION_MODEL.reasoning_effort}"`, '--sandbox', sandbox, '--cd', project, '--add-dir', temporary, '--json', '--output-last-message', output, '-'] };
 }
 
 export function navigationEnvironment(parent, root, nonce) {
@@ -375,8 +376,8 @@ async function withParticipantHost(session, helpers, name, action) {
   try {
     await request('initialize', { clientInfo: { name: 'installed-navigation-canary', version: '1' }, capabilities: { experimentalApi: true } });
     channel.send({ method: 'initialized' });
-    const started = await request('thread/start', { cwd: session.project, model: 'gpt-5.6-terra', sandbox: 'workspace-write', approvalPolicy: 'never', ephemeral: true,
-      config: { model_reasoning_effort: 'low', 'sandbox_workspace_write.writable_roots': [env.TMPDIR] } });
+    const started = await request('thread/start', { cwd: session.project, model: NAVIGATION_MODEL.name, sandbox: 'workspace-write', approvalPolicy: 'never', ephemeral: true,
+      config: { model_reasoning_effort: NAVIGATION_MODEL.reasoning_effort, 'sandbox_workspace_write.writable_roots': [env.TMPDIR] } });
     const threadId = started.thread?.id;
     requireThat(typeof threadId === 'string', 'actual host did not create an ephemeral inspection context');
     const inventory = await request('mcpServerStatus/list', { threadId });
