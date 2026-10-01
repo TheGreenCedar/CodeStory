@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Search reports retrieval deadlines and cancellations while retaining located matches, so you can see when additional matches may exist.
 - Repository-text search reports when scan limits or skipped oversized files leave source uninspected, so missing matches do not appear exhaustive.
 - Go method graphs distinguish exported and unexported members, including Unicode names, so helper methods no longer appear public merely because their receiver is exported. Existing Go indexes need a [full core refresh](docs/users/troubleshooting.md#parser-corrections-after-an-upgrade) to apply this correction.
 - Packet continuation offers up to eight distinct follow-up actions, so multiple gaps for the same target no longer crowd out another choice.
