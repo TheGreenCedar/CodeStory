@@ -10,15 +10,15 @@
     ],
     "preferredMcpProtocolVersion": "2025-11-25",
     "discoveryContracts": {
-      "2024-11-05": "6f3c26dc77b62728ac7ba402abafa5c97662bf5f57981ec638361726a0a71318",
-      "2025-03-26": "4735b1bcff7d44a07cd4aa6dde44b594fbf0b188703700e57dec30fcf0ecdef0",
-      "2025-06-18": "1494a59fc253ffe457c5a4c591a327354321a720f3daed93b481efaad38eb3b9",
-      "2025-11-25": "f9c390db818c3060628163beac29ff52ffd8dac44a123cb9bd0acc6771d3dfa3"
+      "2024-11-05": "9d438cfc5915e890873267c9e22789ac5637f09b7c1530f84cdbe657e0ac8a5f",
+      "2025-03-26": "6e4f392113caefc05f4d237344e3e896aac3a12c7ac279ee322c4f18e59bb7e1",
+      "2025-06-18": "408be84d7d87f985c69c443704a9248c42ef191611c116ad8d927723936eedfc",
+      "2025-11-25": "1a75d3355e8b7aca024a8e96fbc866f118d7e69456df26b72f0da3b225e762f1"
     }
   },
   "revisionProfiles": {
     "2024-11-05": {
-      "discoveryContractSha256": "6f3c26dc77b62728ac7ba402abafa5c97662bf5f57981ec638361726a0a71318",
+      "discoveryContractSha256": "9d438cfc5915e890873267c9e22789ac5637f09b7c1530f84cdbe657e0ac8a5f",
       "tools": [
         {
           "description": "Inspect CodeStory readiness for the requested repository when diagnostics are needed. CodeStory effect: observational and does not activate managed state.",
@@ -272,6 +272,29 @@
                                 "disconnected_seed"
                               ],
                               "type": "string"
+                            },
+                            "source_range": {
+                              "additionalProperties": false,
+                              "description": "Optional pinned complete-line source request.",
+                              "properties": {
+                                "end_line": {
+                                  "description": "Last requested line.",
+                                  "maximum": 4294967295,
+                                  "minimum": 1,
+                                  "type": "integer"
+                                },
+                                "start_line": {
+                                  "description": "First requested line.",
+                                  "maximum": 4294967295,
+                                  "minimum": 1,
+                                  "type": "integer"
+                                }
+                              },
+                              "required": [
+                                "start_line",
+                                "end_line"
+                              ],
+                              "type": "object"
                             },
                             "stable_identity": {
                               "description": "Stable packet identity.",
@@ -1597,7 +1620,7 @@
                     "type": "string"
                   },
                   "paths": {
-                    "description": "File ranges to read in one call, instead of resolving a symbol. Line-numbered and bounded in total; use the paths and lines that search, trail, or packet already returned.",
+                    "description": "File ranges to read in one call, instead of resolving a symbol. Line-numbered and bounded in total; use exact paths from files, search, trail, or packet; filenames are paths, not symbol IDs.",
                     "items": {
                       "allOf": [
                         {
@@ -1884,7 +1907,7 @@
       ]
     },
     "2025-03-26": {
-      "discoveryContractSha256": "4735b1bcff7d44a07cd4aa6dde44b594fbf0b188703700e57dec30fcf0ecdef0",
+      "discoveryContractSha256": "6e4f392113caefc05f4d237344e3e896aac3a12c7ac279ee322c4f18e59bb7e1",
       "tools": [
         {
           "annotations": {
@@ -2150,6 +2173,29 @@
                                 "disconnected_seed"
                               ],
                               "type": "string"
+                            },
+                            "source_range": {
+                              "additionalProperties": false,
+                              "description": "Optional pinned complete-line source request.",
+                              "properties": {
+                                "end_line": {
+                                  "description": "Last requested line.",
+                                  "maximum": 4294967295,
+                                  "minimum": 1,
+                                  "type": "integer"
+                                },
+                                "start_line": {
+                                  "description": "First requested line.",
+                                  "maximum": 4294967295,
+                                  "minimum": 1,
+                                  "type": "integer"
+                                }
+                              },
+                              "required": [
+                                "start_line",
+                                "end_line"
+                              ],
+                              "type": "object"
                             },
                             "stable_identity": {
                               "description": "Stable packet identity.",
@@ -3577,7 +3623,7 @@
                     "type": "string"
                   },
                   "paths": {
-                    "description": "File ranges to read in one call, instead of resolving a symbol. Line-numbered and bounded in total; use the paths and lines that search, trail, or packet already returned.",
+                    "description": "File ranges to read in one call, instead of resolving a symbol. Line-numbered and bounded in total; use exact paths from files, search, trail, or packet; filenames are paths, not symbol IDs.",
                     "items": {
                       "allOf": [
                         {
@@ -3870,7 +3916,7 @@
       ]
     },
     "2025-06-18": {
-      "discoveryContractSha256": "1494a59fc253ffe457c5a4c591a327354321a720f3daed93b481efaad38eb3b9",
+      "discoveryContractSha256": "408be84d7d87f985c69c443704a9248c42ef191611c116ad8d927723936eedfc",
       "tools": [
         {
           "_meta": {
@@ -4345,6 +4391,29 @@
                               ],
                               "type": "string"
                             },
+                            "source_range": {
+                              "additionalProperties": false,
+                              "description": "Optional pinned complete-line source request.",
+                              "properties": {
+                                "end_line": {
+                                  "description": "Last requested line.",
+                                  "maximum": 4294967295,
+                                  "minimum": 1,
+                                  "type": "integer"
+                                },
+                                "start_line": {
+                                  "description": "First requested line.",
+                                  "maximum": 4294967295,
+                                  "minimum": 1,
+                                  "type": "integer"
+                                }
+                              },
+                              "required": [
+                                "start_line",
+                                "end_line"
+                              ],
+                              "type": "object"
+                            },
                             "stable_identity": {
                               "description": "Stable packet identity.",
                               "maxLength": 240,
@@ -4582,6 +4651,73 @@
                                       "type": "null"
                                     }
                                   ]
+                                },
+                                "source_delivery": {
+                                  "additionalProperties": false,
+                                  "description": "Verified source delivery and unread byte receipt.",
+                                  "properties": {
+                                    "blocked_line_rendered_bytes": {
+                                      "description": "Required rendered bytes for an overlong line.",
+                                      "maximum": 18446744073709552000,
+                                      "minimum": 1,
+                                      "type": [
+                                        "integer",
+                                        "null"
+                                      ]
+                                    },
+                                    "next_start_line": {
+                                      "description": "Next complete line, when recoverable.",
+                                      "maximum": 4294967295,
+                                      "minimum": 1,
+                                      "type": [
+                                        "integer",
+                                        "null"
+                                      ]
+                                    },
+                                    "remaining_source_bytes": {
+                                      "description": "Raw bytes not delivered.",
+                                      "maximum": 18446744073709552000,
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "requested_range": {
+                                      "additionalProperties": false,
+                                      "description": "Requested inclusive source range.",
+                                      "properties": {
+                                        "end_line": {
+                                          "description": "Last requested line.",
+                                          "maximum": 4294967295,
+                                          "minimum": 1,
+                                          "type": "integer"
+                                        },
+                                        "start_line": {
+                                          "description": "First requested line.",
+                                          "maximum": 4294967295,
+                                          "minimum": 1,
+                                          "type": "integer"
+                                        }
+                                      },
+                                      "required": [
+                                        "start_line",
+                                        "end_line"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "source_sha256": {
+                                      "description": "Verified indexed source digest.",
+                                      "maxLength": 64,
+                                      "minLength": 64,
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "requested_range",
+                                    "source_sha256",
+                                    "remaining_source_bytes",
+                                    "next_start_line",
+                                    "blocked_line_rendered_bytes"
+                                  ],
+                                  "type": "object"
                                 },
                                 "start_line": {
                                   "anyOf": [
@@ -12662,7 +12798,7 @@
                     "type": "string"
                   },
                   "paths": {
-                    "description": "File ranges to read in one call, instead of resolving a symbol. Line-numbered and bounded in total; use the paths and lines that search, trail, or packet already returned.",
+                    "description": "File ranges to read in one call, instead of resolving a symbol. Line-numbered and bounded in total; use exact paths from files, search, trail, or packet; filenames are paths, not symbol IDs.",
                     "items": {
                       "allOf": [
                         {
@@ -12844,6 +12980,10 @@
                         "description": "Typed stdio retry or unavailable code.",
                         "type": "string"
                       },
+                      "complete": {
+                        "description": "Every requested window was delivered through its end or EOF.",
+                        "type": "boolean"
+                      },
                       "deadline_exceeded": {
                         "description": "Whether the request wait deadline expired.",
                         "type": "boolean"
@@ -12867,6 +13007,10 @@
                         "description": "One-based focused line.",
                         "type": "integer"
                       },
+                      "max_response_bytes": {
+                        "description": "Serialized structured result byte bound, including metadata.",
+                        "type": "integer"
+                      },
                       "max_snippet_bytes": {
                         "description": "Snippet byte cap.",
                         "type": [
@@ -12875,7 +13019,7 @@
                         ]
                       },
                       "max_total_bytes": {
-                        "description": "Total byte cap for a batched paths call.",
+                        "description": "Shared rendered-snippet byte cap for a batched paths call; metadata has a separate response bound.",
                         "type": "integer"
                       },
                       "message": {
@@ -12889,6 +13033,10 @@
                       "node": {
                         "description": "Node details DTO.",
                         "type": "object"
+                      },
+                      "omitted_count": {
+                        "description": "Number of windows with omitted source lines.",
+                        "type": "integer"
                       },
                       "operation": {
                         "description": "Current managed preparation operation.",
@@ -12909,11 +13057,55 @@
                         "description": "Requested source ranges from a batched paths call.",
                         "items": {
                           "additionalProperties": false,
-                          "description": "One requested source range from a batched snippet.paths call.",
+                          "description": "One requested window and its actual source delivery receipt from snippet.paths.",
                           "properties": {
+                            "complete": {
+                              "description": "Requested window complete, including natural EOF clipping; not complete-file coverage.",
+                              "type": "boolean"
+                            },
+                            "delivered_end_line": {
+                              "description": "Actual last delivered physical line, or null.",
+                              "type": [
+                                "integer",
+                                "null"
+                              ]
+                            },
+                            "delivered_start_line": {
+                              "description": "Actual first delivered physical line, or null.",
+                              "type": [
+                                "integer",
+                                "null"
+                              ]
+                            },
                             "end_line": {
                               "description": "1-based last line.",
                               "type": "integer"
+                            },
+                            "last_line_terminated": {
+                              "description": "Whether the last delivered source line ended in LF.",
+                              "type": [
+                                "boolean",
+                                "null"
+                              ]
+                            },
+                            "next_start_line": {
+                              "description": "First omitted line; retry this line or use a larger ordinary file read for an oversized line.",
+                              "type": [
+                                "integer",
+                                "null"
+                              ]
+                            },
+                            "omission_reason": {
+                              "description": "Why complete source lines were omitted.",
+                              "enum": [
+                                "byte_budget",
+                                "line_exceeds_byte_budget",
+                                null
+                              ],
+                              "type": [
+                                "string",
+                                "null"
+                              ]
                             },
                             "path": {
                               "description": "Project-relative file path.",
@@ -12926,6 +13118,27 @@
                             "snippet_truncated": {
                               "description": "Whether this range hit a byte cap.",
                               "type": "boolean"
+                            },
+                            "source_kind": {
+                              "description": "Source provenance.",
+                              "enum": [
+                                "workspace_read"
+                              ],
+                              "type": "string"
+                            },
+                            "source_range_sha256": {
+                              "description": "Digest of delivered raw source bytes, not an indexed file digest.",
+                              "type": [
+                                "string",
+                                "null"
+                              ]
+                            },
+                            "source_total_lines": {
+                              "description": "File line count only when the read observed EOF.",
+                              "type": [
+                                "integer",
+                                "null"
+                              ]
                             },
                             "start_line": {
                               "description": "1-based first line.",
@@ -12980,6 +13193,10 @@
                       },
                       "requested_context": {
                         "description": "Requested context line count.",
+                        "type": "integer"
+                      },
+                      "requested_count": {
+                        "description": "Number of requested ranges; all receive receipts.",
                         "type": "integer"
                       },
                       "resume_operation_attempt": {
@@ -13821,7 +14038,7 @@
       ]
     },
     "2025-11-25": {
-      "discoveryContractSha256": "f9c390db818c3060628163beac29ff52ffd8dac44a123cb9bd0acc6771d3dfa3",
+      "discoveryContractSha256": "1a75d3355e8b7aca024a8e96fbc866f118d7e69456df26b72f0da3b225e762f1",
       "tools": [
         {
           "_meta": {
@@ -14296,6 +14513,29 @@
                               ],
                               "type": "string"
                             },
+                            "source_range": {
+                              "additionalProperties": false,
+                              "description": "Optional pinned complete-line source request.",
+                              "properties": {
+                                "end_line": {
+                                  "description": "Last requested line.",
+                                  "maximum": 4294967295,
+                                  "minimum": 1,
+                                  "type": "integer"
+                                },
+                                "start_line": {
+                                  "description": "First requested line.",
+                                  "maximum": 4294967295,
+                                  "minimum": 1,
+                                  "type": "integer"
+                                }
+                              },
+                              "required": [
+                                "start_line",
+                                "end_line"
+                              ],
+                              "type": "object"
+                            },
                             "stable_identity": {
                               "description": "Stable packet identity.",
                               "maxLength": 240,
@@ -14533,6 +14773,73 @@
                                       "type": "null"
                                     }
                                   ]
+                                },
+                                "source_delivery": {
+                                  "additionalProperties": false,
+                                  "description": "Verified source delivery and unread byte receipt.",
+                                  "properties": {
+                                    "blocked_line_rendered_bytes": {
+                                      "description": "Required rendered bytes for an overlong line.",
+                                      "maximum": 18446744073709552000,
+                                      "minimum": 1,
+                                      "type": [
+                                        "integer",
+                                        "null"
+                                      ]
+                                    },
+                                    "next_start_line": {
+                                      "description": "Next complete line, when recoverable.",
+                                      "maximum": 4294967295,
+                                      "minimum": 1,
+                                      "type": [
+                                        "integer",
+                                        "null"
+                                      ]
+                                    },
+                                    "remaining_source_bytes": {
+                                      "description": "Raw bytes not delivered.",
+                                      "maximum": 18446744073709552000,
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "requested_range": {
+                                      "additionalProperties": false,
+                                      "description": "Requested inclusive source range.",
+                                      "properties": {
+                                        "end_line": {
+                                          "description": "Last requested line.",
+                                          "maximum": 4294967295,
+                                          "minimum": 1,
+                                          "type": "integer"
+                                        },
+                                        "start_line": {
+                                          "description": "First requested line.",
+                                          "maximum": 4294967295,
+                                          "minimum": 1,
+                                          "type": "integer"
+                                        }
+                                      },
+                                      "required": [
+                                        "start_line",
+                                        "end_line"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "source_sha256": {
+                                      "description": "Verified indexed source digest.",
+                                      "maxLength": 64,
+                                      "minLength": 64,
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "requested_range",
+                                    "source_sha256",
+                                    "remaining_source_bytes",
+                                    "next_start_line",
+                                    "blocked_line_rendered_bytes"
+                                  ],
+                                  "type": "object"
                                 },
                                 "start_line": {
                                   "anyOf": [
@@ -22613,7 +22920,7 @@
                     "type": "string"
                   },
                   "paths": {
-                    "description": "File ranges to read in one call, instead of resolving a symbol. Line-numbered and bounded in total; use the paths and lines that search, trail, or packet already returned.",
+                    "description": "File ranges to read in one call, instead of resolving a symbol. Line-numbered and bounded in total; use exact paths from files, search, trail, or packet; filenames are paths, not symbol IDs.",
                     "items": {
                       "allOf": [
                         {
@@ -22795,6 +23102,10 @@
                         "description": "Typed stdio retry or unavailable code.",
                         "type": "string"
                       },
+                      "complete": {
+                        "description": "Every requested window was delivered through its end or EOF.",
+                        "type": "boolean"
+                      },
                       "deadline_exceeded": {
                         "description": "Whether the request wait deadline expired.",
                         "type": "boolean"
@@ -22818,6 +23129,10 @@
                         "description": "One-based focused line.",
                         "type": "integer"
                       },
+                      "max_response_bytes": {
+                        "description": "Serialized structured result byte bound, including metadata.",
+                        "type": "integer"
+                      },
                       "max_snippet_bytes": {
                         "description": "Snippet byte cap.",
                         "type": [
@@ -22826,7 +23141,7 @@
                         ]
                       },
                       "max_total_bytes": {
-                        "description": "Total byte cap for a batched paths call.",
+                        "description": "Shared rendered-snippet byte cap for a batched paths call; metadata has a separate response bound.",
                         "type": "integer"
                       },
                       "message": {
@@ -22840,6 +23155,10 @@
                       "node": {
                         "description": "Node details DTO.",
                         "type": "object"
+                      },
+                      "omitted_count": {
+                        "description": "Number of windows with omitted source lines.",
+                        "type": "integer"
                       },
                       "operation": {
                         "description": "Current managed preparation operation.",
@@ -22860,11 +23179,55 @@
                         "description": "Requested source ranges from a batched paths call.",
                         "items": {
                           "additionalProperties": false,
-                          "description": "One requested source range from a batched snippet.paths call.",
+                          "description": "One requested window and its actual source delivery receipt from snippet.paths.",
                           "properties": {
+                            "complete": {
+                              "description": "Requested window complete, including natural EOF clipping; not complete-file coverage.",
+                              "type": "boolean"
+                            },
+                            "delivered_end_line": {
+                              "description": "Actual last delivered physical line, or null.",
+                              "type": [
+                                "integer",
+                                "null"
+                              ]
+                            },
+                            "delivered_start_line": {
+                              "description": "Actual first delivered physical line, or null.",
+                              "type": [
+                                "integer",
+                                "null"
+                              ]
+                            },
                             "end_line": {
                               "description": "1-based last line.",
                               "type": "integer"
+                            },
+                            "last_line_terminated": {
+                              "description": "Whether the last delivered source line ended in LF.",
+                              "type": [
+                                "boolean",
+                                "null"
+                              ]
+                            },
+                            "next_start_line": {
+                              "description": "First omitted line; retry this line or use a larger ordinary file read for an oversized line.",
+                              "type": [
+                                "integer",
+                                "null"
+                              ]
+                            },
+                            "omission_reason": {
+                              "description": "Why complete source lines were omitted.",
+                              "enum": [
+                                "byte_budget",
+                                "line_exceeds_byte_budget",
+                                null
+                              ],
+                              "type": [
+                                "string",
+                                "null"
+                              ]
                             },
                             "path": {
                               "description": "Project-relative file path.",
@@ -22877,6 +23240,27 @@
                             "snippet_truncated": {
                               "description": "Whether this range hit a byte cap.",
                               "type": "boolean"
+                            },
+                            "source_kind": {
+                              "description": "Source provenance.",
+                              "enum": [
+                                "workspace_read"
+                              ],
+                              "type": "string"
+                            },
+                            "source_range_sha256": {
+                              "description": "Digest of delivered raw source bytes, not an indexed file digest.",
+                              "type": [
+                                "string",
+                                "null"
+                              ]
+                            },
+                            "source_total_lines": {
+                              "description": "File line count only when the read observed EOF.",
+                              "type": [
+                                "integer",
+                                "null"
+                              ]
                             },
                             "start_line": {
                               "description": "1-based first line.",
@@ -22931,6 +23315,10 @@
                       },
                       "requested_context": {
                         "description": "Requested context line count.",
+                        "type": "integer"
+                      },
+                      "requested_count": {
+                        "description": "Number of requested ranges; all receive receipts.",
                         "type": "integer"
                       },
                       "resume_operation_attempt": {
@@ -24246,6 +24634,29 @@
                           ],
                           "type": "string"
                         },
+                        "source_range": {
+                          "additionalProperties": false,
+                          "description": "Optional pinned complete-line source request.",
+                          "properties": {
+                            "end_line": {
+                              "description": "Last requested line.",
+                              "maximum": 4294967295,
+                              "minimum": 1,
+                              "type": "integer"
+                            },
+                            "start_line": {
+                              "description": "First requested line.",
+                              "maximum": 4294967295,
+                              "minimum": 1,
+                              "type": "integer"
+                            }
+                          },
+                          "required": [
+                            "start_line",
+                            "end_line"
+                          ],
+                          "type": "object"
+                        },
                         "stable_identity": {
                           "description": "Stable packet identity.",
                           "maxLength": 240,
@@ -24483,6 +24894,73 @@
                                   "type": "null"
                                 }
                               ]
+                            },
+                            "source_delivery": {
+                              "additionalProperties": false,
+                              "description": "Verified source delivery and unread byte receipt.",
+                              "properties": {
+                                "blocked_line_rendered_bytes": {
+                                  "description": "Required rendered bytes for an overlong line.",
+                                  "maximum": 18446744073709552000,
+                                  "minimum": 1,
+                                  "type": [
+                                    "integer",
+                                    "null"
+                                  ]
+                                },
+                                "next_start_line": {
+                                  "description": "Next complete line, when recoverable.",
+                                  "maximum": 4294967295,
+                                  "minimum": 1,
+                                  "type": [
+                                    "integer",
+                                    "null"
+                                  ]
+                                },
+                                "remaining_source_bytes": {
+                                  "description": "Raw bytes not delivered.",
+                                  "maximum": 18446744073709552000,
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "requested_range": {
+                                  "additionalProperties": false,
+                                  "description": "Requested inclusive source range.",
+                                  "properties": {
+                                    "end_line": {
+                                      "description": "Last requested line.",
+                                      "maximum": 4294967295,
+                                      "minimum": 1,
+                                      "type": "integer"
+                                    },
+                                    "start_line": {
+                                      "description": "First requested line.",
+                                      "maximum": 4294967295,
+                                      "minimum": 1,
+                                      "type": "integer"
+                                    }
+                                  },
+                                  "required": [
+                                    "start_line",
+                                    "end_line"
+                                  ],
+                                  "type": "object"
+                                },
+                                "source_sha256": {
+                                  "description": "Verified indexed source digest.",
+                                  "maxLength": 64,
+                                  "minLength": 64,
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "requested_range",
+                                "source_sha256",
+                                "remaining_source_bytes",
+                                "next_start_line",
+                                "blocked_line_rendered_bytes"
+                              ],
+                              "type": "object"
                             },
                             "start_line": {
                               "anyOf": [
@@ -32563,7 +33041,7 @@
                 "type": "string"
               },
               "paths": {
-                "description": "File ranges to read in one call, instead of resolving a symbol. Line-numbered and bounded in total; use the paths and lines that search, trail, or packet already returned.",
+                "description": "File ranges to read in one call, instead of resolving a symbol. Line-numbered and bounded in total; use exact paths from files, search, trail, or packet; filenames are paths, not symbol IDs.",
                 "items": {
                   "allOf": [
                     {
@@ -32745,6 +33223,10 @@
                     "description": "Typed stdio retry or unavailable code.",
                     "type": "string"
                   },
+                  "complete": {
+                    "description": "Every requested window was delivered through its end or EOF.",
+                    "type": "boolean"
+                  },
                   "deadline_exceeded": {
                     "description": "Whether the request wait deadline expired.",
                     "type": "boolean"
@@ -32768,6 +33250,10 @@
                     "description": "One-based focused line.",
                     "type": "integer"
                   },
+                  "max_response_bytes": {
+                    "description": "Serialized structured result byte bound, including metadata.",
+                    "type": "integer"
+                  },
                   "max_snippet_bytes": {
                     "description": "Snippet byte cap.",
                     "type": [
@@ -32776,7 +33262,7 @@
                     ]
                   },
                   "max_total_bytes": {
-                    "description": "Total byte cap for a batched paths call.",
+                    "description": "Shared rendered-snippet byte cap for a batched paths call; metadata has a separate response bound.",
                     "type": "integer"
                   },
                   "message": {
@@ -32790,6 +33276,10 @@
                   "node": {
                     "description": "Node details DTO.",
                     "type": "object"
+                  },
+                  "omitted_count": {
+                    "description": "Number of windows with omitted source lines.",
+                    "type": "integer"
                   },
                   "operation": {
                     "description": "Current managed preparation operation.",
@@ -32810,11 +33300,55 @@
                     "description": "Requested source ranges from a batched paths call.",
                     "items": {
                       "additionalProperties": false,
-                      "description": "One requested source range from a batched snippet.paths call.",
+                      "description": "One requested window and its actual source delivery receipt from snippet.paths.",
                       "properties": {
+                        "complete": {
+                          "description": "Requested window complete, including natural EOF clipping; not complete-file coverage.",
+                          "type": "boolean"
+                        },
+                        "delivered_end_line": {
+                          "description": "Actual last delivered physical line, or null.",
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
+                        },
+                        "delivered_start_line": {
+                          "description": "Actual first delivered physical line, or null.",
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
+                        },
                         "end_line": {
                           "description": "1-based last line.",
                           "type": "integer"
+                        },
+                        "last_line_terminated": {
+                          "description": "Whether the last delivered source line ended in LF.",
+                          "type": [
+                            "boolean",
+                            "null"
+                          ]
+                        },
+                        "next_start_line": {
+                          "description": "First omitted line; retry this line or use a larger ordinary file read for an oversized line.",
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
+                        },
+                        "omission_reason": {
+                          "description": "Why complete source lines were omitted.",
+                          "enum": [
+                            "byte_budget",
+                            "line_exceeds_byte_budget",
+                            null
+                          ],
+                          "type": [
+                            "string",
+                            "null"
+                          ]
                         },
                         "path": {
                           "description": "Project-relative file path.",
@@ -32827,6 +33361,27 @@
                         "snippet_truncated": {
                           "description": "Whether this range hit a byte cap.",
                           "type": "boolean"
+                        },
+                        "source_kind": {
+                          "description": "Source provenance.",
+                          "enum": [
+                            "workspace_read"
+                          ],
+                          "type": "string"
+                        },
+                        "source_range_sha256": {
+                          "description": "Digest of delivered raw source bytes, not an indexed file digest.",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "source_total_lines": {
+                          "description": "File line count only when the read observed EOF.",
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
                         },
                         "start_line": {
                           "description": "1-based first line.",
@@ -32881,6 +33436,10 @@
                   },
                   "requested_context": {
                     "description": "Requested context line count.",
+                    "type": "integer"
+                  },
+                  "requested_count": {
+                    "description": "Number of requested ranges; all receive receipts.",
                     "type": "integer"
                   },
                   "resume_operation_attempt": {

@@ -2461,17 +2461,18 @@ fn handle_stdio_request(
                         Arc::clone(cancelled),
                         || {
                             project_stdio_tool_execution_v3(
-                                runtime, state, &request, &prepared, name,
+                                runtime, state, &request, &prepared, name, revision,
                             )
                         },
                     )
                 } else {
-                    runtime.public_operation.run_with_cancel(
+                    runtime.public_operation.run_managed_with_cancel(
                         public_operation,
                         Arc::clone(cancelled),
+                        preparation_deadline,
                         || {
                             project_stdio_tool_execution_v3(
-                                runtime, state, &request, &prepared, name,
+                                runtime, state, &request, &prepared, name, revision,
                             )
                         },
                     )
@@ -2483,16 +2484,46 @@ fn handle_stdio_request(
                             .as_ref()
                             .and_then(|publication| serde_json::to_value(publication).ok());
                         let mut execution = operation.value;
-                        execution.publication_meta = Some(stdio_served_publication_meta(
-                            state,
-                            operation.core_publication.as_ref(),
-                            retrieval_publication.as_ref().or_else(|| {
-                                stdio_response_retrieval_publication(&execution.response)
-                            }),
-                            Some(&operation.operation_id),
-                            Some(operation.attempt),
-                            Some(operation.freshness),
-                        ));
+                        if execution.publication_meta.is_some() {
+                            let meta = execution
+                                .publication_meta
+                                .as_ref()
+                                .expect("checked metadata");
+                            let core = operation
+                                .core_publication
+                                .as_ref()
+                                .and_then(|value| serde_json::to_value(value).ok());
+                            if operation.freshness != codestory_runtime::OperationFreshness::Fresh
+                                || meta
+                                    .pointer("/operation/operation_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    != Some(operation.operation_id.as_str())
+                                || meta
+                                    .pointer("/operation/attempt")
+                                    .and_then(serde_json::Value::as_u64)
+                                    != Some(u64::from(operation.attempt))
+                                || meta.get("core_publication") != core.as_ref()
+                                || meta.get("retrieval_publication")
+                                    != retrieval_publication.as_ref()
+                            {
+                                return Some(stdio_jsonrpc_error(
+                                    id,
+                                    -32603,
+                                    "Packet representation publication changed",
+                                ));
+                            }
+                        } else {
+                            execution.publication_meta = Some(stdio_served_publication_meta(
+                                state,
+                                operation.core_publication.as_ref(),
+                                retrieval_publication.as_ref().or_else(|| {
+                                    stdio_response_retrieval_publication(&execution.response)
+                                }),
+                                Some(&operation.operation_id),
+                                Some(operation.attempt),
+                                Some(operation.freshness),
+                            ));
+                        }
                         execution
                     }
                     Err(error) => {
@@ -2503,7 +2534,9 @@ fn handle_stdio_request(
                     }
                 }
             } else {
-                match project_stdio_tool_execution_v3(runtime, state, &request, &prepared, name) {
+                match project_stdio_tool_execution_v3(
+                    runtime, state, &request, &prepared, name, revision,
+                ) {
                     Ok(mut execution) => {
                         execution.publication_meta = Some(stdio_served_publication_meta(
                             state,
@@ -2657,6 +2690,7 @@ struct StdioToolExecutionV3 {
     response: serde_json::Value,
     packet_diagnostics: Option<codestory_runtime::PacketDiagnosticProjectionV3>,
     publication_meta: Option<serde_json::Value>,
+    packet_wall_expiry_epoch_ms: Option<u64>,
 }
 
 fn project_stdio_tool_execution_v3(
@@ -2665,7 +2699,11 @@ fn project_stdio_tool_execution_v3(
     request: &serde_json::Value,
     prepared: &PreparedStdioToolCall,
     tool_name: &str,
+    revision: crate::stdio_v3::McpRevisionV3,
 ) -> std::result::Result<StdioToolExecutionV3, ApiError> {
+    if tool_name == "packet" {
+        return project_stdio_packet_for_representation_v3(runtime, state, request, revision);
+    }
     let mut response = if tool_name == "search" {
         handle_stdio_search_v3(runtime, request)
     } else {
@@ -2676,63 +2714,11 @@ fn project_stdio_tool_execution_v3(
             response,
             packet_diagnostics: None,
             publication_meta: None,
+            packet_wall_expiry_epoch_ms: None,
         });
     };
-    let mut packet_diagnostics = None;
+    let packet_diagnostics = None;
     let projection = match tool_name {
-        "packet" => {
-            let packet = serde_json::from_value::<codestory_contracts::api::AgentPacketDto>(result)
-                .map_err(|_| {
-                    ApiError::internal("Packet execution returned an invalid internal DTO.")
-                })?;
-            let packet_request = AgentPacketRequestDto {
-                question: request
-                    .pointer("/params/arguments/question")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
-                budget: stdio_packet_budget(request)
-                    .map_err(|error| ApiError::invalid_argument(error.to_string()))?,
-                probes: stdio_packet_probes(request)
-                    .map_err(|error| ApiError::invalid_argument(error.to_string()))?,
-                latency_budget_ms: stdio_packet_latency_budget(request)
-                    .map_err(|error| ApiError::invalid_argument(error.to_string()))?,
-                parent_packet_id: request
-                    .pointer("/params/arguments/parent_packet_id")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned),
-                option_ids: request
-                    .pointer("/params/arguments/option_ids")
-                    .and_then(serde_json::Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|value| value.as_str().map(str::to_owned))
-                    .collect(),
-                core_generation_id: request
-                    .pointer("/params/arguments/core_generation_id")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned),
-                retrieval_generation: request
-                    .pointer("/params/arguments/retrieval_generation")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned),
-            };
-            let product = codestory_runtime::project_packet_v3(
-                &runtime.public_operation,
-                "codestory-stdio",
-                &packet_request,
-                &packet,
-                // The public adapter owns the final representation: only it
-                // knows the negotiated revision, capability URI reservation,
-                // wall-expiry metadata, and served-publication stamp. Keep the
-                // runtime projection complete here; the adapter performs the
-                // same bounded compaction against that exact final shape below.
-                |_| Ok(0),
-            )?;
-            packet_diagnostics = Some(product.diagnostics);
-            serde_json::to_value(product.projection)
-                .map_err(|error| ApiError::internal(error.to_string()))?
-        }
         "context" => project_stdio_context_result_v3(runtime, &response, result)?,
         "search" => {
             let results =
@@ -2752,6 +2738,7 @@ fn project_stdio_tool_execution_v3(
                 response,
                 packet_diagnostics: None,
                 publication_meta: None,
+                packet_wall_expiry_epoch_ms: None,
             });
         }
     };
@@ -2760,6 +2747,190 @@ fn project_stdio_tool_execution_v3(
         response,
         packet_diagnostics,
         publication_meta: None,
+        packet_wall_expiry_epoch_ms: None,
+    })
+}
+
+#[derive(Clone)]
+struct StdioPacketRepresentationPlanV3 {
+    revision: crate::stdio_v3::McpRevisionV3,
+    publication_meta: serde_json::Value,
+    wall_expiry_epoch_ms: u64,
+}
+
+impl StdioPacketRepresentationPlanV3 {
+    fn measure(
+        &self,
+        projection: &codestory_contracts::packet_projection_v3::PacketProjectionV3Dto,
+    ) -> Result<usize, ()> {
+        let mut root = serde_json::to_value(projection).map_err(|_| ())?;
+        reserve_packet_diagnostics_capability_v3(&mut root, self.wall_expiry_epoch_ms)?;
+        let result = build_served_tool_result_v3(
+            self.revision,
+            "packet",
+            &root,
+            Some(&self.publication_meta),
+        )
+        .map_err(|_| ())?;
+        v3_serialize_call_tool_result(&result)
+            .map(|bytes| bytes.len())
+            .map_err(|_| ())
+    }
+
+    fn cache_cost_identity(&self) -> Result<String, ApiError> {
+        // _meta is serialized once outside the mirrored root. Its exact JSON
+        // cost accounts for arbitrary refresh data and operation-ID width.
+        // All changing packet/capability IDs are fixed-width unescaped hex/UUID.
+        let metadata_bytes = if self.revision.profile().structured_content {
+            serde_json::to_vec(&self.publication_meta)
+                .map_err(|error| ApiError::internal(error.to_string()))?
+                .len()
+        } else {
+            0
+        };
+        let expiry_bytes = serde_json::to_vec(&self.wall_expiry_epoch_ms)
+            .map_err(|error| ApiError::internal(error.to_string()))?
+            .len();
+        Ok(format!(
+            "packet-representation/v1:{}:{metadata_bytes}:{expiry_bytes}",
+            self.revision.as_str()
+        ))
+    }
+}
+
+fn packet_wall_expiry_epoch_ms_v3() -> Result<u64, ApiError> {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .and_then(|now| now.checked_add(10 * 60 * 1_000))
+        .ok_or_else(|| ApiError::internal("Packet diagnostic expiry is unavailable."))
+}
+
+fn stdio_packet_request_v3(request: &serde_json::Value) -> Result<AgentPacketRequestDto, ApiError> {
+    let question = request
+        .pointer("/params/arguments/question")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|question| !question.is_empty())
+        .ok_or_else(|| ApiError::invalid_argument("packet.question is required"))?;
+    let probes = stdio_packet_probes(request)
+        .map_err(|error| ApiError::invalid_argument(error.to_string()))?;
+    codestory_contracts::api::validate_packet_probe_request(&probes)
+        .map_err(ApiError::invalid_argument)?;
+    Ok(AgentPacketRequestDto {
+        question: question.to_owned(),
+        budget: stdio_packet_budget(request)
+            .map_err(|error| ApiError::invalid_argument(error.to_string()))?,
+        probes,
+        latency_budget_ms: stdio_packet_latency_budget(request)
+            .map_err(|error| ApiError::invalid_argument(error.to_string()))?,
+        parent_packet_id: request
+            .pointer("/params/arguments/parent_packet_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        option_ids: request
+            .pointer("/params/arguments/option_ids")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .collect(),
+        core_generation_id: request
+            .pointer("/params/arguments/core_generation_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        retrieval_generation: request
+            .pointer("/params/arguments/retrieval_generation")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
+fn project_stdio_packet_for_representation_v3(
+    runtime: &RuntimeContext,
+    state: &mut StdioServerState,
+    request: &serde_json::Value,
+    revision: crate::stdio_v3::McpRevisionV3,
+) -> Result<StdioToolExecutionV3, ApiError> {
+    let request = stdio_packet_request_v3(request)?;
+    let active = runtime
+        .public_operation
+        .active_packet_representation_context_v3()
+        .ok_or_else(|| {
+            ApiError::internal("Packet representation requires its actual fresh pinned operation.")
+        })?;
+    let retrieval = active
+        .publication
+        .retrieval_publication
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let plan = StdioPacketRepresentationPlanV3 {
+        revision,
+        // This is the exact refresh/contract snapshot reused by final formatting.
+        publication_meta: stdio_served_publication_meta(
+            state,
+            Some(&active.publication.core_publication),
+            retrieval.as_ref(),
+            Some(&active.operation_id),
+            Some(active.attempt),
+            Some(active.freshness),
+        ),
+        wall_expiry_epoch_ms: packet_wall_expiry_epoch_ms_v3()?,
+    };
+    let publication = stdio_active_product_publication(runtime).ok_or_else(|| {
+        ApiError::internal("Packet representation has no coherent pinned publication.")
+    })?;
+    let cache_key = stdio_packet_cache_key(StdioPacketCacheKeyInput {
+        representation_cost: Some(plan.cache_cost_identity()?),
+        publication: publication.clone(),
+        question: &request.question,
+        budget: request.budget,
+        probes: &request.probes,
+        latency_budget_ms: request.latency_budget_ms,
+        parent_packet_id: request.parent_packet_id.as_deref(),
+        option_ids: &request.option_ids,
+        core_generation_id: request.core_generation_id.as_deref(),
+        retrieval_generation: request.retrieval_generation.as_deref(),
+    });
+    let cached = state.packet_cache.get(&cache_key).and_then(|value| {
+        stdio_bind_cached_publication(value, StdioCachedProduct::Packet, &publication)
+    });
+    let product = if let Some(cached) = cached {
+        let packet = serde_json::from_value::<codestory_contracts::api::AgentPacketDto>(
+            cached["result"].clone(),
+        )
+        .map_err(|_| ApiError::internal("Cached representation packet is invalid."))?;
+        let reserved = codestory_runtime::PacketProjectionIdentityV3::new();
+        // Only an accepted selected result of the same exact cost profile can
+        // hit this cache. The real validator and renderer still remeasure it.
+        codestory_runtime::project_packet_v3_with_identity(
+            &runtime.public_operation,
+            "codestory-stdio",
+            &request,
+            &packet,
+            &reserved,
+            |candidate| plan.measure(candidate),
+        )?
+    } else {
+        let represented = runtime.browser.packet_for_representation_v3(
+            request.clone(),
+            "codestory-stdio",
+            &mut |candidate| plan.measure(candidate),
+        )?;
+        state
+            .packet_cache
+            .insert(cache_key, serde_json::json!({"result": represented.packet}));
+        represented.product
+    };
+    Ok(StdioToolExecutionV3 {
+        response: serde_json::json!({"result": product.projection}),
+        packet_diagnostics: Some(product.diagnostics),
+        publication_meta: Some(plan.publication_meta),
+        packet_wall_expiry_epoch_ms: Some(plan.wall_expiry_epoch_ms),
     })
 }
 
@@ -3022,13 +3193,12 @@ fn stdio_jsonrpc_tool_execution_v3(
     let mut expected_packet_bytes = None;
     let mut registered_diagnostics_uri = None;
     if let Some(diagnostics) = execution.packet_diagnostics.take() {
-        let wall_expiry_epoch_ms = SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .and_then(|duration| u64::try_from(duration.as_millis()).ok())
-            .and_then(|now| now.checked_add(10 * 60 * 1_000));
-        let Some(wall_expiry_epoch_ms) = wall_expiry_epoch_ms else {
-            return stdio_jsonrpc_error(id, -32603, "Internal error");
+        let wall_expiry_epoch_ms = match execution.packet_wall_expiry_epoch_ms.take() {
+            Some(value) => value,
+            None => match packet_wall_expiry_epoch_ms_v3() {
+                Ok(value) => value,
+                Err(_) => return stdio_jsonrpc_error(id, -32603, "Internal error"),
+            },
         };
         let Some(root) = execution.response.get_mut("result") else {
             return stdio_jsonrpc_error(id, -32603, "Internal error");
@@ -3415,6 +3585,9 @@ fn stdio_tool_call_success(
 }
 
 fn stdio_tool_text(tool_name: &str, value: &serde_json::Value) -> String {
+    if tool_name == "snippet" && value.get("ranges").is_some() {
+        return stdio_source_ranges_text(value);
+    }
     if stdio_is_packet(value) {
         return stdio_packet_text(value);
     }
@@ -3533,48 +3706,69 @@ fn stdio_compact_tool_text(tool_name: &str, value: &serde_json::Value) -> String
     stdio_truncate_text(&format!("{}\n", lines.join("\n")), STDIO_TEXT_MAX_BYTES)
 }
 
-/// Render the multi-range source payload that `snippet` returns when it is given `paths`.
-///
-/// Nothing rendered it. The single-target shape puts its source at `/snippet`, which is
-/// handled above; the multi-target shape puts one snippet per entry under `/ranges`, and
-/// with no case for it the whole response collapsed to two header lines. Measured over the
-/// recorded censuses: 83 successful `paths` calls, every one delivering exactly 43 bytes --
-/// `tool: snippet` plus `structuredContent: available` -- while the source sat in
-/// `structuredContent`, which this transport's consumers do not read. The batch path
-/// returned no source at all, which is the likeliest reason it went essentially unused.
+/// Path source already has a typed structured-response bound. Render every
+/// receipt and complete source line under a dedicated bound; the generic 4KiB
+/// summary must not silently cut a successful source delivery a second time.
+fn stdio_source_ranges_text(value: &serde_json::Value) -> String {
+    let mut lines = vec![
+        "tool: snippet".to_string(),
+        REPO_CONTENT_BOUNDARY_LINE.to_string(),
+    ];
+    if let Some(ranges) = value.get("ranges").and_then(serde_json::Value::as_array) {
+        lines.push(format!("ranges_returned: {}", ranges.len()));
+        for key in [
+            "requested_count",
+            "omitted_count",
+            "complete",
+            "max_total_bytes",
+            "max_response_bytes",
+        ] {
+            if let Some(field) = value.get(key) {
+                lines.push(format!("{key}: {field}"));
+            }
+        }
+        append_source_range_evidence(&mut lines, value);
+    }
+    lines.push("structuredContent: available".to_string());
+    let text = format!("{}\n", lines.join("\n"));
+    // JSON escapes cost at least as much as this source projection. The fixed
+    // framing reserve covers twelve headers; paths appear once, not twice.
+    let maximum = codestory_runtime::SOURCE_RANGES_MAX_RESPONSE_BYTES + 1024;
+    if text.len() > maximum {
+        return "tool: snippet\nsource_text_delivery: unavailable\nreason: source projection exceeded its bound; narrow the request or read structuredContent\n".to_string();
+    }
+    text
+}
+
 fn append_source_range_evidence(evidence: &mut Vec<String>, value: &serde_json::Value) {
-    let Some(ranges) = value
-        .pointer("/ranges")
-        .and_then(serde_json::Value::as_array)
-    else {
+    let Some(ranges) = value.get("ranges").and_then(serde_json::Value::as_array) else {
         return;
     };
-    if ranges.is_empty() {
-        return;
-    }
-    evidence.push(format!("ranges_returned: {}", ranges.len()));
-    // Share the per-response allowance across the requested ranges rather than giving each
-    // the single-snippet budget, so asking for more targets never returns less of the first.
-    let per_range = (STDIO_TEXT_MAX_BYTES / ranges.len().max(1)).max(256);
-    for range in ranges.iter().take(STDIO_TEXT_ITEM_LIMIT) {
-        let path = range
-            .get("path")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("<unknown path>");
-        let span = match (
-            range.get("start_line").and_then(serde_json::Value::as_u64),
-            range.get("end_line").and_then(serde_json::Value::as_u64),
-        ) {
-            (Some(start), Some(end)) => format!(":{start}-{end}"),
-            (Some(start), None) => format!(":{start}"),
-            _ => String::new(),
-        };
-        let Some(snippet) = range.get("snippet").and_then(serde_json::Value::as_str) else {
+    for range in ranges {
+        let Some(mut metadata) = range.as_object().cloned() else {
             continue;
         };
+        let path = metadata
+            .remove("path")
+            .and_then(|path| path.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "<unknown path>".to_string());
+        let snippet = metadata
+            .remove("snippet")
+            .and_then(|snippet| snippet.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        let start = range
+            .get("start_line")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let end = range
+            .get("end_line")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        // Start/end label the request; delivered_* and complete describe source.
         evidence.push(format!(
-            "range {path}{span}:\n{}",
-            stdio_truncate_text(snippet, per_range)
+            "range {}:{start}-{end} (requested):\n{}\n{snippet}",
+            stdio_escape_text_scalar(&path),
+            serde_json::Value::Object(metadata)
         ));
     }
 }
@@ -4155,6 +4349,25 @@ fn prepare_stdio_tool_call(
     }
 }
 
+fn stdio_source_line(value: &serde_json::Value, name: &str) -> Result<Option<u32>, ApiError> {
+    value
+        .get(name)
+        .map(|value| {
+            value
+                .as_u64()
+                .filter(|line| {
+                    (1..=u64::from(codestory_runtime::SOURCE_RANGES_MAX_LINE)).contains(line)
+                })
+                .map(|line| line as u32)
+                .ok_or_else(|| {
+                    ApiError::invalid_argument(format!(
+                        "snippet.{name} must be an integer in 1..=1000000"
+                    ))
+                })
+        })
+        .transpose()
+}
+
 fn stdio_snippet_request(
     request: &serde_json::Value,
 ) -> std::result::Result<StdioSnippetRequest, ApiError> {
@@ -4196,7 +4409,7 @@ fn stdio_snippet_request(
     }
 
     // Reading by path is an alternative target, not an addition to one.
-    const MAX_SOURCE_RANGES: usize = 12;
+    const MAX_SOURCE_RANGES: usize = codestory_runtime::SOURCE_RANGES_MAX_ENTRIES;
     // Lines returned when a caller supplies only the `line` a hit reported. Roughly one
     // screen, so a single hit expands into useful context without a second round trip.
     const SOURCE_RANGE_DEFAULT_SPAN: u32 = 60;
@@ -4234,20 +4447,18 @@ fn stdio_snippet_request(
                     // A hit reports one `line`; asking callers to invent an `end_line` is
                     // why this went unused. Accept the field the hits actually emit and
                     // return a window around it.
-                    let read = |name: &str| {
-                        entry
-                            .get(name)
-                            .and_then(serde_json::Value::as_u64)
-                            .filter(|value| *value >= 1)
-                    };
-                    let start_line = read("start_line").or_else(|| read("line")).ok_or_else(|| {
-                        ApiError::invalid_argument(format!(
-                            "snippet.paths entry for {path} needs a 1-based `line` or `start_line`"
-                        ))
-                    })? as u32;
-                    let end_line = read("end_line")
-                        .map(|value| value as u32)
-                        .unwrap_or_else(|| start_line.saturating_add(SOURCE_RANGE_DEFAULT_SPAN));
+                    let start_line = stdio_source_line(entry, "start_line")?
+                        .or(stdio_source_line(entry, "line")?)
+                        .ok_or_else(|| {
+                            ApiError::invalid_argument(format!(
+                                "snippet.paths entry for {path} needs a 1-based line"
+                            ))
+                        })?;
+                    let end_line = stdio_source_line(entry, "end_line")?.unwrap_or_else(|| {
+                        start_line
+                            .saturating_add(SOURCE_RANGE_DEFAULT_SPAN)
+                            .min(codestory_runtime::SOURCE_RANGES_MAX_LINE)
+                    });
                     if end_line < start_line {
                         return Err(ApiError::invalid_argument(format!(
                             "snippet.paths entry for {path} has end_line before start_line"
@@ -4276,16 +4487,15 @@ fn stdio_snippet_request(
                 "snippet.path is an alias for a one-entry paths array; do not send both",
             ));
         }
-        let read = |name: &str| {
-            arguments
-                .get(name)
-                .and_then(serde_json::Value::as_u64)
-                .filter(|value| *value >= 1)
-        };
-        let start_line = read("start_line").or_else(|| read("line")).unwrap_or(1) as u32;
-        let end_line = read("end_line")
-            .map(|value| value as u32)
-            .unwrap_or_else(|| start_line.saturating_add(SOURCE_RANGE_DEFAULT_SPAN));
+        let object = serde_json::Value::Object(arguments.clone());
+        let start_line = stdio_source_line(&object, "start_line")?
+            .or(stdio_source_line(&object, "line")?)
+            .unwrap_or(1);
+        let end_line = stdio_source_line(&object, "end_line")?.unwrap_or_else(|| {
+            start_line
+                .saturating_add(SOURCE_RANGE_DEFAULT_SPAN)
+                .min(codestory_runtime::SOURCE_RANGES_MAX_LINE)
+        });
         if end_line < start_line {
             return Err(ApiError::invalid_argument(format!(
                 "snippet.path {path} has end_line before start_line"
@@ -4969,6 +5179,7 @@ fn handle_stdio_packet(
     let publication = stdio_active_product_publication(runtime);
     let cache_key = publication.clone().map(|publication| {
         stdio_packet_cache_key(StdioPacketCacheKeyInput {
+            representation_cost: None,
             publication,
             question,
             budget,
@@ -5092,6 +5303,7 @@ fn stdio_bind_cached_publication(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StdioPacketCacheKey {
+    representation_cost: Option<String>,
     publication: StdioProductPublicationKey,
     question: String,
     budget: &'static str,
@@ -5165,6 +5377,7 @@ impl StdioPacketCache {
 }
 
 struct StdioPacketCacheKeyInput<'a> {
+    representation_cost: Option<String>,
     publication: StdioProductPublicationKey,
     question: &'a str,
     budget: PacketBudgetModeDto,
@@ -5178,6 +5391,7 @@ struct StdioPacketCacheKeyInput<'a> {
 
 fn stdio_packet_cache_key(input: StdioPacketCacheKeyInput<'_>) -> StdioPacketCacheKey {
     StdioPacketCacheKey {
+        representation_cost: input.representation_cost,
         publication: input.publication,
         question: input.question.to_string(),
         budget: stdio_packet_budget_label(input.budget),
@@ -5789,21 +6003,7 @@ fn handle_stdio_snippet(
             .source_ranges(&snippet.paths, SOURCE_RANGES_MAX_TOTAL_BYTES)
             .map_err(map_api_error)
         {
-            Ok(ranges) => serde_json::json!({
-                "result": {
-                    "ranges": ranges
-                        .iter()
-                        .map(|range| serde_json::json!({
-                            "path": range.path,
-                            "start_line": range.start_line,
-                            "end_line": range.end_line,
-                            "snippet": range.snippet,
-                            "snippet_truncated": range.truncated,
-                        }))
-                        .collect::<Vec<_>>(),
-                    "max_total_bytes": SOURCE_RANGES_MAX_TOTAL_BYTES,
-                }
-            }),
+            Ok(ranges) => serde_json::json!({"result": ranges}),
             Err(error) => {
                 serde_json::json!({"error": stdio_typed_error_value(runtime, &error)})
             }
@@ -8109,6 +8309,7 @@ fn stdio_node_links(
         core_generation_id: continuation.core_generation_id.clone(),
         retrieval_generation: continuation.retrieval_generation.clone(),
         selector: PacketContinuationSelectorV1 {
+            source_range: None,
             stable_identity: format!("node:{node_id}"),
             path: None,
             symbol_id: Some(node_id.to_string()),
@@ -8304,6 +8505,7 @@ mod tests {
                         request_digest: "a".repeat(64),
                     }),
                     publication_meta: None,
+                    packet_wall_expiry_epoch_ms: None,
                 },
                 &registry,
             );
@@ -8395,9 +8597,15 @@ mod tests {
                 }
                 _ => PreparedStdioToolCall::Raw,
             };
-            let execution =
-                project_stdio_tool_execution_v3(&runtime, &mut state, &request, &prepared, tool)
-                    .expect("execute actual local tool and serialize its owning DTO");
+            let execution = project_stdio_tool_execution_v3(
+                &runtime,
+                &mut state,
+                &request,
+                &prepared,
+                tool,
+                crate::stdio_v3::McpRevisionV3::preferred(),
+            )
+            .expect("execute actual local tool and serialize its owning DTO");
             let root = execution
                 .response
                 .get("result")
@@ -8516,6 +8724,7 @@ mod tests {
                     response: json!({"result":null}),
                     packet_diagnostics: None,
                     publication_meta: None,
+                    packet_wall_expiry_epoch_ms: None,
                 },
                 &registry,
             );
@@ -9090,6 +9299,7 @@ mod tests {
                             request_digest: "a".repeat(64),
                         }),
                         publication_meta: Some(publication_meta.clone()),
+                        packet_wall_expiry_epoch_ms: Some(1_725_000_600_123_u64),
                     },
                     &registry,
                 );
@@ -9537,6 +9747,7 @@ mod tests {
 
     fn base_packet_cache_key_input(question: &str) -> StdioPacketCacheKeyInput<'_> {
         StdioPacketCacheKeyInput {
+            representation_cost: None,
             publication: product_publication(1),
             question,
             budget: PacketBudgetModeDto::Compact,
@@ -12002,7 +12213,50 @@ version = "0.11.20"
             text.contains(REPO_CONTENT_BOUNDARY_LINE),
             "range source is repo content and must sit behind the boundary: {text}"
         );
-        assert!(text.len() <= STDIO_TEXT_MAX_BYTES, "{text}");
+        assert!(
+            text.len() <= codestory_runtime::SOURCE_RANGES_MAX_RESPONSE_BYTES + 1024,
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn stdio_path_ranges_deliver_twelve_ranges_beyond_generic_summary_budget() {
+        let ranges = (0..12)
+            .map(|index| {
+                json!({
+                    "path": format!("src/file{index}.rs"), "start_line": 1, "end_line": 2,
+                    "snippet": format!("```text\n     1 | {}\n```", "x".repeat(600)),
+                    "snippet_truncated": false, "complete": true,
+                    "delivered_start_line": 1, "delivered_end_line": 1,
+                    "next_start_line": null
+                })
+            })
+            .collect::<Vec<_>>();
+        let text = stdio_tool_text("snippet", &json!({"ranges": ranges}));
+        assert!(text.len() > STDIO_TEXT_MAX_BYTES);
+        for index in 0..12 {
+            assert!(text.contains(&format!("range src/file{index}.rs:1-2")));
+        }
+        assert!(!text.contains("source_text_delivery: unavailable"));
+    }
+
+    #[test]
+    fn stdio_path_range_line_fields_reject_present_invalid_values() {
+        for value in [
+            json!(0),
+            json!(-1),
+            json!(1.5),
+            json!("1"),
+            json!(1_000_001),
+            json!(u64::MAX),
+        ] {
+            assert!(stdio_source_line(&json!({"line": value}), "line").is_err());
+        }
+        assert_eq!(
+            stdio_source_line(&json!({"line": 1_000_000}), "line").unwrap(),
+            Some(1_000_000)
+        );
+        assert_eq!(stdio_source_line(&json!({}), "line").unwrap(), None);
     }
 
     #[test]
@@ -12843,6 +13097,34 @@ version = "0.11.20"
             })
         );
         let option_ids = ["omitted_mandatory_support:symbol%3A42".to_string()];
+        let paged_probes = |start_line| {
+            [PacketProbeDto::Continuation {
+                contract_version: PACKET_PROBE_CONTRACT_VERSION,
+                project_id: "project".into(),
+                core_generation_id: "core".into(),
+                retrieval_generation: None,
+                selector: PacketContinuationSelectorV1 {
+                    stable_identity: "node:42".into(),
+                    path: None,
+                    symbol_id: Some("42".into()),
+                    reason: PacketStructuralGapReasonV1::SourceBudgetExceeded,
+                    source_range: Some(codestory_contracts::compilation::PacketSourceRangeV1 {
+                        start_line,
+                        end_line: 30,
+                    }),
+                },
+            }]
+        };
+        assert_ne!(
+            stdio_packet_cache_key(StdioPacketCacheKeyInput {
+                probes: &paged_probes(10),
+                ..base_packet_cache_key_input("Explain packet caching.")
+            }),
+            stdio_packet_cache_key(StdioPacketCacheKeyInput {
+                probes: &paged_probes(20),
+                ..base_packet_cache_key_input("Explain packet caching.")
+            })
+        );
         assert_ne!(
             base,
             stdio_packet_cache_key(StdioPacketCacheKeyInput {
@@ -16472,5 +16754,339 @@ version = "0.11.20"
             !wire.contains("\"snippet\":"),
             "no retained snippet body may be served: {wire}"
         );
+    }
+}
+
+#[cfg(test)]
+mod representation_budget_tests {
+    use super::*;
+    use codestory_contracts::compilation::*;
+    use codestory_runtime::representation_budget_test_support as fixture;
+
+    fn hydrated_pages() -> PacketCompilationInputV1 {
+        let admissions = (0..16)
+            .map(|ordinal| PacketAdmissionReceiptV1 {
+                packet_ordinal: ordinal,
+                stable_identity: format!("node:{ordinal}"),
+                score_version: PACKET_RETRIEVAL_SCORE_VERSION_V1.into(),
+                reserved_source_bytes: 512,
+                origin: if ordinal == 0 {
+                    PacketAdmissionOriginV1::ExactTypedSelector
+                } else {
+                    PacketAdmissionOriginV1::Retrieval
+                },
+            })
+            .collect();
+        let sources = (0..16)
+            .map(|ordinal| PacketHydratedSourceRangeV1 {
+                stable_identity: format!("node:{ordinal}"),
+                path: format!("src/{}/page_{ordinal:02}.rs", "directory".repeat(7)),
+                symbol: Some(format!("page_{ordinal:02}")),
+                start_line: 1,
+                end_line: 1,
+                source: format!(
+                    "```rust\n>    1 | fn page_{ordinal:02}() {{ /* {} */ }}\n```",
+                    "quoted\\\"value ".repeat(17)
+                ),
+                parser_completeness: PacketParserCompletenessV1::Complete,
+                delivery: Some(PacketSourceDeliveryV1 {
+                    requested_range: PacketSourceRangeV1 {
+                        start_line: 1,
+                        end_line: 3,
+                    },
+                    source_sha256: "a".repeat(64),
+                    remaining_source_bytes: 40,
+                    next_start_line: Some(2),
+                    blocked_line_rendered_bytes: None,
+                }),
+            })
+            .collect();
+        PacketCompilationInputV1 {
+            contract_version: PACKET_COMPILATION_CONTRACT_VERSION_V1,
+            publication: PacketCompilationPublicationV1 {
+                project_id: "project-1".into(),
+                core_generation_id: "core-generation-1".into(),
+                retrieval_generation: Some("retrieval-generation-1".into()),
+            },
+            admissions,
+            sources,
+            relations: vec![],
+            ambiguities: vec![],
+            admission_gaps: vec![],
+        }
+    }
+
+    fn request() -> AgentPacketRequestDto {
+        stdio_packet_request_v3(
+            &serde_json::json!({"params":{"arguments":{"question":"Inspect a repository"}}}),
+        )
+        .unwrap()
+    }
+
+    fn plan(revision: crate::stdio_v3::McpRevisionV3) -> StdioPacketRepresentationPlanV3 {
+        let mut state = StdioServerState::default();
+        state.status_cache = Some(StdioStatusCacheEntry {
+            key: "fixture".into(),
+            cached_at: Instant::now(),
+            value: serde_json::json!({"local_refresh":{"state":"refreshing",
+                "phase": format!("phase {}", "arbitrary\\\"refresh ".repeat(70)),
+                "pid": u64::MAX, "started_at_epoch_ms": u64::MAX}}),
+        });
+        let publication = IndexPublicationDto {
+            generation: 1,
+            generation_id: "core-generation-1".into(),
+            run_id: "core-run-1".into(),
+            mode: codestory_contracts::api::IndexPublicationModeDto::Incremental,
+            published_at_epoch_ms: 1,
+        };
+        let retrieval = serde_json::json!({"core_generation_id":"core-generation-1",
+            "core_run_id":"core-run-1", "retrieval_generation":"retrieval-generation-1",
+            "retrieval_input_hash":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "semantic_generation":"semantic-generation-1"});
+        StdioPacketRepresentationPlanV3 {
+            revision,
+            publication_meta: stdio_served_publication_meta(
+                &state,
+                Some(&publication),
+                Some(&retrieval),
+                Some("actual-owner-id-with-arbitrary-width"),
+                Some(u32::MAX),
+                Some(codestory_runtime::OperationFreshness::Fresh),
+            ),
+            wall_expiry_epoch_ms: u64::MAX,
+        }
+    }
+
+    #[test]
+    fn prepared_pages_fit_actual_negotiated_envelope_and_final_capability() {
+        let input = hydrated_pages();
+        let request = request();
+        let (full_packet, support_bytes) = fixture::default_packet(input.clone(), &request);
+        assert_eq!(
+            full_packet.support.len(),
+            16,
+            "fixture isolates representation mismatch"
+        );
+        assert!(support_bytes <= 16_384);
+        for revision in crate::stdio_v3::McpRevisionV3::all() {
+            let plan = plan(*revision);
+            let full = fixture::project_packet(&request, &full_packet, |_| Ok(0)).unwrap();
+            let full_bytes = plan.measure(&full.projection).unwrap();
+            assert!(
+                full_bytes > 16_384,
+                "{revision:?}: fixture must exceed served bound"
+            );
+            let selected = fixture::select_prepared(input.clone(), &request, |candidate| {
+                plan.measure(candidate)
+            })
+            .unwrap();
+            let codestory_contracts::packet_projection_v3::PacketProjectionV3Dto::Complete {
+                evidence,
+                gaps,
+                continuation,
+                ..
+            } = &selected.product.projection
+            else {
+                panic!("{revision:?}: a useful prefix must fit the real renderer");
+            };
+            assert!(!evidence.as_slice().is_empty());
+            assert!(selected.packet.support.len() < full_packet.support.len());
+            assert!(gaps.as_slice().iter().any(|gap| gap.kind
+                == codestory_contracts::packet_projection_v3::GapKindV3Dto::ContinuationRequired));
+            assert!(continuation.is_some());
+            let exact = selected
+                .packet
+                .support
+                .iter()
+                .find(|row| row.symbol_id.as_deref() == Some("0"))
+                .unwrap();
+            assert_eq!(
+                exact.snippet.as_deref(),
+                Some(input.sources[0].source.as_str())
+            );
+            assert_eq!(exact.source_delivery, input.sources[0].delivery);
+            assert!(evidence.as_slice().iter().any(|row| {
+                row.symbol_id.as_ref().map(|id| id.as_str()) == Some("0")
+                    && row.summary.as_ref().map(|summary| summary.as_str())
+                        == exact.snippet.as_deref()
+                    && row.source_delivery == exact.source_delivery
+            }));
+            let drill = selected.packet.disposition.drill.as_ref().unwrap();
+            for option in &drill.options {
+                let id = option
+                    .symbol_id
+                    .as_ref()
+                    .expect("node fixture continuation");
+                let retained = selected
+                    .packet
+                    .support
+                    .iter()
+                    .any(|row| row.symbol_id.as_ref() == Some(id));
+                assert_eq!(
+                    option.source_range,
+                    Some(PacketSourceRangeV1 {
+                        start_line: if retained { 2 } else { 1 },
+                        end_line: 3
+                    })
+                );
+            }
+            // Omitted pages retain a start-at-1 structural cursor, never a
+            // fictitious delivered-prefix cursor for an unserved page.
+            assert!(drill.options.iter().any(|option| option.source_range
+                == Some(PacketSourceRangeV1 {
+                    start_line: 1,
+                    end_line: 3
+                })));
+            let measured = plan.measure(&selected.product.projection).unwrap();
+            let registry = Arc::new(std::sync::Mutex::new(
+                crate::stdio_v3::DiagnosticsRegistryV3::new(),
+            ));
+            let response = stdio_jsonrpc_tool_execution_v3(
+                serde_json::json!("final"),
+                "packet",
+                *revision,
+                StdioToolExecutionV3 {
+                    response: serde_json::json!({"result": selected.product.projection}),
+                    packet_diagnostics: Some(selected.product.diagnostics),
+                    publication_meta: Some(plan.publication_meta.clone()),
+                    packet_wall_expiry_epoch_ms: Some(plan.wall_expiry_epoch_ms),
+                },
+                &registry,
+            );
+            assert!(response.get("error").is_none(), "{revision:?}: {response}");
+            let served = &response["result"];
+            let bytes = v3_serialize_call_tool_result(served).unwrap();
+            assert_eq!(
+                bytes.len(),
+                measured,
+                "reservation and actual grant have identical width"
+            );
+            assert!(bytes.len() <= 16_384);
+            let text: serde_json::Value =
+                serde_json::from_str(served["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(text["kind"], "complete");
+            assert_eq!(
+                text["diagnostics"]["reference"]["wall_expiry_epoch_ms"],
+                serde_json::json!(u64::MAX)
+            );
+            if revision.profile().structured_content {
+                assert_eq!(served["structuredContent"], text);
+                assert_eq!(
+                    served["_meta"]["codestory_publication"],
+                    plan.publication_meta
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn representation_cache_cost_tracks_serialized_metadata_and_expiry_width() {
+        let revision = crate::stdio_v3::McpRevisionV3::preferred();
+        let original = plan(revision);
+        let input = hydrated_pages();
+        let request = request();
+        let (packet, _) = fixture::default_packet(input, &request);
+        let product = fixture::project_packet(&request, &packet, |_| Ok(0)).unwrap();
+        let mut same_cost = original.clone();
+        same_cost.publication_meta["operation"]["operation_id"] =
+            serde_json::json!("b".repeat("actual-owner-id-with-arbitrary-width".len()));
+        same_cost.wall_expiry_epoch_ms = u64::MAX - 1;
+        assert_eq!(
+            same_cost.cache_cost_identity().unwrap(),
+            original.cache_cost_identity().unwrap()
+        );
+        assert_eq!(
+            same_cost.measure(&product.projection).unwrap(),
+            original.measure(&product.projection).unwrap()
+        );
+        let mut escaped = original.clone();
+        escaped.publication_meta["refresh"]["phase"] = serde_json::json!("\\\"".repeat(1_000));
+        assert_ne!(
+            escaped.cache_cost_identity().unwrap(),
+            original.cache_cost_identity().unwrap()
+        );
+        assert_ne!(
+            escaped.measure(&product.projection).unwrap(),
+            original.measure(&product.projection).unwrap()
+        );
+        let mut short_expiry = original.clone();
+        short_expiry.wall_expiry_epoch_ms = 1;
+        assert_ne!(
+            short_expiry.cache_cost_identity().unwrap(),
+            original.cache_cost_identity().unwrap()
+        );
+        let publication = StdioProductPublicationKey {
+            core_generation: 1,
+            core_generation_id: "core-generation-1".into(),
+            core_run_id: "core-run-1".into(),
+            retrieval: packet.answer.retrieval_trace.retrieval_publication.unwrap(),
+        };
+        let key = |cost| {
+            stdio_packet_cache_key(StdioPacketCacheKeyInput {
+                representation_cost: cost,
+                publication: publication.clone(),
+                question: &request.question,
+                budget: request.budget,
+                probes: &request.probes,
+                latency_budget_ms: request.latency_budget_ms,
+                parent_packet_id: None,
+                option_ids: &[],
+                core_generation_id: None,
+                retrieval_generation: None,
+            })
+        };
+        let mut cache = StdioPacketCache::default();
+        cache.insert(
+            key(Some(original.cache_cost_identity().unwrap())),
+            serde_json::json!({"selected":true}),
+        );
+        assert!(
+            cache
+                .get(&key(Some(same_cost.cache_cost_identity().unwrap())))
+                .is_some()
+        );
+        assert!(
+            cache
+                .get(&key(Some(escaped.cache_cost_identity().unwrap())))
+                .is_none()
+        );
+        assert!(
+            cache
+                .get(&key(Some(short_expiry.cache_cost_identity().unwrap())))
+                .is_none()
+        );
+        assert!(
+            cache.get(&key(None)).is_none(),
+            "legacy cache cannot bypass representation selection"
+        );
+    }
+
+    #[test]
+    fn real_record_refuses_invalid_receipt_and_measurement_errors_propagate() {
+        let input = hydrated_pages();
+        let request = request();
+        let (mut packet, _) = fixture::default_packet(input.clone(), &request);
+        packet.support[0]
+            .source_delivery
+            .as_mut()
+            .unwrap()
+            .next_start_line = Some(1);
+        let error = fixture::project_packet(&request, &packet, |_| Ok(0)).unwrap_err();
+        assert!(error.message.contains("packet record"));
+        assert!(fixture::select_prepared(input, &request, |_| Err(())).is_err());
+    }
+
+    #[test]
+    fn no_fitting_complete_preserves_typed_refusal_instead_of_fitting_fallback() {
+        let input = hydrated_pages();
+        let request = request();
+        let selected = fixture::select_prepared(input, &request, |projection| {
+            Ok(if matches!(projection, codestory_contracts::packet_projection_v3::PacketProjectionV3Dto::BudgetExceeded { .. }) { 1_024 } else { 1_000_000 })
+        }).unwrap();
+        assert!(matches!(
+            selected.product.projection,
+            codestory_contracts::packet_projection_v3::PacketProjectionV3Dto::BudgetExceeded { .. }
+        ));
+        assert_eq!(selected.packet.support.len(), 16);
     }
 }

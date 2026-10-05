@@ -58,3 +58,38 @@ context: requested_lines=4 max_snippet_bytes=20000
 
 Pass `query` or `id` (or `paths` / `path` / `file_path` / `symbol_id`). There is
 no `file` or `output_file` field.
+
+
+## Exact path windows
+
+Use `files` to locate paths when the question names files or directories; use
+symbol search when it names a symbol. Feed exact returned paths to `snippet.paths`
+without treating filenames as symbols. For example, after inventory returns
+`src/parser.rs`, request `{"project":"/absolute/repo","paths":[{"path":"src/parser.rs","start_line":1,"end_line":80}]}`.
+
+Each requested range receives a receipt. `start_line` and `end_line` describe the
+request; nullable `delivered_start_line` and `delivered_end_line` describe the
+source actually returned. `complete` means the requested window reached its end
+or natural EOF, not that the file or repository was completely inspected.
+`source_total_lines` is null unless this read observed EOF. `source_kind` is
+`workspace_read`; `source_range_sha256` hashes only delivered raw source bytes,
+including original LF/CRLF endings, and is not an indexed whole-file digest.
+`last_line_terminated` preserves whether the final delivered physical line had LF.
+
+The shared source allowance is 64KiB; structured result metadata and JSON escaping
+have a separate 128KiB bound. Host text delivers all range receipts and the same
+whole source lines under a dedicated bound; the generic summary cap does not
+clip this operation. A metadata overflow returns `source_response_too_large`.
+Empty or naturally EOF-clipped windows can be complete without source lines.
+
+When `complete=false`, continue at `next_start_line`, retaining the same path and
+requested end. `line_exceeds_byte_budget` means a physical line cannot fit; a
+larger line-oriented request will not resolve it. Use an appropriate ordinary
+host file read and qualify any partial line instead. Budget-exhausted later ranges
+remain visible as receipts rather than disappearing.
+
+After reading a body, follow relevant called definitions and regression
+assertions using returned paths or actual returned symbol IDs. Use existing
+`scope=function_body` for a symbol body; its range-source/fallback and publication
+contract remain separate from this workspace path-read contract. No mandatory
+packet or status call precedes these reads.

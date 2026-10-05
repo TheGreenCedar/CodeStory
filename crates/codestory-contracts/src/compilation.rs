@@ -147,6 +147,60 @@ pub struct PacketHydratedSourceRangeV1 {
     pub end_line: u32,
     pub source: String,
     pub parser_completeness: PacketParserCompletenessV1,
+    /// Authenticated requested bounds; delivered bounds above cover complete lines only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<PacketSourceDeliveryV1>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq, Hash)]
+#[serde(deny_unknown_fields)]
+pub struct PacketSourceRangeV1 {
+    pub start_line: u32,
+    pub end_line: u32,
+}
+
+impl PacketSourceRangeV1 {
+    pub fn is_valid(self) -> bool {
+        self.start_line > 0 && self.end_line >= self.start_line
+    }
+}
+
+/// Source progress is independent of parser completeness and answer sufficiency.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq, Hash)]
+#[serde(deny_unknown_fields)]
+pub struct PacketSourceDeliveryV1 {
+    pub requested_range: PacketSourceRangeV1,
+    pub source_sha256: String,
+    pub remaining_source_bytes: u64,
+    pub next_start_line: Option<u32>,
+    pub blocked_line_rendered_bytes: Option<u64>,
+}
+
+impl PacketSourceDeliveryV1 {
+    pub fn matches_delivery(&self, start_line: u32, end_line: u32) -> bool {
+        let requested = self.requested_range;
+        requested.is_valid()
+            && requested.start_line == start_line
+            && end_line >= start_line
+            && end_line <= requested.end_line
+            && self.source_sha256.len() == 64
+            && self
+                .source_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            && if end_line == requested.end_line {
+                self.remaining_source_bytes == 0
+                    && self.next_start_line.is_none()
+                    && self.blocked_line_rendered_bytes.is_none()
+            } else {
+                self.remaining_source_bytes > 0
+                    && match (self.next_start_line, self.blocked_line_rendered_bytes) {
+                        (Some(next), None) => next == end_line + 1,
+                        (None, Some(bytes)) => bytes > INTERIM_SOURCE_ROW_UPPER_BOUND as u64,
+                        _ => false,
+                    }
+            }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Type)]
@@ -261,6 +315,8 @@ pub struct PacketContinuationSelectorV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub symbol_id: Option<String>,
     pub reason: PacketStructuralGapReasonV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_range: Option<PacketSourceRangeV1>,
 }
 
 #[cfg(test)]

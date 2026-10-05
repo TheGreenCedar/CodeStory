@@ -1377,6 +1377,38 @@ mod tests {
     }
 
     #[test]
+    fn packet_continuation_accepts_closed_complete_line_ranges() {
+        let mut arguments = json!({
+            "question": "how does routing work",
+            "probes": [{
+                "kind": "continuation", "contract_version": 1,
+                "project_id": "project", "core_generation_id": "core",
+                "selector": {
+                    "stable_identity": "node:42", "symbol_id": "42",
+                    "reason": "source_budget_exceeded",
+                    "source_range": {"start_line": 10, "end_line": 30}
+                }
+            }]
+        });
+        assert_eq!(validate_tool_arguments("packet", Some(&arguments)), Ok(()));
+        for range in [
+            json!({"start_line": 0, "end_line": 30}),
+            json!({"start_line": 10}),
+            json!({"start_line": 10, "end_line": 4294967296_u64}),
+            json!({"start_line": 10, "end_line": 30, "undeclared": true}),
+            json!(null),
+        ] {
+            arguments["probes"][0]["selector"]["source_range"] = range;
+            assert!(validate_tool_arguments("packet", Some(&arguments)).is_err());
+        }
+        arguments["probes"][0]["selector"]
+            .as_object_mut()
+            .unwrap()
+            .remove("source_range");
+        assert_eq!(validate_tool_arguments("packet", Some(&arguments)), Ok(()));
+    }
+
+    #[test]
     fn undeclared_properties_are_rejected_instead_of_silently_dropped() {
         assert_eq!(
             codes(

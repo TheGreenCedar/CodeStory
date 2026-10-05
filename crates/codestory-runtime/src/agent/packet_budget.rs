@@ -75,7 +75,7 @@ pub(crate) fn apply_packet_budget(
     let mut truncated = false;
     let mut omitted_sections = Vec::new();
 
-    if cap_packet_citations_in_repository_order(answer, &limits) {
+    if cap_packet_citations_in_repository_order(project_root, answer, &limits) {
         truncated = true;
         omitted_sections.push("citations".to_string());
     }

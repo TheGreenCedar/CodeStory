@@ -228,7 +228,7 @@ pub(super) fn test_snapshot() -> EmbeddingServerSnapshot {
     }
 }
 
-pub(super) fn test_engine_identity() -> EmbeddingEngineIdentity {
+pub(crate) fn test_engine_identity() -> EmbeddingEngineIdentity {
     EmbeddingEngineIdentity {
         server_instance_id: "server".into(),
         load_generation: 1,

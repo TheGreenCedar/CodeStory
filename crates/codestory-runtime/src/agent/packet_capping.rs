@@ -1,20 +1,30 @@
 //! Deterministic packet citation capping over admitted repository evidence.
 
-use crate::agent::packet_scoring::{packet_citation_key, packet_display_path};
+use crate::agent::packet_scoring::packet_citation_key;
 use codestory_contracts::api::{AgentAnswerDto, PacketBudgetLimitsDto};
 use std::collections::HashSet;
+use std::path::Path;
 
 /// Preserve exact typed selectors first, then sidecar retrieval order. Prefer
 /// a first path witness before a second range from an already represented
 /// path. No prompt text, evidence role, or answer shape participates.
 pub(crate) fn cap_packet_citations_in_repository_order(
+    project_root: &Path,
     answer: &mut AgentAnswerDto,
     limits: &PacketBudgetLimitsDto,
 ) -> bool {
     let original_len = answer.citations.len();
     let mut exact = Vec::new();
     let mut retrieval = Vec::new();
-    for citation in std::mem::take(&mut answer.citations) {
+    for mut citation in std::mem::take(&mut answer.citations) {
+        if let Some(path) = citation.file_path.as_deref()
+            && let Ok(
+                codestory_workspace::ProjectRelativePathResolution::Existing { relative, .. }
+                | codestory_workspace::ProjectRelativePathResolution::Missing { relative, .. },
+            ) = codestory_workspace::resolve_project_relative_path(project_root, Path::new(path))
+        {
+            citation.file_path = Some(relative.to_string_lossy().replace('\\', "/"));
+        }
         if citation
             .evidence_producer
             .as_deref()
@@ -34,7 +44,7 @@ pub(crate) fn cap_packet_citations_in_repository_order(
         if !seen_identities.insert(packet_citation_key(&citation)) {
             continue;
         }
-        let path = citation.file_path.as_deref().map(packet_display_path);
+        let path = citation.file_path.clone();
         let path_is_new = path.as_ref().is_none_or(|path| !seen_paths.contains(path));
         let exact_selector = citation
             .evidence_producer
@@ -47,7 +57,7 @@ pub(crate) fn cap_packet_citations_in_repository_order(
         }
     }
     for citation in repeated_paths {
-        let path = citation.file_path.as_deref().map(packet_display_path);
+        let path = citation.file_path.clone();
         admit_citation(citation, path, limits, &mut selected, &mut seen_paths);
     }
     answer.citations = selected;
@@ -148,6 +158,7 @@ mod tests {
             citation("exact", "src/exact.rs", true),
         ]);
         cap_packet_citations_in_repository_order(
+            Path::new("/project"),
             &mut answer,
             &PacketBudgetLimitsDto {
                 max_anchors: 3,
@@ -164,6 +175,54 @@ mod tests {
                 .map(|citation| citation.node_id.0.as_str())
                 .collect::<Vec<_>>(),
             vec!["exact", "repeat-a", "other"]
+        );
+    }
+    #[test]
+    fn canonical_file_caps_distinguish_nested_suffixes_and_dedup_aliases() {
+        let project = tempfile::tempdir().unwrap();
+        let root = project.path();
+        let first = root.join("src/main.rs").to_string_lossy().into_owned();
+        let nested = root
+            .join("tools/repos/worker/src/main.rs")
+            .to_string_lossy()
+            .into_owned();
+        let mut answer = answer(vec![
+            citation("one", &first, false),
+            citation("one", "./src/main.rs", false),
+            citation("repeat", "src/main.rs", false),
+            citation("two", &nested, false),
+            citation("third", "other/src/main.rs", false),
+        ]);
+        cap_packet_citations_in_repository_order(
+            root,
+            &mut answer,
+            &PacketBudgetLimitsDto {
+                max_anchors: 3,
+                max_files: 2,
+                max_snippets: 3,
+                max_trail_edges: 3,
+                max_output_bytes: 16 * 1024,
+            },
+        );
+        assert_eq!(
+            answer
+                .citations
+                .iter()
+                .map(|c| c.node_id.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["one", "two", "repeat"]
+        );
+        assert_eq!(
+            answer
+                .citations
+                .iter()
+                .map(|c| c.file_path.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("src/main.rs"),
+                Some("tools/repos/worker/src/main.rs"),
+                Some("src/main.rs")
+            ]
         );
     }
 }

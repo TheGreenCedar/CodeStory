@@ -3551,6 +3551,183 @@ mod tests {
         (temp, controller, source_path)
     }
 
+    fn file_node_source_fixture() -> (tempfile::TempDir, tempfile::TempDir, AppController, PathBuf)
+    {
+        let process_cache = tempfile::tempdir().expect("owned cache");
+        let project = tempdir().expect("project");
+        let database = project.path().join("cache").join("codestory.db");
+        std::fs::create_dir_all(database.parent().expect("database parent"))
+            .expect("create database parent");
+        let path = project.path().join("settings.toml");
+        let contents = "[service]\nenabled = true\nmode = \"local\"\n";
+        std::fs::write(&path, contents).expect("write configuration");
+        {
+            let mut storage = Storage::open(&database).expect("storage");
+            insert_file_node_with_role_and_language(
+                &mut storage,
+                11,
+                &path,
+                FileRole::Source,
+                "cargo_manifest",
+                Node {
+                    id: CoreNodeId(101),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "orphan".into(),
+                    start_line: Some(1),
+                    end_line: Some(3),
+                    ..Default::default()
+                },
+            )
+            .expect("indexed file and orphan symbol");
+            let mut file = storage.get_file_by_id(11).unwrap().unwrap();
+            file.line_count = 3;
+            let hash = format!("{:x}", sha2::Sha256::digest(contents.as_bytes()));
+            storage.update_file_metadata(&file, Some(&hash)).unwrap();
+            // A coincident numeric file record must not give an orphan symbol
+            // an association it never had.
+            file.id = 101;
+            file.path = project.path().join("unassociated.toml");
+            std::fs::write(&file.path, contents).unwrap();
+            storage.insert_file(&file).unwrap();
+            storage.update_file_metadata(&file, Some(&hash)).unwrap();
+            storage
+                .insert_nodes_batch(&[Node {
+                    id: CoreNodeId(11),
+                    kind: NodeKind::FILE,
+                    serialized_name: path.to_string_lossy().into_owned(),
+                    start_line: Some(1),
+                    end_line: Some(3),
+                    ..Default::default()
+                }])
+                .unwrap();
+            storage
+                .put_index_publication(&codestory_store::IndexPublicationRecord {
+                    generation: 1,
+                    generation_id: "11111111-1111-4111-8111-111111111111".into(),
+                    run_id: "22222222-2222-4222-8222-222222222222".into(),
+                    mode: codestory_store::IndexPublicationMode::Full,
+                    published_at_epoch_ms: 1,
+                })
+                .unwrap();
+        }
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
+        {
+            let mut state = controller.state.lock();
+            state.project_root = Some(project.path().to_path_buf());
+            state.storage_path = Some(database);
+        }
+        (process_cache, project, controller, path)
+    }
+
+    #[test]
+    fn file_node_source_accepts_file_self_identity() {
+        let (_process_cache, _project, controller, path) = file_node_source_fixture();
+        controller
+            .with_complete_core_snapshot(|publication| {
+                let node = controller.node_details(NodeDetailsRequest {
+                    id: codestory_contracts::api::NodeId("11".into()),
+                })?;
+                assert_eq!(
+                    node.file_path.as_deref(),
+                    Some(path.to_string_lossy().as_ref())
+                );
+                let snippet = controller.snippet_context(node.id.clone(), 2)?;
+                assert!(snippet.snippet.contains("enabled = true"));
+                assert!(snippet.snippet.contains("mode = \"local\""));
+                assert!(!snippet.snippet_truncated);
+                let focused = controller.focused_source_context(&node, 4096, "truncated")?;
+                assert_eq!(focused.evidence.file_id, 11);
+                assert_eq!(
+                    focused.evidence.core_generation_id,
+                    publication.generation_id
+                );
+                assert!(controller.focused_source_matches_current(&focused.evidence, None));
+                let mut forged = focused.evidence.clone();
+                forged.file_id = 101;
+                assert!(!controller.focused_source_matches_current(&forged, None));
+                forged = focused.evidence.clone();
+                forged.core_run_id = "other-run".into();
+                assert!(!controller.focused_source_matches_current(&forged, None));
+                Ok(())
+            })
+            .expect("file anchor is checked under its own pinned identity");
+    }
+
+    #[test]
+    fn file_node_source_rejects_orphan_symbols() {
+        let (_process_cache, _project, controller, _path) = file_node_source_fixture();
+        let node = controller
+            .node_details(NodeDetailsRequest {
+                id: codestory_contracts::api::NodeId("101".into()),
+            })
+            .unwrap();
+        assert!(node.file_path.is_none());
+        let error = controller
+            .verified_node_source(&node)
+            .err()
+            .expect("orphan refused");
+        assert_eq!(error.code, "source_unavailable");
+    }
+
+    #[test]
+    fn file_node_source_rejects_stale_bytes() {
+        let (_process_cache, _project, controller, path) = file_node_source_fixture();
+        std::fs::write(path, "[service]\nenabled = null\nmode = \"local\"\n").unwrap();
+        let error = controller
+            .snippet_context(codestory_contracts::api::NodeId("11".into()), 2)
+            .expect_err("changed bytes refused");
+        assert_eq!(error.code, "source_stale");
+    }
+
+    #[test]
+    fn file_node_source_rejects_missing_bytes() {
+        let (_process_cache, _project, controller, path) = file_node_source_fixture();
+        std::fs::remove_file(path).unwrap();
+        let error = controller
+            .snippet_context(codestory_contracts::api::NodeId("11".into()), 2)
+            .expect_err("missing bytes refused");
+        assert_eq!(error.code, "source_unavailable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_node_source_rejects_symlink_escape() {
+        let (_process_cache, _project, controller, path) = file_node_source_fixture();
+        let outside = tempdir().unwrap();
+        let target = outside.path().join("settings.toml");
+        std::fs::write(&target, std::fs::read(&path).unwrap()).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(target, path).unwrap();
+        let error = controller
+            .snippet_context(codestory_contracts::api::NodeId("11".into()), 2)
+            .expect_err("outside source refused even with identical bytes");
+        assert_eq!(error.code, "source_unavailable");
+    }
+
+    #[test]
+    fn file_node_source_retains_verified_buffer() {
+        let (_process_cache, _project, controller, path) = file_node_source_fixture();
+        let node = controller
+            .node_details(NodeDetailsRequest {
+                id: codestory_contracts::api::NodeId("11".into()),
+            })
+            .unwrap();
+        let source = controller
+            .verified_node_source(&node)
+            .expect("verified file source");
+        std::fs::write(path, "[service]\nenabled = null\nmode = \"other\"\n").unwrap();
+        let rendered = crate::snippets::bounded_markdown_snippet_from_text(
+            &source.content,
+            source.start_line,
+            2,
+            crate::DIRECT_SNIPPET_MAX_BYTES,
+            crate::DIRECT_SNIPPET_TRUNCATION_SUFFIX,
+        )
+        .unwrap();
+        assert!(rendered.markdown.contains("enabled = true"));
+        assert!(!rendered.markdown.contains("other"));
+    }
+
     fn snippet_node_id() -> codestory_contracts::api::NodeId {
         codestory_contracts::api::NodeId("101".to_string())
     }

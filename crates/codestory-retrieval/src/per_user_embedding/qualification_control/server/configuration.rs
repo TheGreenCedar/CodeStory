@@ -33,6 +33,36 @@ pub(in crate::per_user_embedding) fn server_qualification_control_from_values(
     directory: Option<std::ffi::OsString>,
     nonce: Option<String>,
 ) -> Result<Option<ServerQualificationControl>> {
+    let Some((directory, nonce)) = pin_qualification_gate(directory, nonce)? else {
+        return Ok(None);
+    };
+    let events = ServerQualificationEventLog::open(&directory, &nonce)?;
+    let last_sequence = events.last_sequence;
+    Ok(Some(ServerQualificationControl {
+        directory,
+        events: Mutex::new(events),
+        nonce_sha256: hex_sha256(nonce.as_bytes()),
+        nonce,
+        last_sequence: AtomicU64::new(last_sequence),
+        processed_command_sha256: Mutex::new(None),
+        force_incompatible: AtomicBool::new(false),
+        freeze_owner: AtomicBool::new(false),
+        denied_command_ticks: AtomicU32::new(0),
+    }))
+}
+
+/// Validate and pin existing qualification credentials without creating the
+/// event log or any control state. An environment request alone is not admission.
+pub fn validate_qualification_clock_gate() -> Result<bool> {
+    let gate = qualification_gate_environment();
+    let nonce = gate.nonce_string();
+    Ok(pin_qualification_gate(gate.directory, nonce)?.is_some())
+}
+
+fn pin_qualification_gate(
+    directory: Option<std::ffi::OsString>,
+    nonce: Option<String>,
+) -> Result<Option<(PinnedQualificationDirectory, String)>> {
     match (directory, nonce) {
         (None, None) => Ok(None),
         (Some(directory), Some(nonce))
@@ -44,19 +74,7 @@ pub(in crate::per_user_embedding) fn server_qualification_control_from_values(
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')) =>
         {
             let directory = PinnedQualificationDirectory::open(&PathBuf::from(directory))?;
-            let events = ServerQualificationEventLog::open(&directory, &nonce)?;
-            let last_sequence = events.last_sequence;
-            Ok(Some(ServerQualificationControl {
-                directory,
-                events: Mutex::new(events),
-                nonce_sha256: hex_sha256(nonce.as_bytes()),
-                nonce,
-                last_sequence: AtomicU64::new(last_sequence),
-                processed_command_sha256: Mutex::new(None),
-                force_incompatible: AtomicBool::new(false),
-                freeze_owner: AtomicBool::new(false),
-                denied_command_ticks: AtomicU32::new(0),
-            }))
+            Ok(Some((directory, nonce)))
         }
         _ => bail!("embedding_qualification_gate_incomplete"),
     }

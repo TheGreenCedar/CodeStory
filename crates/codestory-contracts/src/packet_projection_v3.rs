@@ -244,6 +244,8 @@ pub enum GapKindV3Dto {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PacketEvidenceRowV3Dto {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_delivery: Option<crate::compilation::PacketSourceDeliveryV1>,
     pub identity: EvidenceIdentityV3Dto,
     pub kind: EvidenceKindV3Dto,
     pub path: Option<PathTextV3>,
@@ -549,6 +551,7 @@ mod tests {
 
     fn packet_evidence(kind: EvidenceKindV3Dto) -> PacketEvidenceRowV3Dto {
         PacketEvidenceRowV3Dto {
+            source_delivery: None,
             identity: evidence_identity("evidence-1"),
             kind,
             path: Some(text("src/lib.rs")),

@@ -35,6 +35,8 @@ mod planner;
 mod process_identity;
 mod query;
 mod query_features;
+mod query_policy;
+mod query_windows;
 mod ranker;
 mod retention;
 mod rollback;
@@ -348,7 +350,7 @@ pub use per_user_embedding::{
     embedding_qualification_watchdog_marker_filename, embedding_retry_state,
     install_embedding_client_transport, install_embedding_client_transport_factory,
     qualification_gate_environment, run_per_user_embedding_qualification,
-    run_per_user_embedding_server,
+    run_per_user_embedding_server, validate_qualification_clock_gate,
 };
 pub use planner::{PlannedStage, RetrievalPlan, RetrievalStageKind, plan_query};
 pub use process_identity::{
@@ -391,3 +393,5 @@ pub use sidecar_search::{
 };
 
 pub use codestory_store::RetrievalIndexManifest;
+
+pub use query_policy::LexicalAdmissionPolicy;

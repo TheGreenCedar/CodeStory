@@ -161,7 +161,7 @@ fn main() {
     )
     .expect("write embedding model contract");
     let embedding_server_proof_marker = format!(
-        "codestory-embedding-server-proof-v1|bootstrap=1|protocol_schema=1|protocol_sha256={embedding_server_protocol_sha256}|constant_set_sha256={embedding_server_constant_set_sha256}|measurement_protocol_sha256={embedding_server_measurement_protocol_sha256}|clock_policy=awake_monotonic|query_capacity=64|bulk_capacity=64|idle_timeout_ms=60000|end"
+        "codestory-embedding-server-proof-v1|bootstrap=1|protocol_schema=2|protocol_sha256={embedding_server_protocol_sha256}|constant_set_sha256={embedding_server_constant_set_sha256}|measurement_protocol_sha256={embedding_server_measurement_protocol_sha256}|clock_policy=awake_monotonic|query_capacity=64|bulk_capacity=64|idle_timeout_ms=60000|end"
     );
     fs::write(
         out_dir.join("embedding_server_contract.rs"),

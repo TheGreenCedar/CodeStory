@@ -259,6 +259,7 @@ fn record_qualification_completed_tokens(
         bail!("embedding_qualification_native_completion_sequence_missing");
     }
     let clock = state.clock.snapshot();
+    let boot_id = clock.qualification_boot_id()?.to_owned();
     write_server_qualification_event(
         control,
         state,
@@ -271,7 +272,7 @@ fn record_qualification_completed_tokens(
             clock: ServerQualificationEventClock {
                 domain: clock.domain,
                 api: clock.api,
-                boot_id: clock.boot_id,
+                boot_id,
                 observed_ns: state.clock.now_ns(),
             },
             snapshot: None,

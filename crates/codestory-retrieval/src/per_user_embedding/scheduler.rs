@@ -228,6 +228,7 @@ pub(super) fn publish_watchdog_fail_stop_marker(
         Err(error) => return Err(error).context("inspect watchdog marker destination"),
     }
     let clock = state.clock.snapshot();
+    let boot_id = clock.qualification_boot_id()?.to_owned();
     let marker = EmbeddingQualificationWatchdogMarker {
         schema_version: 1,
         nonce_sha256: control.nonce_sha256.clone(),
@@ -240,7 +241,7 @@ pub(super) fn publish_watchdog_fail_stop_marker(
         clock: EmbeddingQualificationWatchdogClock {
             domain: clock.domain,
             api: clock.api,
-            boot_id: clock.boot_id,
+            boot_id,
             observed_ns: state.clock.now_ns(),
         },
         progress_sequence,

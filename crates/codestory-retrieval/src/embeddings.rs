@@ -25,7 +25,6 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
-#[cfg(not(feature = "test-support"))]
 use std::time::Instant;
 
 /// CodeRankEmbed vector width shared by stored and query vectors.
@@ -126,13 +125,20 @@ impl Drop for ProductEmbeddingResidencyLease {
 #[derive(Debug, Clone)]
 pub struct ProductEmbeddingClient {
     runtime: SidecarRuntimeConfig,
+    query_identity_pin: Option<ProductEmbeddingIdentity>,
 }
 
 impl ProductEmbeddingClient {
     pub fn new(runtime: &SidecarRuntimeConfig) -> Self {
         Self {
             runtime: runtime.clone(),
+            query_identity_pin: None,
         }
+    }
+
+    pub(crate) fn with_query_identity_pin(mut self, pin: Option<ProductEmbeddingIdentity>) -> Self {
+        self.query_identity_pin = pin;
+        self
     }
 
     pub fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
@@ -189,6 +195,110 @@ impl ProductEmbeddingClient {
             capture_semantic_calibration_query_vector(text, vector)?;
         }
         Ok(vectors)
+    }
+
+    pub(crate) fn embed_query_windows_with_control(
+        &self,
+        text: &str,
+        maximum_timeout: Option<Duration>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<crate::query_windows::QueryWindowBatch> {
+        self.query_windows_with_control(&[text.to_string()], maximum_timeout, cancelled, true, None)
+    }
+
+    pub(crate) fn embed_queries_windows_with_control(
+        &self,
+        texts: &[String],
+        maximum_timeout: Option<Duration>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<crate::query_windows::QueryWindowBatch> {
+        self.query_windows_with_control(texts, maximum_timeout, cancelled, false, None)
+    }
+
+    pub(crate) fn embed_queries_windows_until(
+        &self,
+        texts: &[String],
+        deadline: Instant,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<crate::query_windows::QueryWindowBatch> {
+        self.query_windows_with_control(texts, None, cancelled, false, Some(deadline))
+    }
+
+    fn query_windows_with_control(
+        &self,
+        texts: &[String],
+        maximum_timeout: Option<Duration>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+        scalar: bool,
+        maximum_deadline: Option<Instant>,
+    ) -> Result<crate::query_windows::QueryWindowBatch> {
+        let started = Instant::now();
+        crate::query_windows::validate_query_inputs(texts)?;
+        ensure_test_embedding_available(&self.runtime.cache_root)?;
+        let client = crate::per_user_embedding::PerUserEmbeddingClient::for_runtime(&self.runtime)?;
+        let budget = client.query_request_budget();
+        let timeout = maximum_timeout.map_or(budget, |limit| limit.min(budget));
+        let timeout = maximum_deadline.map_or(timeout, |limit| {
+            timeout.min(limit.saturating_duration_since(started))
+        });
+        let deadline = started
+            .checked_add(timeout)
+            .ok_or_else(|| anyhow::anyhow!("embedding_server_deadline_invalid"))?;
+        let result = crate::query_windows::embed_windows(
+            texts,
+            started,
+            timeout,
+            cancelled,
+            |raw, _, allow_loss_replay| {
+                let (vectors, identity) = if scalar {
+                    let (vector, identity) = client.embed_query_with_identity_until(
+                        &raw[0],
+                        deadline,
+                        cancelled,
+                        allow_loss_replay,
+                    )?;
+                    (vec![vector], identity)
+                } else {
+                    client.embed_queries_with_identity_until(
+                        raw,
+                        deadline,
+                        cancelled,
+                        allow_loss_replay,
+                    )?
+                };
+                let product_identity =
+                    crate::embedding_server_compat::compatibility_identity(identity.clone())?;
+                #[cfg(any(not(feature = "test-support"), test))]
+                validate_identity(&product_identity, self.runtime.embedding.allow_cpu)?;
+                if self
+                    .query_identity_pin
+                    .as_ref()
+                    .is_some_and(|pin| !same_product_query_engine(pin, &product_identity))
+                {
+                    bail!("embedding_query_window_session_identity_changed");
+                }
+                Ok((vectors, identity))
+            },
+        )?;
+        #[cfg(feature = "semantic-calibration-support")]
+        {
+            // One native whole-query vector is the calibration format. Never
+            // counterfeit it by averaging windows or labeling a fragment as it.
+            if result.expanded
+                && std::env::var_os(
+                    crate::semantic_calibration_support::QUERY_VECTOR_CAPTURE_DIR_ENV,
+                )
+                .is_some()
+            {
+                bail!("semantic calibration whole-query capture does not support query windows");
+            }
+            if !result.expanded {
+                for (text, group) in texts.iter().zip(&result.groups) {
+                    capture_semantic_calibration_query_vector(text, &group[0].vector)?;
+                }
+            }
+        }
+        Ok(result)
     }
 
     pub fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
@@ -256,6 +366,30 @@ impl ProductEmbeddingClient {
         }
         embed_prepared_via_server_with_control(&self.runtime, texts, maximum_timeout, cancelled)
     }
+}
+
+/// Bind query encodes to the session's already accepted residency identity.
+/// Runtime counters/timing/memory and sleeping-vs-resident state may advance.
+fn same_product_query_engine(
+    left: &ProductEmbeddingIdentity,
+    right: &ProductEmbeddingIdentity,
+) -> bool {
+    left.instance_id == right.instance_id
+        && left.load_generation == right.load_generation
+        && left.model_load_count == right.model_load_count
+        && left.model_digest == right.model_digest
+        && left.ggml_build_identity == right.ggml_build_identity
+        && left.backend == right.backend
+        && left.adapter_name == right.adapter_name
+        && left.adapter_description == right.adapter_description
+        && left.policy == right.policy
+        && left.embedded_model == right.embedded_model
+        && left.execution_device_names == right.execution_device_names
+        && left.execution_backend_names == right.execution_backend_names
+        && left.execution_observation_source == right.execution_observation_source
+        && left.model_layer_count == right.model_layer_count
+        && left.offloaded_layer_count == right.offloaded_layer_count
+        && left.accelerator_execution_verified == right.accelerator_execution_verified
 }
 
 #[cfg(feature = "semantic-calibration-support")]

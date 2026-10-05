@@ -13,6 +13,7 @@ use codestory_contracts::compilation::{
     PacketCandidateDescriptorV1,
 };
 use codestory_contracts::graph::NodeId as CoreNodeId;
+use codestory_retrieval::LexicalAdmissionPolicy;
 use codestory_retrieval::{QueryResult, RetrievalPublicationIdentity};
 use sha2::{Digest, Sha256};
 #[cfg(any(test, feature = "benchmark-support"))]
@@ -64,8 +65,45 @@ pub(crate) struct PacketProofSession {
     descriptor_stage_candidates: RefCell<BTreeMap<String, u64>>,
 }
 
+/// Origin is retained before query text enters execution or result lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PacketRetrievalQuery {
+    pub query: String,
+    pub lexical_policy: LexicalAdmissionPolicy,
+}
+
+impl PacketRetrievalQuery {
+    pub(crate) fn strict(query: &str) -> Self {
+        Self {
+            query: query.trim().to_string(),
+            lexical_policy: LexicalAdmissionPolicy::StrictLiteralV1,
+        }
+    }
+}
+
+pub(crate) fn packet_retrieval_queries(
+    seed: &codestory_contracts::compilation::RetrievalSeedPlanV1,
+) -> Vec<PacketRetrievalQuery> {
+    let mut queries = vec![PacketRetrievalQuery {
+        query: seed.generic_query.trim().to_string(),
+        lexical_policy: LexicalAdmissionPolicy::BroadQuestionV1,
+    }];
+    queries.extend(
+        seed.free_queries
+            .iter()
+            .map(|query| PacketRetrievalQuery::strict(query)),
+    );
+    let mut seen = HashSet::new();
+    queries.retain(|query| {
+        !query.query.is_empty()
+            && seen.insert((query.query.to_ascii_lowercase(), query.lexical_policy))
+    });
+    queries
+}
+
 #[derive(Debug, Clone)]
 struct RetainedPacketDescriptorResult {
+    lexical_policy: LexicalAdmissionPolicy,
     query: String,
     include_dense_semantic: bool,
     publication: RetrievalPublicationIdentity,
@@ -181,24 +219,45 @@ impl PacketProofSession {
     /// publication. A later hydration stage may reuse only an identical key;
     /// it cannot silently rerun under a shorter budget or cross a packet,
     /// policy, or publication boundary.
+    #[cfg(test)]
     pub(crate) fn retain_descriptor_result(
         &self,
         result: &QueryResult,
         include_dense_semantic: bool,
         publication: &RetrievalPublicationIdentity,
     ) -> Result<(), &'static str> {
+        self.retain_descriptor_result_with_policy(
+            result,
+            LexicalAdmissionPolicy::StrictLiteralV1,
+            include_dense_semantic,
+            publication,
+        )
+    }
+
+    pub(crate) fn retain_descriptor_result_with_policy(
+        &self,
+        result: &QueryResult,
+        expected_policy: LexicalAdmissionPolicy,
+        include_dense_semantic: bool,
+        publication: &RetrievalPublicationIdentity,
+    ) -> Result<(), &'static str> {
+        if result.features.lexical_policy != expected_policy {
+            return Err("descriptor execution policy does not match requested policy");
+        }
         if result.publication_identity.as_ref() != Some(publication) {
             return Err("descriptor result publication does not match the packet pin");
         }
         let mut retained = self.descriptor_results.borrow_mut();
         if retained.iter().any(|entry| {
             entry.query == result.query
+                && entry.lexical_policy == expected_policy
                 && entry.include_dense_semantic == include_dense_semantic
                 && entry.publication == *publication
         }) {
             return Err("descriptor result was retained twice for one packet query");
         }
         retained.push(RetainedPacketDescriptorResult {
+            lexical_policy: expected_policy,
             query: result.query.clone(),
             include_dense_semantic,
             publication: publication.clone(),
@@ -213,11 +272,28 @@ impl PacketProofSession {
         include_dense_semantic: bool,
         publication: &RetrievalPublicationIdentity,
     ) -> Option<QueryResult> {
+        self.descriptor_result_with_policy(
+            query,
+            LexicalAdmissionPolicy::StrictLiteralV1,
+            include_dense_semantic,
+            publication,
+        )
+    }
+
+    pub(crate) fn descriptor_result_with_policy(
+        &self,
+        query: &str,
+        lexical_policy: LexicalAdmissionPolicy,
+        include_dense_semantic: bool,
+        publication: &RetrievalPublicationIdentity,
+    ) -> Option<QueryResult> {
         self.descriptor_results
             .borrow()
             .iter()
             .find(|entry| {
                 entry.query == query
+                    && entry.lexical_policy == lexical_policy
+                    && entry.result.features.lexical_policy == lexical_policy
                     && entry.include_dense_semantic == include_dense_semantic
                     && entry.publication == *publication
             })
@@ -301,6 +377,10 @@ impl PacketProofSession {
             &descriptor.retrieval_score.version,
             descriptor.exact_selector_ordinal,
         )
+    }
+
+    pub(crate) fn retrieval_admission_is_sealed(&self) -> bool {
+        *self.retrieval_admission_sealed.borrow()
     }
 
     pub(crate) fn seal_retrieval_admission(&self) {
@@ -854,6 +934,28 @@ mod tests {
         );
         assert_eq!(*session.hydrated_admissions.borrow(), 0);
         assert_eq!(*session.admitted_source_bytes.borrow(), 0);
+    }
+
+    #[test]
+    fn identical_generic_and_free_query_keep_distinct_origin() {
+        let seed = codestory_contracts::compilation::RetrievalSeedPlanV1 {
+            contract_version: 1,
+            generic_query: "text empty `absent`".into(),
+            exact_selectors: Vec::new(),
+            free_queries: vec!["text empty `absent`".into(), "text empty `absent`".into()],
+        };
+        let queries = packet_retrieval_queries(&seed);
+        assert_eq!(queries.len(), 2);
+        assert_eq!(queries[0].query, seed.generic_query);
+        assert_eq!(queries[1].query, seed.generic_query);
+        assert_eq!(
+            queries[0].lexical_policy,
+            LexicalAdmissionPolicy::BroadQuestionV1
+        );
+        assert_eq!(
+            queries[1].lexical_policy,
+            LexicalAdmissionPolicy::StrictLiteralV1
+        );
     }
 
     #[test]

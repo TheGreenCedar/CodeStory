@@ -1254,6 +1254,128 @@ fn test_header_language_defaults_to_c_and_can_upgrade_to_cpp_from_compile_info()
 }
 
 #[test]
+fn test_native_recovery_does_not_promote_control_flow() -> Result<()> {
+    let source = r#"int owner(int ready) {
+    if (!ready) {
+        return 0;
+    }
+#if EXTRA_BRANCH
+    else if (ready > 2) {
+        return 2;
+    }
+#endif
+    else if (ready > 1) {
+        return 1;
+    }
+    else {
+        return 3;
+    }
+    return 4;
+}
+"#;
+    for extension in ["c", "cpp"] {
+        let config = get_language_for_ext(extension).unwrap();
+        let path = format!("branching.{extension}");
+        let result = index_file(Path::new(&path), source, &config, None, None)?;
+        assert_eq!(result.files.len(), 1);
+        let functions = result
+            .nodes
+            .iter()
+            .filter(|node| node.kind == NodeKind::FUNCTION)
+            .map(|node| node.serialized_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            functions,
+            ["owner"],
+            "{extension}: recovered branches are not functions"
+        );
+        let owner = result
+            .nodes
+            .iter()
+            .find(|node| node.kind == NodeKind::FUNCTION && node.serialized_name == "owner")
+            .unwrap();
+        assert_eq!((owner.start_line, owner.end_line), (Some(1), Some(17)));
+        assert!(
+            result.files.iter().all(|file| !file.complete),
+            "rejecting recovered names must not hide parser incompleteness"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_native_recovery_keeps_valid_keyword_like_names() -> Result<()> {
+    for (extension, names) in [
+        ("c", &["new", "delete", "if_handler"][..]),
+        ("cpp", &["final", "override", "if_handler"][..]),
+    ] {
+        let config = get_language_for_ext(extension).unwrap();
+        for name in names {
+            let source = format!("int {name}(int value) {{ return value; }}\n");
+            let path = format!("valid.{extension}");
+            let result = index_file(Path::new(&path), &source, &config, None, None)?;
+            assert_eq!(result.files.len(), 1);
+            assert!(result.files.iter().all(|file| file.complete));
+            assert!(
+                result
+                    .nodes
+                    .iter()
+                    .any(|node| node.kind == NodeKind::FUNCTION && node.serialized_name == *name),
+                "{extension}: valid {name} missing"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_header_comments_preserve_c_declarations() -> Result<()> {
+    let base_config = get_language_for_ext("h").unwrap();
+    for comment in [
+        "/*\nA C++ adapter may use std::string_view.\n*/",
+        "/* namespace adapter {} */",
+        "// class Adapter; std::string value;",
+        "/*\nclass Adapter;\npublic:\nvirtual void read();\n*/",
+    ] {
+        let source = format!("{comment}\nint settings_read(const char* path);\n");
+        let config = maybe_upgrade_header_language_from_source(
+            Path::new("settings.h"),
+            &source,
+            &base_config,
+        )
+        .unwrap_or_else(|| base_config.clone());
+        assert_eq!(config.language_name, "c", "comment: {comment}");
+        let result = index_file(Path::new("settings.h"), &source, &config, None, None)?;
+        assert!(
+            result.nodes.iter().any(|node| {
+                node.serialized_name == "settings_read" && node.kind == NodeKind::FUNCTION
+            }),
+            "C declaration missing after comment: {comment}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_header_comments_do_not_hide_cpp_code() {
+    let base_config = get_language_for_ext("h").unwrap();
+    for source in [
+        "/* adapter */ class Adapter {};",
+        "/* documentation\n*/ namespace adapter {}",
+        "class Adapter { // interface\npublic:\nvirtual void read();\n};",
+        "const char* marker = \"/*\";\nnamespace adapter {}",
+        "class/**/Adapter {};",
+        "template/**/<typename T> class Adapter {};",
+    ] {
+        assert!(header_source_has_cpp_signals(source), "source: {source}");
+        let config =
+            maybe_upgrade_header_language_from_source(Path::new("adapter.h"), source, &base_config)
+                .expect("real C++ code must upgrade the header parser");
+        assert_eq!(config.language_name, "cpp");
+    }
+}
+
+#[test]
 fn test_header_source_signals_can_upgrade_c_header_to_cpp() {
     let c_header = r#"
 #ifndef COUNT_H
@@ -8115,5 +8237,155 @@ fn type_usage_finalize_resolves_owner_qualified_nested_type_by_bare_name() -> Re
         pending_nodes, 1,
         "resolved pending reference node must remain while the edge targets it"
     );
+    Ok(())
+}
+
+#[test]
+fn test_native_macros_preserve_directive_ranges() -> Result<()> {
+    let cases = [
+        ("#define PEBBLE 7\n", "PEBBLE", 1),
+        ("#define SHIFT(value) ((value) + 3)\n", "SHIFT", 1),
+        ("#define SHIFT(value) \\\n    ((value) + 3)\n", "SHIFT", 2),
+        ("#define PEBBLE\n", "PEBBLE", 1),
+        ("#define PEBBLE 7", "PEBBLE", 1),
+        (
+            "#define SHIFT(value) \\\r\n    ((value) + 3)\r\n",
+            "SHIFT",
+            2,
+        ),
+    ];
+    for extension in ["c", "cpp"] {
+        let config = get_language_for_ext(extension).unwrap();
+        for (directive, name, lines) in cases {
+            for prefix in ["", "// shifted source\n\n"] {
+                let source = format!("{prefix}{directive}");
+                let path = format!("unrelated/macros.{extension}");
+                let result = index_file(Path::new(&path), &source, &config, None, None)?;
+                assert_eq!(result.files.len(), 1);
+                // The native grammar requires a directive newline. The
+                // existing EOF recovery is incomplete in both languages;
+                // extracting its macro must preserve that refusal signal.
+                assert_eq!(
+                    result.files[0].complete,
+                    directive.ends_with('\n'),
+                    "{extension}: {source:?}"
+                );
+                let macros = result
+                    .nodes
+                    .iter()
+                    .filter(|node| node.kind == NodeKind::MACRO)
+                    .collect::<Vec<_>>();
+                assert_eq!(macros.len(), 1, "{extension}: {source:?}");
+                let node = macros[0];
+                let start = prefix.lines().count() as u32 + 1;
+                let final_line = source.lines().last().unwrap();
+                assert_eq!(node.serialized_name, name);
+                assert_eq!(
+                    (node.start_line, node.start_col, node.end_line, node.end_col),
+                    (
+                        Some(start),
+                        Some(1),
+                        Some(start + lines - 1),
+                        Some(final_line.len() as u32 + 1)
+                    ),
+                    "{extension}: {source:?}"
+                );
+                assert!(
+                    result
+                        .nodes
+                        .iter()
+                        .all(|node| node.kind != NodeKind::FUNCTION)
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_native_macros_keep_conditional_declarations_distinct() -> Result<()> {
+    let source = "#ifdef CHOICE\n#define PEBBLE 7\n#else\n#define PEBBLE 9\n#endif\n// #define PHANTOM 1\nconst char *message = \"#define GHOST 2\";\n";
+    for extension in ["c", "cpp"] {
+        let config = get_language_for_ext(extension).unwrap();
+        let result = index_file(
+            Path::new(&format!("conditional.{extension}")),
+            source,
+            &config,
+            None,
+            None,
+        )?;
+        assert_eq!(result.files.len(), 1);
+        assert!(result.files.iter().all(|file| file.complete));
+        let mut macros = result
+            .nodes
+            .iter()
+            .filter(|node| node.kind == NodeKind::MACRO)
+            .collect::<Vec<_>>();
+        macros.sort_by_key(|node| node.start_line);
+        assert_eq!(macros.len(), 2, "{extension}");
+        assert!(macros.iter().all(|node| node.serialized_name == "PEBBLE"));
+        assert_ne!(macros[0].id, macros[1].id);
+        assert_eq!(
+            (macros[0].start_line, macros[0].end_line),
+            (Some(2), Some(2))
+        );
+        assert_eq!(
+            (macros[1].start_line, macros[1].end_line),
+            (Some(4), Some(4))
+        );
+        for node in macros {
+            assert!(
+                result
+                    .occurrences
+                    .iter()
+                    .any(|occurrence| occurrence.element_id == node.id.0
+                        && occurrence.kind
+                            == codestory_contracts::graph::OccurrenceKind::DECLARATION)
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_native_macros_do_not_own_adjacent_function_calls() -> Result<()> {
+    let source = "#define PEBBLE 7\nint caller(void) { int value = helper();\n    return value;\n}\nint helper(void) { return 3; }\n";
+    for extension in ["c", "cpp"] {
+        let config = get_language_for_ext(extension).unwrap();
+        let result = index_file(
+            Path::new(&format!("adjacent.{extension}")),
+            source,
+            &config,
+            None,
+            None,
+        )?;
+        assert_eq!(result.files.len(), 1);
+        assert!(result.files.iter().all(|file| file.complete));
+        let owner = result
+            .nodes
+            .iter()
+            .find(|node| node.kind == NodeKind::FUNCTION && node.serialized_name == "caller")
+            .unwrap();
+        let macro_node = result
+            .nodes
+            .iter()
+            .find(|node| node.kind == NodeKind::MACRO && node.serialized_name == "PEBBLE")
+            .expect("macro declaration");
+        assert_eq!(
+            (macro_node.start_line, macro_node.end_line),
+            (Some(1), Some(1))
+        );
+        let calls = result
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::CALL && edge.line == Some(2))
+            .collect::<Vec<_>>();
+        assert!(!calls.is_empty(), "{extension}: real call missing");
+        assert!(
+            calls.iter().any(|edge| edge.effective_source() == owner.id),
+            "{extension}: call owner missing"
+        );
+        assert!(result.edges.iter().all(|edge| edge.kind != EdgeKind::CALL || edge.effective_source() != macro_node.id), "{extension}: adjacent call stolen");
+    }
     Ok(())
 }

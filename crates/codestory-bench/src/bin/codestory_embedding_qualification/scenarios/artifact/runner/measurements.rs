@@ -1006,10 +1006,11 @@ pub(super) fn measurement_span_interval(
     output: &WorkerOutput,
     span: &WorkerMeasurementSpan,
 ) -> Result<MeasurementInterval> {
+    let boot_id = output.clock.qualification_boot_id()?;
     if span.awake_started_ns > span.awake_finished_ns
         || span.inclusive_started_ns > span.inclusive_finished_ns
-        || span.boot_id_started != output.clock.boot_id
-        || span.boot_id_finished != output.clock.boot_id
+        || span.boot_id_started != boot_id
+        || span.boot_id_finished != boot_id
         || span.awake_started_ns < output.started_ns
         || span.awake_finished_ns > output.finished_ns
         || span.inclusive_started_ns < output.inclusive_started_ns
@@ -1025,7 +1026,7 @@ pub(super) fn measurement_span_interval(
         clock: RawMetricClock {
             domain: output.clock.domain.clone(),
             api: output.clock.api.clone(),
-            boot_id: output.clock.boot_id.clone(),
+            boot_id: boot_id.to_owned(),
             resolution_ns: output.clock.resolution_ns,
         },
         awake_started_ns: span.awake_started_ns,

@@ -185,7 +185,9 @@ pub fn embed_prepared_queries_via_server_with_control(
     )
 }
 
-fn compatibility_identity(identity: EmbeddingEngineIdentity) -> Result<ProductEmbeddingIdentity> {
+pub(crate) fn compatibility_identity(
+    identity: EmbeddingEngineIdentity,
+) -> Result<ProductEmbeddingIdentity> {
     let residency = stable_name(&identity.residency)?;
     let policy = stable_name(&identity.policy)?;
     let execution_observation_source = stable_name(&identity.execution_observation_source)?;

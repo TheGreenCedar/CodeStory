@@ -150,7 +150,7 @@ mod tests {
             EmbeddingServerClockSnapshot {
                 domain: "awake_monotonic".into(),
                 api: "test_step_clock".into(),
-                boot_id: "test-boot".into(),
+                boot_id: Some("test-boot".into()),
                 resolution_ns: 1,
             }
         }

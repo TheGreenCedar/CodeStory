@@ -6,7 +6,7 @@ use crate::args::PacketCommand;
 use crate::output::render_context_markdown;
 use crate::output::{
     REPO_CONTENT_BOUNDARY_LINE, RenderedPublicOutput, emit_public_operation,
-    render_public_operation_json_content,
+    render_public_operation_json_content, render_public_operation_json_content_with_byte_budget,
 };
 use crate::runtime;
 use crate::runtime::map_api_error;
@@ -30,6 +30,21 @@ fn benchmark_request_receipt(request: &AgentPacketRequestDto) -> serde_json::Val
         "core_generation_id": request.core_generation_id.as_deref(),
         "retrieval_generation": request.retrieval_generation.as_deref(),
     })
+}
+
+// Formatting preference for the existing v3 16-KiB public result contract.
+// Runtime finalization still owns enforcement and the typed oversized result.
+const PACKET_CLI_RESULT_MAX_BYTES_V3: usize = 16 * 1024;
+
+fn render_packet_projection_json<T>(
+    operation: &codestory_runtime::PublicOperation<T>,
+    projection: &PacketProjectionV3Dto,
+) -> Result<String> {
+    render_public_operation_json_content_with_byte_budget(
+        operation,
+        projection,
+        PACKET_CLI_RESULT_MAX_BYTES_V3,
+    )
 }
 
 pub(in crate::app) fn run_packet(cmd: PacketCommand) -> Result<()> {
@@ -115,9 +130,11 @@ pub(in crate::app) fn run_packet(cmd: PacketCommand) -> Result<()> {
     codestory_runtime::finalize_packet_projection_v3_for_representation(
         &mut operation.value.projection,
         |projection| {
-            render_public_operation_json_content(&envelope, projection)
-                .map(|content| content.len())
-                .map_err(|_| ())
+            let rendered = match cmd.format {
+                args::OutputFormat::Json => render_packet_projection_json(&envelope, projection),
+                _ => render_public_operation_json_content(&envelope, projection),
+            };
+            rendered.map(|content| content.len()).map_err(|_| ())
         },
     )
     .map_err(map_api_error)?;
@@ -136,7 +153,13 @@ pub(in crate::app) fn run_packet(cmd: PacketCommand) -> Result<()> {
         .map_err(anyhow::Error::new)?;
     }
     let markdown = render_packet_projection_markdown(&operation.value.projection);
-    let rendered = RenderedPublicOutput::structured(&operation.value.projection, markdown)?;
+    let rendered = match cmd.format {
+        args::OutputFormat::Json => RenderedPublicOutput::text(render_packet_projection_json(
+            &envelope,
+            &operation.value.projection,
+        )?),
+        _ => RenderedPublicOutput::structured(&operation.value.projection, markdown)?,
+    };
     let operation = runtime::map_public_operation(operation, |_| rendered);
     emit_public_operation(cmd.format, operation, cmd.output_file.as_deref())
 }
@@ -445,6 +468,197 @@ mod tests {
     use super::packet_request_from_command;
     use crate::args::{Cli, Command};
     use clap::Parser;
+    use codestory_contracts::packet_projection_v3::PacketProjectionV3Dto;
+
+    fn packet_json_fixture(lines: u32, path_padding: usize) -> PacketProjectionV3Dto {
+        let source = "let value = \"雪\";\r\n".repeat(lines as usize);
+        let rows = (0..16).map(|index| serde_json::json!({
+            "identity": {"evidence_id": format!("fixture-evidence-{index:02}")},
+            "kind": "exact_source",
+            "path": format!("src/{}/generic_module_{index:02}/implementation.rs", "p".repeat(path_padding)),
+            "symbol_id": null, "start_line": 1, "end_line": lines,
+            "summary": source,
+            "source_delivery": {
+                "requested_range": {"start_line": 1, "end_line": lines + 1},
+                "source_sha256": "d".repeat(64), "remaining_source_bytes": "let value = \"雪\";\r\n".len(),
+                "next_start_line": lines + 1, "blocked_line_rendered_bytes": null
+            }
+        })).collect::<Vec<_>>();
+        serde_json::from_value(serde_json::json!({
+            "kind": "complete", "schema_version": 3,
+            "identity": {"packet_id": "fixture-packet", "request_id": "fixture-request", "question_sha256": "a".repeat(64)},
+            "publication": {
+                "core": {"project_id": "fixture-project", "generation_id": "b".repeat(36), "run_id": "c".repeat(36)},
+                "retrieval": {"core_generation_id": "b".repeat(36), "core_run_id": "c".repeat(36),
+                    "retrieval_generation": "r".repeat(64), "retrieval_input_sha256": "e".repeat(64),
+                    "semantic_generation": "s".repeat(64)}
+            },
+            "status": "available", "retrieval": {"state": "full", "generation_id": "r".repeat(64)},
+            "evidence": rows, "gaps": [], "continuation": null,
+            "diagnostics": {"availability": "unavailable"}, "answer_sufficiency": "not_asserted"
+        })).expect("bounded complete packet fixture")
+    }
+
+    fn packet_json_operation() -> codestory_runtime::PublicOperation<()> {
+        codestory_runtime::PublicOperation {
+            value: (),
+            core_publication: Some(codestory_contracts::api::IndexPublicationDto {
+                generation: 7,
+                generation_id: "b".repeat(36),
+                run_id: "c".repeat(36),
+                mode: codestory_contracts::api::IndexPublicationModeDto::Full,
+                published_at_epoch_ms: 1234567890,
+            }),
+            retrieval_publication: Some(
+                codestory_contracts::api::EmbeddingVectorPublicationIdentityDto {
+                    core_generation_id: "b".repeat(36),
+                    core_run_id: "c".repeat(36),
+                    retrieval_generation: "r".repeat(64),
+                    retrieval_input_hash: "e".repeat(64),
+                    semantic_generation: "s".repeat(64),
+                },
+            ),
+            operation_id: "fixture-public-operation".to_string(),
+            attempt: 1,
+            freshness: codestory_runtime::OperationFreshness::Fresh,
+        }
+    }
+
+    #[test]
+    fn packet_json_budget_preserves_pretty_output_when_it_fits() {
+        let operation = packet_json_operation();
+        let projection = packet_json_fixture(1, 0);
+        let pretty = super::render_public_operation_json_content(&operation, &projection).unwrap();
+        assert!(pretty.len() < super::PACKET_CLI_RESULT_MAX_BYTES_V3);
+        assert_eq!(
+            super::render_packet_projection_json(&operation, &projection).unwrap(),
+            pretty
+        );
+    }
+
+    #[test]
+    fn packet_json_budget_preserves_complete_source_and_exact_emitted_bytes() {
+        let operation = packet_json_operation();
+        let original = packet_json_fixture(19, 0);
+        let pretty = super::render_public_operation_json_content(&operation, &original).unwrap();
+        let rendered = super::render_packet_projection_json(&operation, &original).unwrap();
+        assert!(pretty.len() > super::PACKET_CLI_RESULT_MAX_BYTES_V3);
+        assert!(rendered.len() <= super::PACKET_CLI_RESULT_MAX_BYTES_V3);
+        assert!(rendered.ends_with('\n'));
+        let expected = crate::runtime::public_operation_json_value(&operation, &original).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&rendered).unwrap(),
+            expected
+        );
+        let mut previous = original.clone();
+        codestory_runtime::finalize_packet_projection_v3_for_representation(&mut previous, |p| {
+            Ok(super::render_public_operation_json_content(&operation, p)
+                .unwrap()
+                .len())
+        })
+        .unwrap();
+        assert!(matches!(
+            previous,
+            PacketProjectionV3Dto::BudgetExceeded { .. }
+        ));
+        let mut projection = original.clone();
+        let measured = codestory_runtime::finalize_packet_projection_v3_for_representation(
+            &mut projection,
+            |p| {
+                Ok(super::render_packet_projection_json(&operation, p)
+                    .unwrap()
+                    .len())
+            },
+        )
+        .unwrap();
+        assert_eq!(projection, original);
+        assert_eq!(measured, rendered.len());
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("packet.json");
+        let response = crate::runtime::map_public_operation(operation, |_| {
+            crate::output::RenderedPublicOutput::text(rendered.clone())
+        });
+        crate::output::emit_public_operation(
+            crate::args::OutputFormat::Json,
+            response,
+            Some(&path),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), rendered.as_bytes());
+        eprintln!(
+            "packet-json proof: pretty={} compact={} measured={} emitted={}",
+            pretty.len(),
+            rendered.len(),
+            measured,
+            rendered.len()
+        );
+    }
+
+    #[test]
+    fn packet_json_budget_keeps_typed_refusal_when_compact_is_oversized() {
+        let operation = packet_json_operation();
+        let mut projection = packet_json_fixture(19, 1024);
+        let original_bytes = super::render_packet_projection_json(&operation, &projection)
+            .unwrap()
+            .len();
+        assert!(original_bytes > super::PACKET_CLI_RESULT_MAX_BYTES_V3);
+        let measured = codestory_runtime::finalize_packet_projection_v3_for_representation(
+            &mut projection,
+            |p| {
+                Ok(super::render_packet_projection_json(&operation, p)
+                    .unwrap()
+                    .len())
+            },
+        )
+        .unwrap();
+        let PacketProjectionV3Dto::BudgetExceeded {
+            maximum_bytes,
+            required_complete_bytes,
+            ..
+        } = &projection
+        else {
+            panic!("mandatory source remains too large for the unchanged contract");
+        };
+        assert_eq!(*maximum_bytes, super::PACKET_CLI_RESULT_MAX_BYTES_V3 as u64);
+        assert_eq!(*required_complete_bytes, original_bytes as u64);
+        assert!(measured <= super::PACKET_CLI_RESULT_MAX_BYTES_V3);
+        assert_eq!(
+            measured,
+            super::render_packet_projection_json(&operation, &projection)
+                .unwrap()
+                .len()
+        );
+    }
+
+    #[test]
+    fn packet_json_budget_counts_utf8_escaping_and_final_newline_at_boundary() {
+        let operation = packet_json_operation();
+        let projection = packet_json_fixture(19, 0);
+        let expected =
+            crate::runtime::public_operation_json_value(&operation, &projection).unwrap();
+        let pretty = super::render_public_operation_json_content(&operation, &projection).unwrap();
+        let at = crate::output::render_public_operation_json_content_with_byte_budget(
+            &operation,
+            &projection,
+            pretty.len(),
+        )
+        .unwrap();
+        assert_eq!(at, pretty);
+        let below = crate::output::render_public_operation_json_content_with_byte_budget(
+            &operation,
+            &projection,
+            pretty.len() - 1,
+        )
+        .unwrap();
+        assert!(below.len() < pretty.len());
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&below).unwrap(),
+            expected
+        );
+        assert!(below.ends_with('\n'));
+        assert!(below.contains("雪"));
+        assert!(below.contains("\\r\\n"));
+    }
 
     #[test]
     fn packet_request_forwards_typed_drill_flags() {

@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "bootstrap": {
     "magic": "CSEB",
     "version": 1
@@ -150,5 +150,16 @@
       "retrieval",
       "candidate_publication"
     ]
+  },
+  "snapshot": {
+    "schema_version": 2,
+    "clock": {
+      "boot_id": {
+        "ordinary": "null; provenance not collected",
+        "qualification": "nonempty genuine boot witness, required before qualification effects"
+      },
+      "deadline_source": "awake_monotonic_now_ns; independent of boot provenance"
+    },
+    "compatibility": "reject mismatched protocol hash or snapshot schema"
   }
 }

@@ -48,7 +48,6 @@ readiness leases, hook installation, and the confined workspace reader cannot
 regress between dispatch-gated workspace proofs:
 
 ```bash
-cargo test --locked -p codestory-runtime --lib agent::packet_evidence::
 cargo test --locked -p codestory-runtime --lib agent::packet_compiler::tests
 cargo test --locked -p codestory-runtime --lib agent::packet_batch::
 cargo test --locked -p codestory-runtime --lib tests::search_scoring_tests::
@@ -57,6 +56,9 @@ cargo test --locked -p codestory-cli --lib
 cargo test --locked -p codestory-workspace
 cargo test --locked -p codestory-agent
 ```
+
+Evidence classification now lives in `codestory-agent` and is covered by its
+full suite above. The former runtime module filter selects no tests.
 
 The workspace crate additionally owns one external-fixture lane,
 `helm-u08-fixture`. Its only test,

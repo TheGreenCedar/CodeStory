@@ -1,5 +1,6 @@
 //! Project-local SQLite FTS lexical index.
 
+use crate::query_policy::LexicalAdmissionPolicy;
 use anyhow::{Context, Result, bail};
 use codestory_contracts::api::SearchTargetDto;
 use codestory_contracts::owned_artifacts::sqlite_file_with_sidecars;
@@ -589,13 +590,14 @@ pub struct LexicalHit {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LexicalHitPayload {
+pub(crate) enum LexicalHitPayload {
     Full,
     DescriptorOnly,
 }
 
 #[derive(Clone, Copy)]
 struct LexicalCandidateScope<'a> {
+    lexical_policy: LexicalAdmissionPolicy,
     payload: LexicalHitPayload,
     shadowed_document_keys_json: Option<&'a str>,
 }
@@ -1852,6 +1854,7 @@ where
         limit,
         Arc::clone(&cancelled),
         LexicalHitPayload::Full,
+        LexicalAdmissionPolicy::StrictLiteralV1,
     );
     if result.is_err() && cancelled() {
         bail!("lexical search cancelled");
@@ -1877,6 +1880,7 @@ where
         limit,
         Arc::clone(&cancelled),
         LexicalHitPayload::DescriptorOnly,
+        LexicalAdmissionPolicy::StrictLiteralV1,
     );
     if result.is_err() && cancelled() {
         bail!("lexical descriptor search cancelled");
@@ -1891,6 +1895,7 @@ fn search_lexical_index_with_cancel_inner(
     limit: usize,
     cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
     payload: LexicalHitPayload,
+    lexical_policy: LexicalAdmissionPolicy,
 ) -> Result<Vec<LexicalHit>> {
     if cancelled() {
         bail!("lexical search cancelled");
@@ -1913,6 +1918,7 @@ fn search_lexical_index_with_cancel_inner(
             limit,
             cancelled,
             payload,
+            lexical_policy,
         );
     }
     let index_path = shard_dir.join(LEXICAL_INDEX_FILE);
@@ -1940,6 +1946,7 @@ fn search_lexical_index_with_cancel_inner(
         &mut HashMap::new(),
         cancelled.as_ref(),
         payload,
+        lexical_policy,
     )
 }
 
@@ -1947,6 +1954,58 @@ pub(crate) fn search_lexical_index_batch_with_cancel(
     shard_dir: &Path,
     expected_sidecar_input_hash: &str,
     queries: &[(String, usize)],
+    cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+) -> Result<Vec<Vec<LexicalHit>>> {
+    let queries = queries
+        .iter()
+        .map(|(query, limit)| {
+            (
+                query.clone(),
+                *limit,
+                LexicalAdmissionPolicy::StrictLiteralV1,
+            )
+        })
+        .collect::<Vec<_>>();
+    search_lexical_index_batch_with_policy_cancel(
+        shard_dir,
+        expected_sidecar_input_hash,
+        &queries,
+        cancelled,
+    )
+}
+
+pub(crate) fn search_lexical_index_with_policy_cancel<F>(
+    shard_dir: &Path,
+    expected_sidecar_input_hash: &str,
+    query: &str,
+    limit: usize,
+    payload: LexicalHitPayload,
+    lexical_policy: LexicalAdmissionPolicy,
+    cancelled: F,
+) -> Result<Vec<LexicalHit>>
+where
+    F: Fn() -> bool + Send + Sync + 'static,
+{
+    let cancelled: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(cancelled);
+    let result = search_lexical_index_with_cancel_inner(
+        shard_dir,
+        expected_sidecar_input_hash,
+        query,
+        limit,
+        Arc::clone(&cancelled),
+        payload,
+        lexical_policy,
+    );
+    if result.is_err() && cancelled() {
+        bail!("lexical search cancelled");
+    }
+    result
+}
+
+pub(crate) fn search_lexical_index_batch_with_policy_cancel(
+    shard_dir: &Path,
+    expected_sidecar_input_hash: &str,
+    queries: &[(String, usize, LexicalAdmissionPolicy)],
     cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
 ) -> Result<Vec<Vec<LexicalHit>>> {
     if queries.is_empty() {
@@ -1965,7 +2024,7 @@ pub(crate) fn search_lexical_index_batch_with_cancel(
     )? {
         return queries
             .iter()
-            .map(|(query, limit)| {
+            .map(|(query, limit, lexical_policy)| {
                 search_lexical_component_set(
                     shard_dir,
                     &component_set,
@@ -1973,6 +2032,7 @@ pub(crate) fn search_lexical_index_batch_with_cancel(
                     *limit,
                     Arc::clone(&cancelled),
                     LexicalHitPayload::Full,
+                    *lexical_policy,
                 )
             })
             .collect();
@@ -1997,7 +2057,7 @@ pub(crate) fn search_lexical_index_batch_with_cancel(
     let mut token_frequencies = HashMap::new();
     queries
         .iter()
-        .map(|(query, limit)| {
+        .map(|(query, limit, lexical_policy)| {
             search_lexical_index_on_connection(
                 &connection,
                 query,
@@ -2006,6 +2066,7 @@ pub(crate) fn search_lexical_index_batch_with_cancel(
                 &mut token_frequencies,
                 cancelled.as_ref(),
                 LexicalHitPayload::Full,
+                *lexical_policy,
             )
         })
         .collect()
@@ -2018,6 +2079,7 @@ fn search_lexical_component_set(
     limit: usize,
     cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
     payload: LexicalHitPayload,
+    lexical_policy: LexicalAdmissionPolicy,
 ) -> Result<Vec<LexicalHit>> {
     if cancelled() {
         bail!("lexical search cancelled");
@@ -2056,6 +2118,7 @@ fn search_lexical_component_set(
         logical_count,
         Arc::clone(&cancelled),
         LexicalCandidateScope {
+            lexical_policy,
             payload,
             shadowed_document_keys_json: (base_shadowed_json != "[]")
                 .then_some(base_shadowed_json.as_str()),
@@ -2087,6 +2150,7 @@ fn search_lexical_component_set(
             logical_count,
             Arc::clone(&cancelled),
             LexicalCandidateScope {
+                lexical_policy,
                 payload,
                 shadowed_document_keys_json: (delta_shadowed_json != "[]")
                     .then_some(delta_shadowed_json.as_str()),
@@ -2194,6 +2258,7 @@ fn search_lexical_index_on_connection(
     frequency_cache: &mut HashMap<String, usize>,
     cancelled: &(dyn Fn() -> bool + Send + Sync),
     payload: LexicalHitPayload,
+    lexical_policy: LexicalAdmissionPolicy,
 ) -> Result<Vec<LexicalHit>> {
     search_lexical_index_on_connection_excluding(
         connection,
@@ -2203,6 +2268,7 @@ fn search_lexical_index_on_connection(
         frequency_cache,
         cancelled,
         LexicalCandidateScope {
+            lexical_policy,
             payload,
             shadowed_document_keys_json: None,
         },
@@ -2265,7 +2331,12 @@ fn search_lexical_index_on_connection_excluding(
     // Coverage is a count of distinct query terms. Rarity weights order
     // candidates within lexical lanes; an unmatched rare term must not veto
     // the documented two-of-three or forty-percent admission contracts.
-    let required_match_count = required_lexical_match_count(tokens.len());
+    let required_match_count = match scope.lexical_policy {
+        LexicalAdmissionPolicy::StrictLiteralV1 => required_lexical_match_count(tokens.len()),
+        // Broad prose needs real agreement on more than one term, not a ratio
+        // of every scenario word. Single-term questions still need that term.
+        LexicalAdmissionPolicy::BroadQuestionV1 => tokens.len().min(2),
+    };
     let representation = lexical_database_representation(connection)?;
     let exact_candidates = query_exact_candidates(
         connection,
@@ -2356,7 +2427,13 @@ fn search_lexical_index_on_connection_excluding(
             connection,
             &mut candidates,
             &tokens,
-            required_match_count,
+            if scope.lexical_policy == LexicalAdmissionPolicy::BroadQuestionV1 {
+                // Soft coverage/literal ranking must use complete proven token
+                // membership even when two path terms already clear admission.
+                tokens.len().saturating_add(1)
+            } else {
+                required_match_count
+            },
         )?;
     }
 
@@ -2385,11 +2462,12 @@ fn search_lexical_index_on_connection_excluding(
             &candidate.normalized_content,
         );
         if token_match.matched_count >= required_match_count
-            && mandatory_tokens_match(
-                &mandatory_tokens,
-                &candidate.normalized_path,
-                &candidate.normalized_content,
-            )
+            && (scope.lexical_policy == LexicalAdmissionPolicy::BroadQuestionV1
+                || mandatory_tokens_match(
+                    &mandatory_tokens,
+                    &candidate.normalized_path,
+                    &candidate.normalized_content,
+                ))
         {
             let (target, matched_line, source_excerpt) = if candidate.document.source
                 == LexicalDocumentSource::LexicalSource
@@ -2411,7 +2489,15 @@ fn search_lexical_index_on_connection_excluding(
                 (None, None, None)
             };
             hits.push(LexicalHit {
-                score: lexical_sublane_score(sublane_ranks, query_shape),
+                score: lexical_policy_score(
+                    scope.lexical_policy,
+                    lexical_sublane_score(sublane_ranks, query_shape),
+                    token_match.matched_count,
+                    tokens.len(),
+                    &mandatory_tokens,
+                    &candidate.normalized_path,
+                    &candidate.normalized_content,
+                ),
                 path: candidate.document.path,
                 source: candidate.document.source,
                 node_id: candidate.document.node_id,
@@ -3058,6 +3144,33 @@ fn symbol_identifier_overlap(
         .zip(token_weights.iter().copied())
         .filter_map(|(token, weight)| symbol_tokens.contains(token.as_str()).then_some(weight))
         .sum()
+}
+
+/// Broad policy v1 preserves focused sublane rank as the dominant signal.
+/// Coverage and literal agreement improve relevance, never manufacture proof.
+fn lexical_policy_score(
+    policy: LexicalAdmissionPolicy,
+    sublane_score: f32,
+    matched_count: usize,
+    token_count: usize,
+    literals: &[String],
+    path: &str,
+    content: &str,
+) -> f32 {
+    if policy == LexicalAdmissionPolicy::StrictLiteralV1 {
+        return sublane_score;
+    }
+    let coverage = matched_count as f32 / token_count.max(1) as f32;
+    let literal_coverage = if literals.is_empty() {
+        0.0
+    } else {
+        literals
+            .iter()
+            .filter(|term| path.contains(term.as_str()) || content.contains(term.as_str()))
+            .count() as f32
+            / literals.len() as f32
+    };
+    (0.70 * sublane_score + 0.20 * coverage + 0.10 * literal_coverage).clamp(0.0, 1.0)
 }
 
 fn lexical_sublane_score(
@@ -4748,24 +4861,66 @@ fn lexical_query_tokens(query: &str) -> Vec<String> {
 }
 
 fn quoted_query_tokens(query: &str) -> Vec<String> {
+    // Fenced examples are query context, not inline exact-match entities.
+    // Keep all original bytes in lexical_query_tokens and semantic retrieval.
+    fn fence_marker(line: &str) -> Option<(u8, usize, &str)> {
+        let spaces = line.bytes().take_while(|byte| *byte == b' ').count();
+        if spaces > 3 {
+            return None;
+        }
+        let line = &line[spaces..];
+        let marker = *line.as_bytes().first()?;
+        if !matches!(marker, b'`' | b'~') {
+            return None;
+        }
+        let count = line.bytes().take_while(|byte| *byte == marker).count();
+        (count >= 3).then_some((marker, count, &line[count..]))
+    }
+
     let mut tokens = Vec::new();
     let mut delimiter = None;
     let mut current = String::new();
-    for character in query.chars() {
-        if delimiter == Some(character) {
-            if !current.is_empty() {
-                for token in lexical_query_tokens(&current) {
-                    if !tokens.iter().any(|existing| existing == &token) {
-                        tokens.push(token);
-                    }
-                }
-                current.clear();
+    let mut fence = None;
+    for line in query.split_inclusive('\n') {
+        let marker = fence_marker(line);
+        if let Some((open_marker, open_count)) = fence {
+            if marker.is_some_and(|(marker, count, tail)| {
+                marker == open_marker
+                    && count >= open_count
+                    && tail
+                        .bytes()
+                        .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+            }) {
+                fence = None;
             }
-            delimiter = None;
-        } else if delimiter.is_none() && matches!(character, '`' | '"') {
-            delimiter = Some(character);
-        } else if delimiter.is_some() {
-            current.push(character);
+            continue;
+        }
+        if let Some((marker, count, tail)) = marker {
+            if marker != b'`' || !tail.contains('`') {
+                fence = Some((marker, count));
+                // A fence is a syntax boundary. Do not join fragments of an
+                // unfinished inline quote across the removed example.
+                delimiter = None;
+                current.clear();
+                continue;
+            }
+        }
+        for character in line.chars() {
+            if delimiter == Some(character) {
+                if !current.is_empty() {
+                    for token in lexical_query_tokens(&current) {
+                        if !tokens.iter().any(|existing| existing == &token) {
+                            tokens.push(token);
+                        }
+                    }
+                    current.clear();
+                }
+                delimiter = None;
+            } else if delimiter.is_none() && matches!(character, '`' | '"') {
+                delimiter = Some(character);
+            } else if delimiter.is_some() {
+                current.push(character);
+            }
         }
     }
     tokens
@@ -5986,6 +6141,7 @@ mod tests {
             &mut HashMap::new(),
             &|| false,
             LexicalHitPayload::Full,
+            LexicalAdmissionPolicy::StrictLiteralV1,
         )
         .expect("query V2 raw content");
 
@@ -6266,10 +6422,30 @@ mod tests {
             &mut HashMap::new(),
             &|| false,
             LexicalHitPayload::DescriptorOnly,
+            LexicalAdmissionPolicy::StrictLiteralV1,
         )
         .expect("descriptor path reads FTS membership and metadata only");
         assert_eq!(descriptors.len(), 1);
         assert_eq!(descriptors[0].node_id.as_deref(), Some("7"));
+        let before = DESCRIPTOR_FTS_BODY_READS.get();
+        let broad = search_lexical_index_on_connection(
+            &connection,
+            "src needle `implementation` violet marble",
+            1,
+            1,
+            &mut HashMap::new(),
+            &|| false,
+            LexicalHitPayload::DescriptorOnly,
+            LexicalAdmissionPolicy::BroadQuestionV1,
+        )
+        .expect("broad descriptor uses FTS proof and never decodes hostile stored body");
+        assert_eq!(broad.len(), 1);
+        assert!(broad[0].source_excerpt.is_none());
+        assert!(
+            DESCRIPTOR_FTS_BODY_READS.get() > before,
+            "soft relevance proves content terms even when two path terms clear admission"
+        );
+
         assert!(descriptors[0].source_excerpt.is_none());
         assert!(
             search_lexical_index_on_connection(
@@ -6280,6 +6456,7 @@ mod tests {
                 &mut HashMap::new(),
                 &|| false,
                 LexicalHitPayload::Full,
+                LexicalAdmissionPolicy::StrictLiteralV1,
             )
             .is_err(),
             "the hostile stored body must fail if a query tries to materialize it"
@@ -6321,6 +6498,7 @@ mod tests {
             &mut HashMap::new(),
             &|| false,
             LexicalHitPayload::Full,
+            LexicalAdmissionPolicy::StrictLiteralV1,
         )
         .expect("an unadmitted source body does not need hydration");
         assert_eq!(hits.len(), 1);
@@ -6338,6 +6516,7 @@ mod tests {
             &mut HashMap::new(),
             &|| false,
             LexicalHitPayload::Full,
+            LexicalAdmissionPolicy::StrictLiteralV1,
         );
         assert!(
             admitted_error.is_err(),
@@ -6750,6 +6929,101 @@ mod tests {
     }
 
     #[test]
+    fn fenced_examples_do_not_create_mandatory_inline_entities() {
+        for newline in ["\n", "\r\n"] {
+            for fence in ["```", "````", "~~~"] {
+                for example in ["label: trial_39", "mode: sample_82", "key: \"invented_17\""] {
+                    let query = format!(
+                        "selection update mechanism `select_version`{newline}{fence}yaml{newline}{example}{newline}{fence}{newline}`persist_choice`"
+                    );
+                    assert_eq!(
+                        quoted_query_tokens(&query),
+                        vec!["select", "version", "persist", "choice"],
+                        "{query:?}"
+                    );
+                }
+            }
+        }
+        for query in [
+            "`entity`\n```yaml\n\"example\"\n",
+            "`entity`\n~~~yaml\n\"example\"\n",
+            "`entity`\n````yaml\n```\n\"example\"\n~~~~\n\"example\"\n```` trailing\n\"example\"\n````\n",
+            "`entity`\n   ```yaml\n\"example\"\n    ```\n\"example\"\n   ```\n",
+        ] {
+            assert_eq!(quoted_query_tokens(query), vec!["entity"], "{query:?}");
+        }
+        assert_eq!(
+            quoted_query_tokens(
+                "\"unfinished\n```yaml\nexample: value\n```\n\"fragment\" `entity`"
+            ),
+            vec!["fragment", "entity"],
+            "unfinished inline entities must not bridge a fenced block"
+        );
+        assert_eq!(
+            quoted_query_tokens("```bad`info\n\"entity\"\n"),
+            vec!["bad", "entity"],
+            "backtick info strings containing a backtick are not fence openers"
+        );
+        assert_eq!(
+            quoted_query_tokens("    ~~~\n\"entity\"\n"),
+            vec!["entity"],
+            "four-space indentation must not open a fence"
+        );
+    }
+
+    #[test]
+    fn lexical_recall_preserves_inline_entities_with_fenced_configuration_examples() {
+        let project = TempDir::new().expect("project");
+        std::fs::create_dir_all(project.path().join("src")).expect("src");
+        std::fs::write(
+            project.path().join("src/selection.rs"),
+            "fn select_version() {} // selection update mechanism",
+        )
+        .expect("implementation");
+        std::fs::write(
+            project.path().join("src/declaration.rs"),
+            "// selection update mechanism yaml",
+        )
+        .expect("distractor missing inline entity");
+        let data = TempDir::new().expect("data");
+        let shard = build(project.path(), data.path(), "fenced-example", "input");
+
+        for fence in ["```", "~~~"] {
+            for example in ["label: trial_39", "mode: sample_82"] {
+                let query = format!(
+                    "selection update mechanism `select_version`\n{fence}yaml\n{example}\n{fence}\n"
+                );
+                let tokens = lexical_query_tokens(&query);
+                let owner =
+                    normalize_lexical_text("fn select_version() {} // selection update mechanism");
+                let matched = tokens
+                    .iter()
+                    .filter(|token| owner.contains(token.as_str()))
+                    .count();
+                assert!(matched >= required_lexical_match_count(tokens.len()));
+                let distractor = normalize_lexical_text("selection update mechanism yaml");
+                let distractor_matched = tokens
+                    .iter()
+                    .filter(|token| distractor.contains(token.as_str()))
+                    .count();
+                assert_eq!(tokens.len(), 9, "example variants keep coverage constant");
+                assert!(distractor_matched >= required_lexical_match_count(tokens.len()));
+                assert!(!mandatory_tokens_match(
+                    &quoted_query_tokens(&query),
+                    "",
+                    &distractor,
+                ));
+                let hits = search_lexical_index(&shard, "input", &query, 8).expect("search");
+                assert_eq!(
+                    hits.iter().map(|hit| hit.path.as_str()).collect::<Vec<_>>(),
+                    vec!["src/selection.rs"],
+                    "example values must not veto the implementation, and the inline entity must still exclude the distractor"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn lexical_recall_requires_quoted_entities_without_a_long_query_path_gate() {
         let project = TempDir::new().expect("project");
         std::fs::create_dir_all(project.path().join("src")).expect("src");
@@ -6777,6 +7051,79 @@ mod tests {
         assert_eq!(
             hits.iter().map(|hit| hit.path.as_str()).collect::<Vec<_>>(),
             vec!["src/flow.rs"]
+        );
+    }
+
+    #[test]
+    fn broad_question_admission_softens_absent_literals_without_zero_or_one_term_hits() {
+        let project = TempDir::new().expect("project");
+        std::fs::create_dir_all(project.path().join("src")).expect("src");
+        for (path, body) in [
+            ("src/text_checks.rs", "fn isEmpty() -> bool { true }"),
+            ("src/cache_state.rs", "fn isEmpty() -> bool { false }"),
+            ("src/unrelated.rs", "fn unrelated() {}"),
+        ] {
+            std::fs::write(project.path().join(path), body).expect("source");
+        }
+        let data = TempDir::new().expect("data");
+        let shard = build(project.path(), data.path(), "broad-policy", "input");
+        let question = "text empty `predicate` violet marble glacier ocean";
+        let mut policy_scores = Vec::new();
+        for payload in [LexicalHitPayload::Full, LexicalHitPayload::DescriptorOnly] {
+            let strict = search_lexical_index_with_policy_cancel(
+                &shard,
+                "input",
+                question,
+                8,
+                payload,
+                LexicalAdmissionPolicy::StrictLiteralV1,
+                || false,
+            )
+            .expect("strict");
+            assert!(
+                strict.is_empty(),
+                "strict still requires absent quoted predicate"
+            );
+            let broad = search_lexical_index_with_policy_cancel(
+                &shard,
+                "input",
+                question,
+                8,
+                payload,
+                LexicalAdmissionPolicy::BroadQuestionV1,
+                || false,
+            )
+            .expect("broad");
+            assert_eq!(
+                broad
+                    .iter()
+                    .map(|hit| hit.path.as_str())
+                    .collect::<Vec<_>>(),
+                ["src/text_checks.rs"]
+            );
+            policy_scores.push(broad[0].score);
+            let no_overlap = search_lexical_index_with_policy_cancel(
+                &shard,
+                "input",
+                "violet marble",
+                8,
+                payload,
+                LexicalAdmissionPolicy::BroadQuestionV1,
+                || false,
+            )
+            .expect("no overlap");
+            assert!(no_overlap.is_empty());
+            if payload == LexicalHitPayload::DescriptorOnly {
+                assert!(
+                    broad
+                        .iter()
+                        .all(|hit| hit.source_excerpt.is_none() && hit.target.is_none())
+                );
+            }
+        }
+        assert_eq!(
+            policy_scores[0], policy_scores[1],
+            "complete FTS membership gives descriptor and full payload the same soft relevance"
         );
     }
 

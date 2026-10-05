@@ -336,11 +336,15 @@ fn compact_packet_candidate_v3(
 ) -> Result<PacketProjectionV3Dto, ProjectionBuildErrorV3> {
     let mut evidence = original_evidence.to_vec();
     for row in evidence.iter_mut().skip(detailed_rows) {
-        row.summary = None;
+        if row.source_delivery.is_none() {
+            row.summary = None;
+        }
     }
     let mut gaps = original_gaps.to_vec();
     for row in &mut gaps {
-        row.message = None;
+        if row.kind != GapKindV3Dto::SourceUnavailable {
+            row.message = None;
+        }
     }
     if gaps.len() < GAP_ROWS_MAX_V3 {
         gaps.push(ProjectionGapRowV3Dto {
@@ -499,13 +503,14 @@ fn canonical_continuation_v3(
         .iter()
         .map(|gap| gap.identity.gap_id.as_str())
         .collect::<BTreeSet<_>>();
-    let mut references = source.gap_ids.as_slice().to_vec();
-    references.sort();
-    for pair in references.windows(2) {
-        if pair[0] == pair[1] {
+    let references = source.gap_ids.as_slice().to_vec();
+    // Preserve the producer's choice order while validating identity uniqueness.
+    let mut seen = BTreeSet::new();
+    for reference in &references {
+        if !seen.insert(reference) {
             return Err(ProjectionBuildErrorV3::InvalidInput(
                 ProjectionInputErrorV3::DuplicateContinuationGapReference(
-                    pair[0].gap_id.as_str().to_owned(),
+                    reference.gap_id.as_str().to_owned(),
                 ),
             ));
         }
@@ -801,6 +806,7 @@ mod tests {
 
     fn packet_evidence(id: &str, summary: Option<&str>) -> PacketEvidenceRowV3Dto {
         PacketEvidenceRowV3Dto {
+            source_delivery: None,
             identity: EvidenceIdentityV3Dto {
                 evidence_id: identity(id),
             },
@@ -1785,6 +1791,30 @@ mod tests {
                     maximum: EVIDENCE_ROWS_MAX_V3,
                     actual: count,
                 }
+            ))
+        );
+    }
+
+    #[test]
+    fn continuation_progress_rejects_nonadjacent_duplicate_public_references() {
+        let record = record_fixture("finalized typed context");
+        let mut input = context_input_fixture(&record);
+        input.continuation.as_mut().unwrap().gap_ids = BoundedVecV3::new(vec![
+            GapIdentityV3Dto {
+                gap_id: identity("gap-b"),
+            },
+            GapIdentityV3Dto {
+                gap_id: identity("gap-a"),
+            },
+            GapIdentityV3Dto {
+                gap_id: identity("gap-b"),
+            },
+        ])
+        .unwrap();
+        assert_eq!(
+            build_context_projection_v3(&input),
+            Err(ProjectionBuildErrorV3::InvalidInput(
+                ProjectionInputErrorV3::DuplicateContinuationGapReference("gap-b".into())
             ))
         );
     }

@@ -2064,6 +2064,58 @@ pub enum SnippetScopeDto {
     FunctionBody,
 }
 
+/// Source range delivery is a workspace read, not a fabricated symbol identity.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceRangeKindDto {
+    WorkspaceRead,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceRangeOmissionDto {
+    ByteBudget,
+    LineExceedsByteBudget,
+}
+
+/// Requested endpoints retain their legacy meaning. Delivered endpoints are
+/// nullable because an empty file, EOF, or a byte budget can deliver no lines.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct SourceRangeSnippetDto {
+    pub path: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub snippet: String,
+    #[serde(rename = "snippet_truncated")]
+    pub truncated: bool,
+    pub delivered_start_line: Option<u32>,
+    pub delivered_end_line: Option<u32>,
+    /// Known only when the single source scan actually observed EOF.
+    pub source_total_lines: Option<u32>,
+    pub last_line_terminated: Option<bool>,
+    /// SHA-256 of delivered source bytes, including original LF/CRLF endings;
+    /// this is deliberately not the file's indexed content hash.
+    pub source_range_sha256: Option<String>,
+    pub source_kind: SourceRangeKindDto,
+    /// Complete for the requested window, including natural EOF clipping.
+    /// This does not assert complete-file or complete-index coverage.
+    pub complete: bool,
+    pub omission_reason: Option<SourceRangeOmissionDto>,
+    pub next_start_line: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct SourceRangesDto {
+    pub ranges: Vec<SourceRangeSnippetDto>,
+    /// Legacy field: shared rendered-snippet byte allowance, not wire size.
+    pub max_total_bytes: u32,
+    /// Separate bound for the serialized structured result including metadata.
+    pub max_response_bytes: u32,
+    pub requested_count: u32,
+    pub omitted_count: u32,
+    pub complete: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct SnippetContextDto {
     pub node: NodeDetailsDto,
@@ -2796,6 +2848,11 @@ pub fn validate_packet_probe(probe: &PacketProbeDto) -> Result<(), String> {
                 validate_packet_probe_text("retrieval_generation", retrieval_generation)?;
             }
             validate_packet_probe_text("stable_identity", &selector.stable_identity)?;
+            if selector.source_range.is_some_and(|range| !range.is_valid()) {
+                return Err(
+                    "continuation source range must have positive ordered bounds".to_string(),
+                );
+            }
             if let Some(path) = selector.path.as_deref() {
                 validate_packet_probe_text("path", path)?;
             }
@@ -2981,6 +3038,8 @@ pub enum SupportUnitKindDto {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
 pub struct SupportUnitDto {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_delivery: Option<crate::compilation::PacketSourceDeliveryV1>,
     pub id: String,
     pub kind: SupportUnitKindDto,
     pub summary: String,
@@ -3024,6 +3083,8 @@ pub enum DrillGapKindDto {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
 pub struct DrillOptionDto {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_range: Option<crate::compilation::PacketSourceRangeV1>,
     pub id: String,
     pub gap_id: String,
     pub kind: DrillGapKindDto,
@@ -3112,10 +3173,26 @@ impl PacketDispositionDto {
 }
 
 impl DrillOptionDto {
+    pub fn with_source_range(mut self, range: crate::compilation::PacketSourceRangeV1) -> Self {
+        let target = if let Some(symbol_id) = self.symbol_id.as_deref() {
+            format!("symbol:{symbol_id}")
+        } else {
+            format!("path:{}", self.path.as_deref().unwrap_or_default())
+        };
+        self.id = encode_drill_option_id(
+            DrillGapKindDto::OmittedMandatorySupport,
+            &format!("range:{}:{}:{target}", range.start_line, range.end_line),
+        );
+        self.kind = DrillGapKindDto::OmittedMandatorySupport;
+        self.source_range = Some(range);
+        self
+    }
+
     pub fn bounded_source_read(gap_id: impl Into<String>, path: impl Into<String>) -> Self {
         let path = path.into();
         let gap_id = gap_id.into();
         Self {
+            source_range: None,
             id: encode_drill_option_id(DrillGapKindDto::BoundedSourceRead, &path),
             gap_id,
             kind: DrillGapKindDto::BoundedSourceRead,
@@ -3131,6 +3208,7 @@ impl DrillOptionDto {
         let symbol_id = symbol_id.into();
         let gap_id = gap_id.into();
         Self {
+            source_range: None,
             id: encode_drill_option_id(
                 DrillGapKindDto::OmittedMandatorySupport,
                 &format!("symbol:{symbol_id}"),
@@ -3149,6 +3227,7 @@ impl DrillOptionDto {
         let path = path.into();
         let gap_id = gap_id.into();
         Self {
+            source_range: None,
             id: encode_drill_option_id(
                 DrillGapKindDto::OmittedMandatorySupport,
                 &format!("path:{path}"),
@@ -3535,6 +3614,7 @@ mod packet_tests {
                 core_generation_id: "core-generation".into(),
                 retrieval_generation: Some("retrieval-generation".into()),
                 selector: PacketContinuationSelectorV1 {
+                    source_range: None,
                     stable_identity: "node:42".into(),
                     path: None,
                     symbol_id: Some("42".into()),
@@ -3583,6 +3663,7 @@ mod packet_tests {
                 core_generation_id: "core-generation".into(),
                 retrieval_generation: Some("retrieval-generation".into()),
                 selector: PacketContinuationSelectorV1 {
+                    source_range: None,
                     stable_identity: "node:42".into(),
                     path: None,
                     symbol_id: Some("42".into()),
@@ -3930,6 +4011,7 @@ mod packet_tests {
     #[test]
     fn packet_disposition_and_support_units_round_trip() {
         let support = SupportUnitDto {
+            source_delivery: None,
             id: "sym-1".to_string(),
             kind: SupportUnitKindDto::SymbolLocation,
             summary: "AgentPacketDto at dto.rs:3251".to_string(),

@@ -153,6 +153,24 @@ impl<'a> EmbeddingCallControl<'a> {
         Ok(control)
     }
 
+    fn until(
+        operation_timeout: Duration,
+        outer_deadline: Instant,
+        cancelled: &'a (dyn Fn() -> bool + Sync),
+    ) -> Result<Self> {
+        if operation_timeout.is_zero() {
+            bail!("embedding_server_deadline_invalid");
+        }
+        let control = Self {
+            operation_timeout,
+            outer_deadline: Some(outer_deadline),
+            operation_deadline: OnceLock::new(),
+            cancelled,
+        };
+        control.check()?;
+        Ok(control)
+    }
+
     fn arm(&self) -> Result<()> {
         if self.operation_deadline.get().is_none() {
             let deadline = Instant::now()
@@ -342,6 +360,90 @@ impl PerUserEmbeddingClient {
         normalize_and_validate_vectors(decode_vectors(rows, columns, &payload)?)
     }
 
+    pub(crate) fn query_request_budget(&self) -> Duration {
+        self.transport.budgets().query_request
+    }
+
+    pub(crate) fn embed_query_with_identity_until(
+        &self,
+        text: &str,
+        deadline: Instant,
+        cancelled: &(dyn Fn() -> bool + Sync),
+        allow_loss_replay: bool,
+    ) -> Result<(Vec<f32>, EmbeddingEngineIdentity)> {
+        let (mut vectors, identity) = self.query_vectors_with_identity_until(
+            &[text.to_string()],
+            deadline,
+            cancelled,
+            allow_loss_replay,
+            true,
+        )?;
+        let vector = vectors
+            .pop()
+            .ok_or_else(|| anyhow!("embedding_vector_missing"))?;
+        Ok((vector, identity))
+    }
+
+    pub(crate) fn embed_queries_with_identity_until(
+        &self,
+        texts: &[String],
+        deadline: Instant,
+        cancelled: &(dyn Fn() -> bool + Sync),
+        allow_loss_replay: bool,
+    ) -> Result<(Vec<Vec<f32>>, EmbeddingEngineIdentity)> {
+        self.query_vectors_with_identity_until(texts, deadline, cancelled, allow_loss_replay, false)
+    }
+
+    fn query_vectors_with_identity_until(
+        &self,
+        texts: &[String],
+        deadline: Instant,
+        cancelled: &(dyn Fn() -> bool + Sync),
+        allow_loss_replay: bool,
+        scalar: bool,
+    ) -> Result<(Vec<Vec<f32>>, EmbeddingEngineIdentity)> {
+        if texts.len() > super::protocol::PER_USER_EMBEDDING_QUERY_BATCH_MAX {
+            bail!("embedding_query_batch_too_large");
+        }
+        validate_raw_inputs(texts)?;
+        let budgets = self.transport.budgets();
+        let control = EmbeddingCallControl::until(budgets.query_request, deadline, cancelled)?;
+        let (result, _) = self.call_pure_with_control_and_attempts(
+            &control,
+            allow_loss_replay,
+            |deadline_ms, token| {
+                if scalar {
+                    EmbeddingOperation::EmbedQuery {
+                        scope_id: self.scope_id.clone(),
+                        deadline_ms,
+                        retry_after_ms: duration_ms(budgets.retry_after),
+                        cancel_token: Some(token),
+                        input: texts[0].clone(),
+                    }
+                } else {
+                    EmbeddingOperation::EmbedQueries {
+                        scope_id: self.scope_id.clone(),
+                        deadline_ms,
+                        retry_after_ms: duration_ms(budgets.retry_after),
+                        cancel_token: Some(token),
+                        inputs: texts.to_vec(),
+                    }
+                }
+            },
+        )?;
+        let (rows, columns, identity, _, payload) = vectors_result(result)?;
+        if rows as usize != texts.len() {
+            bail!(
+                "embedding_vector_row_count_mismatch: expected={} observed={rows}",
+                texts.len()
+            );
+        }
+        validate_engine_identity(&identity, &self.compatibility)?;
+        let vectors = normalize_and_validate_vectors(decode_vectors(rows, columns, &payload)?)?;
+        control.check()?;
+        Ok((vectors, identity))
+    }
+
     pub fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         self.embed_documents_with_control(texts, None, &|| false)
     }
@@ -525,6 +627,19 @@ impl PerUserEmbeddingClient {
         B: Fn(u64, String) -> EmbeddingOperation,
     {
         let control = EmbeddingCallControl::new(operation_timeout, outer_timeout, cancelled)?;
+        self.call_pure_with_control_and_attempts(&control, true, operation)
+    }
+
+    fn call_pure_with_control_and_attempts<B>(
+        &self,
+        control: &EmbeddingCallControl<'_>,
+        allow_loss_replay: bool,
+        operation: B,
+    ) -> Result<EmbeddingQualificationAttemptExchange>
+    where
+        B: Fn(u64, String) -> EmbeddingOperation,
+    {
+        let operation_timeout = control.operation_timeout;
         let clock = self.transport.clock();
         let mut replayed = false;
         let mut lost_server_instance_id = None;
@@ -534,11 +649,11 @@ impl PerUserEmbeddingClient {
             let mut connection = match self.connect_with_control(
                 EmbeddingConnectIntent::Activate,
                 true,
-                Some(&control),
+                Some(control),
                 lost_server_instance_id.as_deref(),
             ) {
                 Ok(connection) => connection,
-                Err(error) if !replayed && is_server_loss(&error) => {
+                Err(error) if allow_loss_replay && !replayed && is_server_loss(&error) => {
                     control.check()?;
                     replayed = true;
                     continue;
@@ -558,7 +673,7 @@ impl PerUserEmbeddingClient {
             let exchange_result = thread::scope(|scope| {
                 scope.spawn(|| {
                     self.watch_controlled_cancellation(
-                        &control,
+                        control,
                         &completed,
                         &request_id,
                         &cancel_token,
@@ -602,7 +717,7 @@ impl PerUserEmbeddingClient {
             });
             match call {
                 Ok(result) => return Ok((result, attempts)),
-                Err(error) if !replayed && is_server_loss(&error) => {
+                Err(error) if allow_loss_replay && !replayed && is_server_loss(&error) => {
                     control.check()?;
                     replayed = true;
                     lost_server_instance_id = Some(server_instance_id);

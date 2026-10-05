@@ -11,9 +11,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub const PER_USER_EMBEDDING_BOOTSTRAP_VERSION: u32 = 1;
-pub const PER_USER_EMBEDDING_PROTOCOL_SCHEMA_VERSION: u32 = 1;
+pub const PER_USER_EMBEDDING_PROTOCOL_SCHEMA_VERSION: u32 = 2;
 pub const PER_USER_EMBEDDING_PROTOCOL_V1: &str = "codestory.per-user-embedding/v1";
-pub const PER_USER_EMBEDDING_SERVER_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+pub const PER_USER_EMBEDDING_SERVER_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 pub const PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS: u64 = 60_000;
 pub const PER_USER_EMBEDDING_QUERY_BATCH_MAX: usize = 8;
 pub const PER_USER_EMBEDDING_PROTOCOL_SHA256: &str =
@@ -89,8 +89,24 @@ impl EmbeddingCompatibility {
 pub struct EmbeddingServerClockSnapshot {
     pub domain: String,
     pub api: String,
-    pub boot_id: String,
+    /// Genuine boot provenance is collected only for qualification. Ordinary
+    /// operational deadlines use the monotonic clock without this witness.
+    pub boot_id: Option<String>,
     pub resolution_ns: u64,
+}
+
+impl EmbeddingServerClockSnapshot {
+    /// Qualification must not interpret uncollected provenance as a witness.
+    pub fn qualification_boot_id(&self) -> Result<&str> {
+        let boot_id = self
+            .boot_id
+            .as_deref()
+            .context("embedding_qualification_boot_identity_missing")?;
+        if boot_id.trim().is_empty() {
+            bail!("embedding_qualification_boot_identity_empty");
+        }
+        Ok(boot_id)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -475,4 +491,31 @@ pub(super) fn validate_raw_inputs(inputs: &[String]) -> Result<()> {
 
 pub(super) fn hex_sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+#[cfg(test)]
+mod clock_provenance_tests {
+    use super::*;
+
+    #[test]
+    fn uncollected_and_empty_boot_provenance_cannot_qualify() {
+        let mut clock = EmbeddingServerClockSnapshot {
+            domain: "awake_monotonic".into(),
+            api: "synthetic".into(),
+            boot_id: None,
+            resolution_ns: 1,
+        };
+        let value = serde_json::to_value(&clock).expect("clock JSON");
+        assert_eq!(value.get("boot_id"), Some(&serde_json::Value::Null));
+        assert!(clock.qualification_boot_id().is_err());
+        for empty in ["", " "] {
+            clock.boot_id = Some(empty.into());
+            assert!(clock.qualification_boot_id().is_err());
+        }
+        clock.boot_id = Some("synthetic-boot".into());
+        assert_eq!(
+            clock.qualification_boot_id().expect("fixture witness"),
+            "synthetic-boot"
+        );
+    }
 }

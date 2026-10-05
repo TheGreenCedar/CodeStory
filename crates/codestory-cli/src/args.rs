@@ -1672,7 +1672,8 @@ pub(crate) struct IndexOutput<'a> {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) refresh_reason: Option<&'a str>,
     pub(crate) summary: &'a ProjectSummary,
-    pub(crate) retrieval: &'a RetrievalStateDto,
+    /// Unobserved for a Core-only index operation. Full retrieval has its own gate.
+    pub(crate) retrieval: Option<&'a RetrievalStateDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) phase_timings: Option<&'a IndexingPhaseTimings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

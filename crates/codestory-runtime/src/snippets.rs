@@ -13,16 +13,6 @@ pub(crate) struct BoundedSnippet {
     pub(crate) truncated: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct BoundedSnippetRangeOptions<'a> {
-    pub(crate) focus_line: u32,
-    pub(crate) start_line: u32,
-    pub(crate) end_line: u32,
-    pub(crate) context_lines: usize,
-    pub(crate) max_bytes: usize,
-    pub(crate) truncation_suffix: &'a str,
-}
-
 #[cfg(test)]
 pub(crate) fn markdown_snippet(text: &str, focus_line: Option<u32>, context: usize) -> String {
     let all_lines: Vec<&str> = text.lines().collect();
@@ -232,28 +222,6 @@ pub(crate) fn cap_source_window(text: &str, start_line: u32, maximum_bytes: usiz
     }
 }
 
-pub(super) fn bounded_markdown_snippet_range_from_path(
-    path: &Path,
-    focus_line: u32,
-    start_line: u32,
-    end_line: u32,
-    context: usize,
-    max_bytes: usize,
-    truncation_suffix: &str,
-) -> io::Result<BoundedSnippet> {
-    let file = std::fs::File::open(path)?;
-    let reader = io::BufReader::new(file);
-    bounded_markdown_snippet_range_from_reader(
-        reader,
-        focus_line,
-        start_line,
-        end_line,
-        context,
-        max_bytes,
-        truncation_suffix,
-    )
-}
-
 /// Render an explicit line range from an already verified UTF-8 buffer.
 /// Callers that carry a symbol identity must pass verified content instead of
 /// reopening the path: a second read could serve bytes the index never saw.
@@ -439,4 +407,228 @@ mod source_window_tests {
         assert!(first.truncated && public.truncated);
         assert!(!public.text.contains('\u{fffd}'));
     }
+}
+
+/// Path windows use a separate renderer: symbol windows intentionally retain
+/// their existing partial-line contract. A shared physical line is decoded once
+/// and retained only while at least one requested window can still fit it.
+pub(crate) struct PathSourceWindow {
+    lines: Vec<(u32, std::sync::Arc<str>)>,
+    source_total_lines: Option<u32>,
+    omission_reason: Option<codestory_contracts::api::SourceRangeOmissionDto>,
+    next_start_line: Option<u32>,
+}
+
+pub(crate) fn read_path_source_windows(
+    mut reader: impl BufRead,
+    requests: &[(u32, u32)],
+    maximum_bytes: usize,
+) -> io::Result<Vec<PathSourceWindow>> {
+    use codestory_contracts::api::SourceRangeOmissionDto;
+    let mut windows = requests
+        .iter()
+        .map(|(start, _)| PathSourceWindow {
+            lines: Vec::new(),
+            source_total_lines: None,
+            omission_reason: (maximum_bytes == 0).then_some(SourceRangeOmissionDto::ByteBudget),
+            next_start_line: (maximum_bytes == 0).then_some(*start),
+        })
+        .collect::<Vec<_>>();
+    if maximum_bytes == 0 {
+        return Ok(windows);
+    }
+    let mut used = vec![11usize; requests.len()]; // opening and closing fence
+    let maximum_line = requests.iter().map(|(_, end)| *end).max().unwrap_or(0);
+    let mut line_number = 0u32;
+    let mut eof = false;
+    while line_number < maximum_line
+        && windows.iter().enumerate().any(|(index, window)| {
+            window.omission_reason.is_none() && requests[index].1 > line_number
+        })
+    {
+        if crate::active_public_operation_cancellation()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "source read cancelled",
+            ));
+        }
+        let wanted = requests.iter().enumerate().any(|(index, (start, end))| {
+            windows[index].omission_reason.is_none()
+                && *start <= line_number + 1
+                && line_number < *end
+        });
+        // Consume complete physical lines with bounded retention. Decode only
+        // after collecting bytes, so UTF-8 split across BufRead chunks survives.
+        let mut bytes = Vec::new();
+        let mut read = 0usize;
+        let mut over_cap = false;
+        loop {
+            if crate::active_public_operation_cancellation()
+                .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "source read cancelled",
+                ));
+            }
+            let chunk = reader.fill_buf()?;
+            if chunk.is_empty() {
+                eof = true;
+                break;
+            }
+            let lf = chunk.iter().position(|byte| *byte == b'\n');
+            let count = lf.map_or(chunk.len(), |index| index + 1);
+            read = read.saturating_add(count);
+            if wanted {
+                let keep = count.min(maximum_bytes.saturating_sub(bytes.len()));
+                bytes.extend_from_slice(&chunk[..keep]);
+                over_cap |= keep < count;
+            }
+            reader.consume(count);
+            if lf.is_some() {
+                break;
+            }
+        }
+        if read == 0 {
+            break;
+        }
+        line_number += 1;
+        if wanted {
+            let line = if over_cap {
+                None
+            } else {
+                Some(std::sync::Arc::<str>::from(
+                    String::from_utf8(bytes)
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+                ))
+            };
+            for (index, (start, end)) in requests.iter().enumerate() {
+                let window = &mut windows[index];
+                if window.omission_reason.is_some() || line_number < *start || line_number > *end {
+                    continue;
+                }
+                let Some(line) = &line else {
+                    window.omission_reason = Some(SourceRangeOmissionDto::LineExceedsByteBudget);
+                    window.next_start_line = Some(line_number);
+                    continue;
+                };
+                let cost = path_source_line(line_number, line).len();
+                if used[index].saturating_add(cost) > maximum_bytes {
+                    window.omission_reason = Some(if window.lines.is_empty() {
+                        SourceRangeOmissionDto::LineExceedsByteBudget
+                    } else {
+                        SourceRangeOmissionDto::ByteBudget
+                    });
+                    window.next_start_line = Some(line_number);
+                } else {
+                    used[index] += cost;
+                    window
+                        .lines
+                        .push((line_number, std::sync::Arc::clone(line)));
+                }
+            }
+        }
+        if eof {
+            break;
+        }
+    }
+    // Peeking at EOF adds no fabricated empty line after a terminal LF.
+    eof |= reader.fill_buf()?.is_empty();
+    if eof {
+        for window in &mut windows {
+            window.source_total_lines = Some(line_number);
+        }
+    }
+    Ok(windows)
+}
+
+fn path_source_line(number: u32, raw: &str) -> String {
+    // Remove only the physical LF. Preserve CR, Unicode separators, and all
+    // source bytes; an unterminated final line gets a display-only newline.
+    format!(" {number:>5} | {}\n", raw.strip_suffix('\n').unwrap_or(raw))
+}
+
+impl PathSourceWindow {
+    pub(crate) fn render(
+        &self,
+        path: String,
+        start_line: u32,
+        end_line: u32,
+        maximum_bytes: usize,
+    ) -> codestory_contracts::api::SourceRangeSnippetDto {
+        use codestory_contracts::api::{
+            SourceRangeKindDto, SourceRangeOmissionDto, SourceRangeSnippetDto,
+        };
+        use sha2::{Digest, Sha256};
+        let mut snippet = String::new();
+        let mut delivered = 0usize;
+        let mut digest = Sha256::new();
+        for (number, raw) in &self.lines {
+            let line = path_source_line(*number, raw);
+            let fence_bytes = if delivered == 0 { 11 } else { 3 };
+            if snippet
+                .len()
+                .saturating_add(line.len())
+                .saturating_add(fence_bytes)
+                > maximum_bytes
+            {
+                break;
+            }
+            if delivered == 0 {
+                snippet.push_str("```text\n");
+            }
+            snippet.push_str(&line);
+            digest.update(raw.as_bytes());
+            delivered += 1;
+        }
+        if delivered > 0 {
+            snippet.push_str("```");
+        }
+        let cut = delivered < self.lines.len();
+        let omission_reason = if cut {
+            Some(SourceRangeOmissionDto::ByteBudget)
+        } else {
+            self.omission_reason
+        };
+        let next_start_line = if cut {
+            Some(self.lines[delivered].0)
+        } else {
+            self.next_start_line
+        };
+        let complete = omission_reason.is_none();
+        SourceRangeSnippetDto {
+            path,
+            start_line,
+            end_line,
+            snippet,
+            truncated: !complete,
+            delivered_start_line: (delivered > 0).then(|| self.lines[0].0),
+            delivered_end_line: (delivered > 0).then(|| self.lines[delivered - 1].0),
+            source_total_lines: self.source_total_lines,
+            last_line_terminated: (delivered > 0)
+                .then(|| self.lines[delivered - 1].1.ends_with('\n')),
+            source_range_sha256: (delivered > 0).then(|| format!("{:x}", digest.finalize())),
+            source_kind: SourceRangeKindDto::WorkspaceRead,
+            complete,
+            omission_reason,
+            next_start_line,
+        }
+    }
+}
+
+pub(crate) fn render_path_source_windows(
+    windows: impl IntoIterator<Item = (String, u32, u32, PathSourceWindow)>,
+    maximum_bytes: usize,
+) -> Vec<codestory_contracts::api::SourceRangeSnippetDto> {
+    let mut spent = 0usize;
+    windows
+        .into_iter()
+        .map(|(path, start, end, window)| {
+            let result = window.render(path, start, end, maximum_bytes.saturating_sub(spent));
+            spent = spent.saturating_add(result.snippet.len());
+            result
+        })
+        .collect()
 }

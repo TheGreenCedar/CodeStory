@@ -300,7 +300,7 @@ fn gap_identity_schema_v3() -> Value {
 }
 
 fn packet_evidence_schema_v3() -> Value {
-    closed_object_schema_v3(vec![
+    let mut schema = closed_object_schema_v3(vec![
         ("identity", evidence_identity_schema_v3()),
         (
             "kind",
@@ -320,7 +320,10 @@ fn packet_evidence_schema_v3() -> Value {
         ),
         ("end_line", nullable_schema_v3(unsigned_integer_schema_v3())),
         ("summary", nullable_schema_v3(string_schema_v3())),
-    ])
+    ]);
+    // The DTO omits this field for non-paged evidence and legacy source rows.
+    schema["properties"]["source_delivery"] = crate::stdio_catalog::packet_source_delivery_schema();
+    schema
 }
 
 fn context_evidence_schema_v3() -> Value {
@@ -898,6 +901,54 @@ mod tests {
             "diagnostics":diagnostics
         });
         let tools = tools_for_revision_v3(McpRevisionV3::June2025);
+        let packet_schema = &tool(&tools, "packet")["outputSchema"];
+        let mut paged_packet = packet_complete.clone();
+        paged_packet["evidence"][0]["source_delivery"] =
+            serde_json::to_value(codestory_contracts::compilation::PacketSourceDeliveryV1 {
+                requested_range: codestory_contracts::compilation::PacketSourceRangeV1 {
+                    start_line: 4,
+                    end_line: 20,
+                },
+                source_sha256: "a".repeat(64),
+                remaining_source_bytes: 100,
+                next_start_line: Some(10),
+                blocked_line_rendered_bytes: None,
+            })
+            .unwrap();
+        assert!(
+            crate::stdio_arguments::validate_structured_content(packet_schema, &paged_packet)
+                .is_ok()
+        );
+        for (field, invalid) in [
+            ("remaining_source_bytes", json!(-1)),
+            ("next_start_line", json!(0)),
+            ("source_sha256", json!("short")),
+            (
+                "requested_range",
+                json!({"start_line": 4, "end_line": 20, "undeclared": true}),
+            ),
+            ("undeclared", json!(true)),
+        ] {
+            let mut invalid_packet = paged_packet.clone();
+            invalid_packet["evidence"][0]["source_delivery"][field] = invalid;
+            assert!(
+                crate::stdio_arguments::validate_structured_content(packet_schema, &invalid_packet)
+                    .is_err(),
+                "accepted invalid source receipt field {field}"
+            );
+        }
+        let mut missing_receipt_field = paged_packet;
+        missing_receipt_field["evidence"][0]["source_delivery"]
+            .as_object_mut()
+            .unwrap()
+            .remove("next_start_line");
+        assert!(
+            crate::stdio_arguments::validate_structured_content(
+                packet_schema,
+                &missing_receipt_field
+            )
+            .is_err()
+        );
         let mut packet_location = packet_complete.clone();
         packet_location["evidence"][0]["kind"] = json!("source_location");
         packet_location["evidence"][0]["start_line"] = json!(null);

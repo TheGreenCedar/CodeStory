@@ -1,5 +1,8 @@
 //! Mandatory sidecar retrieval integration for packet and agent ask paths.
 
+use super::packet_candidate::PacketRetrievalQuery;
+use codestory_retrieval::LexicalAdmissionPolicy;
+
 use crate::agent::nucleo_policy::with_sidecar_primary_retrieval;
 use crate::agent::packet_candidate::{
     PacketAdmissionDecision, PacketGraphDirection, PacketGraphEdgeProvenance, PacketSearchHit,
@@ -944,9 +947,22 @@ pub(crate) fn run_sidecar_query(
 /// candidate source or graph hydration begins. The packet session retains
 /// these exact query results under its retrieval policy and publication pin;
 /// later resolution reuses them and may hydrate only identities admitted here.
+#[cfg(test)]
 pub(crate) fn preadmit_packet_descriptor_queries(
     controller: &AppController,
     queries: &[String],
+    latency_budget_ms: Option<u32>,
+) -> Result<(), ApiError> {
+    let typed = queries
+        .iter()
+        .map(|query| PacketRetrievalQuery::strict(query))
+        .collect::<Vec<_>>();
+    preadmit_packet_descriptor_queries_with_policy(controller, &typed, latency_budget_ms)
+}
+
+pub(crate) fn preadmit_packet_descriptor_queries_with_policy(
+    controller: &AppController,
+    queries: &[PacketRetrievalQuery],
     latency_budget_ms: Option<u32>,
 ) -> Result<(), ApiError> {
     let session = active_packet_proof_session().ok_or_else(|| {
@@ -1026,7 +1042,8 @@ pub(crate) fn preadmit_packet_descriptor_queries(
         let batch_items = queries
             .iter()
             .map(|query| QueryBatchItem {
-                query,
+                lexical_policy: query.lexical_policy,
+                query: &query.query,
                 budget_ms: Some(per_query_budget),
             })
             .collect::<Vec<_>>();
@@ -1069,21 +1086,24 @@ pub(crate) fn preadmit_packet_descriptor_queries(
         }
 
         for (expected_query, result) in queries.iter().zip(&query_results) {
-            if result.query != *expected_query {
+            if result.query != expected_query.query
+                || result.features.lexical_policy != expected_query.lexical_policy
+            {
                 return Err(sidecar_retrieval_unavailable_error(
                     controller,
                     format!(
-                        "packet descriptor batch query mismatch expected `{expected_query}` got `{}`",
-                        result.query
+                        "packet descriptor batch query mismatch expected `{}` got `{}`",
+                        expected_query.query, result.query
                     ),
                 ));
             }
             pinned.ensure_query_identity(result, "admitting packet descriptors")?;
         }
-        for result in &query_results {
+        for (expected, result) in queries.iter().zip(&query_results) {
             session
-                .retain_descriptor_result(
+                .retain_descriptor_result_with_policy(
                     result,
+                    expected.lexical_policy,
                     include_dense_semantic,
                     pinned.session.publication_identity(),
                 )
@@ -1206,18 +1226,49 @@ pub(crate) fn run_and_resolve_sidecar_query(
     max_results: usize,
     latency_budget_ms: Option<u32>,
 ) -> Result<(QueryResult, SidecarCandidateResolutionOutcome), ApiError> {
+    run_and_resolve_sidecar_query_with_policy(
+        controller,
+        query,
+        max_results,
+        latency_budget_ms,
+        LexicalAdmissionPolicy::StrictLiteralV1,
+    )
+}
+
+pub(crate) fn run_and_resolve_sidecar_query_with_policy(
+    controller: &AppController,
+    query: &str,
+    max_results: usize,
+    latency_budget_ms: Option<u32>,
+    lexical_policy: LexicalAdmissionPolicy,
+) -> Result<(QueryResult, SidecarCandidateResolutionOutcome), ApiError> {
     with_pinned_retrieval_read(controller, |pinned| {
         let packet_session = crate::agent::packet_candidate::active_packet_proof_session();
         let include_dense_semantic = packet_session
             .as_ref()
             .is_none_or(|session| session.includes_dense_semantic());
         let retained = packet_session.as_ref().and_then(|session| {
-            session.descriptor_result(
+            session.descriptor_result_with_policy(
                 query,
+                lexical_policy,
                 include_dense_semantic,
                 pinned.session.publication_identity(),
             )
         });
+        if retained.is_none()
+            && packet_session
+                .as_ref()
+                .is_some_and(|session| session.retrieval_admission_is_sealed())
+        {
+            return Err(ApiError::internal(
+                "sealed packet is missing its admitted query/policy result",
+            ));
+        }
+        if packet_session.is_none() && lexical_policy != LexicalAdmissionPolicy::StrictLiteralV1 {
+            return Err(ApiError::internal(
+                "broad question retrieval requires typed packet origin",
+            ));
+        }
         let _executed_query = retained.is_none();
         let query_result = if let Some(result) = retained {
             result
@@ -1228,15 +1279,17 @@ pub(crate) fn run_and_resolve_sidecar_query(
                     if !include_dense_semantic {
                         return pinned
                         .session
-                        .execute_packet_descriptors_without_dense_semantic_for_benchmark_with_cache(
+                        .execute_packet_descriptors_without_dense_semantic_for_benchmark_with_admission_policy(
                             query,
+                            lexical_policy,
                             Some(sidecar_budget_ms(latency_budget_ms)),
                             crate::services::active_public_operation_cancellation(),
                             cache,
                         );
                     }
-                    pinned.session.execute_packet_descriptors_with_cache(
+                    pinned.session.execute_packet_descriptors_with_admission_policy(
                         query,
+                        lexical_policy,
                         Some(sidecar_budget_ms(latency_budget_ms)),
                         crate::services::active_public_operation_cancellation(),
                         cache,
@@ -1255,6 +1308,11 @@ pub(crate) fn run_and_resolve_sidecar_query(
         #[cfg(any(test, feature = "benchmark-support"))]
         if _executed_query && let Some(session) = packet_session {
             session.record_descriptor_trace(&query_result.trace);
+        }
+        if query_result.features.lexical_policy != lexical_policy {
+            return Err(ApiError::internal(
+                "sidecar result executed a different lexical admission policy",
+            ));
         }
         pinned.ensure_query_identity(&query_result, "resolving sidecar candidates")?;
         let resolution = resolve_sidecar_candidates_in_read(
@@ -1333,17 +1391,24 @@ fn sidecar_primary_error_outcome(error: ApiError) -> SidecarPrimarySearchOutcome
     }
 }
 
-pub(crate) fn try_sidecar_primary_search(
+pub(crate) fn try_sidecar_primary_search_with_policy(
     controller: &AppController,
     prompt: &str,
     max_results: usize,
     latency_budget_ms: Option<u32>,
+    lexical_policy: LexicalAdmissionPolicy,
 ) -> Option<SidecarPrimarySearchOutcome> {
     if !sidecar_retrieval_primary_enabled(controller) {
         return sidecar_retrieval_unavailable_reason(controller)
             .map(|reason| SidecarPrimarySearchOutcome::Unavailable { reason });
     }
-    match run_and_resolve_sidecar_query(controller, prompt, max_results, latency_budget_ms) {
+    match run_and_resolve_sidecar_query_with_policy(
+        controller,
+        prompt,
+        max_results,
+        latency_budget_ms,
+        lexical_policy,
+    ) {
         Ok((query_result, resolution)) => Some(sidecar_primary_search_outcome_from_resolution(
             controller,
             query_result,
@@ -1554,9 +1619,19 @@ fn search_sidecar_packet_batch_inner(
                 missing_indices.push(index);
             }
         }
+        if !missing_indices.is_empty()
+            && packet_session
+                .as_ref()
+                .is_some_and(|session| session.retrieval_admission_is_sealed())
+        {
+            return Err(ApiError::internal(
+                "sealed packet is missing a strict free-query result",
+            ));
+        }
         let missing_items = missing_indices
             .iter()
             .map(|index| QueryBatchItem {
+                lexical_policy: codestory_retrieval::LexicalAdmissionPolicy::StrictLiteralV1,
                 query: batch_queries[*index].0.as_str(),
                 budget_ms: Some(batch_queries[*index].1),
             })
@@ -1614,6 +1689,11 @@ fn search_sidecar_packet_batch_inner(
             })
             .collect::<Result<Vec<_>, _>>()?;
         for result in &query_results {
+            if result.features.lexical_policy != LexicalAdmissionPolicy::StrictLiteralV1 {
+                return Err(ApiError::internal(
+                    "free-query batch received a non-strict result",
+                ));
+            }
             pinned.ensure_query_identity(result, "resolving sidecar packet batch")?;
         }
         build_sidecar_packet_batch_outcome(
@@ -1689,6 +1769,14 @@ fn build_sidecar_packet_batch_outcome(
                 queries.len()
             ),
         ));
+    }
+    // Authenticate the entire positional batch before hydrating even its first hit.
+    for ((expected_query, _), result) in queries.iter().zip(&query_results) {
+        if result.query != *expected_query
+            || result.features.lexical_policy != LexicalAdmissionPolicy::StrictLiteralV1
+        {
+            return Err(ApiError::internal("free-query batch query/policy mismatch"));
+        }
     }
     let mut results = Vec::with_capacity(queries.len());
     let mut retryable_queries = Vec::new();
@@ -4782,6 +4870,100 @@ mod tests {
     }
 
     #[test]
+    fn same_text_policy_results_retain_and_resolve_in_both_orders_and_refuse_sealed_miss() {
+        use crate::agent::packet_candidate::{PacketProofSession, install_packet_proof_session};
+        for order in [
+            [
+                LexicalAdmissionPolicy::StrictLiteralV1,
+                LexicalAdmissionPolicy::BroadQuestionV1,
+            ],
+            [
+                LexicalAdmissionPolicy::BroadQuestionV1,
+                LexicalAdmissionPolicy::StrictLiteralV1,
+            ],
+        ] {
+            let fixture = pinned_operation_fixture();
+            let pinned = Rc::new(
+                PinnedRetrievalRead::begin_packet_descriptor(&fixture.controller).expect("pin"),
+            );
+            let session = Rc::new(PacketProofSession::new());
+            let query = "renamed lattice transition";
+            let requests = order.map(|lexical_policy| PacketRetrievalQuery {
+                query: query.to_string(),
+                lexical_policy,
+            });
+            with_active_pinned_retrieval_read(&fixture.controller, Rc::clone(&pinned), || {
+                let _guard = install_packet_proof_session(Rc::clone(&session));
+                preadmit_packet_descriptor_queries_with_policy(
+                    &fixture.controller,
+                    &requests,
+                    None,
+                )
+                .expect("typed preadmit");
+                assert!(session.retrieval_admission_is_sealed());
+                assert_eq!(
+                    session.benchmark_retrieval_proof().descriptor_query_count,
+                    2
+                );
+                for policy in order {
+                    let (result, _) = run_and_resolve_sidecar_query_with_policy(
+                        &fixture.controller,
+                        query,
+                        4,
+                        None,
+                        policy,
+                    )
+                    .expect("retained typed resolution");
+                    assert_eq!(result.features.lexical_policy, policy);
+                    let wrong_policy = if policy == LexicalAdmissionPolicy::StrictLiteralV1 {
+                        LexicalAdmissionPolicy::BroadQuestionV1
+                    } else {
+                        LexicalAdmissionPolicy::StrictLiteralV1
+                    };
+                    assert!(
+                        PacketProofSession::new()
+                            .retain_descriptor_result_with_policy(
+                                &result,
+                                wrong_policy,
+                                true,
+                                pinned.session.publication_identity(),
+                            )
+                            .is_err(),
+                        "expected policy must authenticate actual execution"
+                    );
+                }
+                assert_eq!(
+                    session.benchmark_retrieval_proof().descriptor_query_count,
+                    2
+                );
+                assert!(
+                    run_and_resolve_sidecar_query_with_policy(
+                        &fixture.controller,
+                        "not preadmitted",
+                        4,
+                        None,
+                        LexicalAdmissionPolicy::BroadQuestionV1,
+                    )
+                    .is_err()
+                );
+                assert!(
+                    search_sidecar_packet_batch_inner(
+                        &fixture.controller,
+                        &[("not preadmitted".into(), 4)],
+                        None,
+                    )
+                    .is_err(),
+                    "strict free-query misses also refuse a post-seal rerun"
+                );
+                assert_eq!(
+                    session.benchmark_retrieval_proof().descriptor_query_count,
+                    2
+                );
+            });
+        }
+    }
+
+    #[test]
     fn preadmitted_descriptor_result_is_reused_by_initial_resolution() {
         use crate::agent::packet_candidate::{PacketProofSession, install_packet_proof_session};
 
@@ -5083,6 +5265,38 @@ mod tests {
     }
 
     #[test]
+    fn fresh_strict_query_executes_outside_packet_proof_session() {
+        use codestory_contracts::api::PacketQueryCompletionDto;
+
+        assert!(active_packet_proof_session().is_none());
+        let fixture = public_packet_fixture_with_unindexed_lexical_artifact();
+        assert!(active_packet_proof_session().is_none());
+        let query = "metadata";
+        let outcome = search_sidecar_packet_batch_inner(
+            &fixture.controller,
+            &[(query.into(), 4)],
+            Some(18_000),
+        )
+        .expect("a fresh strict query outside a packet session remains eligible");
+
+        assert_eq!(outcome.results.len(), 1);
+        assert_eq!(outcome.results[0].0, query);
+        assert!(
+            !outcome.results[0].1.is_empty(),
+            "the fresh fixture must produce real strict-query hits"
+        );
+        assert_eq!(outcome.diagnostics.len(), 1);
+        assert_eq!(outcome.diagnostics[0].query, query);
+        assert_eq!(
+            outcome.diagnostics[0].completion,
+            PacketQueryCompletionDto::Completed
+        );
+        assert!(outcome.retained_deadline_queries.is_empty());
+        assert!(outcome.retryable_queries.is_empty());
+        assert!(active_packet_proof_session().is_none());
+    }
+
+    #[test]
     fn planned_query_preserves_sealed_deadline_hits_without_phantom_retry() {
         use crate::agent::packet_batch::{PacketLatencyBudget, run_packet_planned_subqueries};
         use crate::agent::packet_budget::packet_budget_limits;
@@ -5109,6 +5323,8 @@ mod tests {
                 let mut results = with_detached_sidecar_query_cache(&fixture.controller, |cache| {
                     pinned.session.execute_packet_descriptor_batch_with_cache(
                         &[QueryBatchItem {
+                            lexical_policy:
+                                codestory_retrieval::LexicalAdmissionPolicy::StrictLiteralV1,
                             query,
                             budget_ms: Some(18_000),
                         }],
@@ -5268,22 +5484,22 @@ mod tests {
                         ))
                 );
 
-                let fresh = search_sidecar_packet_batch_inner(
+                let error = search_sidecar_packet_batch_inner(
                     &fixture.controller,
                     &[("metadata".into(), 4)],
                     Some(18_000),
                 )
-                .expect("an absent descriptor key still executes an eligible fresh query");
+                .expect_err("sealed session must refuse an unretained strict query");
+                assert_eq!(error.code, "internal");
+                assert_eq!(
+                    error.message,
+                    "sealed packet is missing a strict free-query result"
+                );
                 assert_eq!(
                     session.benchmark_retrieval_proof().descriptor_query_count,
-                    2
+                    1,
+                    "a sealed miss must not execute another descriptor query"
                 );
-                assert!(fresh.retained_deadline_queries.is_empty());
-                assert_eq!(
-                    fresh.diagnostics[0].completion,
-                    PacketQueryCompletionDto::Completed
-                );
-                assert!(!fresh.results[0].1.is_empty());
 
                 assert_eq!(
                     serde_json::to_value(
@@ -7804,6 +8020,26 @@ mod tests {
         assert_eq!(outcome.results.len(), queries.len());
         assert_eq!(batch_call_count, 1);
         assert_eq!(observed_budgets, vec![4_500, 4_500, 4_500, 4_500]);
+    }
+
+    #[test]
+    fn free_query_batch_checks_later_policy_mismatch_before_any_hydration() {
+        let fixture = pinned_operation_fixture();
+        let first = query_result_with_stages(Vec::new());
+        let mut second = first.clone();
+        second.features.lexical_policy = LexicalAdmissionPolicy::BroadQuestionV1;
+        let query = first.query.clone();
+        let result = build_sidecar_packet_batch_outcome(
+            &fixture.controller,
+            &[(query.clone(), 4), (query, 4)],
+            vec![first, second],
+            0,
+            &HashSet::new(),
+            |_, _| {
+                panic!("no candidate may hydrate before all query/policy positions authenticate")
+            },
+        );
+        assert!(result.is_err());
     }
 
     #[test]

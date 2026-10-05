@@ -1,8 +1,10 @@
 use crate::config::SidecarLayout;
 use crate::lexical_index::{
-    LexicalDocumentSource, LexicalHit, search_lexical_index_batch_with_cancel,
-    search_lexical_index_descriptors_with_cancel, search_lexical_index_with_cancel, shard_dir_for,
+    LexicalDocumentSource, LexicalHit, LexicalHitPayload, search_lexical_index_batch_with_cancel,
+    search_lexical_index_batch_with_policy_cancel, search_lexical_index_descriptors_with_cancel,
+    search_lexical_index_with_cancel, search_lexical_index_with_policy_cancel, shard_dir_for,
 };
+use crate::query_policy::LexicalAdmissionPolicy;
 use anyhow::Result;
 use std::sync::Arc;
 
@@ -86,6 +88,78 @@ impl LexicalClient {
         search_lexical_index_batch_with_cancel(
             &shard_dir_for(&layout.lexical_data_dir, generation),
             sidecar_input_hash,
+            queries,
+            cancelled,
+        )?
+        .into_iter()
+        .map(|hits| hits.into_iter().map(lexical_hit_to_candidate).collect())
+        .collect()
+    }
+    pub(crate) fn search_with_policy_cancel<F>(
+        &self,
+        layout: &SidecarLayout,
+        generation: &str,
+        input_hash: &str,
+        query: &str,
+        limit: usize,
+        policy: LexicalAdmissionPolicy,
+        cancelled: F,
+    ) -> Result<Vec<super::CandidateHit>>
+    where
+        F: Fn() -> bool + Send + Sync + 'static,
+    {
+        search_lexical_index_with_policy_cancel(
+            &shard_dir_for(&layout.lexical_data_dir, generation),
+            input_hash,
+            query,
+            limit,
+            LexicalHitPayload::Full,
+            policy,
+            cancelled,
+        )?
+        .into_iter()
+        .map(lexical_hit_to_candidate)
+        .collect()
+    }
+
+    pub(crate) fn search_descriptors_with_policy_cancel<F>(
+        &self,
+        layout: &SidecarLayout,
+        generation: &str,
+        input_hash: &str,
+        query: &str,
+        limit: usize,
+        policy: LexicalAdmissionPolicy,
+        cancelled: F,
+    ) -> Result<Vec<super::CandidateHit>>
+    where
+        F: Fn() -> bool + Send + Sync + 'static,
+    {
+        search_lexical_index_with_policy_cancel(
+            &shard_dir_for(&layout.lexical_data_dir, generation),
+            input_hash,
+            query,
+            limit,
+            LexicalHitPayload::DescriptorOnly,
+            policy,
+            cancelled,
+        )?
+        .into_iter()
+        .map(lexical_hit_to_candidate)
+        .collect()
+    }
+
+    pub(crate) fn search_batch_with_policy_cancel(
+        &self,
+        layout: &SidecarLayout,
+        generation: &str,
+        input_hash: &str,
+        queries: &[(String, usize, LexicalAdmissionPolicy)],
+        cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<Vec<Vec<super::CandidateHit>>> {
+        search_lexical_index_batch_with_policy_cancel(
+            &shard_dir_for(&layout.lexical_data_dir, generation),
+            input_hash,
             queries,
             cancelled,
         )?

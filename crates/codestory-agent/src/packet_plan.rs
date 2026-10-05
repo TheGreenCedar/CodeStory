@@ -191,9 +191,9 @@ fn packet_plan_query_cap(budget: PacketBudgetModeDto) -> usize {
 fn push_packet_query(queries: &mut Vec<PacketPlanQueryDto>, query: &str, purpose: &str) {
     let query = query.trim();
     if query.is_empty()
-        || queries
-            .iter()
-            .any(|existing| existing.query.eq_ignore_ascii_case(query))
+        || queries.iter().any(|existing| {
+            existing.query.eq_ignore_ascii_case(query) && existing.purpose == purpose
+        })
     {
         return;
     }
@@ -341,6 +341,25 @@ Inspect `src/real.rs`, `node:42`, and `crate::real`.
 
         assert!(seed_plan.exact_selectors.is_empty());
         assert_eq!(seed_plan.generic_query, question);
+    }
+
+    #[test]
+    fn same_generic_and_typed_free_text_survives_both_plan_dedup_stages() {
+        let question = "text empty `absent`";
+        let seed = build_retrieval_seed_plan(
+            question,
+            &[PacketProbeDto::FreeQuery {
+                query: question.into(),
+            }],
+        );
+        let mut plan = build_packet_plan_from_seed_plan(&seed, PacketBudgetModeDto::Standard);
+        assert_eq!(plan.queries.len(), 2);
+        assert_eq!(plan.queries[0].query, question);
+        assert_eq!(plan.queries[1].query, question);
+        assert_ne!(plan.queries[0].purpose, plan.queries[1].purpose);
+        dedupe_packet_plan_queries(&mut plan);
+        assert_eq!(plan.queries.len(), 2);
+        assert!(seed.exact_selectors.is_empty());
     }
 
     #[test]

@@ -69,7 +69,7 @@ pub(super) fn run(command: InternalEmbeddingQualificationCommand) -> Result<()> 
             bail!("embedding_qualification_retry_marker_unexpected");
         }
     }
-    let transport = crate::embedding_server_transport::NativeEmbeddingClientTransport::capture()?;
+    let transport = crate::embedding_server_transport::NativeEmbeddingClientTransport::capture_for_qualification()?;
     let clock = EmbeddingClientTransport::clock(&transport);
     if let Some(gate) = request.start_gate.as_deref() {
         let timeout_ms = request

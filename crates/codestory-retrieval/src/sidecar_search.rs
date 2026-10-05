@@ -3,6 +3,7 @@ use crate::config::{SidecarLayout, SidecarRuntimeConfig};
 use crate::embedded_vector::EmbeddedVectorIndex;
 use crate::embeddings::EmbeddingDeviceReadiness;
 use crate::lexical_client::LexicalClient;
+use crate::query_policy::LexicalAdmissionPolicy;
 use crate::scip_client::ScipClient;
 use anyhow::Result;
 use codestory_store::{RetrievalIndexManifest, Store};
@@ -262,6 +263,58 @@ pub trait SidecarSearch: Send + Sync {
     ) -> Result<Vec<CandidateHit>> {
         context.run(|| self.scip_expand(anchors, limit))
     }
+    /// Broad admission requires an implementation that actually executes it.
+    fn lexical_search_with_policy_context(
+        &self,
+        query: &str,
+        limit: usize,
+        policy: LexicalAdmissionPolicy,
+        context: &SearchExecutionContext,
+    ) -> Result<Vec<CandidateHit>> {
+        match policy {
+            LexicalAdmissionPolicy::StrictLiteralV1 => {
+                self.lexical_search_with_context(query, limit, context)
+            }
+            LexicalAdmissionPolicy::BroadQuestionV1 => {
+                anyhow::bail!("sidecar does not implement broad lexical admission")
+            }
+        }
+    }
+
+    fn lexical_descriptor_search_with_policy_context(
+        &self,
+        query: &str,
+        limit: usize,
+        policy: LexicalAdmissionPolicy,
+        context: &SearchExecutionContext,
+    ) -> Result<Vec<CandidateHit>> {
+        match policy {
+            LexicalAdmissionPolicy::StrictLiteralV1 => {
+                self.lexical_descriptor_search_with_context(query, limit, context)
+            }
+            LexicalAdmissionPolicy::BroadQuestionV1 => {
+                anyhow::bail!("sidecar does not implement broad descriptor admission")
+            }
+        }
+    }
+
+    fn lexical_search_batch_with_policy(
+        &self,
+        queries: &[(String, usize, LexicalAdmissionPolicy)],
+        context: &SearchExecutionContext,
+    ) -> Result<Option<Vec<Vec<CandidateHit>>>> {
+        if queries
+            .iter()
+            .any(|(_, _, policy)| *policy != LexicalAdmissionPolicy::StrictLiteralV1)
+        {
+            return Ok(None);
+        }
+        let strict = queries
+            .iter()
+            .map(|(query, limit, _)| (query.clone(), *limit))
+            .collect::<Vec<_>>();
+        self.lexical_search_batch(&strict, context)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -356,6 +409,14 @@ impl LiveSidecarSearch {
             semantic,
             core_context: None,
         })
+    }
+
+    pub(crate) fn with_embedding_identity_pin(
+        mut self,
+        pin: Option<crate::embedding_server_compat::ProductEmbeddingIdentity>,
+    ) -> Self {
+        self.semantic = self.semantic.with_query_identity_pin(pin);
+        self
     }
 
     pub(crate) fn with_core_candidate_context(
@@ -529,6 +590,58 @@ impl SidecarSearch for LiveSidecarSearch {
             limit,
             &|| context.is_cancelled(),
         )
+    }
+    fn lexical_search_with_policy_context(
+        &self,
+        query: &str,
+        limit: usize,
+        policy: LexicalAdmissionPolicy,
+        context: &SearchExecutionContext,
+    ) -> Result<Vec<CandidateHit>> {
+        let context = context.clone();
+        self.lexical.search_with_policy_cancel(
+            &self.layout,
+            &self.sidecar_generation,
+            &self.sidecar_input_hash,
+            query,
+            limit,
+            policy,
+            move || context.is_cancelled(),
+        )
+    }
+
+    fn lexical_descriptor_search_with_policy_context(
+        &self,
+        query: &str,
+        limit: usize,
+        policy: LexicalAdmissionPolicy,
+        context: &SearchExecutionContext,
+    ) -> Result<Vec<CandidateHit>> {
+        let context = context.clone();
+        self.lexical.search_descriptors_with_policy_cancel(
+            &self.layout,
+            &self.sidecar_generation,
+            &self.sidecar_input_hash,
+            query,
+            limit,
+            policy,
+            move || context.is_cancelled(),
+        )
+    }
+
+    fn lexical_search_batch_with_policy(
+        &self,
+        queries: &[(String, usize, LexicalAdmissionPolicy)],
+        context: &SearchExecutionContext,
+    ) -> Result<Option<Vec<Vec<CandidateHit>>>> {
+        let context = context.clone();
+        Ok(Some(self.lexical.search_batch_with_policy_cancel(
+            &self.layout,
+            &self.sidecar_generation,
+            &self.sidecar_input_hash,
+            queries,
+            Arc::new(move || context.is_cancelled()),
+        )?))
     }
 }
 

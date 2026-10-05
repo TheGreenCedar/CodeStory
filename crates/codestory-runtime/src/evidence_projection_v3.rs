@@ -24,6 +24,7 @@ use crate::{
         packet_execution_record_v3::{
             FinalizedDiagnosticSourceRowV3, FinalizedPacketExecutionInputV3,
             PacketRequestFingerprintV3, build_packet_execution_record_v3,
+            build_packet_execution_record_v3_with_id,
         },
         packet_projection_v3::{
             DiagnosticArtifactBuildV3, FinalizedContextProjectionInputV3,
@@ -52,6 +53,26 @@ pub struct PacketDiagnosticProjectionV3 {
 pub struct PacketEvidenceProductV3 {
     pub projection: PacketProjectionV3Dto,
     pub diagnostics: PacketDiagnosticProjectionV3,
+}
+
+/// A single immutable UUID reserved for all unserved previews and final delivery.
+#[derive(Debug, Clone)]
+pub struct PacketProjectionIdentityV3(String);
+impl PacketProjectionIdentityV3 {
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4().to_string())
+    }
+}
+impl Default for PacketProjectionIdentityV3 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RepresentedPacketProductV3 {
+    pub packet: AgentPacketDto,
+    pub product: PacketEvidenceProductV3,
 }
 
 /// Re-apply the packet budget against an adapter's complete serialized
@@ -95,7 +116,37 @@ pub fn project_packet_v3(
     caller_id: &str,
     request: &AgentPacketRequestDto,
     packet: &AgentPacketDto,
+    measure: impl FnMut(&PacketProjectionV3Dto) -> Result<usize, ()>,
+) -> Result<PacketEvidenceProductV3, codestory_contracts::api::ApiError> {
+    project_packet_v3_using_record_builder(caller_id, request, packet, measure, |input| {
+        build_packet_execution_record_v3(service, input)
+    })
+}
+
+pub fn project_packet_v3_with_identity(
+    service: &PublicOperationService,
+    caller_id: &str,
+    request: &AgentPacketRequestDto,
+    packet: &AgentPacketDto,
+    reserved: &PacketProjectionIdentityV3,
+    measure: impl FnMut(&PacketProjectionV3Dto) -> Result<usize, ()>,
+) -> Result<PacketEvidenceProductV3, codestory_contracts::api::ApiError> {
+    project_packet_v3_using_record_builder(caller_id, request, packet, measure, |input| {
+        build_packet_execution_record_v3_with_id(service, input, &reserved.0)
+    })
+}
+
+fn project_packet_v3_using_record_builder(
+    caller_id: &str,
+    request: &AgentPacketRequestDto,
+    packet: &AgentPacketDto,
     mut measure: impl FnMut(&PacketProjectionV3Dto) -> Result<usize, ()>,
+    build_record: impl FnOnce(
+        &FinalizedPacketExecutionInputV3,
+    ) -> Result<
+        crate::agent::packet_execution_record_v3::PacketExecutionRecordV3,
+        crate::agent::packet_execution_record_v3::RecordValidationErrorV3,
+    >,
 ) -> Result<PacketEvidenceProductV3, codestory_contracts::api::ApiError> {
     let PacketEvidenceSelectionV3 {
         rows: evidence,
@@ -130,8 +181,7 @@ pub fn project_packet_v3(
         retrieval,
         diagnostics,
     );
-    let record = build_packet_execution_record_v3(service, &input)
-        .map_err(|error| projection_error("packet record", error))?;
+    let record = build_record(&input).map_err(|error| projection_error("packet record", error))?;
     let artifact = build_diagnostic_artifact_v3(&record)
         .map_err(|error| projection_error("packet diagnostics", error))?;
     let (bytes, reference) = match artifact {
@@ -173,6 +223,7 @@ struct PacketEvidenceSelectionV3 {
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct PacketEvidenceContentKeyV3 {
+    delivery: Option<codestory_contracts::compilation::PacketSourceDeliveryV1>,
     kind: u8,
     path: Option<String>,
     symbol_id: Option<String>,
@@ -374,6 +425,7 @@ fn packet_evidence_kind_order(
 
 fn packet_evidence_content_key(row: &PacketEvidenceRowV3Dto) -> PacketEvidenceContentKeyV3 {
     PacketEvidenceContentKeyV3 {
+        delivery: row.source_delivery.clone(),
         kind: match row.kind {
             EvidenceKindV3Dto::ExactSource => 0,
             EvidenceKindV3Dto::SourceLocation => 1,
@@ -729,6 +781,7 @@ fn packet_evidence_row(index: usize, unit: &SupportUnitDto) -> Option<PacketEvid
         return None;
     }
     Some(PacketEvidenceRowV3Dto {
+        source_delivery: unit.source_delivery.clone(),
         // The execution record canonicalizes by identity. A fixed-width rank
         // prefix keeps that canonical order equal to the projection's useful-
         // context order while avoiding repository-shaped identifiers.
@@ -812,6 +865,31 @@ fn packet_gaps(packet: &AgentPacketDto) -> Vec<ProjectionGapRowV3Dto> {
             .expect("static bounded gap")
         })
         .collect::<Vec<_>>();
+    for (index, receipt) in packet.disposition.omission_receipts.iter().enumerate() {
+        gaps.push(
+            gap_row(
+                &format!("packet-source-refusal-{index}"),
+                GapKindV3Dto::SourceUnavailable,
+                Some(receipt),
+            )
+            .expect("bounded admitted source refusal"),
+        );
+    }
+    for (index, unit) in packet.support.iter().enumerate() {
+        if let Some(delivery) = &unit.source_delivery
+            && delivery.remaining_source_bytes > 0
+        {
+            let blocked = delivery.blocked_line_rendered_bytes.map_or_else(String::new, |bytes| format!("; next complete line requires {bytes} rendered bytes, exceeding the 512-byte row cap"));
+            gaps.push(gap_row(
+                &format!("packet-source-unread-{index}"),
+                GapKindV3Dto::EvidenceMissing,
+                Some(&format!("Requested lines {}-{}; complete lines {}-{} delivered; {} source bytes remain{}.",
+                    delivery.requested_range.start_line, delivery.requested_range.end_line,
+                    unit.start_line.unwrap_or_default(), unit.end_line.unwrap_or_default(),
+                    delivery.remaining_source_bytes, blocked)),
+            ).expect("bounded source delivery gap"));
+        }
+    }
     match packet.disposition.kind {
         PacketDispositionKindDto::Supported => {}
         PacketDispositionKindDto::DrillOnce => {
@@ -864,12 +942,30 @@ fn packet_continuation(
         )?);
     }
     canonicalize_gaps(gaps);
-    let references = gaps
-        .iter()
-        .filter(|gap| gap.kind == GapKindV3Dto::ContinuationRequired)
-        .map(|gap| gap.identity.clone())
-        .take(codestory_contracts::packet_projection_v3::REFERENCE_ROWS_MAX_V3)
-        .collect();
+    let references = if drill.gap_ids.is_empty() {
+        gaps.iter()
+            .filter(|gap| gap.kind == GapKindV3Dto::ContinuationRequired)
+            .map(|gap| gap.identity.clone())
+            .take(codestory_contracts::packet_projection_v3::REFERENCE_ROWS_MAX_V3)
+            .collect()
+    } else {
+        // Structural gap IDs carry compiler priority; public gap identities
+        // carry executable option IDs. Resolve through the offered options
+        // without borrowing canonical storage order as selection priority.
+        drill
+            .gap_ids
+            .iter()
+            .filter_map(|gap_id| drill.options.iter().find(|option| &option.gap_id == gap_id))
+            .filter_map(|option| {
+                gaps.iter().find(|gap| {
+                    gap.kind == GapKindV3Dto::ContinuationRequired
+                        && gap.identity.gap_id.as_str() == option.id
+                })
+            })
+            .map(|gap| gap.identity.clone())
+            .take(codestory_contracts::packet_projection_v3::REFERENCE_ROWS_MAX_V3)
+            .collect()
+    };
     ContinuationStateV3Dto::new(
         identity(&drill.parent_packet_id, "continuation_id")?,
         u16::try_from(drill.remaining_rounds).unwrap_or(u16::MAX),
@@ -1077,6 +1173,7 @@ mod tests {
 
     fn support_unit(kind: SupportUnitKindDto) -> SupportUnitDto {
         SupportUnitDto {
+            source_delivery: None,
             id: "unit-1".to_string(),
             kind,
             summary: "fixture".to_string(),
@@ -1090,6 +1187,132 @@ mod tests {
             to_symbol: None,
             query: None,
         }
+    }
+
+    fn continuation_progress_packet() -> AgentPacketDto {
+        let trace = json!({"request_id":"continuation-request", "resolved_profile":"investigate",
+            "policy_mode":"latency_first", "total_latency_ms":0, "sla_missed":false,
+            "semantic_fallback_count":0, "semantic_fallbacks":[], "semantic_stage_timeout_zero_hits":0,
+            "semantic_abstained_count":0, "annotations":[], "steps":[], "packet_sidecar_diagnostics":[]});
+        serde_json::from_value(json!({
+            "packet_id":"continuation-request", "question":"repository investigation",
+            "plan":{"queries":[],"trace":[]},
+            "answer":{"answer_id":"continuation-answer", "prompt":"repository investigation",
+                "summary":"fixture", "sections":[], "citations":[], "subgraph_ids":[],
+                "retrieval_version":"fixture", "graphs":[], "retrieval_trace":trace},
+            "support":[], "disposition":{"kind":"not_established"},
+            "budget":{"requested":"standard", "limits":{"max_anchors":16,"max_files":16,
+                "max_snippets":16,"max_trail_edges":16,"max_output_bytes":65536},
+                "used":{"anchors":0,"files":0,"snippets":0,"trail_edges":0,"output_bytes":0},
+                "truncated":false,"next_deeper_command":null},
+            "retrieval_trace_summary":{"retrieval_trace":trace,"source_read_steps":0,
+                "search_steps":0,"trail_steps":0}
+        }))
+        .expect("internal packet envelope")
+    }
+
+    fn continuation_progress_plan(
+        options: Vec<codestory_contracts::api::DrillOptionDto>,
+    ) -> codestory_contracts::api::BoundedDrillPlanDto {
+        use codestory_contracts::api::*;
+        BoundedDrillPlanDto {
+            parent_packet_id: "continuation-request".into(),
+            core_generation_id: "core".into(),
+            retrieval_generation: Some("retrieval".into()),
+            gap_ids: options.iter().map(|option| option.gap_id.clone()).collect(),
+            options,
+            max_bytes: PACKET_DRILL_MAX_BYTES,
+            max_hits: PACKET_DRILL_MAX_HITS,
+            max_depth: PACKET_DRILL_MAX_DEPTH,
+            remaining_rounds: 1,
+        }
+    }
+
+    #[test]
+    fn continuation_progress_projects_priority_as_executable_references_with_canonical_gaps() {
+        use codestory_contracts::api::{DrillOptionDto, PacketDispositionDto};
+        let options = vec![
+            DrillOptionDto::omitted_symbol("source_budget_exceeded:node:z", "z"),
+            DrillOptionDto::omitted_symbol("disconnected_seed:node:a", "a"),
+        ];
+        let expected_ids = options
+            .iter()
+            .map(|option| option.id.clone())
+            .collect::<Vec<_>>();
+        let mut packet = continuation_progress_packet();
+        let mut drill = continuation_progress_plan(options);
+        // Gap order is authoritative even if option storage is reordered.
+        drill.options.reverse();
+        packet.disposition = PacketDispositionDto::drill_once("structural gap", drill);
+        let mut gaps = packet_gaps(&packet);
+        gaps.push(gap_row("unrelated-gap", GapKindV3Dto::EvidenceMissing, None).unwrap());
+        let continuation = packet_continuation(&packet, &mut gaps).unwrap().unwrap();
+        assert_eq!(
+            continuation
+                .gap_ids
+                .as_slice()
+                .iter()
+                .map(|gap| gap.gap_id.as_str())
+                .collect::<Vec<_>>(),
+            expected_ids.iter().map(String::as_str).collect::<Vec<_>>(),
+            "continuation refs must retain priority and remain executable option identities"
+        );
+        assert_eq!(continuation.remaining_rounds, 1);
+        assert!(
+            gaps.windows(2)
+                .all(|pair| pair[0].identity < pair[1].identity)
+        );
+        assert!(
+            continuation
+                .gap_ids
+                .as_slice()
+                .iter()
+                .all(|reference| gaps.iter().any(|gap| &gap.identity == reference))
+        );
+        assert_eq!(gaps.len(), 3);
+    }
+
+    #[test]
+    fn continuation_progress_preserves_terminal_fallback_and_reference_caps() {
+        use codestory_contracts::api::{DrillOptionDto, PacketDispositionDto};
+        use codestory_contracts::packet_projection_v3::{GAP_ROWS_MAX_V3, REFERENCE_ROWS_MAX_V3};
+        let mut packet = continuation_progress_packet();
+        packet.disposition = PacketDispositionDto::drill_once(
+            "structural gap",
+            continuation_progress_plan(Vec::new()),
+        );
+        let mut gaps = packet_gaps(&packet);
+        let fallback = packet_continuation(&packet, &mut gaps).unwrap().unwrap();
+        assert_eq!(fallback.gap_ids.as_slice().len(), 1);
+        assert_eq!(
+            fallback.gap_ids.as_slice()[0].gap_id.as_str(),
+            "packet-continuation-required"
+        );
+        packet.disposition.drill.as_mut().unwrap().remaining_rounds = 0;
+        assert!(packet_continuation(&packet, &mut gaps).unwrap().is_none());
+
+        let options = (0..GAP_ROWS_MAX_V3 + 2)
+            .rev()
+            .map(|index| {
+                DrillOptionDto::omitted_symbol(
+                    format!("disconnected_seed:node:{index:03}"),
+                    format!("{index:03}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        packet.disposition =
+            PacketDispositionDto::drill_once("structural gap", continuation_progress_plan(options));
+        let mut gaps = packet_gaps(&packet);
+        let bounded = packet_continuation(&packet, &mut gaps).unwrap().unwrap();
+        assert_eq!(gaps.len(), GAP_ROWS_MAX_V3);
+        assert_eq!(bounded.gap_ids.as_slice().len(), REFERENCE_ROWS_MAX_V3);
+        assert!(
+            bounded
+                .gap_ids
+                .as_slice()
+                .iter()
+                .all(|reference| gaps.iter().any(|gap| &gap.identity == reference))
+        );
     }
 
     fn indexed_search_fixture() -> (
@@ -3024,5 +3247,184 @@ mod tests {
         assert_eq!(evidence["start_line"], serde_json::Value::Null);
         assert_eq!(evidence["end_line"], serde_json::Value::Null);
         assert_eq!(evidence["symbol_id"], serde_json::Value::Null);
+    }
+}
+
+/// Fixtures use the production compiler, shared proposal application, normal
+/// validated record construction and public finalizer; only hydration and the
+/// captured publication are supplied by the test. No private runtime is opened.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod representation_budget_test_support {
+    use super::*;
+    use crate::agent::packet_compiler::{
+        PreparedPacketCompilationV1, commit_measured_packet_compilation,
+    };
+    use codestory_contracts::api::*;
+    use codestory_contracts::compilation::PacketCompilationInputV1;
+
+    fn empty_packet(question: &str, max_output_bytes: u32) -> AgentPacketDto {
+        let answer = AgentAnswerDto {
+            focused_source: None,
+            source_coverage: Vec::new(),
+            answer_id: "packet-budget-test".to_string(),
+            prompt: question.to_string(),
+            summary: "Packet budget test answer.".to_string(),
+            freshness: None,
+            sections: vec![AgentResponseSectionDto {
+                id: "answer".to_string(),
+                title: "Answer".to_string(),
+                blocks: vec![AgentResponseBlockDto::Markdown {
+                    markdown: "Bounded source-backed evidence.".to_string(),
+                }],
+            }],
+            citations: Vec::new(),
+            subgraph_ids: Vec::new(),
+            retrieval_version: "test".to_string(),
+            graphs: Vec::new(),
+            retrieval_trace: AgentRetrievalTraceDto {
+                request_id: "packet-budget-test".to_string(),
+                retrieval_publication: None,
+                resolved_profile: AgentRetrievalPresetDto::Architecture,
+                policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
+                total_latency_ms: 1,
+                sla_target_ms: None,
+                sla_missed: false,
+                semantic_fallback_count: 0,
+                semantic_fallbacks: Vec::new(),
+                semantic_stage_timeout_zero_hits: 0,
+                semantic_abstained_count: 0,
+                annotations: Vec::new(),
+                source_freshness_telemetry: None,
+                steps: Vec::new(),
+                packet_sidecar_diagnostics: Vec::new(),
+                retrieval_shadow: None,
+            },
+        };
+        let budget = PacketBudgetDto {
+            requested: PacketBudgetModeDto::Compact,
+            limits: PacketBudgetLimitsDto {
+                max_anchors: 16,
+                max_files: 16,
+                max_snippets: 16,
+                max_trail_edges: 20,
+                max_output_bytes,
+            },
+            used: PacketBudgetUsageDto {
+                anchors: 0,
+                files: 0,
+                snippets: 0,
+                trail_edges: 0,
+                output_bytes: 0,
+            },
+            truncated: false,
+            omitted_sections: Vec::new(),
+            next_deeper_command: None,
+        };
+        let retrieval_trace_summary = PacketRetrievalTraceSummaryDto {
+            retrieval_trace: answer.retrieval_trace.clone(),
+            source_read_steps: 0,
+            search_steps: 0,
+            trail_steps: 0,
+        };
+
+        AgentPacketDto {
+            packet_id: answer.answer_id.clone(),
+            question: question.to_string(),
+            plan: PacketPlanDto {
+                queries: Vec::new(),
+                probe_resolutions: Vec::new(),
+                trace: Vec::new(),
+            },
+            answer,
+            budget,
+            support: Vec::new(),
+            disposition: PacketDispositionDto::supported(),
+            retrieval_trace_summary,
+            answer_sufficiency: Default::default(),
+        }
+    }
+
+    fn shell(request: &AgentPacketRequestDto) -> AgentPacketDto {
+        let mut packet = empty_packet(&request.question, 16_384);
+        packet.answer.freshness = Some(crate::agent::packet_freshness::fresh_index_observation());
+        packet.answer.retrieval_trace.retrieval_publication =
+            Some(EmbeddingVectorPublicationIdentityDto {
+                core_generation_id: "core-generation-1".into(),
+                core_run_id: "core-run-1".into(),
+                retrieval_generation: "retrieval-generation-1".into(),
+                retrieval_input_hash:
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+                semantic_generation: "semantic-generation-1".into(),
+            });
+        packet.retrieval_trace_summary.retrieval_trace = packet.answer.retrieval_trace.clone();
+        packet
+    }
+
+    pub fn default_packet(
+        input: PacketCompilationInputV1,
+        request: &AgentPacketRequestDto,
+    ) -> (AgentPacketDto, usize) {
+        let prepared = PreparedPacketCompilationV1::from_fixture_input(input);
+        let compiled = prepared.default_product();
+        let support_bytes = serde_json::to_vec(&compiled.support).unwrap().len();
+        let mut packet = shell(request);
+        prepared.apply_proposal(&mut packet, Some(request), &compiled);
+        (packet, support_bytes)
+    }
+
+    pub fn project_packet(
+        request: &AgentPacketRequestDto,
+        packet: &AgentPacketDto,
+        measure: impl FnMut(&PacketProjectionV3Dto) -> Result<usize, ()>,
+    ) -> Result<PacketEvidenceProductV3, ApiError> {
+        project_packet_v3_using_record_builder(
+            "codestory-stdio",
+            request,
+            packet,
+            measure,
+            |input| {
+                crate::agent::packet_execution_record_v3::build_packet_execution_record_fixture_v3(
+                    input, true,
+                )
+            },
+        )
+    }
+
+    pub fn select_prepared(
+        input: PacketCompilationInputV1,
+        request: &AgentPacketRequestDto,
+        mut measure: impl FnMut(&PacketProjectionV3Dto) -> Result<usize, ()>,
+    ) -> Result<RepresentedPacketProductV3, ApiError> {
+        let prepared = PreparedPacketCompilationV1::from_fixture_input(input);
+        let shell = shell(request);
+        let mut full = None;
+        let mut accepted = None;
+        let frozen = prepared.select_for_representation(|prepared, compiled| {
+            let mut packet = shell.clone();
+            prepared.apply_proposal(&mut packet, Some(request), compiled);
+            let product = project_packet(request, &packet, &mut measure)?;
+            let bytes = if matches!(&product.projection, PacketProjectionV3Dto::Complete { .. }) {
+                Some(
+                    measure(&product.projection)
+                        .map_err(|_| ApiError::internal("fixture measure failed"))?,
+                )
+            } else {
+                None
+            };
+            let proposal = RepresentedPacketProductV3 { packet, product };
+            if full.is_none() {
+                full = Some(proposal.clone());
+            }
+            if bytes.is_some_and(|bytes| bytes <= 16_384) {
+                accepted = Some(proposal);
+            }
+            Ok(bytes)
+        })?;
+        let selected = accepted
+            .or(full)
+            .ok_or_else(|| ApiError::internal("fixture had no proposal"))?;
+        commit_measured_packet_compilation(&selected.packet, frozen)?;
+        Ok(selected)
     }
 }

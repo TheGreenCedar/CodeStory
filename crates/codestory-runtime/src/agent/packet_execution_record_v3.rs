@@ -110,6 +110,7 @@ pub(crate) enum RecordValidationErrorV3 {
     IdentityTooLong(&'static str, usize),
     ProjectMismatch,
     InvalidRequest(String),
+    InvalidSourceDelivery(String),
     RequestedCoreGenerationMismatch,
     RequestedRetrievalGenerationMismatch,
     RetrievalCoreSkew,
@@ -325,24 +326,46 @@ impl PacketIdSourceV3 for OsPacketIdSourceV3 {
     }
 }
 
+pub(crate) fn build_packet_execution_record_v3_with_id(
+    service: &PublicOperationService,
+    input: &FinalizedPacketExecutionInputV3,
+    packet_id: &str,
+) -> Result<PacketExecutionRecordV3, RecordValidationErrorV3> {
+    struct ReservedId<'a>(&'a str);
+    impl PacketIdSourceV3 for ReservedId<'_> {
+        fn next_packet_id(&mut self) -> String {
+            self.0.to_owned()
+        }
+    }
+    let capture = capture_packet_publication_v3(service)?;
+    // Reuse every normal receipt/publication/identity validator.
+    build_record_from_captured_v3(&capture, input, &mut ReservedId(packet_id))
+}
+
 pub(crate) fn build_packet_execution_record_v3(
     service: &PublicOperationService,
     input: &FinalizedPacketExecutionInputV3,
 ) -> Result<PacketExecutionRecordV3, RecordValidationErrorV3> {
+    let capture = capture_packet_publication_v3(service)?;
+    build_record_from_captured_product_v3(&capture, input)
+}
+
+fn capture_packet_publication_v3(
+    service: &PublicOperationService,
+) -> Result<CapturedPacketPublicationV3, RecordValidationErrorV3> {
     let active = service
         .active_publication()
         .ok_or(RecordValidationErrorV3::NoActiveCorePin)?;
     let project = service
         .active_project_identity_v3()
         .map_err(|_| RecordValidationErrorV3::ProjectIdentityUnavailable)?;
-    let capture = CapturedPacketPublicationV3 {
+    Ok(CapturedPacketPublicationV3 {
         core_project_id: project.project_id.clone(),
         core_generation_id: active.core_publication.generation_id,
         core_run_id: active.core_publication.run_id,
         project,
         retrieval: active.retrieval_publication,
-    };
-    build_record_from_captured_product_v3(&capture, input)
+    })
 }
 
 fn build_record_from_captured_product_v3(
@@ -409,6 +432,19 @@ fn build_record_from_captured_v3(
     evidence.sort_by(|left, right| left.identity.cmp(&right.identity));
     for row in &evidence {
         validate_required_identity("evidence_id", row.identity.evidence_id.as_str())?;
+        if let Some(delivery) = &row.source_delivery
+            && (row.kind
+                != codestory_contracts::packet_projection_v3::EvidenceKindV3Dto::ExactSource
+                || row.summary.is_none()
+                || !row
+                    .start_line
+                    .zip(row.end_line)
+                    .is_some_and(|(start, end)| delivery.matches_delivery(start, end)))
+        {
+            return Err(RecordValidationErrorV3::InvalidSourceDelivery(
+                row.identity.evidence_id.as_str().to_owned(),
+            ));
+        }
     }
     reject_duplicate_by(
         &evidence,
@@ -617,12 +653,13 @@ fn canonical_continuation(
     continuation
         .validate()
         .map_err(|_| RecordValidationErrorV3::ZeroContinuationRounds)?;
-    let mut references = continuation.gap_ids.as_slice().to_vec();
-    references.sort();
-    for pair in references.windows(2) {
-        if pair[0] == pair[1] {
+    let references = continuation.gap_ids.as_slice().to_vec();
+    // Continuation references are ordered choices, unlike canonical gap rows.
+    let mut seen = BTreeSet::new();
+    for reference in &references {
+        if !seen.insert(reference) {
             return Err(RecordValidationErrorV3::DuplicateContinuationGapReference(
-                pair[0].gap_id.as_str().to_owned(),
+                reference.gap_id.as_str().to_owned(),
             ));
         }
     }
@@ -637,7 +674,7 @@ fn canonical_continuation(
         continuation.continuation_id.clone(),
         continuation.remaining_rounds,
         codestory_contracts::packet_projection_v3::BoundedVecV3::new(references)
-            .expect("the source bounded vector remains bounded after sorting"),
+            .expect("the source bounded vector remains bounded"),
     )
     .expect("validated continuation remains positive"))
 }
@@ -757,7 +794,11 @@ fn digest_v3(bytes: &[u8]) -> Result<Sha256DigestV3Dto, RecordValidationErrorV3>
         .map_err(|_| RecordValidationErrorV3::InvalidDigest)
 }
 
-#[cfg(any(test, feature = "v3-evidence-separation-support"))]
+#[cfg(any(
+    test,
+    feature = "test-support",
+    feature = "v3-evidence-separation-support"
+))]
 pub(crate) fn build_packet_execution_record_fixture_v3(
     input: &FinalizedPacketExecutionInputV3,
     with_retrieval_publication: bool,
@@ -875,6 +916,7 @@ mod tests {
 
     fn evidence(id: &str) -> PacketEvidenceRowV3Dto {
         PacketEvidenceRowV3Dto {
+            source_delivery: None,
             identity: EvidenceIdentityV3Dto {
                 evidence_id: identity(id),
             },
@@ -1074,6 +1116,156 @@ mod tests {
     }
 
     #[test]
+    fn complete_source_receipts_survive_compaction_and_reject_false_delivery() {
+        use crate::agent::packet_projection_v3::build_packet_projection_v3;
+        use codestory_contracts::compilation::{PacketSourceDeliveryV1, PacketSourceRangeV1};
+        use codestory_contracts::packet_projection_v3::{
+            DiagnosticsCapabilityV3Dto, PacketProjectionV3Dto,
+        };
+        let mut input = finalized_fixture();
+        let receipt = PacketSourceDeliveryV1 {
+            requested_range: PacketSourceRangeV1 {
+                start_line: 1,
+                end_line: 10,
+            },
+            source_sha256: "a".repeat(64),
+            remaining_source_bytes: 100,
+            next_start_line: Some(2),
+            blocked_line_rendered_bytes: None,
+        };
+        input.evidence[0].source_delivery = Some(receipt.clone());
+        input.gaps[0].kind = GapKindV3Dto::SourceUnavailable;
+        input.gaps[0].message = Some(
+            codestory_contracts::packet_projection_v3::MessageTextV3::new(
+                "zero complete lines delivered; source bytes remain",
+            )
+            .unwrap(),
+        );
+        let mut ids = deterministic_id_source();
+        let record = build_record_from_captured_v3(&capture_fixture(), &input, &mut ids).unwrap();
+        let projected = build_packet_projection_v3(&record, DiagnosticsCapabilityV3Dto::Unavailable, |candidate| {
+            let extra_optional = matches!(candidate, PacketProjectionV3Dto::Complete { evidence, .. } if evidence.as_slice().iter().any(|row| row.source_delivery.is_none() && row.summary.is_some()));
+            Ok(if extra_optional { 20_000 } else { 100 })
+        }).unwrap();
+        let PacketProjectionV3Dto::Complete { evidence, gaps, .. } = projected else {
+            panic!("mandatory receipt fits after unrelated optional prose compaction")
+        };
+        let delivered = evidence
+            .as_slice()
+            .iter()
+            .find(|row| row.source_delivery.is_some())
+            .unwrap();
+        assert_eq!(delivered.source_delivery, Some(receipt));
+        assert!(
+            delivered.summary.is_some(),
+            "delivery metadata cannot survive without its actual source page"
+        );
+        assert!(
+            gaps.as_slice()
+                .iter()
+                .any(|gap| gap.kind == GapKindV3Dto::SourceUnavailable && gap.message.is_some())
+        );
+        input.evidence[0]
+            .source_delivery
+            .as_mut()
+            .unwrap()
+            .next_start_line = Some(1);
+        let mut ids = deterministic_id_source();
+        assert!(matches!(
+            build_record_from_captured_v3(&capture_fixture(), &input, &mut ids),
+            Err(RecordValidationErrorV3::InvalidSourceDelivery(_))
+        ));
+    }
+
+    #[test]
+    fn continuation_progress_survives_record_capture_and_public_projection() {
+        use crate::agent::packet_projection_v3::build_packet_projection_v3;
+        use codestory_contracts::packet_projection_v3::{
+            DiagnosticsCapabilityV3Dto, PacketProjectionV3Dto,
+        };
+        let input = finalized_fixture();
+        let mut ids = deterministic_id_source();
+        let record = build_record_from_captured_v3(&capture_fixture(), &input, &mut ids).unwrap();
+        assert_eq!(
+            record
+                .continuation()
+                .unwrap()
+                .gap_ids
+                .as_slice()
+                .iter()
+                .map(|gap| gap.gap_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gap-b", "gap-a"],
+            "record capture must preserve semantic continuation priority"
+        );
+        for compact in [false, true] {
+            let projection = build_packet_projection_v3(
+                &record,
+                DiagnosticsCapabilityV3Dto::Unavailable,
+                |candidate| {
+                    let has_context = matches!(candidate, PacketProjectionV3Dto::Complete {
+                        evidence, ..
+                    } if evidence.as_slice().iter().any(|row| row.summary.is_some()));
+                    Ok(if compact && has_context { 20_000 } else { 100 })
+                },
+            )
+            .unwrap();
+            let PacketProjectionV3Dto::Complete {
+                gaps, continuation, ..
+            } = projection
+            else {
+                panic!("mandatory identities fit the public budget");
+            };
+            assert_eq!(
+                gaps.as_slice()
+                    .iter()
+                    .map(|gap| gap.identity.gap_id.as_str())
+                    .collect::<Vec<_>>(),
+                if compact {
+                    vec!["gap-a", "gap-b", "packet-optional-context-omitted"]
+                } else {
+                    vec!["gap-a", "gap-b"]
+                }
+            );
+            assert_eq!(
+                continuation
+                    .unwrap()
+                    .gap_ids
+                    .as_slice()
+                    .iter()
+                    .map(|gap| gap.gap_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["gap-b", "gap-a"],
+                "public projection and context compaction must preserve continuation priority"
+            );
+        }
+
+        let mut duplicate = input;
+        duplicate.continuation.as_mut().unwrap().gap_ids = BoundedVecV3::new(vec![
+            GapIdentityV3Dto {
+                gap_id: identity("gap-b"),
+            },
+            GapIdentityV3Dto {
+                gap_id: identity("gap-a"),
+            },
+            GapIdentityV3Dto {
+                gap_id: identity("gap-b"),
+            },
+        ])
+        .unwrap();
+        let mut ids = deterministic_id_source();
+        assert!(
+            matches!(
+                build_record_from_captured_v3(&capture_fixture(), &duplicate, &mut ids),
+                Err(RecordValidationErrorV3::DuplicateContinuationGapReference(
+                    _
+                ))
+            ),
+            "nonadjacent duplicate refs remain invalid when order is preserved"
+        );
+    }
+
+    #[test]
     fn packet_execution_record_v3_is_canonical_owned_and_immutable() {
         let mut input = finalized_fixture();
         let mut ids = deterministic_id_source();
@@ -1103,7 +1295,7 @@ mod tests {
             record.continuation().unwrap().gap_ids.as_slice()[0]
                 .gap_id
                 .as_str(),
-            "gap-a"
+            "gap-b"
         );
 
         input.request.question = "caller-mutated".to_owned();
@@ -1123,22 +1315,12 @@ mod tests {
         reordered.evidence.reverse();
         reordered.gaps.reverse();
         reordered.diagnostics.reverse();
-        let mut gap_references = reordered
-            .continuation
-            .as_ref()
-            .unwrap()
-            .gap_ids
-            .as_slice()
-            .to_vec();
-        gap_references.reverse();
-        reordered.continuation.as_mut().unwrap().gap_ids =
-            BoundedVecV3::new(gap_references).unwrap();
         let mut reordered_ids = deterministic_id_source();
         assert_eq!(
             build_record_from_captured_v3(&capture_fixture(), &reordered, &mut reordered_ids)
                 .unwrap(),
             before_borrow,
-            "canonical row ordering must not depend on caller vector order"
+            "canonical evidence, gap, and diagnostic rows must not depend on caller vector order"
         );
     }
 
@@ -1432,7 +1614,18 @@ mod tests {
 
     #[test]
     fn packet_execution_record_v3_does_not_bypass_mid_operation_freshness_refusal() {
-        let fixture = ready_activation_fixture();
+        let fixture =
+            crate::services::activation_tests::ready_activation_fixture_with_observer_setup(
+                |root, controller| {
+                    // Model a notification that has not arrived yet. The content
+                    // fence must still prevent a second build after source drift.
+                    let observer =
+                        crate::tests::freshness_observer_tests::scripted_session(root, |_| {
+                            Vec::new()
+                        });
+                    controller.install_source_observer_for_test(root, Arc::new(observer));
+                },
+            );
         let service = fixture.runtime.public_operation_service();
         let source = fixture.project.path().join("metadata.rs");
         let mut builds = 0;
@@ -1440,6 +1633,10 @@ mod tests {
         let refusal = service
             .run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
                 builds += 1;
+                assert_eq!(
+                    builds, 1,
+                    "source drift must refuse the next build before capture"
+                );
                 let input = finalized_fixture_for_active_pin(&service, finalized_fixture());
                 let record = build_packet_execution_record_v3(&service, &input)
                     .map_err(RecordValidationErrorV3::into_api_error)?;

@@ -107,6 +107,7 @@ fn task_brief_exposes_only_the_typed_drill_once_continuation() {
             retrieval_generation: Some("retrieval-generation-4".to_string()),
             gap_ids: vec!["gap-1".to_string()],
             options: vec![DrillOptionDto {
+                source_range: None,
                 id: "option-1".to_string(),
                 gap_id: "gap-1".to_string(),
                 kind: DrillGapKindDto::BoundedSourceRead,

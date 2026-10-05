@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Managed tools can refresh once after a content check catches a delayed filesystem notification, within the original call deadline. Source-backed reads still refuse stale bytes; retained graph results remain labelled historical.
+
+- Packet retrieval considers matching source when an ordinary question includes example values absent from the code. Explicit search queries retain their quoted-term requirements.
+- Lexical search treats fenced configuration examples as context while preserving inline quoted entity requirements.
+- Packet JSON uses compact formatting when indentation would exceed its byte limit, preserving source evidence and publication metadata within the same limit.
+- Graph indexing no longer initializes optional embedding transport to report its result. Retrieval readiness remains unobserved until you request retrieval status or a full retrieval operation.
+- Symbol source excerpts retain complete lines and report unread bytes. A bounded follow-up advances to the next unread line in the same verified index.
 - Child-symbol lists retain distinct declarations with the same name, so you can navigate each declaration in a file.
 - Search reports retrieval deadlines and cancellations while retaining located matches, so you can see when additional matches may exist.
 - Repository-text search reports when scan limits or skipped oversized files leave source uninspected, so missing matches do not appear exhaustive.

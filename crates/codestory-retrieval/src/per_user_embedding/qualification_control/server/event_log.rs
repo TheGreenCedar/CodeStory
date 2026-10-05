@@ -208,9 +208,13 @@ impl ServerQualificationEventLog {
 
 pub(in crate::per_user_embedding) fn write_server_qualification_event(
     control: &ServerQualificationControl,
-    _state: &PerUserEmbeddingServerState,
+    state: &PerUserEmbeddingServerState,
     event: ServerQualificationEvent,
 ) -> Result<()> {
+    let clock = state.clock.snapshot();
+    if event.clock.boot_id != clock.qualification_boot_id()? {
+        bail!("embedding_qualification_event_boot_identity_changed");
+    }
     control
         .events
         .lock()

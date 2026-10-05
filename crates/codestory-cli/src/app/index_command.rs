@@ -1,5 +1,4 @@
 use super::artifacts::{ensure_dot_only_for_trail, preflight_output_file};
-use super::diagnostics::{build_summary_readiness, doctor_sidecar_status};
 use crate::args;
 use crate::args::{IndexCommand, IndexDryRunOutput, IndexOutput};
 use crate::output::{emit, render_index_dry_run_markdown, render_index_markdown};
@@ -8,8 +7,7 @@ use crate::runtime::{
     map_api_error_for_project, refresh_label, refresh_mode_name,
 };
 use crate::{display, readiness};
-use anyhow::Context;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use codestory_contracts::api::{AppEventPayload, IndexMode};
 use std::fs;
 use std::sync::{
@@ -114,7 +112,7 @@ fn run_index_once(cmd: &IndexCommand) -> Result<()> {
     } else {
         None
     };
-    let opened = runtime.ensure_open(cmd.refresh)?;
+    let mut opened = runtime.ensure_core_open(cmd.refresh)?;
     if let Some(progress) = progress {
         progress.finish();
     }
@@ -128,20 +126,18 @@ fn run_index_once(cmd: &IndexCommand) -> Result<()> {
     } else {
         None
     };
-    let retrieval = opened
-        .summary
-        .retrieval
-        .as_ref()
-        .context("Open project summary did not include retrieval state")?;
+    if summary_generation.is_some() {
+        opened.summary = runtime.open_core_read_only()?.summary;
+    }
+    let retrieval = opened.summary.retrieval.as_ref();
     let refresh_label = refresh_label(cmd.refresh, opened.refresh_mode);
     let storage_path = runtime.storage_path.to_string_lossy().to_string();
-    let sidecar_retrieval = doctor_sidecar_status(&runtime);
-    let readiness = build_summary_readiness(
-        &opened.summary.root,
-        &opened.summary.stats,
-        opened.summary.freshness.as_ref(),
-        &sidecar_retrieval,
-    );
+    let readiness = readiness::build_readiness_verdicts(readiness::ReadinessInputs {
+        project: &opened.summary.root,
+        stats: &opened.summary.stats,
+        freshness: opened.summary.freshness.as_ref(),
+        sidecar: None,
+    });
     let next_commands = readiness::compatibility_next_commands(&readiness);
     let warnings = opened
         .summary
@@ -367,5 +363,73 @@ mod tests {
         assert_eq!(detail.available_bytes, 0);
         assert!(detail.required_bytes > 0);
         assert!(!output_file.exists());
+    }
+}
+
+#[cfg(test)]
+mod core_only_tests {
+    use super::*;
+    use crate::args::{OutputFormat, ProjectArgs, RefreshMode};
+
+    #[test]
+    fn core_only_index_reports_unobserved_retrieval_across_refresh_modes() {
+        let owned = tempfile::tempdir().expect("owned index fixture");
+        let project = owned.path().join("project");
+        let cache = owned.path().join("core");
+        fs::create_dir(&project).expect("project");
+        fs::write(project.join("lib.rs"), "pub fn original() {}\n").expect("source");
+        let output = owned.path().join("index.json");
+        let command = |refresh| IndexCommand {
+            project: ProjectArgs {
+                project: project.clone(),
+                cache_dir: Some(cache.clone()),
+            },
+            refresh,
+            format: OutputFormat::Json,
+            output_file: Some(output.clone()),
+            dry_run: false,
+            summarize: false,
+            progress: false,
+            watch: false,
+        };
+        assert!(run_index(command(RefreshMode::None)).is_err());
+        assert!(
+            !cache.exists(),
+            "read without a publication must not create a cache"
+        );
+        for refresh in [
+            RefreshMode::Full,
+            RefreshMode::None,
+            RefreshMode::Incremental,
+        ] {
+            if refresh == RefreshMode::Incremental {
+                fs::write(
+                    project.join("lib.rs"),
+                    "pub fn original() {}\npub fn added() {}\n",
+                )
+                .expect("changed source");
+            }
+            run_index(command(refresh)).expect("Core indexing without retrieval observation");
+            let value: serde_json::Value =
+                serde_json::from_slice(&fs::read(&output).expect("output")).expect("JSON");
+            assert_eq!(
+                value.get("retrieval"),
+                Some(&serde_json::Value::Null),
+                "{value:#}"
+            );
+            assert!(value["summary"].get("retrieval").is_none(), "{value:#}");
+            assert!(value["summary"]["publication"].is_object(), "{value:#}");
+            assert_eq!(value["summary"]["stats"]["file_count"], 1, "{value:#}");
+            let agent = value["readiness"]
+                .as_array()
+                .expect("readiness")
+                .iter()
+                .find(|row| row["goal"] == "agent_packet_search")
+                .expect("agent readiness");
+            assert_eq!(agent["status"], "blocked", "{value:#}");
+            if refresh == RefreshMode::None {
+                assert!(value.get("phase_timings").is_none(), "{value:#}");
+            }
+        }
     }
 }

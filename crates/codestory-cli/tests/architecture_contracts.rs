@@ -693,7 +693,6 @@ fn repository_derived_compiler_is_the_public_evidence_planning_boundary() {
     assert!(!orchestrator.contains("append_packet_source_evidence"));
     assert!(!orchestrator.contains("directed_relations_from_graphs(&answer.graphs"));
     let adapter = read("crates/codestory-runtime/src/agent/packet_compiler.rs");
-    assert!(adapter.contains("hydrate_admitted_sources(controller, &storage, &admissions"));
     assert!(adapter.contains("get_certain_edge_representatives_between_node_ids(&node_ids)"));
     assert!(
         !adapter.contains("controller.node_details("),
@@ -708,6 +707,17 @@ fn repository_derived_compiler_is_the_public_evidence_planning_boundary() {
         "pub(crate) fn freeze_packet_compilation",
         "fn attach_file_navigation_paths",
     );
+    let compact_freeze = freeze.split_whitespace().collect::<String>();
+    assert!(compact_freeze.contains(
+        "hydrate_admitted_sources_with_ranges(controller,&storage,&admissions,&mutadmission_gaps,&ranges,&mutsource_refusals,)"
+    ));
+    let range_authentication = freeze
+        .find("authenticated_continuation_ranges(")
+        .expect("runtime authenticates continuation ranges before source hydration");
+    let source_hydration = freeze
+        .find("hydrate_admitted_sources_with_ranges(")
+        .expect("runtime hydrates admitted sources with authenticated ranges");
+    assert!(range_authentication < source_hydration);
     let input_build = freeze
         .find("let input = PacketCompilationInputV1")
         .expect("runtime builds typed compiler input");

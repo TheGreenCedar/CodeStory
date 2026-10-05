@@ -653,15 +653,10 @@ pub(crate) fn normalized_path_extension(path: &Path) -> Option<String> {
 }
 
 fn header_source_has_cpp_signals(source: &str) -> bool {
-    source
-        .lines()
-        .map(str::trim)
-        .filter(|line| {
-            !line.is_empty()
-                && !line.starts_with("//")
-                && !line.starts_with("/*")
-                && !line.starts_with('*')
-        })
+    strip_c_style_comments_inner(source, true)
+        .iter()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
         .any(|line| {
             line.starts_with("class ")
                 || line.starts_with("namespace ")
@@ -5813,6 +5808,26 @@ struct GraphCaptureNormalizationInput<'a> {
 fn normalize_graph_capture(
     input: &GraphCaptureNormalizationInput<'_>,
 ) -> Option<(String, u32, u32, u32, u32)> {
+    if matches!(input.language_name, "c" | "cpp")
+        && input.kind == NodeKind::MACRO
+        && input.graph_span.end_col == 1
+        && input.graph_span.end_line > input.graph_span.start_line
+    {
+        // Native directive nodes include the terminating newline. Keep the
+        // half-open endpoint on the last directive line so an adjacent
+        // declaration or call cannot fall within this macro's line range.
+        let end_line = input.graph_span.end_line - 1;
+        let line = input.source.split('\n').nth((end_line - 1) as usize)?;
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        return Some((
+            input.name.to_string(),
+            input.graph_span.start_line,
+            input.graph_span.start_col,
+            end_line,
+            line.len() as u32 + 1,
+        ));
+    }
+
     if input.language_name == "rust" && input.rust_impl_expr {
         let (normalized_name, normalized_span) =
             normalize_rust_impl_expr_surface(input.name, input.graph_span)?;
@@ -13255,6 +13270,10 @@ fn route_language_uses_c_style_comments(language_name: &str) -> bool {
 }
 
 fn strip_c_style_comments(source: &str) -> Vec<String> {
+    strip_c_style_comments_inner(source, false)
+}
+
+fn strip_c_style_comments_inner(source: &str, preserve_separator: bool) -> Vec<String> {
     let mut lines = vec![String::new()];
     let mut chars = source.chars().peekable();
     let mut quote: Option<char> = None;
@@ -13320,6 +13339,15 @@ fn strip_c_style_comments(source: &str) -> Vec<String> {
             }
             if next == '*' {
                 chars.next();
+                if preserve_separator {
+                    // C preprocessing replaces each comment with whitespace.
+                    // Keep adjacent header tokens separate without changing
+                    // the existing framework collector's comment handling.
+                    lines
+                        .last_mut()
+                        .expect("strip_c_style_comments keeps one current line")
+                        .push(' ');
+                }
                 in_block_comment = true;
                 continue;
             }

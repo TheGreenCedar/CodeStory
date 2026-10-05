@@ -8,9 +8,9 @@ use crate::AppController;
 use crate::agent::packet_candidate::PacketProofSession;
 use crate::agent::packet_coverage::PacketCoverageInput;
 use crate::agent::packet_freshness::PacketFreshnessInput;
-use crate::agent::packet_scoring::packet_display_path;
 use codestory_agent::evidence_compiler::{
-    RepositoryDerivedCompilationV1, compile_repository_evidence,
+    RepositoryDerivedCompilationV1, RepresentationBudgetSelectionV1, compile_repository_evidence,
+    compile_repository_evidence_for_representation,
 };
 use codestory_contracts::api::{
     AgentPacketDto, AgentPacketRequestDto, BoundedDrillPlanDto, DrillGapKindDto, DrillOptionDto,
@@ -26,7 +26,7 @@ use codestory_contracts::compilation::{
     PacketAdmissionReceiptV1, PacketCompilationInputV1, PacketCompilationPublicationV1,
     PacketContinuationSelectorV1, PacketDirectedRelationV1, PacketHydratedSourceRangeV1,
     PacketIdentityAmbiguityV1, PacketParserCompletenessV1, PacketRelationCertaintyV1,
-    PacketRelationKindV1, PacketStructuralGapReasonV1,
+    PacketRelationKindV1, PacketSourceDeliveryV1, PacketSourceRangeV1, PacketStructuralGapReasonV1,
 };
 use codestory_contracts::graph::{
     EdgeKind as CoreEdgeKind, FileCoverageReason, Node as CoreNode, NodeId as CoreNodeId,
@@ -39,13 +39,88 @@ use std::fmt::Write as _;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-const COMPILER_SOURCE_TRUNCATION_SUFFIX: &str = "\n// ... source truncated by packet row cap\n```";
 const FILE_NAVIGATION_VERIFICATION_MAX_BYTES: usize = 1024 * 1024;
+
+pub(crate) struct PreparedPacketCompilationV1 {
+    input: PacketCompilationInputV1,
+    pub(crate) source_coverage: Vec<SourceCoverageObservationDto>,
+    publication: PacketCompilationPublicationV1,
+    source_refusals: Vec<String>,
+    file_navigation_paths: HashMap<String, String>,
+}
+
+impl PreparedPacketCompilationV1 {
+    #[cfg(feature = "test-support")]
+    pub(crate) fn from_fixture_input(input: PacketCompilationInputV1) -> Self {
+        Self {
+            publication: input.publication.clone(),
+            input,
+            source_coverage: Vec::new(),
+            source_refusals: Vec::new(),
+            file_navigation_paths: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn default_product(&self) -> RepositoryDerivedCompilationV1 {
+        let mut product = compile_repository_evidence(&self.input);
+        attach_file_navigation_paths(&mut product.support, &self.file_navigation_paths);
+        product
+    }
+
+    pub(crate) fn into_frozen(
+        self,
+        mut product: RepositoryDerivedCompilationV1,
+    ) -> FrozenPacketCompilationV1 {
+        attach_file_navigation_paths(&mut product.support, &self.file_navigation_paths);
+        FrozenPacketCompilationV1 {
+            product,
+            source_coverage: self.source_coverage,
+            publication: self.publication,
+            source_refusals: self.source_refusals,
+        }
+    }
+
+    pub(crate) fn apply_proposal(
+        &self,
+        packet: &mut AgentPacketDto,
+        request: Option<&AgentPacketRequestDto>,
+        product: &RepositoryDerivedCompilationV1,
+    ) {
+        apply_compilation_state(
+            packet,
+            request,
+            product,
+            &self.publication,
+            &self.source_refusals,
+        );
+    }
+
+    pub(crate) fn select_for_representation(
+        self,
+        mut measure: impl FnMut(
+            &Self,
+            &RepositoryDerivedCompilationV1,
+        ) -> Result<Option<usize>, codestory_contracts::api::ApiError>,
+    ) -> Result<FrozenPacketCompilationV1, codestory_contracts::api::ApiError> {
+        let selection = compile_repository_evidence_for_representation(&self.input, |product| {
+            let mut product = product.clone();
+            // File-only navigation paths are public bytes, not post-measurement decoration.
+            attach_file_navigation_paths(&mut product.support, &self.file_navigation_paths);
+            measure(&self, &product)
+        })?;
+        let product = match selection {
+            RepresentationBudgetSelectionV1::Complete { product, .. }
+            | RepresentationBudgetSelectionV1::BudgetExceeded { product, .. } => product,
+        };
+        Ok(self.into_frozen(product))
+    }
+}
 
 pub(crate) struct FrozenPacketCompilationV1 {
     pub(crate) product: RepositoryDerivedCompilationV1,
     pub(crate) source_coverage: Vec<SourceCoverageObservationDto>,
     publication: PacketCompilationPublicationV1,
+    source_refusals: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -57,18 +132,53 @@ struct AuthenticatedPacketAdmissionV1 {
 /// Hydrate exactly the packet-wide admitted identities and compile their
 /// repository evidence while the core/retrieval publication is pinned. This
 /// runs before any presentation or output-budget mutation.
+#[cfg(test)]
 pub(crate) fn freeze_packet_compilation(
     controller: &AppController,
     project_id: &str,
     probe_resolutions: &[PacketProbeResolutionDto],
     publication: Option<&EmbeddingVectorPublicationIdentityDto>,
     session: &PacketProofSession,
+    request: Option<&AgentPacketRequestDto>,
 ) -> Result<FrozenPacketCompilationV1, codestory_contracts::api::ApiError> {
+    let prepared = prepare_packet_compilation(
+        controller,
+        project_id,
+        probe_resolutions,
+        publication,
+        session,
+        request,
+    )?;
+    let product = prepared.default_product();
+    Ok(prepared.into_frozen(product))
+}
+
+pub(crate) fn prepare_packet_compilation(
+    controller: &AppController,
+    project_id: &str,
+    probe_resolutions: &[PacketProbeResolutionDto],
+    publication: Option<&EmbeddingVectorPublicationIdentityDto>,
+    session: &PacketProofSession,
+    request: Option<&AgentPacketRequestDto>,
+) -> Result<PreparedPacketCompilationV1, codestory_contracts::api::ApiError> {
+    if let Some(request) = request {
+        validate_requested_publication(controller, request, publication)?;
+    }
     let admissions = session.receipts();
     let mut admission_gaps = session.gaps();
     let storage = controller.open_storage_read_only()?;
+    let mut source_refusals = Vec::new();
+    let ranges =
+        authenticated_continuation_ranges(controller, project_id, probe_resolutions, publication)?;
     let (authenticated_admissions, mut sources, file_navigation_paths) =
-        hydrate_admitted_sources(controller, &storage, &admissions, &mut admission_gaps)?;
+        hydrate_admitted_sources_with_ranges(
+            controller,
+            &storage,
+            &admissions,
+            &mut admission_gaps,
+            &ranges,
+            &mut source_refusals,
+        )?;
     let source_paths = sources
         .iter()
         .map(|source| source.path.clone())
@@ -86,7 +196,12 @@ pub(crate) fn freeze_packet_compilation(
         project_id: project_id.to_string(),
         core_generation_id: publication
             .map(|publication| publication.core_generation_id.clone())
-            .unwrap_or_default(),
+            .unwrap_or_else(|| {
+                controller
+                    .active_core_publication()
+                    .map(|pin| pin.generation_id)
+                    .unwrap_or_default()
+            }),
         retrieval_generation: publication
             .map(|publication| publication.retrieval_generation.clone()),
     };
@@ -99,13 +214,91 @@ pub(crate) fn freeze_packet_compilation(
         ambiguities: probe_ambiguities(probe_resolutions),
         admission_gaps,
     };
-    let mut product = compile_repository_evidence(&input);
-    attach_file_navigation_paths(&mut product.support, &file_navigation_paths);
-    Ok(FrozenPacketCompilationV1 {
-        product,
+    Ok(PreparedPacketCompilationV1 {
+        input,
         source_coverage,
         publication,
+        source_refusals,
+        file_navigation_paths,
     })
+}
+
+pub(crate) fn validate_requested_publication(
+    controller: &AppController,
+    request: &AgentPacketRequestDto,
+    publication: Option<&EmbeddingVectorPublicationIdentityDto>,
+) -> Result<(), codestory_contracts::api::ApiError> {
+    let actual_core = controller
+        .active_core_publication()
+        .map(|pin| pin.generation_id);
+    if request
+        .core_generation_id
+        .as_deref()
+        .is_some_and(|expected| Some(expected) != actual_core.as_deref())
+        || request
+            .retrieval_generation
+            .as_deref()
+            .is_some_and(|expected| {
+                publication.is_none_or(|pin| pin.retrieval_generation != expected)
+            })
+    {
+        return Err(codestory_contracts::api::ApiError::invalid_argument(
+            "pinned continuation publication changed before source hydration",
+        ));
+    }
+    Ok(())
+}
+
+fn authenticated_continuation_ranges(
+    controller: &AppController,
+    project_id: &str,
+    resolutions: &[PacketProbeResolutionDto],
+    publication: Option<&EmbeddingVectorPublicationIdentityDto>,
+) -> Result<HashMap<String, PacketSourceRangeV1>, codestory_contracts::api::ApiError> {
+    let mut ranges = HashMap::new();
+    for resolution in resolutions {
+        let codestory_contracts::api::PacketProbeDto::Continuation {
+            contract_version,
+            project_id: expected_project,
+            core_generation_id,
+            retrieval_generation,
+            selector,
+        } = &resolution.probe
+        else {
+            continue;
+        };
+        let Some(range) = selector.source_range else {
+            continue;
+        };
+        let core = controller
+            .active_core_publication()
+            .map(|pin| pin.generation_id);
+        if *contract_version != codestory_contracts::api::PACKET_PROBE_CONTRACT_VERSION
+            || expected_project != project_id
+            || core.as_deref() != Some(core_generation_id.as_str())
+            || retrieval_generation.as_deref()
+                != publication.map(|pin| pin.retrieval_generation.as_str())
+            || resolution.status != PacketProbeResolutionStatusDto::Continuation
+            || !range.is_valid()
+            || resolution
+                .symbol_id
+                .as_ref()
+                .is_none_or(|id| selector.stable_identity != format!("node:{id}"))
+        {
+            return Err(codestory_contracts::api::ApiError::invalid_argument(
+                "source continuation is not authenticated against the pinned publication and node",
+            ));
+        }
+        if ranges
+            .insert(selector.stable_identity.clone(), range)
+            .is_some_and(|previous| previous != range)
+        {
+            return Err(codestory_contracts::api::ApiError::invalid_argument(
+                "conflicting source ranges for one admitted identity",
+            ));
+        }
+    }
+    Ok(ranges)
 }
 
 fn attach_file_navigation_paths(support: &mut [SupportUnitDto], paths: &HashMap<String, String>) {
@@ -124,17 +317,68 @@ pub(crate) fn apply_frozen_packet_compilation(
     request: Option<&AgentPacketRequestDto>,
     frozen: FrozenPacketCompilationV1,
 ) {
-    packet.support = frozen.product.support;
+    apply_compilation_state(
+        packet,
+        request,
+        &frozen.product,
+        &frozen.publication,
+        &frozen.source_refusals,
+    );
+    // Rejected previews never enter final-support telemetry.
     crate::agent::packet_batch::observe_packet_raf_final_support(
         &final_support_identities_for_observation(&packet.support),
     );
+}
+
+/// Commit a proposal whose shared compilation state has already been applied,
+/// presentation-bounded and validated by the public record builder. Do not
+/// reclassify or mutate the exact measured packet at the freeze boundary.
+pub(crate) fn commit_measured_packet_compilation(
+    packet: &AgentPacketDto,
+    frozen: FrozenPacketCompilationV1,
+) -> Result<(), codestory_contracts::api::ApiError> {
+    if packet.support != frozen.product.support
+        || packet
+            .answer
+            .source_coverage
+            .iter()
+            .any(|observation| !frozen.source_coverage.contains(observation))
+    {
+        return Err(codestory_contracts::api::ApiError::internal(
+            "Frozen compilation differs from measured source delivery.",
+        ));
+    }
+    crate::agent::packet_batch::observe_packet_raf_final_support(
+        &final_support_identities_for_observation(&packet.support),
+    );
+    Ok(())
+}
+
+fn apply_compilation_state(
+    packet: &mut AgentPacketDto,
+    request: Option<&AgentPacketRequestDto>,
+    product: &RepositoryDerivedCompilationV1,
+    publication: &PacketCompilationPublicationV1,
+    source_refusals: &[String],
+) {
+    packet.support = product.support.clone();
     packet.disposition = classify_packet_disposition(
         packet,
         request,
-        &frozen.product.continuation,
-        frozen.publication.core_generation_id,
-        frozen.publication.retrieval_generation,
+        &product.continuation,
+        publication.core_generation_id.clone(),
+        publication.retrieval_generation.clone(),
     );
+    if !source_refusals.is_empty()
+        && packet.disposition.kind == codestory_contracts::api::PacketDispositionKindDto::Supported
+    {
+        packet.disposition =
+            PacketDispositionDto::not_established("an admitted source could not be delivered");
+    }
+    packet
+        .disposition
+        .omission_receipts
+        .extend(source_refusals.iter().cloned());
 }
 
 fn final_support_identities_for_observation(support: &[SupportUnitDto]) -> Vec<String> {
@@ -182,17 +426,37 @@ type HydratedAdmittedSources = (
     HashMap<String, String>,
 );
 
+#[cfg(test)]
 fn hydrate_admitted_sources(
     controller: &AppController,
     storage: &Store,
     admissions: &[PacketAdmissionReceiptV1],
     admission_gaps: &mut Vec<PacketAdmissionGapV1>,
 ) -> Result<HydratedAdmittedSources, codestory_contracts::api::ApiError> {
+    hydrate_admitted_sources_with_ranges(
+        controller,
+        storage,
+        admissions,
+        admission_gaps,
+        &HashMap::new(),
+        &mut Vec::new(),
+    )
+}
+
+fn hydrate_admitted_sources_with_ranges(
+    controller: &AppController,
+    storage: &Store,
+    admissions: &[PacketAdmissionReceiptV1],
+    admission_gaps: &mut Vec<PacketAdmissionGapV1>,
+    ranges: &HashMap<String, PacketSourceRangeV1>,
+    source_refusals: &mut Vec<String>,
+) -> Result<HydratedAdmittedSources, codestory_contracts::api::ApiError> {
     let project_root = controller.require_project_root()?;
     let mut authenticated = Vec::new();
     let mut sources = Vec::new();
     let mut file_navigation_paths = HashMap::new();
     for admission in admissions {
+        let previous_refusal_count = source_refusals.len();
         let (core_node_id, result) =
             if let Some(raw_id) = admission.stable_identity.strip_prefix("node:") {
                 let Some(node) = authenticated_node(storage, raw_id)? else {
@@ -218,7 +482,14 @@ fn hydrate_admitted_sources(
                 }
                 (
                     node.id,
-                    hydrate_admitted_node_source(controller, storage, admission, &node),
+                    hydrate_admitted_node_source_with_range(
+                        controller,
+                        storage,
+                        admission,
+                        &node,
+                        ranges.get(&admission.stable_identity).copied(),
+                        source_refusals,
+                    ),
                 )
             } else if let Some(path) = admission.stable_identity.strip_prefix("path:") {
                 let Some(file) = find_admitted_file(storage, &project_root, path)? else {
@@ -255,6 +526,14 @@ fn hydrate_admitted_sources(
                 sources.push(source);
             }
             Err(PacketAdmissionGapKindV1::SourceBudgetExceeded) => {
+                if admission.reserved_source_bytes as usize >= INTERIM_SOURCE_ROW_UPPER_BOUND
+                    && source_refusals.len() == previous_refusal_count
+                {
+                    source_refusals.push(format!(
+                        "Admitted source {} did not fit the {}-byte source-row cap; no source range was delivered under the pinned publication.",
+                        admission.packet_ordinal, INTERIM_SOURCE_ROW_UPPER_BOUND,
+                    ));
+                }
                 authenticated.push(AuthenticatedPacketAdmissionV1 {
                     receipt: admission.clone(),
                     core_node_id,
@@ -268,6 +547,19 @@ fn hydrate_admitted_sources(
             }
             Err(kind) => {
                 file_navigation_paths.remove(&admission.stable_identity);
+                let missing_bounds = kind == PacketAdmissionGapKindV1::SourceBoundMissing;
+                source_refusals.push(format!(
+                    "Admitted source {}: {}; no source range was delivered under the pinned publication.",
+                    admission.packet_ordinal,
+                    if missing_bounds { "source bounds are unavailable" } else { "source bytes are unavailable" },
+                ));
+                // Descriptor allocation bounds can be missing before admission.
+                // Only a failed authenticated hydration becomes terminal here.
+                let kind = if missing_bounds {
+                    PacketAdmissionGapKindV1::SourceUnavailable
+                } else {
+                    kind
+                };
                 push_admission_gap(admission_gaps, admission, kind, true);
             }
         }
@@ -322,11 +614,13 @@ fn authenticated_node(
     })
 }
 
-fn hydrate_admitted_node_source(
+fn hydrate_admitted_node_source_with_range(
     controller: &AppController,
     storage: &Store,
     admission: &PacketAdmissionReceiptV1,
     node: &CoreNode,
+    requested: Option<PacketSourceRangeV1>,
+    source_refusals: &mut Vec<String>,
 ) -> Result<PacketHydratedSourceRangeV1, PacketAdmissionGapKindV1> {
     let file_id = if node.kind == CoreNodeKind::FILE {
         node.id
@@ -339,35 +633,137 @@ fn hydrate_admitted_node_source(
         .map_err(|_| PacketAdmissionGapKindV1::SourceUnavailable)?
         .ok_or(PacketAdmissionGapKindV1::SourceUnavailable)?;
     if node.kind == CoreNodeKind::FILE {
+        if requested.is_some() {
+            return Err(PacketAdmissionGapKindV1::SourceBoundMissing);
+        }
         return hydrate_admitted_file_source(controller, storage, admission, &file);
     }
     let (start_line, end_line) = valid_source_bounds(node.start_line, node.end_line)
         .ok_or(PacketAdmissionGapKindV1::SourceBoundMissing)?;
+    let requested = requested.unwrap_or(PacketSourceRangeV1 {
+        start_line,
+        end_line,
+    });
+    if !requested.is_valid() || requested.start_line < start_line || requested.end_line > end_line {
+        return Err(PacketAdmissionGapKindV1::SourceBoundMissing);
+    }
     let project_root = controller
         .require_project_root()
         .map_err(|_| PacketAdmissionGapKindV1::SourceUnavailable)?;
     let source = crate::search_evidence::verified_file_checked(storage, Some(&project_root), &file)
         .map_err(|_| PacketAdmissionGapKindV1::SourceUnavailable)?;
-    let bounded = crate::snippets::bounded_markdown_snippet_range_from_text(
+    if source.content.lines().count() >= requested.end_line as usize {
+        let raw = source
+            .content
+            .split_inclusive('\n')
+            .nth(requested.start_line as usize - 1)
+            .ok_or(PacketAdmissionGapKindV1::SourceBoundMissing)?;
+        let line = raw
+            .strip_suffix("\r\n")
+            .or_else(|| raw.strip_suffix('\n'))
+            .unwrap_or(raw);
+        let required = format!(">{:>5} | ", requested.start_line).len() + line.len() + 11;
+        if required > INTERIM_SOURCE_ROW_UPPER_BOUND {
+            let remaining = source
+                .content
+                .split_inclusive('\n')
+                .skip(requested.start_line as usize - 1)
+                .take((requested.end_line - requested.start_line + 1) as usize)
+                .map(str::len)
+                .sum::<usize>();
+            source_refusals.push(format!(
+                "{}: requested lines {}-{}; zero complete lines delivered; {} source bytes remain; first complete line requires {} rendered bytes, exceeding the 512-byte row cap; indexed SHA-256 {}.",
+                admission.stable_identity, requested.start_line, requested.end_line,
+                remaining, required, source.content_sha256,
+            ));
+            return Err(PacketAdmissionGapKindV1::SourceBudgetExceeded);
+        }
+    }
+    let (markdown, delivered_end, delivery) = complete_node_page(
         &source.content,
-        start_line,
-        start_line,
-        end_line,
-        0,
+        requested,
         source_byte_cap(admission),
-        COMPILER_SOURCE_TRUNCATION_SUFFIX,
-    )
-    .map_err(|_| PacketAdmissionGapKindV1::SourceUnavailable)?;
-    hydrated_source(
-        admission,
-        &file.path.to_string_lossy(),
-        Some(
+        &source.content_sha256,
+    )?;
+    Ok(PacketHydratedSourceRangeV1 {
+        stable_identity: admission.stable_identity.clone(),
+        path: authenticated_file_navigation_path(controller, &file)
+            .ok_or(PacketAdmissionGapKindV1::SourceUnavailable)?,
+        symbol: Some(
             node.qualified_name
                 .clone()
                 .unwrap_or_else(|| node.serialized_name.clone()),
         ),
-        &bounded.markdown,
-    )
+        start_line: requested.start_line,
+        end_line: delivered_end,
+        source: markdown,
+        parser_completeness: PacketParserCompletenessV1::Unknown,
+        delivery: Some(delivery),
+    })
+}
+
+/// Packet pages never clip a numbered physical line or infer bounds from prose.
+fn complete_node_page(
+    text: &str,
+    requested: PacketSourceRangeV1,
+    cap: usize,
+    source_sha256: &str,
+) -> Result<(String, u32, PacketSourceDeliveryV1), PacketAdmissionGapKindV1> {
+    if !requested.is_valid() || text.lines().count() < requested.end_line as usize {
+        return Err(PacketAdmissionGapKindV1::SourceBoundMissing);
+    }
+    let mut markdown = String::from("```text\n");
+    let mut end = None;
+    let mut remaining = 0_u64;
+    let mut next_line_bytes = None;
+    for (index, raw) in text
+        .split_inclusive('\n')
+        .enumerate()
+        .skip(requested.start_line as usize - 1)
+        .take((requested.end_line - requested.start_line + 1) as usize)
+    {
+        let line_number = index as u32 + 1;
+        let line = raw
+            .strip_suffix("\r\n")
+            .or_else(|| raw.strip_suffix('\n'))
+            .unwrap_or(raw);
+        let prefix = format!(
+            "{}{:>5} | ",
+            if end.is_none() { ">" } else { " " },
+            line_number
+        );
+        let rendered_bytes = prefix.len().saturating_add(line.len()).saturating_add(1);
+        if next_line_bytes.is_none()
+            && markdown
+                .len()
+                .saturating_add(rendered_bytes)
+                .saturating_add(3)
+                <= cap
+        {
+            markdown.push_str(&prefix);
+            markdown.push_str(line);
+            markdown.push('\n');
+            end = Some(line_number);
+        } else {
+            remaining = remaining.saturating_add(raw.len() as u64);
+            next_line_bytes.get_or_insert(rendered_bytes.saturating_add(10) as u64);
+        }
+    }
+    let end = end.ok_or(PacketAdmissionGapKindV1::SourceBudgetExceeded)?;
+    markdown.push_str("```");
+    let blocked = next_line_bytes.filter(|bytes| *bytes > INTERIM_SOURCE_ROW_UPPER_BOUND as u64);
+    let next_start_line = (remaining > 0 && blocked.is_none()).then(|| end + 1);
+    let delivery = PacketSourceDeliveryV1 {
+        requested_range: requested,
+        source_sha256: source_sha256.to_owned(),
+        remaining_source_bytes: remaining,
+        next_start_line,
+        blocked_line_rendered_bytes: blocked,
+    };
+    if !delivery.matches_delivery(requested.start_line, end) {
+        return Err(PacketAdmissionGapKindV1::SourceBoundMissing);
+    }
+    Ok((markdown, end, delivery))
 }
 
 fn hydrate_admitted_file_source(
@@ -425,7 +821,11 @@ fn hydrate_admitted_file_source(
         return Err(PacketAdmissionGapKindV1::SourceBudgetExceeded);
     }
     let markdown = complete_file_markdown(&text, file.line_count, cap)?;
-    hydrated_source(admission, &path, None, &markdown)
+    let canonical_path = codestory_workspace::workspace_relative_path(&project_root, &resolved)
+        .ok_or(PacketAdmissionGapKindV1::SourceUnavailable)?
+        .to_string_lossy()
+        .replace('\\', "/");
+    hydrated_source(admission, &canonical_path, None, &markdown)
 }
 
 fn complete_file_markdown(
@@ -464,11 +864,12 @@ fn hydrated_source(
         source_receipt_line_range(source).ok_or(PacketAdmissionGapKindV1::SourceBoundMissing)?;
     Ok(PacketHydratedSourceRangeV1 {
         stable_identity: admission.stable_identity.clone(),
-        path: packet_display_path(path),
+        path: path.to_string(),
         symbol,
         start_line,
         end_line,
         source: source.to_string(),
+        delivery: None,
         parser_completeness: PacketParserCompletenessV1::Unknown,
     })
 }
@@ -545,14 +946,30 @@ pub(crate) fn observe_admitted_source_coverage(
             .collect();
     };
     let mut seen = BTreeSet::new();
-    paths
-        .iter()
-        .filter(|path| seen.insert(packet_display_path(path)))
-        .map(|path| {
-            observe_one_admitted_source_coverage(storage, &project_root, path)
-                .unwrap_or_else(|_| source_coverage_not_established(path))
-        })
-        .collect()
+    let mut observations = Vec::new();
+    for path in paths {
+        let canonical = match codestory_workspace::resolve_project_relative_path(
+            &project_root,
+            Path::new(path),
+        ) {
+            Ok(
+                codestory_workspace::ProjectRelativePathResolution::Existing { relative, .. }
+                | codestory_workspace::ProjectRelativePathResolution::Missing { relative, .. },
+            ) => Some(relative.to_string_lossy().replace('\\', "/")),
+            _ => None,
+        };
+        let identity = canonical.as_deref().unwrap_or(path);
+        if !seen.insert(identity.to_string()) {
+            continue;
+        }
+        observations.push(if canonical.is_some() {
+            observe_one_admitted_source_coverage(storage, &project_root, identity)
+                .unwrap_or_else(|_| source_coverage_not_established(identity))
+        } else {
+            source_coverage_not_established(path)
+        });
+    }
+    observations
 }
 
 fn observe_one_admitted_source_coverage(
@@ -643,7 +1060,7 @@ fn parser_completeness_for_path(
 ) -> PacketParserCompletenessV1 {
     source_coverage
         .iter()
-        .find(|observation| packet_display_path(&observation.path) == packet_display_path(path))
+        .find(|observation| observation.path == path)
         .map(|observation| match observation.status {
             SourceCoverageStatusDto::Indexed => PacketParserCompletenessV1::Complete,
             SourceCoverageStatusDto::Incomplete => PacketParserCompletenessV1::Partial,
@@ -790,7 +1207,14 @@ fn classify_packet_disposition(
     }
 
     let already_drilled = request.is_some_and(|request| {
-        request.parent_packet_id.is_some() || !request.option_ids.is_empty()
+        request.parent_packet_id.is_some()
+            || !request.option_ids.is_empty()
+            || request.probes.iter().any(|probe| {
+                matches!(
+                    probe,
+                    codestory_contracts::api::PacketProbeDto::Continuation { .. }
+                )
+            })
     });
     if !already_drilled {
         let mut seen_options = BTreeSet::new();
@@ -820,7 +1244,13 @@ fn classify_packet_disposition(
 
     if packet.support.is_empty() {
         PacketDispositionDto::not_established("no bounded repository evidence was retained")
-    } else if already_drilled && !continuation.is_empty() {
+    } else if (already_drilled && !continuation.is_empty())
+        || packet.support.iter().any(|unit| {
+            unit.source_delivery
+                .as_ref()
+                .is_some_and(|delivery| delivery.remaining_source_bytes > 0)
+        })
+    {
         PacketDispositionDto::not_established("the bounded continuation left a structural gap")
     } else {
         // This legacy internal state means only that positive evidence exists.
@@ -841,14 +1271,14 @@ fn packet_coverage_for_disposition(
                 .as_deref()
                 .is_some_and(|snippet| !snippet.is_empty())
         })
-        .filter_map(|unit| unit.path.as_deref().map(packet_display_path))
+        .filter_map(|unit| unit.path.as_deref())
         .collect::<BTreeSet<_>>();
     let blocking = observations
         .iter()
         .filter(|observation| {
             observation.status != SourceCoverageStatusDto::Incomplete
                 || observation.reason != Some(FileCoverageReason::ParserPartial)
-                || !verified_source_paths.contains(&packet_display_path(&observation.path))
+                || !verified_source_paths.contains(observation.path.as_str())
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -856,11 +1286,14 @@ fn packet_coverage_for_disposition(
 }
 
 fn drill_option_from_selector(selector: &PacketContinuationSelectorV1) -> Option<DrillOptionDto> {
-    let gap_id = format!(
+    let mut gap_id = format!(
         "{}:{}",
         structural_reason_label(selector.reason),
         selector.stable_identity
     );
+    if let Some(range) = selector.source_range {
+        gap_id.push_str(&format!(":lines:{}:{}", range.start_line, range.end_line));
+    }
     let mut option = if let Some(path) = selector
         .path
         .as_deref()
@@ -875,6 +1308,15 @@ fn drill_option_from_selector(selector: &PacketContinuationSelectorV1) -> Option
         DrillOptionDto::omitted_symbol(gap_id, symbol_id)
     };
     option.structural_reason = Some(selector.reason);
+    if let Some(range) = selector.source_range {
+        if !range.is_valid() {
+            return None;
+        }
+        option = option.with_source_range(range);
+    }
+    if option.id.len() > codestory_contracts::packet_projection_v3::IDENTITY_MAX_BYTES_V3 {
+        return None;
+    }
     Some(option)
 }
 
@@ -888,6 +1330,50 @@ fn structural_reason_label(reason: PacketStructuralGapReasonV1) -> &'static str 
     }
 }
 
+pub(crate) fn continuation_probes_from_options(
+    req: &AgentPacketRequestDto,
+    project_id: &str,
+) -> Result<Vec<codestory_contracts::api::PacketProbeDto>, codestory_contracts::api::ApiError> {
+    use codestory_contracts::api::{ApiError, PacketProbeDto};
+    let decoded_options = drill_options_from_ids(&req.option_ids);
+    if decoded_options.len() != req.option_ids.len() {
+        return Err(ApiError::invalid_argument(
+            "packet contains a malformed continuation option ID",
+        ));
+    }
+    let mut probes = Vec::new();
+    for option in decoded_options {
+        if let Some(range) = option.source_range {
+            let symbol_id = option.symbol_id.ok_or_else(|| {
+                ApiError::invalid_argument("source range continuation requires a node identity")
+            })?;
+            let core_generation_id = req.core_generation_id.clone().ok_or_else(|| {
+                ApiError::invalid_argument(
+                    "source range continuation requires a pinned core generation",
+                )
+            })?;
+            probes.push(PacketProbeDto::Continuation {
+                contract_version: codestory_contracts::api::PACKET_PROBE_CONTRACT_VERSION,
+                project_id: project_id.to_owned(),
+                core_generation_id,
+                retrieval_generation: req.retrieval_generation.clone(),
+                selector: codestory_contracts::compilation::PacketContinuationSelectorV1 {
+                    stable_identity: format!("node:{symbol_id}"),
+                    path: None,
+                    symbol_id: Some(symbol_id),
+                    reason: codestory_contracts::compilation::PacketStructuralGapReasonV1::SourceBudgetExceeded,
+                    source_range: Some(range),
+                },
+            });
+        } else if let Some(path) = option.path {
+            probes.push(PacketProbeDto::ExactPath { path });
+        } else if let Some(symbol_id) = option.symbol_id {
+            probes.push(PacketProbeDto::SymbolId { id: symbol_id });
+        }
+    }
+    Ok(probes)
+}
+
 /// Decode only stable path or symbol continuations. Historical query-text
 /// options are deliberately not reintroduced as retrieval policy.
 pub fn drill_options_from_ids(option_ids: &[String]) -> Vec<DrillOptionDto> {
@@ -895,7 +1381,29 @@ pub fn drill_options_from_ids(option_ids: &[String]) -> Vec<DrillOptionDto> {
         .iter()
         .filter_map(|id| {
             let (kind, target) = decode_drill_option_id(id)?;
-            match kind {
+            let (target, range) = if kind == DrillGapKindDto::OmittedMandatorySupport {
+                if let Some(encoded) = target.strip_prefix("range:") {
+                    let mut parts = encoded.splitn(3, ':');
+                    let start = parts.next()?;
+                    let end = parts.next()?;
+                    let range = PacketSourceRangeV1 {
+                        start_line: start.parse().ok()?,
+                        end_line: end.parse().ok()?,
+                    };
+                    if !range.is_valid()
+                        || range.start_line.to_string() != start
+                        || range.end_line.to_string() != end
+                    {
+                        return None;
+                    }
+                    (parts.next()?.to_owned(), Some(range))
+                } else {
+                    (target, None)
+                }
+            } else {
+                (target, None)
+            };
+            let option = match kind {
                 DrillGapKindDto::BoundedSourceRead => Some(DrillOptionDto::bounded_source_read(
                     format!("source_unavailable:{target}"),
                     target,
@@ -914,7 +1422,15 @@ pub fn drill_options_from_ids(option_ids: &[String]) -> Vec<DrillOptionDto> {
                         ))
                     }
                 }
-            }
+            }?;
+            let option = if let Some(range) = range {
+                option.with_source_range(range)
+            } else {
+                option
+            };
+            // Reject noncanonical escapes and malformed range IDs rather than
+            // quietly turning them into a different executable action.
+            (option.id == *id).then_some(option)
         })
         .take(PACKET_DRILL_MAX_OPTIONS)
         .collect()
@@ -925,6 +1441,776 @@ mod tests {
     use super::*;
     use codestory_contracts::graph::{Edge as CoreEdge, EdgeId as CoreEdgeId};
     use codestory_store::FileRole;
+
+    #[test]
+    fn complete_source_pages_preserve_physical_lines_and_terminal_bounds() {
+        let hash = "a".repeat(64);
+        for text in ["éé\n\nlast", "éé\r\n\r\nlast", "a\n", "a", "a\r"] {
+            let requested = PacketSourceRangeV1 {
+                start_line: 1,
+                end_line: text.lines().count() as u32,
+            };
+            let (full, end, delivery) = complete_node_page(text, requested, 512, &hash).unwrap();
+            assert_eq!(end, requested.end_line);
+            assert_eq!(delivery.remaining_source_bytes, 0);
+            assert_eq!(delivery.next_start_line, None);
+            assert_eq!(delivery.blocked_line_rendered_bytes, None);
+            assert!(full.ends_with("\n```"));
+            let (exact, exact_end, _) =
+                complete_node_page(text, requested, full.len(), &hash).unwrap();
+            assert_eq!((exact, exact_end), (full.clone(), end));
+            if requested.end_line == 1 {
+                assert_eq!(
+                    complete_node_page(text, requested, full.len() - 1, &hash),
+                    Err(PacketAdmissionGapKindV1::SourceBudgetExceeded)
+                );
+            } else {
+                let (short, delivered, receipt) =
+                    complete_node_page(text, requested, full.len() - 1, &hash).unwrap();
+                assert!(short.ends_with("\n```"));
+                assert_eq!(delivered, end - 1);
+                assert_eq!(receipt.next_start_line, Some(end));
+                assert_eq!(
+                    receipt.remaining_source_bytes,
+                    text.split_inclusive('\n').last().unwrap().len() as u64
+                );
+            }
+        }
+        let text = format!("first\r\n{}\r\nlast", "é".repeat(300));
+        let (page, end, receipt) = complete_node_page(
+            &text,
+            PacketSourceRangeV1 {
+                start_line: 1,
+                end_line: 3,
+            },
+            512,
+            &hash,
+        )
+        .unwrap();
+        assert_eq!(end, 1);
+        assert!(page.contains("first") && !page.contains('é'));
+        assert_eq!(receipt.remaining_source_bytes, 600 + 2 + 4);
+        assert_eq!(receipt.next_start_line, None);
+        assert!(receipt.blocked_line_rendered_bytes.unwrap() > 512);
+        assert_eq!(
+            complete_node_page(
+                &text,
+                PacketSourceRangeV1 {
+                    start_line: 2,
+                    end_line: 3
+                },
+                512,
+                &hash
+            ),
+            Err(PacketAdmissionGapKindV1::SourceBudgetExceeded)
+        );
+        assert_eq!(
+            complete_node_page(
+                "one\n",
+                PacketSourceRangeV1 {
+                    start_line: 1,
+                    end_line: 2
+                },
+                512,
+                &hash
+            ),
+            Err(PacketAdmissionGapKindV1::SourceBoundMissing)
+        );
+        assert_eq!(
+            complete_node_page(
+                "one",
+                PacketSourceRangeV1 {
+                    start_line: 0,
+                    end_line: 1
+                },
+                512,
+                &hash
+            ),
+            Err(PacketAdmissionGapKindV1::SourceBoundMissing)
+        );
+    }
+
+    #[test]
+    fn source_range_option_ids_round_trip_and_reject_malformed_cursors() {
+        let range = PacketSourceRangeV1 {
+            start_line: 12,
+            end_line: 80,
+        };
+        let original = DrillOptionDto::omitted_symbol("gap", "-42").with_source_range(range);
+        let decoded = drill_options_from_ids(&[original.id.clone()]);
+        assert_eq!(decoded[0].id, original.id);
+        assert_eq!(decoded[0].symbol_id.as_deref(), Some("-42"));
+        assert_eq!(decoded[0].source_range, Some(range));
+        for target in [
+            "range:0:9:symbol:1",
+            "range:10:9:symbol:1",
+            "range:01:9:symbol:1",
+            "range:1:999999999999:symbol:1",
+            "range:1:9:query:guess",
+        ] {
+            let id = codestory_contracts::api::encode_drill_option_id(
+                DrillGapKindDto::OmittedMandatorySupport,
+                target,
+            );
+            assert!(drill_options_from_ids(&[id]).is_empty(), "{target}");
+        }
+        assert!(
+            drill_options_from_ids(
+                &["omitted_mandatory_support:range%3a1%3A9%3Asymbol%3A1".into()]
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn canonical_coverage_keeps_nested_files_and_parser_status_distinct() {
+        let process_cache = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        // The host path contains a source marker before the actual project root.
+        let root = parent.path().join("src/checkout");
+        std::fs::create_dir_all(&root).unwrap();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
+        controller.state.lock().project_root = Some(root.clone());
+        let storage = Store::new_in_memory().unwrap();
+        for (id, relative, complete) in [
+            (1, "src/main.rs", true),
+            (2, "tools/repos/worker/src/main.rs", false),
+        ] {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let text = format!("fn item_{id}() {{}}\n");
+            std::fs::write(&path, &text).unwrap();
+            let file = FileInfo {
+                id,
+                path,
+                language: "rust".into(),
+                modification_time: 0,
+                indexed: true,
+                complete,
+                line_count: 1,
+                file_role: FileRole::Source,
+            };
+            storage.insert_file(&file).unwrap();
+            storage
+                .update_file_metadata(
+                    &file,
+                    Some(&format!("{:x}", Sha256::digest(text.as_bytes()))),
+                )
+                .unwrap();
+        }
+        let observations = observe_admitted_source_coverage(
+            &controller,
+            &storage,
+            &[
+                root.join("src/main.rs").to_string_lossy().into_owned(),
+                "./src/main.rs".into(),
+                root.join("tools/repos/worker/src/main.rs")
+                    .to_string_lossy()
+                    .into_owned(),
+                "tools/repos/worker/src/main.rs".into(),
+            ],
+        );
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].path, "src/main.rs");
+        assert_eq!(observations[1].path, "tools/repos/worker/src/main.rs");
+        assert_eq!(
+            parser_completeness_for_path("src/main.rs", &observations),
+            PacketParserCompletenessV1::Complete
+        );
+        assert_eq!(
+            parser_completeness_for_path("tools/repos/worker/src/main.rs", &observations),
+            PacketParserCompletenessV1::Partial
+        );
+        assert_eq!(
+            parser_completeness_for_path("repos/other/src/main.rs", &observations),
+            PacketParserCompletenessV1::Unknown
+        );
+        let outside = parent.path().join("outside.rs");
+        std::fs::write(&outside, "fn outside() {}\n").unwrap();
+        let unavailable = observe_admitted_source_coverage(
+            &controller,
+            &storage,
+            &[outside.to_string_lossy().into_owned()],
+        );
+        assert_eq!(
+            unavailable[0].status,
+            SourceCoverageStatusDto::NotEstablished
+        );
+    }
+
+    #[test]
+    fn parser_partial_source_exception_never_crosses_nested_file_identity() {
+        let observation = SourceCoverageObservationDto {
+            path: "tools/repos/worker/src/main.rs".into(),
+            status: SourceCoverageStatusDto::Incomplete,
+            reason: Some(FileCoverageReason::ParserPartial),
+            not_established_cause: None,
+            observed_size: None,
+            byte_cap: None,
+        };
+        let mut source = SupportUnitDto {
+            source_delivery: None,
+            id: "source:1".into(),
+            kind: SupportUnitKindDto::SourceRange,
+            summary: "bounded source".into(),
+            path: Some("src/main.rs".into()),
+            symbol_id: Some("1".into()),
+            start_line: Some(1),
+            end_line: Some(1),
+            snippet: Some("fn root() {}".into()),
+            edge_kind: None,
+            from_symbol: None,
+            to_symbol: None,
+            query: None,
+        };
+        assert!(
+            packet_coverage_for_disposition(
+                std::slice::from_ref(&observation),
+                std::slice::from_ref(&source)
+            )
+            .blocks_packet_availability()
+        );
+        source.path = Some(observation.path.clone());
+        assert!(
+            !packet_coverage_for_disposition(
+                std::slice::from_ref(&observation),
+                std::slice::from_ref(&source)
+            )
+            .blocks_packet_availability()
+        );
+        source.snippet = None;
+        assert!(
+            packet_coverage_for_disposition(
+                std::slice::from_ref(&observation),
+                std::slice::from_ref(&source)
+            )
+            .blocks_packet_availability()
+        );
+    }
+
+    #[test]
+    fn registered_nested_source_refuses_missing_stale_and_directory_replacements() {
+        let cache = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let controller = AppController::new_with_owned_cache_root(cache.path());
+        controller.state.lock().project_root = Some(project.path().to_owned());
+        let mut storage = Store::new_in_memory().unwrap();
+        let path = project.path().join("tools/repos/worker/src/main.rs");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let text = "fn action() {}\n";
+        std::fs::write(&path, text).unwrap();
+        let file = FileInfo {
+            id: 1,
+            path: path.clone(),
+            language: "rust".into(),
+            modification_time: 0,
+            indexed: true,
+            complete: true,
+            line_count: 1,
+            file_role: FileRole::Source,
+        };
+        storage.insert_file(&file).unwrap();
+        storage
+            .update_file_metadata(
+                &file,
+                Some(&format!("{:x}", Sha256::digest(text.as_bytes()))),
+            )
+            .unwrap();
+        storage
+            .insert_nodes_batch(&[
+                CoreNode {
+                    id: CoreNodeId(1),
+                    kind: CoreNodeKind::FILE,
+                    serialized_name: "main.rs".into(),
+                    ..Default::default()
+                },
+                CoreNode {
+                    id: CoreNodeId(2),
+                    kind: CoreNodeKind::FUNCTION,
+                    serialized_name: "action".into(),
+                    file_node_id: Some(CoreNodeId(1)),
+                    start_line: Some(1),
+                    end_line: Some(1),
+                    ..Default::default()
+                },
+            ])
+            .unwrap();
+        let admissions = ["node:2", "path:tools/repos/worker/src/main.rs"]
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, identity)| PacketAdmissionReceiptV1 {
+                packet_ordinal: ordinal as u32,
+                stable_identity: identity.into(),
+                score_version: "test".into(),
+                reserved_source_bytes: 512,
+                origin: PacketAdmissionOriginV1::ExactTypedSelector,
+            })
+            .collect::<Vec<_>>();
+        let mut gaps = Vec::new();
+        let (authenticated, sources, _) =
+            hydrate_admitted_sources(&controller, &storage, &admissions, &mut gaps).unwrap();
+        assert_eq!(authenticated.len(), 2);
+        assert_eq!(sources.len(), 2);
+        assert!(gaps.is_empty());
+        assert!(
+            sources
+                .iter()
+                .all(|source| source.path == "tools/repos/worker/src/main.rs")
+        );
+        let refuse = |label: &str| {
+            let mut gaps = Vec::new();
+            let (authenticated, sources, navigation) =
+                hydrate_admitted_sources(&controller, &storage, &admissions, &mut gaps).unwrap();
+            assert!(
+                authenticated.is_empty() && sources.is_empty() && navigation.is_empty(),
+                "{label}"
+            );
+            assert_eq!(gaps.len(), 2, "{label}");
+            assert!(
+                gaps.iter()
+                    .all(|gap| gap.kind == PacketAdmissionGapKindV1::SourceUnavailable),
+                "{label}"
+            );
+            let input = PacketCompilationInputV1 {
+                contract_version: PACKET_COMPILATION_CONTRACT_VERSION_V1,
+                publication: PacketCompilationPublicationV1 {
+                    project_id: "project".into(),
+                    core_generation_id: "generation".into(),
+                    retrieval_generation: None,
+                },
+                admissions: vec![],
+                sources,
+                relations: vec![],
+                ambiguities: vec![],
+                admission_gaps: gaps,
+            };
+            assert!(
+                compile_repository_evidence(&input).support.is_empty(),
+                "{label}"
+            );
+        };
+        std::fs::remove_file(&path).unwrap();
+        refuse("deleted registered file");
+        std::fs::write(&path, "fn changed() {}\n").unwrap();
+        refuse("stale registered hash");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        refuse("registered file replaced by directory");
+        std::fs::remove_dir(&path).unwrap();
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().unwrap();
+            let target = outside.path().join("main.rs");
+            std::fs::write(&target, text).unwrap();
+            // Identical pinned bytes do not authorize an outside target.
+            std::os::unix::fs::symlink(&target, &path).unwrap();
+            refuse("escaping symlink with unchanged source bytes");
+        }
+    }
+
+    #[test]
+    fn authenticated_node_pages_advance_and_refuse_changed_or_out_of_bound_source() {
+        let process_cache = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let controller = AppController::new_with_owned_cache_root(process_cache.path());
+        controller.state.lock().project_root = Some(project.path().to_path_buf());
+        let storage = Store::new_in_memory().unwrap();
+        let text = (1..=30)
+            .map(|line| format!("let stage_{line:02} = \"{}\";\r\n", "x".repeat(40)))
+            .collect::<String>();
+        let path = project.path().join("stages.rs");
+        std::fs::write(&path, &text).unwrap();
+        let file = FileInfo {
+            id: 1,
+            path,
+            language: "rust".into(),
+            modification_time: 0,
+            indexed: true,
+            complete: true,
+            line_count: 30,
+            file_role: FileRole::Source,
+        };
+        storage.insert_file(&file).unwrap();
+        let hash = format!("{:x}", Sha256::digest(text.as_bytes()));
+        storage.update_file_metadata(&file, Some(&hash)).unwrap();
+        let node = CoreNode {
+            id: CoreNodeId(2),
+            kind: CoreNodeKind::FUNCTION,
+            serialized_name: "stages".into(),
+            file_node_id: Some(CoreNodeId(1)),
+            start_line: Some(1),
+            end_line: Some(30),
+            ..Default::default()
+        };
+        let admission = PacketAdmissionReceiptV1 {
+            packet_ordinal: 0,
+            stable_identity: "node:2".into(),
+            score_version: "test".into(),
+            reserved_source_bytes: 512,
+            origin: PacketAdmissionOriginV1::ExactTypedSelector,
+        };
+        let first = hydrate_admitted_node_source_with_range(
+            &controller,
+            &storage,
+            &admission,
+            &node,
+            None,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let input = PacketCompilationInputV1 {
+            contract_version: 1,
+            publication: PacketCompilationPublicationV1 {
+                project_id: "p".into(),
+                core_generation_id: "g".into(),
+                retrieval_generation: None,
+            },
+            admissions: vec![admission.clone()],
+            sources: vec![first.clone()],
+            relations: vec![],
+            ambiguities: vec![],
+            admission_gaps: vec![],
+        };
+        let product = compile_repository_evidence(&input);
+        let selector = product
+            .continuation
+            .iter()
+            .find(|selector| selector.source_range.is_some())
+            .unwrap();
+        let option = drill_option_from_selector(selector).unwrap();
+        let decoded = drill_options_from_ids(&[option.id]);
+        let second = hydrate_admitted_node_source_with_range(
+            &controller,
+            &storage,
+            &admission,
+            &node,
+            decoded[0].source_range,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(second.start_line, first.end_line + 1);
+        assert!(second.end_line > first.end_line);
+        assert_eq!(second.delivery.as_ref().unwrap().source_sha256, hash);
+        assert!(
+            second.delivery.as_ref().unwrap().remaining_source_bytes
+                < first.delivery.as_ref().unwrap().remaining_source_bytes
+        );
+        assert!(!second.source.contains("stage_01"));
+        for range in [
+            PacketSourceRangeV1 {
+                start_line: 0,
+                end_line: 30,
+            },
+            PacketSourceRangeV1 {
+                start_line: 10,
+                end_line: 31,
+            },
+        ] {
+            assert_eq!(
+                hydrate_admitted_node_source_with_range(
+                    &controller,
+                    &storage,
+                    &admission,
+                    &node,
+                    Some(range),
+                    &mut Vec::new()
+                ),
+                Err(PacketAdmissionGapKindV1::SourceBoundMissing)
+            );
+        }
+        std::fs::write(&file.path, text.replace("stage_01", "changed!")).unwrap();
+        assert_eq!(
+            hydrate_admitted_node_source_with_range(
+                &controller,
+                &storage,
+                &admission,
+                &node,
+                decoded[0].source_range,
+                &mut Vec::new()
+            ),
+            Err(PacketAdmissionGapKindV1::SourceUnavailable)
+        );
+    }
+
+    #[test]
+    fn emitted_range_reaches_pinned_freeze_and_public_projection() {
+        for first_overlong in [false, true] {
+            use codestory_contracts::api::{PacketDispositionKindDto, PacketProbeDto};
+            use codestory_contracts::packet_projection_v3::{GapKindV3Dto, PacketProjectionV3Dto};
+            use codestory_store::{IndexPublicationMode, IndexPublicationRecord};
+            use std::sync::{Arc, atomic::AtomicBool};
+            let project = tempfile::tempdir().unwrap();
+            let process_cache = tempfile::tempdir().unwrap();
+            let database = process_cache.path().join("core.sqlite3");
+            let mut storage = Store::open(&database).unwrap();
+            let path = project.path().join("stages.rs");
+            let text = (1..=30)
+                .map(|line| format!("let stage_{line:02} = \"{}\";\r\n", "x".repeat(40)))
+                .collect::<String>();
+            let text = if first_overlong {
+                format!("{}\n{}", "é".repeat(300), "\n".repeat(29))
+            } else {
+                text
+            };
+            std::fs::write(&path, &text).unwrap();
+            let file = FileInfo {
+                id: 1,
+                path,
+                language: "rust".into(),
+                modification_time: 0,
+                indexed: true,
+                complete: true,
+                line_count: 30,
+                file_role: FileRole::Source,
+            };
+            storage.insert_file(&file).unwrap();
+            let hash = format!("{:x}", Sha256::digest(text.as_bytes()));
+            storage.update_file_metadata(&file, Some(&hash)).unwrap();
+            let unavailable_path = project.path().join("unavailable.h");
+            let unavailable_text = "#define FLAG 1\n";
+            std::fs::write(&unavailable_path, unavailable_text).unwrap();
+            let unavailable_file = FileInfo {
+                id: 3,
+                path: unavailable_path,
+                language: "c".into(),
+                modification_time: 0,
+                indexed: true,
+                complete: false,
+                line_count: 1,
+                file_role: FileRole::Source,
+            };
+            storage.insert_file(&unavailable_file).unwrap();
+            storage
+                .update_file_metadata(
+                    &unavailable_file,
+                    Some(&format!(
+                        "{:x}",
+                        Sha256::digest(unavailable_text.as_bytes())
+                    )),
+                )
+                .unwrap();
+            storage
+                .insert_nodes_batch(&[
+                    CoreNode {
+                        id: CoreNodeId(1),
+                        kind: CoreNodeKind::FILE,
+                        serialized_name: "stages.rs".into(),
+                        ..Default::default()
+                    },
+                    CoreNode {
+                        id: CoreNodeId(2),
+                        kind: CoreNodeKind::FUNCTION,
+                        serialized_name: "stages".into(),
+                        file_node_id: Some(CoreNodeId(1)),
+                        start_line: Some(1),
+                        end_line: Some(30),
+                        ..Default::default()
+                    },
+                    CoreNode {
+                        id: CoreNodeId(3),
+                        kind: CoreNodeKind::FILE,
+                        serialized_name: "unavailable.h".into(),
+                        ..Default::default()
+                    },
+                    CoreNode {
+                        id: CoreNodeId(4),
+                        kind: CoreNodeKind::FUNCTION,
+                        serialized_name: "boundless".into(),
+                        file_node_id: Some(CoreNodeId(1)),
+                        ..Default::default()
+                    },
+                ])
+                .unwrap();
+            let publication = IndexPublicationRecord {
+                generation: 1,
+                generation_id: "11111111-1111-4111-8111-111111111111".into(),
+                run_id: "source-page-run".into(),
+                mode: IndexPublicationMode::Full,
+                published_at_epoch_ms: 1,
+            };
+            // Publish a genuine tiny lexical identity generation inside this test's tempdir.
+            let search_path = crate::search_publication::search_index_path_for_publication(
+                &database,
+                Some(&publication),
+            )
+            .unwrap();
+            let mut engine = crate::search::engine::SearchEngine::new(Some(&search_path)).unwrap();
+            let mut symbol_session = engine.begin_symbol_index().unwrap();
+            let (_, stats) = crate::search_publication::load_canonical_search_symbols(
+                &storage,
+                16,
+                None,
+                |batch| {
+                    symbol_session
+                        .add_nodes(
+                            batch
+                                .into_iter()
+                                .map(|entry| (entry.node_id, entry.display_name)),
+                        )
+                        .map(|_| ())
+                        .map_err(|error| {
+                            codestory_contracts::api::ApiError::internal(error.to_string())
+                        })
+                },
+            )
+            .unwrap();
+            symbol_session.finish().unwrap();
+            crate::search_publication::write_search_generation_completion(
+                &search_path,
+                &publication,
+                stats.search_symbol_stream_rows as usize,
+                engine.tantivy_doc_count(),
+            )
+            .unwrap();
+            drop(engine);
+            storage.put_index_publication(&publication).unwrap();
+            drop(storage);
+            let controller = AppController::new_with_owned_cache_root(process_cache.path());
+            {
+                let mut state = controller.state.lock();
+                state.project_root = Some(project.path().to_owned());
+                state.storage_path = Some(database);
+            }
+            let service = crate::services::PublicOperationService::new(controller.clone());
+            let project_id = codestory_workspace::project_identity_v3(project.path()).project_id;
+            service.run_observational_with_cancel("source-pages", Arc::new(AtomicBool::new(false)), || {
+            let initial_request: AgentPacketRequestDto = serde_json::from_value(serde_json::json!({"question":"show repository source"})).unwrap();
+            let session = PacketProofSession::new();
+            session.admit("node:2", 512);
+            session.admit("path:unavailable.h", 512);
+            session.admit("node:3", 512);
+            session.admit("node:4", 512);
+            session.admit("path:stages.rs", 512);
+            let first = freeze_packet_compilation(&controller, &project_id, &[], None, &session, Some(&initial_request))?;
+            if first_overlong {
+                assert!(first.product.support.iter().all(|unit| unit.kind != SupportUnitKindDto::SourceRange));
+                assert!(first.product.continuation.is_empty());
+                assert_eq!(first.source_refusals.len(), 5);
+                assert!(first.source_refusals[0].contains("zero complete lines delivered"));
+                assert!(first.source_refusals[0].contains("630 source bytes remain"));
+                assert!(first.source_refusals[0].contains(&hash));
+                let mut packet = source_page_test_packet();
+                apply_frozen_packet_compilation(&mut packet, Some(&initial_request), first);
+                assert_eq!(packet.disposition.kind, PacketDispositionKindDto::NotEstablished);
+                let public = crate::evidence_projection_v3::project_packet_v3(&service, "refusal-test-caller", &initial_request, &packet, |projection| Ok(serde_json::to_vec(projection).unwrap().len()))?;
+                let PacketProjectionV3Dto::Complete { evidence, gaps, continuation, .. } = public.projection else { panic!("small refusal fits") };
+                assert!(continuation.is_none());
+                assert!(evidence.as_slice().iter().all(|row| row.kind != codestory_contracts::packet_projection_v3::EvidenceKindV3Dto::ExactSource));
+                assert!(gaps.as_slice().iter().any(|gap| gap.kind == GapKindV3Dto::SourceUnavailable && gap.message.as_ref().is_some_and(|message| message.as_str().contains("630 source bytes remain"))));
+                return Ok(());
+            }
+            let selector = first.product.continuation.iter().find(|selector| selector.source_range.is_some()).unwrap();
+            let first_end = first.product.support.iter().find(|unit| unit.source_delivery.is_some()).unwrap().end_line.unwrap();
+            let first_unread = first.product.support.iter().find(|unit| unit.source_delivery.is_some()).unwrap().source_delivery.as_ref().unwrap().remaining_source_bytes;
+            let option = drill_option_from_selector(selector).unwrap();
+            assert_eq!(first.product.continuation.len(), 1, "only the verified cursor can progress");
+            assert_eq!(first.source_refusals.len(), 4);
+            assert!(first.source_refusals.iter().any(|receipt| receipt.contains("source bounds")));
+            assert!(first.product.support.iter().all(|unit| unit.symbol_id.as_deref() == Some("2") || (unit.kind == SupportUnitKindDto::SymbolLocation && unit.path.as_deref() == Some("stages.rs") && unit.snippet.is_none())), "only verified file navigation and the bounded function survive");
+            let mut initial_packet = source_page_test_packet();
+            initial_packet.answer.source_coverage = first.source_coverage.clone();
+            apply_frozen_packet_compilation(&mut initial_packet, Some(&initial_request), first);
+            assert_eq!(initial_packet.disposition.kind, PacketDispositionKindDto::DrillOnce);
+            let public = crate::evidence_projection_v3::project_packet_v3(&service, "mixed-refusal-caller", &initial_request, &initial_packet, |projection| Ok(serde_json::to_vec(projection).unwrap().len()))?;
+            let PacketProjectionV3Dto::Complete { gaps, continuation, .. } = public.projection else { panic!("bounded mixed refusal fits") };
+            assert_eq!(gaps.as_slice().iter().filter(|gap| gap.kind == GapKindV3Dto::SourceUnavailable).count(), 4);
+            assert!(gaps.as_slice().iter().any(|gap| gap.kind == GapKindV3Dto::SourceUnavailable && gap.message.as_ref().is_some_and(|message| message.as_str().contains("512-byte source-row cap"))));
+            assert!(continuation.is_some());
+
+            let navigation_session = PacketProofSession::new();
+            navigation_session.admit("path:stages.rs", 512);
+            let navigation = freeze_packet_compilation(&controller, &project_id, &[], None, &navigation_session, Some(&initial_request))?;
+            assert_eq!(navigation.product.support.len(), 1);
+            assert!(navigation.product.support.iter().all(|unit| unit.kind == SupportUnitKindDto::SymbolLocation && unit.path.as_deref() == Some("stages.rs") && unit.snippet.is_none()));
+            assert!(navigation.product.continuation.is_empty());
+            let mut navigation_packet = source_page_test_packet();
+            apply_frozen_packet_compilation(&mut navigation_packet, Some(&initial_request), navigation);
+            assert_eq!(navigation_packet.disposition.kind, PacketDispositionKindDto::NotEstablished);
+            let public = crate::evidence_projection_v3::project_packet_v3(&service, "navigation-refusal-caller", &initial_request, &navigation_packet, |projection| Ok(serde_json::to_vec(projection).unwrap().len()))?;
+            let PacketProjectionV3Dto::Complete { evidence, gaps, continuation, .. } = public.projection else { panic!("bounded file refusal fits") };
+            assert!(continuation.is_none());
+            assert!(evidence.as_slice().iter().all(|row| row.kind != codestory_contracts::packet_projection_v3::EvidenceKindV3Dto::ExactSource));
+            assert!(gaps.as_slice().iter().any(|gap| gap.kind == GapKindV3Dto::SourceUnavailable && gap.message.as_ref().is_some_and(|message| message.as_str().contains("512-byte source-row cap"))));
+
+            let refused_session = PacketProofSession::new();
+            refused_session.admit("path:unavailable.h", 512);
+            refused_session.admit("node:3", 512);
+            refused_session.admit("node:4", 512);
+            let refused = freeze_packet_compilation(&controller, &project_id, &[], None, &refused_session, Some(&initial_request))?;
+            assert!(refused.product.support.is_empty() && refused.product.continuation.is_empty());
+            let mut refused_packet = source_page_test_packet();
+            apply_frozen_packet_compilation(&mut refused_packet, Some(&initial_request), refused);
+            assert_eq!(refused_packet.disposition.kind, PacketDispositionKindDto::NotEstablished);
+            let public = crate::evidence_projection_v3::project_packet_v3(&service, "empty-refusal-caller", &initial_request, &refused_packet, |projection| Ok(serde_json::to_vec(projection).unwrap().len()))?;
+            let PacketProjectionV3Dto::Complete { evidence, gaps, continuation, .. } = public.projection else { panic!("bounded empty refusal fits") };
+            assert!(evidence.as_slice().is_empty() && continuation.is_none());
+            assert_eq!(gaps.as_slice().iter().filter(|gap| gap.kind == GapKindV3Dto::SourceUnavailable).count(), 3);
+            let request: AgentPacketRequestDto = serde_json::from_value(serde_json::json!({
+                "question":"show repository source", "parent_packet_id":"first-source-page",
+                "core_generation_id":"11111111-1111-4111-8111-111111111111", "option_ids":[option.id],
+            })).unwrap();
+            let probes = continuation_probes_from_options(&request, &project_id)?;
+            assert!(matches!(&probes[0], PacketProbeDto::Continuation { selector, .. } if selector.source_range.unwrap().start_line == first_end + 1));
+            let resolutions = crate::agent::packet_probe::resolve_packet_probes(&controller, probes.clone());
+            assert_eq!(resolutions[0].status, PacketProbeResolutionStatusDto::Continuation, "{:?}", resolutions[0]);
+            let second_session = PacketProofSession::new(); second_session.admit("node:2", 512);
+            let second = freeze_packet_compilation(&controller, &project_id, &resolutions, None, &second_session, Some(&request))?;
+            let source = second.product.support.iter().find(|unit| unit.source_delivery.is_some()).unwrap();
+            assert_eq!(source.start_line, Some(first_end + 1));
+            assert!(source.end_line.unwrap() > first_end);
+            assert!(source.source_delivery.as_ref().unwrap().remaining_source_bytes < first_unread);
+            let expected_receipt = source.source_delivery.clone();
+            let mut packet = source_page_test_packet();
+            packet.answer.source_coverage = second.source_coverage.clone();
+            apply_frozen_packet_compilation(&mut packet, Some(&request), second);
+            assert_eq!(packet.disposition.kind, PacketDispositionKindDto::NotEstablished);
+            assert!(packet.disposition.drill.is_none(), "one permitted round cannot emit another drill");
+            let public = crate::evidence_projection_v3::project_packet_v3(&service, "page-test-caller", &request, &packet, |projection| Ok(serde_json::to_vec(projection).unwrap().len()))?;
+            let PacketProjectionV3Dto::Complete { evidence, gaps, continuation, .. } = public.projection else { panic!("small page fits") };
+            assert!(continuation.is_none());
+            assert_eq!(evidence.as_slice().iter().find(|row| row.source_delivery.is_some()).unwrap().source_delivery, expected_receipt);
+            assert!(gaps.as_slice().iter().any(|gap| gap.kind == GapKindV3Dto::EvidenceMissing && gap.message.as_ref().is_some_and(|message| message.as_str().contains("source bytes remain"))));
+            for mutation in ["core", "project", "status", "node", "retrieval"] {
+                let mut hostile = resolutions.clone();
+                match mutation {
+                    "status" => hostile[0].status = PacketProbeResolutionStatusDto::Rejected,
+                    "node" => hostile[0].symbol_id = Some("3".into()),
+                    _ => if let PacketProbeDto::Continuation { project_id, core_generation_id, retrieval_generation, .. } = &mut hostile[0].probe { match mutation { "core" => *core_generation_id = "different".into(), "project" => *project_id = "different".into(), _ => *retrieval_generation = Some("different".into()) } },
+                }
+                let reads = crate::search_evidence::verified_source_read_count();
+                assert!(freeze_packet_compilation(&controller, &project_id, &hostile, None, &second_session, Some(&request)).is_err(), "{mutation}");
+                assert_eq!(crate::search_evidence::verified_source_read_count(), reads, "refuse {mutation} before source hydration");
+            }
+            let mut conflict = resolutions.clone(); let mut different = resolutions[0].clone();
+            if let PacketProbeDto::Continuation { selector, .. } = &mut different.probe { selector.source_range.as_mut().unwrap().start_line += 1; }
+            conflict.push(different);
+            assert!(freeze_packet_compilation(&controller, &project_id, &conflict, None, &second_session, Some(&request)).is_err());
+            let mut stale_request = request.clone(); stale_request.core_generation_id = Some("different".into());
+            let reads = crate::search_evidence::verified_source_read_count();
+            assert!(freeze_packet_compilation(&controller, &project_id, &resolutions, None, &second_session, Some(&stale_request)).is_err());
+            assert_eq!(crate::search_evidence::verified_source_read_count(), reads);
+            Ok(())
+        }).unwrap();
+        }
+    }
+
+    fn source_page_test_packet() -> AgentPacketDto {
+        let trace = serde_json::json!({"request_id":"source-page-request", "resolved_profile":"investigate",
+            "policy_mode":"latency_first", "total_latency_ms":0, "sla_missed":false,
+            "semantic_fallback_count":0, "semantic_fallbacks":[], "semantic_stage_timeout_zero_hits":0,
+            "semantic_abstained_count":0, "annotations":[], "steps":[], "packet_sidecar_diagnostics":[]});
+        serde_json::from_value(serde_json::json!({
+            "packet_id":"source-page-request", "question":"show repository source", "plan":{"queries":[],"trace":[]},
+            "answer":{"answer_id":"source-page-answer", "prompt":"show repository source", "summary":"fixture",
+                "sections":[], "citations":[], "subgraph_ids":[], "retrieval_version":"fixture", "graphs":[], "retrieval_trace":trace,
+                "freshness":{"status":"fresh", "changed_file_count":0, "new_file_count":0, "removed_file_count":0,
+                    "checked_file_count":0, "indexed_file_count":0, "duration_ms":0}},
+            "support":[], "disposition":{"kind":"not_established"},
+            "budget":{"requested":"standard", "limits":{"max_anchors":16,"max_files":16,"max_snippets":16,"max_trail_edges":16,"max_output_bytes":65536},
+                "used":{"anchors":0,"files":0,"snippets":0,"trail_edges":0,"output_bytes":0}, "truncated":false, "next_deeper_command":null},
+            "retrieval_trace_summary":{"retrieval_trace":trace,"source_read_steps":0,"search_steps":0,"trail_steps":0}
+        })).unwrap()
+    }
 
     #[test]
     fn continuation_budget_counts_distinct_actions_in_compiler_order() {
@@ -954,9 +2240,9 @@ mod tests {
         }))
         .expect("fresh internal packet envelope");
 
-        // A typed selector can admit ambiguous candidates whose source could
-        // not be hydrated. The compiler preserves both structural reasons;
-        // runtime maps them to the same executable symbol-read action.
+        // An ambiguous exact selector can lack descriptor allocation bounds
+        // before admission. Both recoverable structural reasons map to the
+        // same executable symbol-read action.
         let candidate_ids = [9, 2, 10, 8, 3, 7, 4, 6, 5];
         for duplicate_reasons in [false, true] {
             let hydrated_ids = candidate_ids.iter().skip(usize::from(duplicate_reasons));
@@ -988,13 +2274,14 @@ mod tests {
                         start_line: 1,
                         end_line: 1,
                         source: "fn shared_symbol() {}".into(),
+                        delivery: None,
                         parser_completeness: PacketParserCompletenessV1::Complete,
                     })
                     .collect(),
                 relations: Vec::new(),
                 admission_gaps: if duplicate_reasons {
                     vec![PacketAdmissionGapV1 {
-                        kind: PacketAdmissionGapKindV1::SourceUnavailable,
+                        kind: PacketAdmissionGapKindV1::SourceBoundMissing,
                         stable_identity: Some("node:9".into()),
                         exact_selector_ordinal: Some(0),
                     }]
@@ -1083,7 +2370,15 @@ mod tests {
                     Some("retrieval".into()),
                 );
                 assert!(terminal.drill.is_none());
-                if request.parent_packet_id.is_some() || !request.option_ids.is_empty() {
+                if request.parent_packet_id.is_some()
+                    || !request.option_ids.is_empty()
+                    || request.probes.iter().any(|probe| {
+                        matches!(
+                            probe,
+                            codestory_contracts::api::PacketProbeDto::Continuation { .. }
+                        )
+                    })
+                {
                     assert_eq!(
                         terminal.reason.as_deref(),
                         Some("the bounded continuation left a structural gap")
@@ -1091,7 +2386,13 @@ mod tests {
                 }
                 assert_eq!(
                     terminal.kind,
-                    if request.parent_packet_id.is_some() || !request.option_ids.is_empty() {
+                    if request.parent_packet_id.is_some()
+                        || !request.option_ids.is_empty()
+                        || request.probes.iter().any(|probe| matches!(
+                            probe,
+                            codestory_contracts::api::PacketProbeDto::Continuation { .. }
+                        ))
+                    {
                         PacketDispositionKindDto::NotEstablished
                     } else {
                         PacketDispositionKindDto::Unavailable
@@ -1118,9 +2419,13 @@ mod tests {
         // unrelated rows must remain present throughout the test.
         let files = [
             (10, "src/alpha.rs", "fn alpha() {}\n"),
-            (20, "src/beta.rs", "fn beta() {}\n"),
-            (30, "src/gamma.rs", "fn gamma() {}\n"),
-            (40, "src/reference.rs", "const REFERENCE: usize = 1;\n"),
+            (20, "tools/repos/worker/src/beta.rs", "fn beta() {}\n"),
+            (30, "tools/runner/src/alpha.rs", "fn gamma() {}\n"),
+            (
+                40,
+                "tools/runner/src/reference.rs",
+                "const REFERENCE: usize = 1;\n",
+            ),
             (90, "noise/outside.rs", "fn NOISE_OUTSIDE() {}\n"),
             (190, "noise/unrelated.rs", "fn NOISE_UNRELATED() {}\n"),
         ];
@@ -1265,7 +2570,12 @@ mod tests {
         }
         let service = crate::services::PublicOperationService::new(controller.clone());
         let session = PacketProofSession::new();
-        let admitted = ["node:11", "node:21", "node:31", "path:src/reference.rs"];
+        let admitted = [
+            "node:11",
+            "node:21",
+            "node:31",
+            "path:tools/runner/src/reference.rs",
+        ];
         for identity in admitted {
             assert_eq!(
                 session.admit(identity, INTERIM_SOURCE_ROW_UPPER_BOUND),
@@ -1292,6 +2602,28 @@ mod tests {
                 "truncated":false, "next_deeper_command":null},
             "retrieval_trace_summary":{"retrieval_trace":trace,"source_read_steps":0,"search_steps":0,"trail_steps":0}
         })).expect("typed internal packet envelope");
+        // Missing freshness remains unavailable. The hydration fixture then
+        // opts into the existing synthetic freshness control so that its
+        // source refusal assertions exercise hydration rather than that cap.
+        let unknown = classify_packet_disposition(
+            &packet,
+            Some(&request),
+            &[],
+            publication.generation_id.clone(),
+            None,
+        );
+        assert_eq!(
+            unknown.kind,
+            codestory_contracts::api::PacketDispositionKindDto::Unavailable
+        );
+        assert!(
+            unknown
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("freshness unknown"))
+        );
+        packet.answer.freshness =
+            Some(codestory_agent::packet_freshness::fresh_index_observation());
         let projected = service
             .run_observational_with_cancel(
                 "h7-packet-compilation",
@@ -1346,8 +2678,14 @@ mod tests {
                         26,
                         "all kinds for both admitted directed pairs before forest selection"
                     );
-                    let frozen =
-                        freeze_packet_compilation(&controller, "h7-project", &[], None, &session)?;
+                    let frozen = freeze_packet_compilation(
+                        &controller,
+                        "h7-project",
+                        &[],
+                        None,
+                        &session,
+                        None,
+                    )?;
                     assert_eq!(
                         frozen
                             .source_coverage
@@ -1356,9 +2694,9 @@ mod tests {
                             .collect::<BTreeSet<_>>(),
                         BTreeSet::from([
                             "src/alpha.rs",
-                            "src/beta.rs",
-                            "src/gamma.rs",
-                            "src/reference.rs"
+                            "tools/repos/worker/src/beta.rs",
+                            "tools/runner/src/alpha.rs",
+                            "tools/runner/src/reference.rs"
                         ])
                     );
                     packet.answer.source_coverage = frozen.source_coverage.clone();
@@ -1386,9 +2724,9 @@ mod tests {
                             .collect::<BTreeSet<_>>(),
                         BTreeSet::from([
                             (Some("11"), Some("src/alpha.rs")),
-                            (Some("21"), Some("src/beta.rs")),
-                            (Some("31"), Some("src/gamma.rs")),
-                            (None, Some("src/reference.rs"))
+                            (Some("21"), Some("tools/repos/worker/src/beta.rs")),
+                            (Some("31"), Some("tools/runner/src/alpha.rs")),
+                            (None, Some("tools/runner/src/reference.rs"))
                         ])
                     );
                     assert!(
@@ -1398,9 +2736,9 @@ mod tests {
                     );
                     for (path, body) in [
                         ("src/alpha.rs", "fn alpha() {}"),
-                        ("src/beta.rs", "fn beta() {}"),
-                        ("src/gamma.rs", "fn gamma() {}"),
-                        ("src/reference.rs", "const REFERENCE: usize = 1;"),
+                        ("tools/repos/worker/src/beta.rs", "fn beta() {}"),
+                        ("tools/runner/src/alpha.rs", "fn gamma() {}"),
+                        ("tools/runner/src/reference.rs", "const REFERENCE: usize = 1;"),
                     ] {
                         let source = source_units
                             .iter()
@@ -1431,7 +2769,7 @@ mod tests {
                             ("edge:200", Some("21"), Some("31"), Some("member"))
                         ])
                     );
-                    crate::evidence_projection_v3::project_packet_v3(
+                    let positive = crate::evidence_projection_v3::project_packet_v3(
                         &service,
                         "h7-caller",
                         &request,
@@ -1441,7 +2779,49 @@ mod tests {
                                 .map(|bytes| bytes.len())
                                 .map_err(|_| ())
                         },
-                    )
+                    )?;
+                    let path = project.path().join("tools/repos/worker/src/beta.rs");
+                    let original = std::fs::read(&path).unwrap();
+                    let check_refusal = |label: &str| -> Result<(), codestory_contracts::api::ApiError> {
+                        let session = PacketProofSession::new();
+                        session.admit("node:21", INTERIM_SOURCE_ROW_UPPER_BOUND);
+                        session.admit("path:tools/repos/worker/src/beta.rs", INTERIM_SOURCE_ROW_UPPER_BOUND);
+                        let frozen = freeze_packet_compilation(&controller, "h7-project", &[], None, &session, Some(&request))?;
+                        assert!(frozen.product.support.is_empty(), "{label}");
+                        assert!(frozen.product.continuation.is_empty(), "{label}");
+                        assert_eq!(frozen.source_refusals.len(), 2, "{label}");
+                        let mut refused = packet.clone();
+                        refused.packet_id = format!("h7-refusal-{label}");
+                        refused.answer.source_coverage = frozen.source_coverage.clone();
+                        apply_frozen_packet_compilation(&mut refused, Some(&request), frozen);
+                        assert_eq!(refused.disposition.kind, codestory_contracts::api::PacketDispositionKindDto::NotEstablished, "{label}");
+                        let public = crate::evidence_projection_v3::project_packet_v3(&service, "h7-refusal-caller", &request, &refused, |projection| Ok(serde_json::to_vec(projection).unwrap().len()))?;
+                        let PacketProjectionV3Dto::Complete { evidence, gaps, continuation, answer_sufficiency, .. } = public.projection else { panic!("bounded refusal fits: {label}") };
+                        assert!(evidence.as_slice().is_empty(), "{label}");
+                        assert!(continuation.is_none(), "{label}");
+                        assert_eq!(gaps.as_slice().iter().filter(|gap| gap.kind == codestory_contracts::packet_projection_v3::GapKindV3Dto::SourceUnavailable).count(), 2, "{label}");
+                        assert_eq!(serde_json::to_value(answer_sufficiency).unwrap(), json!("not_asserted"), "{label}");
+                        Ok(())
+                    };
+                    std::fs::remove_file(&path).unwrap();
+                    check_refusal("deleted")?;
+                    std::fs::write(&path, "fn changed() {}\n").unwrap();
+                    check_refusal("stale")?;
+                    std::fs::remove_file(&path).unwrap();
+                    std::fs::create_dir(&path).unwrap();
+                    check_refusal("directory")?;
+                    std::fs::remove_dir(&path).unwrap();
+                    #[cfg(unix)]
+                    {
+                        let outside = tempfile::tempdir().unwrap();
+                        let target = outside.path().join("beta.rs");
+                        std::fs::write(&target, &original).unwrap();
+                        std::os::unix::fs::symlink(&target, &path).unwrap();
+                        check_refusal("escaping-symlink")?;
+                        std::fs::remove_file(&path).unwrap();
+                    }
+                    std::fs::write(&path, &original).unwrap();
+                    Ok(positive)
                 },
             )
             .expect("normal pinned freeze-to-public projection")
@@ -1464,9 +2844,9 @@ mod tests {
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from([
                 (Some("11"), Some("src/alpha.rs")),
-                (Some("21"), Some("src/beta.rs")),
-                (Some("31"), Some("src/gamma.rs")),
-                (None, Some("src/reference.rs"))
+                (Some("21"), Some("tools/repos/worker/src/beta.rs")),
+                (Some("31"), Some("tools/runner/src/alpha.rs")),
+                (None, Some("tools/runner/src/reference.rs"))
             ])
         );
         assert_eq!(
@@ -1515,10 +2895,10 @@ mod tests {
         let controller = AppController::new_with_owned_cache_root(process_cache.path());
         controller.state.lock().project_root = Some(project.path().to_path_buf());
         let storage = Store::new_in_memory().expect("store");
-        let path = project.path().join("settings.rs");
+        let path = project.path().join("tools/repos/worker/src/settings.rs");
         let admission = PacketAdmissionReceiptV1 {
             packet_ordinal: 0,
-            stable_identity: "path:settings.rs".into(),
+            stable_identity: "path:tools/repos/worker/src/settings.rs".into(),
             score_version: "test".into(),
             reserved_source_bytes: INTERIM_SOURCE_ROW_UPPER_BOUND as u32,
             origin: PacketAdmissionOriginV1::Retrieval,
@@ -1533,6 +2913,7 @@ mod tests {
             line_count: 2,
             file_role: FileRole::Source,
         };
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let short = "const ENABLED: bool = true;\nconst LIMIT: usize = 2;\n";
         std::fs::write(&path, short).expect("short source");
         storage.insert_file(&file).expect("file");
@@ -1542,6 +2923,7 @@ mod tests {
             .expect("pinned source hash");
         let whole = hydrate_admitted_file_source(&controller, &storage, &admission, &file)
             .expect("complete short file source");
+        assert_eq!(whole.path, "tools/repos/worker/src/settings.rs");
         assert_eq!((whole.start_line, whole.end_line), (1, 2));
         assert!(whole.source.contains("const LIMIT: usize = 2;"));
 
@@ -1621,6 +3003,7 @@ mod tests {
     #[test]
     fn file_node_navigation_keeps_authenticated_path_without_source_text() {
         let mut support = vec![SupportUnitDto {
+            source_delivery: None,
             id: "symbol:node:17".into(),
             kind: SupportUnitKindDto::SymbolLocation,
             summary: "Navigation only: no bounded source range for node:17".into(),

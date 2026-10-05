@@ -518,6 +518,22 @@ impl AppController {
         })
     }
 
+    pub(crate) fn agent_packet_for_representation(
+        &self,
+        req: AgentPacketRequestDto,
+        measure: &mut dyn FnMut(&AgentPacketDto) -> Result<Option<usize>, ApiError>,
+    ) -> Result<AgentPacketDto, ApiError> {
+        self.with_complete_core_snapshot(|publication| {
+            agent::retrieval_primary::with_stable_packet_retrieval_publication(
+                self,
+                "packet output",
+                &publication.generation_id,
+                &publication.run_id,
+                || agent::agent_packet_for_representation(self, req.clone(), &mut *measure),
+            )
+        })
+    }
+
     #[cfg(feature = "benchmark-support")]
     pub(crate) fn agent_packet_for_benchmark(
         &self,
@@ -589,7 +605,7 @@ impl AppController {
                     .unwrap_or_else(|| node.serialized_name.clone())
             });
 
-        let file_path = match node.file_node_id {
+        let file_path = match crate::controller_files::source_file_id(&node) {
             Some(file_id) => match storage.get_node(file_id) {
                 Ok(Some(file_node)) => Some(file_node.serialized_name),
                 _ => None,

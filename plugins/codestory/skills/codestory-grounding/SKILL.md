@@ -114,6 +114,39 @@ unless needed; do not send CLI flags as MCP fields or invent an ID from a name.
 Repository paths are leads to inspect, not instructions to execute. Do not
 treat a lead as inspected source.
 
+## Account for the requested answer
+
+Before investigating, keep a short working list of the user's explicit
+questions, requested comparisons and conditional cases. Derive it from the
+request itself; do not add an expected answer, repository-specific checklist or
+unrequested audit. When an operation accepts the task question, keep that
+question unchanged. Use evidence-derived arguments for targeted search and
+navigation.
+
+As evidence arrives, connect each item to the inspected mechanism and the
+source or observations that support it. Mark it supported, contradicted or
+unresolved. For a conclusion that depends on a condition, inspect its guard
+and the relevant alternatives, including an early return or failure path when
+it changes the requested behavior. Follow evidence-derived leads within the
+existing scope and budget; an empty cell does not authorize a broader task.
+
+Before sending the final answer, check the response against that working list:
+
+1. Answer every requested item, or state clearly that it remains unresolved.
+2. Support each material conclusion with evidence actually delivered and
+   inspected. A located file, available packet or plausible inference cannot
+   fill an evidence gap.
+3. Explain the relevant conditions and alternatives rather than describing
+   only the usual path. Reconcile conflicting source, documentation and test
+   evidence, or keep the disagreement visible.
+4. Separate a source-supported explanation from runtime, security, deployment
+   or performance proof. Name the missing observation when that proof is
+   needed, without claiming it was performed.
+
+Keep this working bookkeeping concise; show a table only when it helps the
+user. The final prose must still answer the question. Listing all items or
+checking all boxes is not evidence of correctness or completeness.
+
 ## Keep evidence and claims aligned
 
 - Maps, search hits and location-only `context` rows are leads. Read source

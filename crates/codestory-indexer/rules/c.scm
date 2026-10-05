@@ -1,3 +1,30 @@
+;; Source declarations only; macro expansion and active branches are not evaluated.
+(preproc_def
+  name: (identifier) @name) @def
+{
+  node @name.node
+  attr (@name.node) kind = "MACRO"
+  attr (@name.node) canonical_role = "declaration"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @def)
+  attr (@name.node) start_col = (start-column @def)
+  attr (@name.node) end_row = (end-row @def)
+  attr (@name.node) end_col = (end-column @def)
+}
+
+(preproc_function_def
+  name: (identifier) @name) @def
+{
+  node @name.node
+  attr (@name.node) kind = "MACRO"
+  attr (@name.node) canonical_role = "declaration"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @def)
+  attr (@name.node) start_col = (start-column @def)
+  attr (@name.node) end_row = (end-row @def)
+  attr (@name.node) end_col = (end-column @def)
+}
+
 (function_definition
   declarator: (_) @name) @def
 {

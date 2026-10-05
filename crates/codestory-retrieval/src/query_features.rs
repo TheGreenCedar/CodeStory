@@ -58,6 +58,9 @@ pub struct QueryIntent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QueryFeatures {
     pub raw_query: String,
+    /// Actual lexical execution policy; never inferred from prompt text.
+    #[serde(skip)]
+    pub lexical_policy: crate::query_policy::LexicalAdmissionPolicy,
     #[serde(default = "current_query_intent_policy", skip_serializing)]
     pub intent_policy: String,
     pub shape: QueryShape,
@@ -260,6 +263,7 @@ pub fn classify_query(query: &str) -> QueryFeatures {
     };
 
     QueryFeatures {
+        lexical_policy: crate::query_policy::LexicalAdmissionPolicy::StrictLiteralV1,
         raw_query: trimmed.to_string(),
         intent_policy: QUERY_INTENT_POLICY_VERSION.into(),
         shape,

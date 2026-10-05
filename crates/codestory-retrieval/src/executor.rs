@@ -11,6 +11,7 @@ use crate::index::query_fingerprint;
 use crate::mode::{RetrievalDegradedMode, derive_degraded_mode};
 use crate::planner::{PlannedStage, RetrievalStageKind};
 use crate::query_features::{QueryFeatures, QueryLookupMode, classify_query};
+use crate::query_policy::LexicalAdmissionPolicy;
 use crate::ranker::{rank_candidates, retain_primary_candidates_for_query};
 use crate::sidecar_search::{SearchExecutionContext, SidecarSearch};
 use anyhow::{Result, bail};
@@ -167,7 +168,13 @@ impl<'a> QueryExecutor<'a> {
     /// `total_budget_ms` caps retrieval work only; it does not include runtime candidate
     /// resolution, packet sufficiency checks, or answer composition.
     pub fn execute(&mut self, query: &str, total_budget_ms: Option<u64>) -> Result<QueryResult> {
-        self.execute_with_payload(query, total_budget_ms, CandidatePayloadMode::Full, true)
+        self.execute_with_payload(
+            query,
+            total_budget_ms,
+            CandidatePayloadMode::Full,
+            true,
+            LexicalAdmissionPolicy::StrictLiteralV1,
+        )
     }
 
     pub(crate) fn execute_packet_descriptors(
@@ -180,6 +187,7 @@ impl<'a> QueryExecutor<'a> {
             total_budget_ms,
             CandidatePayloadMode::DescriptorOnly,
             true,
+            LexicalAdmissionPolicy::StrictLiteralV1,
         )
     }
 
@@ -199,6 +207,47 @@ impl<'a> QueryExecutor<'a> {
             total_budget_ms,
             CandidatePayloadMode::DescriptorOnly,
             false,
+            LexicalAdmissionPolicy::StrictLiteralV1,
+        )
+    }
+
+    pub(crate) fn execute_with_lexical_policy(
+        &mut self,
+        query: &str,
+        budget_ms: Option<u64>,
+        policy: LexicalAdmissionPolicy,
+    ) -> Result<QueryResult> {
+        self.execute_with_payload(query, budget_ms, CandidatePayloadMode::Full, true, policy)
+    }
+
+    pub(crate) fn execute_packet_descriptors_with_lexical_policy(
+        &mut self,
+        query: &str,
+        budget_ms: Option<u64>,
+        policy: LexicalAdmissionPolicy,
+    ) -> Result<QueryResult> {
+        self.execute_with_payload(
+            query,
+            budget_ms,
+            CandidatePayloadMode::DescriptorOnly,
+            true,
+            policy,
+        )
+    }
+
+    #[cfg(feature = "benchmark-support")]
+    pub(crate) fn execute_packet_descriptors_without_dense_semantic_for_benchmark_with_lexical_policy(
+        &mut self,
+        query: &str,
+        budget_ms: Option<u64>,
+        policy: LexicalAdmissionPolicy,
+    ) -> Result<QueryResult> {
+        self.execute_with_payload(
+            query,
+            budget_ms,
+            CandidatePayloadMode::DescriptorOnly,
+            false,
+            policy,
         )
     }
 
@@ -208,11 +257,13 @@ impl<'a> QueryExecutor<'a> {
         total_budget_ms: Option<u64>,
         payload: CandidatePayloadMode,
         include_dense_semantic: bool,
+        lexical_policy: LexicalAdmissionPolicy,
     ) -> Result<QueryResult> {
         let request_started = Instant::now();
-        let features = classify_query(query);
+        let mut features = classify_query(query);
+        features.lexical_policy = lexical_policy;
         let fingerprint = payload.cache_fingerprint(
-            query_fingerprint(&features.raw_query),
+            lexical_policy.cache_fingerprint(query_fingerprint(&features.raw_query)),
             include_dense_semantic,
         );
 
@@ -229,8 +280,11 @@ impl<'a> QueryExecutor<'a> {
             && let Some(manifest) = self.manifest.as_ref()
         {
             let key = self.cache.key_for_manifest(manifest, fingerprint.clone());
-            if let Some(cached) = self.cache.get(&key) {
+            if let Some((executed_policy, cached)) =
+                self.cache.get_with_policy(&key, lexical_policy)
+            {
                 let cached = cached.to_vec();
+                features.lexical_policy = executed_policy;
                 if self.cancelled.load(Ordering::Acquire) {
                     return Ok(cancelled_query_result(
                         features,
@@ -333,7 +387,8 @@ impl<'a> QueryExecutor<'a> {
         {
             let key = self.cache.key_for_manifest(manifest, fingerprint);
             if !self.cancelled.load(Ordering::Acquire) {
-                self.cache.insert(key.clone(), hits.clone());
+                self.cache
+                    .insert_with_policy(key.clone(), hits.clone(), features.lexical_policy);
                 if self.cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
                     self.cache.remove(&key);
                     cancel_reason = Some(cancellation_reason(&self.cancelled).into());
@@ -447,9 +502,19 @@ impl<'a> QueryExecutor<'a> {
             }
             RetrievalStageKind::Stage1Lexical => {
                 if payload.is_descriptor() {
-                    sidecars.lexical_descriptor_search_with_context(query, stage.top_k, &context)
+                    sidecars.lexical_descriptor_search_with_policy_context(
+                        query,
+                        stage.top_k,
+                        features.lexical_policy,
+                        &context,
+                    )
                 } else {
-                    sidecars.lexical_search_with_context(query, stage.top_k, &context)
+                    sidecars.lexical_search_with_policy_context(
+                        query,
+                        stage.top_k,
+                        features.lexical_policy,
+                        &context,
+                    )
                 }
             }
             RetrievalStageKind::Stage1bSemantic => {
@@ -1316,6 +1381,133 @@ mod tests {
         assert!(!result.hits.is_empty());
         assert!(!result.trace.stages.is_empty());
         assert!(!result.trace.cache_hit);
+    }
+
+    #[test]
+    fn lexical_policy_cache_is_separate_in_both_orders_and_payloads() {
+        struct PolicySidecars;
+        impl SidecarSearch for PolicySidecars {
+            fn lexical_search(&self, _: &str, _: usize) -> Result<Vec<CandidateHit>> {
+                panic!("typed execution must reach policy owner")
+            }
+            fn lexical_search_with_policy_context(
+                &self,
+                query: &str,
+                _: usize,
+                policy: LexicalAdmissionPolicy,
+                context: &SearchExecutionContext,
+            ) -> Result<Vec<CandidateHit>> {
+                context.check_cancelled()?;
+                assert_eq!(query, "text empty `absent`");
+                let path = match policy {
+                    LexicalAdmissionPolicy::StrictLiteralV1 => "src/strict.rs",
+                    LexicalAdmissionPolicy::BroadQuestionV1 => "src/broad.rs",
+                };
+                let mut hit = CandidateHit::lexical_stub(path, 1.0);
+                hit.source_bytes_upper_bound = Some(32);
+                Ok(vec![hit])
+            }
+            fn lexical_descriptor_search_with_policy_context(
+                &self,
+                query: &str,
+                limit: usize,
+                policy: LexicalAdmissionPolicy,
+                context: &SearchExecutionContext,
+            ) -> Result<Vec<CandidateHit>> {
+                self.lexical_search_with_policy_context(query, limit, policy, context)
+            }
+            fn semantic_search(&self, _: &str, _: usize) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+            fn scip_anchor(&self, _: &str, _: usize) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+            fn scip_expand(&self, _: &[CandidateHit], _: usize) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+        }
+        for order in [
+            [
+                LexicalAdmissionPolicy::StrictLiteralV1,
+                LexicalAdmissionPolicy::BroadQuestionV1,
+            ],
+            [
+                LexicalAdmissionPolicy::BroadQuestionV1,
+                LexicalAdmissionPolicy::StrictLiteralV1,
+            ],
+        ] {
+            for payload in [
+                CandidatePayloadMode::Full,
+                CandidatePayloadMode::DescriptorOnly,
+            ] {
+                let mut cache = RetrievalCache::new();
+                let poisoned_key = cache.key_for_manifest(
+                    &sample_manifest(),
+                    payload.cache_fingerprint(
+                        LexicalAdmissionPolicy::BroadQuestionV1
+                            .cache_fingerprint(query_fingerprint("text empty `absent`")),
+                        true,
+                    ),
+                );
+                cache.insert(
+                    poisoned_key,
+                    vec![CandidateHit::lexical_stub("src/poisoned.rs", 1.0)],
+                );
+                let mut executor = QueryExecutor {
+                    sidecars: Arc::new(PolicySidecars),
+                    cache: &mut cache,
+                    manifest: Some(sample_manifest()),
+                    file_roles: Arc::new(HashMap::new()),
+                    cancelled: cancellation_flag(),
+                    mode_override: Some(RetrievalDegradedMode::Full),
+                };
+                for round in 0..2 {
+                    for policy in order {
+                        let result = executor
+                            .execute_with_payload(
+                                "text empty `absent`",
+                                Some(1_000),
+                                payload,
+                                true,
+                                policy,
+                            )
+                            .expect("policy execution");
+                        assert_eq!(result.features.lexical_policy, policy);
+                        assert_eq!(result.trace.cache_hit, round == 1);
+                        assert_eq!(
+                            result.hits[0].file_path,
+                            if policy == LexicalAdmissionPolicy::StrictLiteralV1 {
+                                "src/strict.rs"
+                            } else {
+                                "src/broad.rs"
+                            }
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_broad_sidecar_refuses_instead_of_running_strict() {
+        let mut cache = RetrievalCache::new();
+        let mut executor = QueryExecutor {
+            sidecars: Arc::new(MockSidecarSearch::default()),
+            cache: &mut cache,
+            manifest: Some(sample_manifest()),
+            file_roles: Arc::new(HashMap::new()),
+            cancelled: cancellation_flag(),
+            mode_override: Some(RetrievalDegradedMode::Full),
+        };
+        assert!(
+            executor
+                .execute_packet_descriptors_with_lexical_policy(
+                    "text empty `absent`",
+                    Some(1_000),
+                    LexicalAdmissionPolicy::BroadQuestionV1,
+                )
+                .is_err()
+        );
     }
 
     #[test]

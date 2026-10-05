@@ -71,6 +71,10 @@ fn checked_in_protocol_hash_flows_into_the_build_marker() {
     assert_eq!(PER_USER_EMBEDDING_PROTOCOL_SHA256, expected);
 
     let marker = std::str::from_utf8(PER_USER_EMBEDDING_SERVER_PROOF_MARKER).expect("UTF-8 marker");
+    assert!(marker.contains(&format!(
+        "protocol_schema={}|",
+        super::super::PER_USER_EMBEDDING_PROTOCOL_SCHEMA_VERSION
+    )));
     assert!(
         marker.contains(&format!("protocol_sha256={expected}|")),
         "build marker did not bind the checked-in protocol hash: {marker}"
@@ -428,5 +432,113 @@ fn a_trickling_peer_cannot_hold_the_exchange_past_one_absolute_deadline() {
             .flatten()
             .is_some_and(|first| first <= budget),
         "no syscall may be armed with more than the whole remaining budget"
+    );
+}
+
+#[test]
+fn oversized_input_wire_errors_require_input_change_on_both_server_paths() {
+    use super::super::EmbeddingProtocolResponse;
+    use super::super::server::{write_anyhow_failure, write_engine_failure};
+    use codestory_llama_sys::EngineError;
+
+    for wrapped in [false, true] {
+        let (mut stream, output) = MemoryStream::new(Vec::new(), true);
+        let error = EngineError::InputTooLong {
+            actual: 615,
+            maximum: 512,
+        };
+        if wrapped {
+            write_anyhow_failure(
+                &mut stream,
+                "oversized",
+                anyhow::Error::new(error).context("encode query"),
+            )
+            .expect("deliver wrapped input failure");
+        } else {
+            write_engine_failure(&mut stream, "oversized", error).expect("deliver input failure");
+        }
+        let bytes = output.lock().unwrap().clone();
+        let (mut reader, _) = MemoryStream::new(bytes, true);
+        let (response, payload) = read_frame::<EmbeddingProtocolResponse>(&mut reader)
+            .expect("decode delivered failure frame");
+        assert_eq!(response.request_id, "oversized");
+        assert!(response.result.is_none() && payload.is_empty());
+        let failure = response.error.expect("typed input failure");
+        assert_eq!(failure.code, "native_embedding_input_too_long");
+        assert_eq!(failure.retry_class, "terminal", "wrapped={wrapped}");
+        assert_eq!(failure.retry_after_ms, 0);
+        assert!(failure.capacity.is_none());
+        assert!(failure.retry_condition.contains("input"));
+        assert!(!failure.retry_condition.contains("server"));
+        assert!(failure.message.contains("615") && failure.message.contains("512"));
+    }
+}
+
+#[test]
+fn model_failure_wire_errors_keep_server_change_guidance() {
+    use super::super::EmbeddingProtocolResponse;
+    use super::super::server::{write_anyhow_failure, write_engine_failure};
+    use codestory_llama_sys::EngineError;
+
+    for wrapped in [false, true] {
+        let (mut stream, output) = MemoryStream::new(Vec::new(), true);
+        let error = EngineError::ModelNotEmbedded;
+        if wrapped {
+            write_anyhow_failure(
+                &mut stream,
+                "model",
+                anyhow::Error::new(error).context("encode query"),
+            )
+            .expect("deliver wrapped model failure");
+        } else {
+            write_engine_failure(&mut stream, "model", error).expect("deliver model failure");
+        }
+        let bytes = output.lock().unwrap().clone();
+        let (mut reader, _) = MemoryStream::new(bytes, true);
+        let (response, payload) = read_frame::<EmbeddingProtocolResponse>(&mut reader)
+            .expect("decode model failure frame");
+        assert!(payload.is_empty());
+        let failure = response.error.expect("typed model failure");
+        assert_eq!(failure.code, "native_model_not_embedded");
+        assert_eq!(failure.retry_class, "after_server_change");
+        assert!(failure.retry_condition.contains("server"));
+        assert_eq!(failure.retry_after_ms, 0);
+        assert!(failure.capacity.is_none());
+    }
+}
+
+#[test]
+fn ordinary_snapshot_without_boot_provenance_preserves_authentication_and_versions() {
+    let mut snapshot = test_snapshot();
+    snapshot.clock.boot_id = None;
+    validate_server_snapshot(&snapshot, &test_transport_identity(), &test_executable())
+        .expect("ordinary authenticated operational snapshot needs no qualification witness");
+    let mut old_snapshot = snapshot.clone();
+    old_snapshot.schema_version = 1;
+    assert!(
+        validate_server_snapshot(
+            &old_snapshot,
+            &test_transport_identity(),
+            &test_executable()
+        )
+        .is_err()
+    );
+    let mut old_protocol = snapshot.clone();
+    old_protocol.protocol.schema_version = 1;
+    assert!(
+        validate_server_snapshot(
+            &old_protocol,
+            &test_transport_identity(),
+            &test_executable()
+        )
+        .is_err()
+    );
+    let mut unauthenticated = test_transport_identity();
+    unauthenticated.peer_verified = false;
+    assert!(validate_server_snapshot(&snapshot, &unauthenticated, &test_executable()).is_err());
+    snapshot.process.executable_sha256 = "b".repeat(64);
+    assert!(
+        validate_server_snapshot(&snapshot, &test_transport_identity(), &test_executable())
+            .is_err()
     );
 }

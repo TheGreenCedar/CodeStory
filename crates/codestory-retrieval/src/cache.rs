@@ -1,3 +1,4 @@
+use crate::query_policy::LexicalAdmissionPolicy;
 use codestory_store::RetrievalIndexManifest;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -37,7 +38,11 @@ impl RetrievalCacheKey {
             sidecar_input_hash: manifest.sidecar_input_hash.clone(),
             sidecar_schema_version: manifest.sidecar_schema_version,
             projection_count: manifest.projection_count,
-            query_fingerprint: query_fingerprint.into(),
+            query_fingerprint: format!(
+                "{}:{}",
+                crate::query_windows::QUERY_WINDOW_POLICY,
+                query_fingerprint.into()
+            ),
         }
     }
 }
@@ -49,9 +54,15 @@ const DEFAULT_RETRIEVAL_CACHE_CAPACITY: usize = 128;
 /// Entries are safe only for the manifest identity captured by [`RetrievalCacheKey`]. Cache
 /// rehydration across worktrees must invalidate copied retrieval manifests before this cache is
 /// trusted again.
+#[derive(Debug, Clone, PartialEq)]
+struct CachedRetrievalResult {
+    lexical_policy: LexicalAdmissionPolicy,
+    hits: Vec<super::CandidateHit>,
+}
+
 #[derive(Debug, Clone)]
 pub struct RetrievalCache {
-    entries: HashMap<RetrievalCacheKey, Vec<super::CandidateHit>>,
+    entries: HashMap<RetrievalCacheKey, CachedRetrievalResult>,
     order: VecDeque<RetrievalCacheKey>,
     capacity: usize,
     publication_identity: Option<(String, String)>,
@@ -102,15 +113,45 @@ impl RetrievalCache {
     }
 
     pub fn get(&self, key: &RetrievalCacheKey) -> Option<&[super::CandidateHit]> {
-        self.entries.get(key).map(Vec::as_slice)
+        self.entries.get(key).map(|entry| entry.hits.as_slice())
     }
 
+    /// Policy-aware callers authenticate retained execution metadata as well as the key.
+    pub(crate) fn get_with_policy(
+        &self,
+        key: &RetrievalCacheKey,
+        expected: LexicalAdmissionPolicy,
+    ) -> Option<(LexicalAdmissionPolicy, &[super::CandidateHit])> {
+        let entry = self.entries.get(key)?;
+        (entry.lexical_policy == expected).then_some((entry.lexical_policy, entry.hits.as_slice()))
+    }
+
+    /// Ordinary legacy insertion has strict origin; it cannot forge a broad cache hit.
     pub fn insert(&mut self, key: RetrievalCacheKey, hits: Vec<super::CandidateHit>) {
+        self.insert_with_policy(key, hits, LexicalAdmissionPolicy::StrictLiteralV1);
+    }
+
+    pub(crate) fn insert_with_policy(
+        &mut self,
+        key: RetrievalCacheKey,
+        hits: Vec<super::CandidateHit>,
+        lexical_policy: LexicalAdmissionPolicy,
+    ) {
+        self.insert_entry(
+            key,
+            CachedRetrievalResult {
+                lexical_policy,
+                hits,
+            },
+        );
+    }
+
+    fn insert_entry(&mut self, key: RetrievalCacheKey, entry: CachedRetrievalResult) {
         if self.entries.contains_key(&key) {
             self.order.retain(|existing| existing != &key);
         }
         self.order.push_back(key.clone());
-        self.entries.insert(key, hits);
+        self.entries.insert(key, entry);
         while self.entries.len() > self.capacity {
             let Some(evicted) = self.order.pop_front() else {
                 break;
@@ -152,7 +193,7 @@ impl RetrievalCache {
             if baseline.entries.get(&key) == Some(hits) {
                 continue;
             }
-            self.insert(key, hits.clone());
+            self.insert_entry(key, hits.clone());
         }
     }
 
@@ -233,7 +274,8 @@ mod tests {
             query_fingerprint: "first".into(),
         };
         let second = RetrievalCacheKey {
-            query_fingerprint: "second".into(),
+            query_fingerprint: LexicalAdmissionPolicy::BroadQuestionV1
+                .cache_fingerprint("second".into()),
             ..first.clone()
         };
 
@@ -248,12 +290,13 @@ mod tests {
         let baseline = target.clone();
 
         let mut newer_worker = baseline.clone();
-        newer_worker.insert(
+        newer_worker.insert_with_policy(
             second.clone(),
             vec![super::super::CandidateHit::lexical_stub(
                 "src/second.rs",
                 1.0,
             )],
+            LexicalAdmissionPolicy::BroadQuestionV1,
         );
         target.merge_delta_from(&baseline, newer_worker);
         assert_eq!(
@@ -267,6 +310,16 @@ mod tests {
         assert_eq!(
             target.get(&second).expect("stale snapshot must not replay")[0].file_path,
             "src/second.rs"
+        );
+        assert!(
+            target
+                .get_with_policy(&second, LexicalAdmissionPolicy::BroadQuestionV1)
+                .is_some()
+        );
+        assert!(
+            target
+                .get_with_policy(&second, LexicalAdmissionPolicy::StrictLiteralV1)
+                .is_none()
         );
     }
 

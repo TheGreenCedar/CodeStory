@@ -33,3 +33,12 @@ CLI flags. Every call requires `project` (absolute repository root).
   - `stale`: refresh before promoting the claim.
   - `non-promotable`: required fixtures, known-gap notes, or eval evidence are missing or failing.
 - Role inference is path/name based. It is useful for navigation and test selection, but not a formal build-system classification.
+
+
+## Read selected paths
+
+Choose exact returned paths, then call `snippet` with `paths` entries containing
+`path`, `start_line`, and `end_line`. A filename is a path selector, not a symbol
+query or an invented symbol ID. Distinct windows in the same file are supported.
+The listing can be capped or partial; its `line_count` does not prove that a
+subsequent read delivered the entire file. Inspect the snippet delivery receipts.
