@@ -67,6 +67,30 @@ symbol search when it names a symbol. Feed exact returned paths to `snippet.path
 without treating filenames as symbols. For example, after inventory returns
 `src/parser.rs`, request `{"project":"/absolute/repo","paths":[{"path":"src/parser.rs","start_line":1,"end_line":80}]}`.
 
+Keep the exact returned path, opaque ID and match coordinates while choosing
+source for the connection the task still needs. For a relevant callable,
+prefer an existing reliable body extent with `scope=function_body`; check its
+range source, fallback, freshness and truncation fields. The bounded brace
+fallback qualifies supported lexical syntax, and unresolved or ambiguous
+closure reports line context; retain that limitation. A requested hydration
+range is not automatically a complete symbol or body. If resolution selects a
+more useful implementation, retain both the original anchor and resolved source
+identity. A complete body does not establish the surrounding callers or uses.
+
+When trustworthy structural extent is unavailable, a first 200-line fallback
+preview starts at `max(1, anchor_start_line - 100)` and ends 199 lines later.
+Keep an unknown anchor unknown. Interpret each read using its actual delivered
+bounds; a complete window does not establish an enclosing block or file.
+
+After a read, identify the missing relationship before requesting more source.
+Use visible references and existing relationship or targeted lookup operations
+to locate the relevant caller, called definition, registration, guard or parent.
+Inspect that source rather than expanding every discovered lead. Batch
+independent known path windows in `snippet.paths` or an existing host read when
+the current source and response caps allow it. Keep receipts for every range
+and leave capped or unavailable relationships explicit. This selection strategy
+adds no parser, new relationship type, repository-specific rule or larger budget.
+
 Each requested range receives a receipt. `start_line` and `end_line` describe the
 request; nullable `delivered_start_line` and `delivered_end_line` describe the
 source actually returned. `complete` means the requested window reached its end
