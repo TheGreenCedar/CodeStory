@@ -10,15 +10,15 @@
     ],
     "preferredMcpProtocolVersion": "2025-11-25",
     "discoveryContracts": {
-      "2024-11-05": "9d438cfc5915e890873267c9e22789ac5637f09b7c1530f84cdbe657e0ac8a5f",
-      "2025-03-26": "6e4f392113caefc05f4d237344e3e896aac3a12c7ac279ee322c4f18e59bb7e1",
-      "2025-06-18": "408be84d7d87f985c69c443704a9248c42ef191611c116ad8d927723936eedfc",
-      "2025-11-25": "1a75d3355e8b7aca024a8e96fbc866f118d7e69456df26b72f0da3b225e762f1"
+      "2024-11-05": "122ddafac5b510cc6aafa95250851da4053fd566db995652abfd1cc2a9c994cf",
+      "2025-03-26": "5e93732973d0b953735f5f741029aaf185727744efa2d39f3af10bdf1a1148c6",
+      "2025-06-18": "73dfec711893f46f733ac0995d7ad614f469445523983170b13cb022534fd71f",
+      "2025-11-25": "e8b60da689a88856315ff8c116f0258b30ba12144b3ceddabce45718174e8b96"
     }
   },
   "revisionProfiles": {
     "2024-11-05": {
-      "discoveryContractSha256": "9d438cfc5915e890873267c9e22789ac5637f09b7c1530f84cdbe657e0ac8a5f",
+      "discoveryContractSha256": "122ddafac5b510cc6aafa95250851da4053fd566db995652abfd1cc2a9c994cf",
       "tools": [
         {
           "description": "Inspect CodeStory readiness for the requested repository when diagnostics are needed. CodeStory effect: observational and does not activate managed state.",
@@ -1614,6 +1614,12 @@
                     "minimum": 0,
                     "type": "integer"
                   },
+                  "max_tool_result_bytes": {
+                    "description": "Optional path-read allowance for UTF-8 serialized served MCP tool result, including revision text/structured mirroring and publication metadata. Excludes JSON-RPC and host framing; does not bound an investigation. Whole-line receipts may be partial; a receipt that cannot fit refuses.",
+                    "maximum": 524288,
+                    "minimum": 256,
+                    "type": "integer"
+                  },
                   "path": {
                     "description": "Single-file alias for `paths`: repository-relative path as returned in `file_path`. Combine with `line`.",
                     "minLength": 1,
@@ -1907,7 +1913,7 @@
       ]
     },
     "2025-03-26": {
-      "discoveryContractSha256": "6e4f392113caefc05f4d237344e3e896aac3a12c7ac279ee322c4f18e59bb7e1",
+      "discoveryContractSha256": "5e93732973d0b953735f5f741029aaf185727744efa2d39f3af10bdf1a1148c6",
       "tools": [
         {
           "annotations": {
@@ -3617,6 +3623,12 @@
                     "minimum": 0,
                     "type": "integer"
                   },
+                  "max_tool_result_bytes": {
+                    "description": "Optional path-read allowance for UTF-8 serialized served MCP tool result, including revision text/structured mirroring and publication metadata. Excludes JSON-RPC and host framing; does not bound an investigation. Whole-line receipts may be partial; a receipt that cannot fit refuses.",
+                    "maximum": 524288,
+                    "minimum": 256,
+                    "type": "integer"
+                  },
                   "path": {
                     "description": "Single-file alias for `paths`: repository-relative path as returned in `file_path`. Combine with `line`.",
                     "minLength": 1,
@@ -3916,7 +3928,7 @@
       ]
     },
     "2025-06-18": {
-      "discoveryContractSha256": "408be84d7d87f985c69c443704a9248c42ef191611c116ad8d927723936eedfc",
+      "discoveryContractSha256": "73dfec711893f46f733ac0995d7ad614f469445523983170b13cb022534fd71f",
       "tools": [
         {
           "_meta": {
@@ -12790,6 +12802,12 @@
                     "description": "Agent-friendly compatibility alias for `context`.",
                     "maximum": 200,
                     "minimum": 0,
+                    "type": "integer"
+                  },
+                  "max_tool_result_bytes": {
+                    "description": "Optional path-read allowance for UTF-8 serialized served MCP tool result, including revision text/structured mirroring and publication metadata. Excludes JSON-RPC and host framing; does not bound an investigation. Whole-line receipts may be partial; a receipt that cannot fit refuses.",
+                    "maximum": 524288,
+                    "minimum": 256,
                     "type": "integer"
                   },
                   "path": {
@@ -14038,7 +14056,7 @@
       ]
     },
     "2025-11-25": {
-      "discoveryContractSha256": "1a75d3355e8b7aca024a8e96fbc866f118d7e69456df26b72f0da3b225e762f1",
+      "discoveryContractSha256": "e8b60da689a88856315ff8c116f0258b30ba12144b3ceddabce45718174e8b96",
       "tools": [
         {
           "_meta": {
@@ -22912,6 +22930,12 @@
                     "description": "Agent-friendly compatibility alias for `context`.",
                     "maximum": 200,
                     "minimum": 0,
+                    "type": "integer"
+                  },
+                  "max_tool_result_bytes": {
+                    "description": "Optional path-read allowance for UTF-8 serialized served MCP tool result, including revision text/structured mirroring and publication metadata. Excludes JSON-RPC and host framing; does not bound an investigation. Whole-line receipts may be partial; a receipt that cannot fit refuses.",
+                    "maximum": 524288,
+                    "minimum": 256,
                     "type": "integer"
                   },
                   "path": {
@@ -33033,6 +33057,12 @@
                 "description": "Agent-friendly compatibility alias for `context`.",
                 "maximum": 200,
                 "minimum": 0,
+                "type": "integer"
+              },
+              "max_tool_result_bytes": {
+                "description": "Optional path-read allowance for UTF-8 serialized served MCP tool result, including revision text/structured mirroring and publication metadata. Excludes JSON-RPC and host framing; does not bound an investigation. Whole-line receipts may be partial; a receipt that cannot fit refuses.",
+                "maximum": 524288,
+                "minimum": 256,
                 "type": "integer"
               },
               "path": {

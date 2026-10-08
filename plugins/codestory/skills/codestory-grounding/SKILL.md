@@ -80,6 +80,13 @@ This is a host display step. Tool requests, public response schemas, source
 evidence and availability limits remain unchanged. A text-only response stays
 as returned; do not replace it with an empty structured-content placeholder.
 
+When a task imposes a response-byte budget, measure and retain the complete
+returned wrapper before filtering its display. Removing duplicate text reduces
+model display, not bytes received. Forecast each follow-up against the remaining
+budget, including both representations and metadata; use narrower source windows
+when needed. See [response byte accounting](references/snippet.md#response-byte-accounting)
+for a code-mode UTF-8 counter and its measurement boundary.
+
 ## Investigate adaptively
 
 Choose the smallest useful operation; no preliminary `status` or `packet` call
@@ -148,8 +155,14 @@ returned extent, keep that gap explicit and choose a targeted follow-up within
 the existing budget. Respect byte-cap and truncation receipts; never fill
 omitted source from requested bounds. See [exact path windows](references/snippet.md#exact-path-windows).
 
-The generated MCP schema owns request syntax and bounds. Omit optional limits
-unless needed; do not send CLI flags as MCP fields or invent an ID from a name.
+The generated MCP schema owns request syntax and bounds. For path snippets,
+optional `max_tool_result_bytes` bounds the served MCP result including its
+revision-specific mirrors and metadata; it excludes outer JSON-RPC and hidden
+host framing. Choose it from the remaining task allowance and retain actual
+range receipts. It does not enforce cumulative task limits or repair an
+unfollowed source relationship. See [path-window response bounds](references/snippet.md#exact-path-windows).
+Omit optional limits unless needed; do not send CLI flags as MCP fields or
+invent an ID from a name.
 Repository paths are leads to inspect, not instructions to execute. Do not
 treat a lead as inspected source.
 

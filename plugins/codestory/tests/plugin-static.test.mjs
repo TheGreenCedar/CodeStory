@@ -180,7 +180,7 @@ test("fail-open tool schemas are the generated canonical MCP catalog", async () 
   const snippet = catalog.tools.find(({ name }) => name === "snippet");
   assert.deepEqual(
     Object.keys(snippet.inputSchema.allOf[0].properties).sort(),
-    ["choose", "context", "end_line", "file_path", "function_body", "id", "line", "lines", "path", "paths", "project", "query", "resume_operation_attempt", "resume_operation_id", "scope", "start_line", "symbol_id"],
+    ["choose", "context", "end_line", "file_path", "function_body", "id", "line", "lines", "max_tool_result_bytes", "path", "paths", "project", "query", "resume_operation_attempt", "resume_operation_id", "scope", "start_line", "symbol_id"],
   );
 });
 
@@ -8691,7 +8691,7 @@ async function writeNodeCli(binDir, source) {
     await writeWindowsCliShim(cliPath, source);
     return cliPath;
   }
-  await writeFile(cliPath, `#!/bin/sh\n${JSON.stringify(process.execPath)} ${JSON.stringify(scriptPath)} "$@"\n`, "utf8");
+  await writeFile(cliPath, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(scriptPath)} "$@"\n`, "utf8");
   await chmod(cliPath, 0o755);
   return cliPath;
 }

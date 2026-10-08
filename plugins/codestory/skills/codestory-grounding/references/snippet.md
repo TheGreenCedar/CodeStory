@@ -106,6 +106,27 @@ whole source lines under a dedicated bound; the generic summary cap does not
 clip this operation. A metadata overflow returns `source_response_too_large`.
 Empty or naturally EOF-clipped windows can be complete without source lines.
 
+For an opt-in whole-response bound, pass `max_tool_result_bytes=256..524288`
+with `paths`, `path` or `file_path`. The allowance measures the UTF-8 JSON
+serialization of the served MCP tool result, including range receipts,
+publication metadata and any revision-specific text/structured-content mirror.
+It excludes the outer JSON-RPC frame and unexposed host framing. This field is
+not accepted with symbol/query snippets; omit it to keep existing defaults.
+
+For example, an exact path window can use
+`{"project":"/absolute/repo","paths":[{"path":"src/parser.rs","start_line":1,"end_line":80}],"max_tool_result_bytes":4096}`.
+The server reduces the shared source allowance until the complete result fits,
+keeping whole physical lines and every requested range receipt. It does not
+promise to fill the allowance. Continue incomplete ranges using their actual
+`next_start_line`; delivered hashes still cover only returned raw source bytes.
+If even zero-source receipts cannot fit, `source_response_budget_too_small`
+returns a bounded semantic error. An early error whose details exceed the
+allowance is replaced with `source_response_error_exceeds_budget`; increase the
+allowance where permitted, or narrow the request. JSON-RPC protocol errors
+are outside this tool-result bound. A single-call allowance does not enforce a
+cumulative investigation budget: charge each attempted result and reserve room
+for subsequent calls and any unknown framing.
+
 When `complete=false`, continue at `next_start_line`, retaining the same path and
 requested end. `line_exceeds_byte_budget` means a physical line cannot fit; a
 larger line-oriented request will not resolve it. Use an appropriate ordinary
@@ -117,3 +138,44 @@ assertions using returned paths or actual returned symbol IDs. Use existing
 `scope=function_body` for a symbol body; its range-source/fallback and publication
 contract remain separate from this workspace path-read contract. No mandatory
 packet or status call precedes these reads.
+
+## Response byte accounting
+
+A source allowance, a serialized tool result and model display are different
+measurements. The source and structured-result caps above do not bound a whole
+investigation. Some MCP revisions mirror JSON in text and structured content;
+account for both and their framing when a task limits returned response bytes.
+Deduplicating display does not reduce the received wrapper.
+
+In code-mode hosts, this optional counter uses ordinary JavaScript without
+requiring `TextEncoder` or Node's `Buffer`:
+
+```javascript
+function returnedWrapperUtf8Bytes(result) {
+  const serialized = JSON.stringify(result);
+  if (typeof serialized !== "string") throw new Error("result_not_serializable");
+  let bytes = 0;
+  for (const character of serialized) {
+    const codepoint = character.codePointAt(0);
+    bytes += codepoint <= 0x7f ? 1 : codepoint <= 0x7ff ? 2 : codepoint <= 0xffff ? 3 : 4;
+  }
+  return bytes;
+}
+const returnedWrapperBytes = returnedWrapperUtf8Bytes(result);
+// Retain result and record this size with the attempted call before display.
+```
+
+For an ordinary JSON-data tool wrapper, this measures the UTF-8 bytes of
+`JSON.stringify(result)`. JavaScript serialization can omit non-JSON members or
+invoke getters and `toJSON`; this is not a lossless wire counter for arbitrary
+objects. It does not measure unexposed protocol framing, host envelopes or token
+usage. Keep those unknown when they are not captured.
+Retain the original result before formatting; if capture or sizing fails, count
+the attempted call and record its byte amount as unknown rather than zero.
+
+Before another call, compare its expected complete response cost with the
+remaining task allowance. Prefer an evidence-derived body or smaller known path
+windows over a wide file read when that resolves the missing relationship.
+Batching reduces calls, but source windows and mirrored result metadata still
+consume bytes. Follow actual delivery receipts for further pages; do not reopen
+an exhausted or closed evaluation to complete a missing body.

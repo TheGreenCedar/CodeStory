@@ -15,10 +15,10 @@ repository-text retrieval. MCP may create or refresh the core index before
 answering a cold or stale project. Other modes require full, current retrieval
 and may prepare it automatically.
 
-The CLI's `search --repo-text off --refresh none` reads only an existing core
-cache. A cold project returns `project_unavailable` without creating a cache.
-The MCP preparation path owns core readiness; `serve --refresh none` does not
-make its tool calls existing-cache-only.
+Core-only MCP search can prepare Core; it is not an existing-cache-only read.
+A cold cache in the CLI's existing-only mode returns `project_unavailable`
+without creating a cache. CLI-side refresh settings do not change MCP tool
+preparation.
 
 In this core-only mode, `query` is one fuzzy pattern matched independently
 against each symbol name. Qualified owner/member text can form one pattern;
