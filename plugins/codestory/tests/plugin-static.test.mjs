@@ -1472,6 +1472,61 @@ function spawnLauncher(launcher, env, options = {}) {
   return { child, completed };
 }
 
+// Observe matching responses and drained child closure without losing the
+// causal failure to an unchecked array access on a busy host.
+function observeLauncherResponses(child) {
+  const responses = [];
+  let buffer = "";
+  let stderr = "";
+  let failure;
+  let closed;
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => { stderr = (stderr + chunk).slice(-4096); });
+  child.on("error", (error) => { failure = error; });
+  child.stdout.on("data", (chunk) => {
+    buffer += chunk;
+    const lines = buffer.split(/\r?\n/u);
+    buffer = lines.pop() || "";
+    try {
+      const parsed = lines.filter(Boolean).map((line) => JSON.parse(line));
+      assert.ok(parsed.every((entry) => entry !== null && typeof entry === "object" && !Array.isArray(entry)),
+        "malformed launcher JSON-RPC frame");
+      responses.push(...parsed);
+    } catch (error) {
+      failure = error;
+    }
+  });
+  const completed = new Promise((resolve) => child.once("close", (...result) => {
+    closed = result;
+    resolve(result);
+  }));
+  return {
+    responses,
+    completed,
+    async waitForResponse(id, redactPaths = [], timeoutMs = 10000) {
+      const deadline = Date.now() + timeoutMs;
+      const diagnostic = () => JSON.stringify({
+        response_id: id,
+        closed,
+        failure: failure?.message,
+        stderr: redactPaths.reduce((text, pathname) => text.replaceAll(pathname, "<fixture>"), stderr),
+      });
+      while (Date.now() < deadline) {
+        assert.equal(failure, undefined, diagnostic());
+        const response = responses.find((entry) => entry.id === id);
+        if (response) {
+          assert.equal(typeof response.result?.contents?.[0]?.text, "string", diagnostic());
+          return response;
+        }
+        assert.equal(closed, undefined, diagnostic());
+        await delay(10);
+      }
+      assert.fail(`timed out waiting for launcher response: ${diagnostic()}`);
+    },
+  };
+}
+
 async function waitForPath(pathname, timeoutMs = 10000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -5567,22 +5622,10 @@ test("mcp launcher fails open when managed cli probe fails", async () => {
       },
       stdio: ["pipe", "pipe", "pipe"],
     });
-    const completed = once(child, "close");
-    let buffer = "";
-    const responses = [];
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      buffer += chunk;
-      const lines = buffer.split(/\r?\n/u);
-      buffer = lines.pop() || "";
-      responses.push(...lines.filter(Boolean).map((line) => JSON.parse(line)));
-    });
+    const { responses, completed, waitForResponse } = observeLauncherResponses(child);
     child.stdin.write(input);
-    const firstDeadline = Date.now() + 2000;
-    while (Date.now() < firstDeadline && responses.length === 0) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-    const firstReason = JSON.parse(responses[0].result.contents[0].text).degraded_reason;
+    const firstResponse = await waitForResponse("status", [dataDir]);
+    const firstReason = JSON.parse(firstResponse.result.contents[0].text).degraded_reason;
     assert.equal([
       "managed_cli_provisioning",
       "managed_cli_provision_failed:managed_cli_asset_fetch_failed",
@@ -5595,7 +5638,7 @@ test("mcp launcher fails open when managed cli probe fails", async () => {
     }
     const [exitCode] = await completed;
     assert.equal(exitCode, 0);
-    const response = responses.find((entry) => entry.id === "terminal") || responses[0];
+    const response = responses.find((entry) => entry.id === "terminal") || firstResponse;
     const status = JSON.parse(response.result.contents[0].text);
     assert.equal(
       status.readiness[0].reason,
@@ -8534,22 +8577,10 @@ test("mcp launcher keeps managed provision failures primary", async () => {
       },
       stdio: ["pipe", "pipe", "pipe"],
     });
-    const completed = once(child, "close");
-    let buffer = "";
-    const responses = [];
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      buffer += chunk;
-      const lines = buffer.split(/\r?\n/u);
-      buffer = lines.pop() || "";
-      responses.push(...lines.filter(Boolean).map((line) => JSON.parse(line)));
-    });
+    const { responses, completed, waitForResponse } = observeLauncherResponses(child);
     child.stdin.write(input);
-    const firstDeadline = Date.now() + 2000;
-    while (Date.now() < firstDeadline && responses.length === 0) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-    const first = JSON.parse(responses[0].result.contents[0].text);
+    const firstResponse = await waitForResponse(1, [dataDir, releaseDir]);
+    const first = JSON.parse(firstResponse.result.contents[0].text);
     if (first.degraded_reason === "managed_cli_provisioning") {
       await waitForPath(join(dataDir, ".codestory-mcp-runtime.json"));
       child.stdin.end(input.replace('"id":1', '"id":2'));
@@ -8557,7 +8588,7 @@ test("mcp launcher keeps managed provision failures primary", async () => {
       child.stdin.end();
     }
     assert.equal((await completed)[0], 0);
-    const response = responses.find((entry) => entry.id === 2) || responses[0];
+    const response = responses.find((entry) => entry.id === 2) || firstResponse;
     const status = JSON.parse(response.result.contents[0].text);
     assert.equal(status.degraded_reason, "managed_cli_provision_failed:managed_cli_asset_fetch_failed");
     assert.doesNotMatch(JSON.stringify(status), new RegExp(releaseDir.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u"));
