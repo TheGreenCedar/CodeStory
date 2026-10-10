@@ -191,6 +191,19 @@ Check:
 - whether JSON and markdown output still match the runtime DTO shape
 - whether the change belongs in runtime rather than the adapter layer
 
+## If Windows Runtime Setup Fails Before Indexing
+
+`managed_cli_staging_verification_failed:version_probe_exit:1` means the
+staged launcher failed its `--version` check. Run that launcher directly to
+read its stderr before investigating indexes or embeddings. If the failed
+stage was removed, extract the retained archive into an isolated directory
+of the same depth. If it reports
+`native runtime activation failed` with Windows error 3 while the child
+executable exists, check the full path through the temporary staging directory
+and native generation. The Windows launcher must use an extended-length path
+when starting that child; a short-path success alone does not prove managed
+provisioning works.
+
 ## Runtime Failure Evidence
 
 WARN-and-higher process diagnostics are JSONL under
