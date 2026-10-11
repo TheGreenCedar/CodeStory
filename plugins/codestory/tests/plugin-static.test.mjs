@@ -174,7 +174,9 @@ test("fail-open tool schemas are the generated canonical MCP catalog", async () 
       uriTemplate === "codestory://status{?project}"),
   );
   assert.ok(
-    catalog.resourceTemplates.every(({ uriTemplate }) => uriTemplate.endsWith("{?project}")),
+    catalog.resourceTemplates.every(({ uriTemplate }) =>
+      uriTemplate.endsWith("{?project}")
+      || uriTemplate === "codestory://symbols/root{?project,limit,cursor}"),
     "every advertised repository resource template must carry a project selector",
   );
   const snippet = catalog.tools.find(({ name }) => name === "snippet");

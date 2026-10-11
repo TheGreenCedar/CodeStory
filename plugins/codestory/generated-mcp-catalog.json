@@ -10,15 +10,15 @@
     ],
     "preferredMcpProtocolVersion": "2025-11-25",
     "discoveryContracts": {
-      "2024-11-05": "122ddafac5b510cc6aafa95250851da4053fd566db995652abfd1cc2a9c994cf",
-      "2025-03-26": "5e93732973d0b953735f5f741029aaf185727744efa2d39f3af10bdf1a1148c6",
-      "2025-06-18": "704f2d8575e83cf7da37f1282dc9e535c0238139fd689ec0d1ff94d62fb11ca7",
-      "2025-11-25": "9051457ff6dc09baced2b2f962368262a64b94c9692cd9f8a7b00e014e1f9dc6"
+      "2024-11-05": "1a1b0643c3ddd5804ab2da4bc0ec260952f0e6bb613762d08cd4a3a9ae6d7e23",
+      "2025-03-26": "6071bd24115e10394bc977ae011168ed40a261f0fe2f5d97c3971760746608f2",
+      "2025-06-18": "1a3fb4e97eaa6378806577a817cd68a6c1e23d243b139ad21bde7c01be74bb4c",
+      "2025-11-25": "d5ad31ed3089ddd26916a41d6b6701285cbbc6bf5f05e0453633e1b9585e5fed"
     }
   },
   "revisionProfiles": {
     "2024-11-05": {
-      "discoveryContractSha256": "122ddafac5b510cc6aafa95250851da4053fd566db995652abfd1cc2a9c994cf",
+      "discoveryContractSha256": "1a1b0643c3ddd5804ab2da4bc0ec260952f0e6bb613762d08cd4a3a9ae6d7e23",
       "tools": [
         {
           "description": "Inspect CodeStory readiness for the requested repository when diagnostics are needed. CodeStory effect: observational and does not activate managed state.",
@@ -1874,7 +1874,7 @@
         {
           "mimeType": "application/json",
           "name": "Root symbols",
-          "uriTemplate": "codestory://symbols/root{?project}"
+          "uriTemplate": "codestory://symbols/root{?project,limit,cursor}"
         },
         {
           "mimeType": "application/json",
@@ -1913,7 +1913,7 @@
       ]
     },
     "2025-03-26": {
-      "discoveryContractSha256": "5e93732973d0b953735f5f741029aaf185727744efa2d39f3af10bdf1a1148c6",
+      "discoveryContractSha256": "6071bd24115e10394bc977ae011168ed40a261f0fe2f5d97c3971760746608f2",
       "tools": [
         {
           "annotations": {
@@ -3889,7 +3889,7 @@
         {
           "mimeType": "application/json",
           "name": "Root symbols",
-          "uriTemplate": "codestory://symbols/root{?project}"
+          "uriTemplate": "codestory://symbols/root{?project,limit,cursor}"
         },
         {
           "mimeType": "application/json",
@@ -3928,7 +3928,7 @@
       ]
     },
     "2025-06-18": {
-      "discoveryContractSha256": "704f2d8575e83cf7da37f1282dc9e535c0238139fd689ec0d1ff94d62fb11ca7",
+      "discoveryContractSha256": "1a3fb4e97eaa6378806577a817cd68a6c1e23d243b139ad21bde7c01be74bb4c",
       "tools": [
         {
           "_meta": {
@@ -14681,7 +14681,7 @@
         {
           "mimeType": "application/json",
           "name": "Root symbols",
-          "uriTemplate": "codestory://symbols/root{?project}"
+          "uriTemplate": "codestory://symbols/root{?project,limit,cursor}"
         },
         {
           "mimeType": "application/json",
@@ -14720,7 +14720,7 @@
       ]
     },
     "2025-11-25": {
-      "discoveryContractSha256": "9051457ff6dc09baced2b2f962368262a64b94c9692cd9f8a7b00e014e1f9dc6",
+      "discoveryContractSha256": "d5ad31ed3089ddd26916a41d6b6701285cbbc6bf5f05e0453633e1b9585e5fed",
       "tools": [
         {
           "_meta": {
@@ -25473,7 +25473,7 @@
         {
           "mimeType": "application/json",
           "name": "Root symbols",
-          "uriTemplate": "codestory://symbols/root{?project}"
+          "uriTemplate": "codestory://symbols/root{?project,limit,cursor}"
         },
         {
           "mimeType": "application/json",
@@ -36264,7 +36264,7 @@
     {
       "mimeType": "application/json",
       "name": "Root symbols",
-      "uriTemplate": "codestory://symbols/root{?project}"
+      "uriTemplate": "codestory://symbols/root{?project,limit,cursor}"
     },
     {
       "mimeType": "application/json",
