@@ -12,28 +12,29 @@ use codestory_contracts::api::{
 use codestory_contracts::compilation::{
     PACKET_COMPILATION_CONTRACT_VERSION_V1, PacketSeedSelectorV1, RetrievalSeedPlanV1,
 };
+use std::collections::HashSet;
 
 const GENERIC_RETRIEVAL_PURPOSE: &str =
     "unchanged question for generic lexical and semantic retrieval";
 const TYPED_FREE_QUERY_PURPOSE: &str = "typed free-query retrieval seed";
 
-/// Keep the unchanged query and bounded literal paragraph views. Blank lines
-/// are syntax only: no words, task classes, selectors or evidence roles are
-/// inferred. Every view receives ordinary generic retrieval authority.
+/// Keep the unchanged query and existing literal paragraph views, then fill
+/// spare slots with uniformly sampled literal sentences. Delimiters are syntax
+/// only: every view receives the same ordinary generic retrieval authority.
 pub fn generic_retrieval_queries(question: &str) -> Vec<&str> {
-    const MAX_PARAGRAPH_QUERIES: usize = 7;
+    const MAX_SUPPLEMENTAL_QUERIES: usize = 7;
     let whole = question.trim();
     if whole.is_empty() {
         return Vec::new();
     }
     let paragraph_count = literal_paragraphs(question).count();
-    let count = paragraph_count.min(MAX_PARAGRAPH_QUERIES);
+    let count = paragraph_count.min(MAX_SUPPLEMENTAL_QUERIES);
     let positions = (0..count)
         .map(|position| {
-            if paragraph_count <= MAX_PARAGRAPH_QUERIES {
+            if paragraph_count <= MAX_SUPPLEMENTAL_QUERIES {
                 position
             } else {
-                position * (paragraph_count - 1) / (MAX_PARAGRAPH_QUERIES - 1)
+                position * (paragraph_count - 1) / (MAX_SUPPLEMENTAL_QUERIES - 1)
             }
         })
         .collect::<Vec<_>>();
@@ -54,7 +55,105 @@ pub fn generic_retrieval_queries(question: &str) -> Vec<&str> {
             break;
         }
     }
+    let remaining = (MAX_SUPPLEMENTAL_QUERIES + 1).saturating_sub(queries.len());
+    if remaining == 0 {
+        return queries;
+    }
+    let mut seen = queries
+        .iter()
+        .map(|query| query.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let sentences = literal_sentences(question)
+        .into_iter()
+        .filter(|sentence| seen.insert(sentence.to_ascii_lowercase()))
+        .collect::<Vec<_>>();
+    let count = remaining.min(sentences.len());
+    for position in 0..count {
+        let index = if count == 1 {
+            sentences.len() - 1
+        } else {
+            position * (sentences.len() - 1) / (count - 1)
+        };
+        queries.push(sentences[index]);
+    }
     queries
+}
+
+// Keep punctuation inside quoted strings and matching code delimiters literal.
+// Unclosed delimiters conservatively retain the rest as one slice.
+fn literal_sentences(question: &str) -> Vec<&str> {
+    let mut slices = Vec::new();
+    let mut chars = question.char_indices().peekable();
+    let mut start = 0;
+    let mut line_start = 0;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut code = None;
+    while let Some((index, character)) = chars.next() {
+        let blank_line = character == '\n' && question[line_start..index].trim().is_empty();
+        if character == '\n' {
+            line_start = index + 1;
+        }
+        if let Some((delimiter, length)) = code {
+            if character == delimiter {
+                let mut run = 1;
+                while chars.peek().is_some_and(|(_, next)| *next == delimiter) {
+                    chars.next();
+                    run += 1;
+                }
+                if run == length || (length >= 3 && run > length) {
+                    code = None;
+                }
+            }
+            continue;
+        }
+        let previous = question[..index].chars().next_back();
+        let next = chars.peek().map(|(_, character)| *character);
+        let apostrophe = character == '\''
+            && previous.is_some_and(char::is_alphanumeric)
+            && next.is_some_and(char::is_alphanumeric);
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == delimiter && !apostrophe {
+                quote = None;
+            }
+            continue;
+        }
+        if character == '"' || (character == '\'' && !previous.is_some_and(char::is_alphanumeric)) {
+            quote = Some(character);
+            continue;
+        }
+        if character == '`' || character == '~' {
+            let mut run = 1;
+            while chars.peek().is_some_and(|(_, next)| *next == character) {
+                chars.next();
+                run += 1;
+            }
+            if character == '`' || run >= 3 {
+                code = Some((character, run));
+            }
+            continue;
+        }
+        let terminator = matches!(character, '.' | '?' | '!')
+            && next.is_none_or(char::is_whitespace)
+            && !(character == '.' && previous.is_some_and(char::is_numeric));
+        if blank_line || terminator {
+            let end = index + character.len_utf8();
+            let slice = question[start..end].trim();
+            if !slice.is_empty() {
+                slices.push(slice);
+            }
+            start = end;
+        }
+    }
+    let tail = question[start..].trim();
+    if !tail.is_empty() {
+        slices.push(tail);
+    }
+    slices
 }
 
 fn literal_paragraphs(question: &str) -> impl Iterator<Item = &str> {
@@ -264,6 +363,168 @@ fn push_packet_query(queries: &mut Vec<PacketPlanQueryDto>, query: &str, purpose
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sentence_views_preserve_whole_paragraph_order_and_literal_unicode() {
+        let question = "背景 café first. 質問 second?\r\n\r\nвопрос third! End fourth.";
+        let queries = generic_retrieval_queries(question);
+        assert_eq!(queries[0], question);
+        assert_eq!(
+            &queries[1..3],
+            &["背景 café first. 質問 second?", "вопрос third! End fourth."]
+        );
+        assert_eq!(
+            &queries[3..],
+            &[
+                "背景 café first.",
+                "質問 second?",
+                "вопрос third!",
+                "End fourth."
+            ]
+        );
+        assert!(queries.iter().all(|query| question.contains(query)));
+        let seed = build_retrieval_seed_plan(question, &[]);
+        assert_eq!(seed.generic_query, question);
+        assert!(seed.exact_selectors.is_empty());
+        assert_eq!(
+            build_packet_plan_from_seed_plan(&seed, PacketBudgetModeDto::Standard)
+                .queries
+                .into_iter()
+                .map(|query| query.query)
+                .collect::<Vec<_>>(),
+            queries
+        );
+    }
+
+    #[test]
+    fn sentence_views_sample_positions_uniformly_including_the_last() {
+        let question = (0..20)
+            .map(|index| format!("item_{index:02} ends."))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let queries = generic_retrieval_queries(&question);
+        assert_eq!(queries.len(), 8);
+        assert_eq!(queries[0], question);
+        assert_eq!(
+            &queries[1..],
+            &[
+                "item_00 ends.",
+                "item_03 ends.",
+                "item_06 ends.",
+                "item_09 ends.",
+                "item_12 ends.",
+                "item_15 ends.",
+                "item_19 ends."
+            ]
+        );
+        assert!(queries.iter().all(|query| question.contains(query)));
+        let many_paragraphs = (0..12)
+            .map(|index| format!("paragraph_{index}. Next."))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let views = generic_retrieval_queries(&many_paragraphs);
+        assert_eq!(views.len(), 8);
+        assert_eq!(views[1], "paragraph_0. Next.");
+        assert_eq!(views[7], "paragraph_11. Next.");
+    }
+
+    #[test]
+    fn sentence_views_deduplicate_repetition_before_sampling_and_keep_plain_tail() {
+        let question = "Repeat. Repeat. REPEAT. Other? Tail without punctuation";
+        assert_eq!(
+            generic_retrieval_queries(question),
+            [question, "Repeat.", "Other?", "Tail without punctuation"]
+        );
+        let no_punctuation = "ordinary café wording\r\ncontinued wording";
+        assert_eq!(generic_retrieval_queries(no_punctuation), [no_punctuation]);
+        let question = "One. Two.\n\nThree.\n\nFour.\n\nFive.\n\nSix.\n\nSeven.";
+        let views = generic_retrieval_queries(question);
+        assert_eq!(views.len(), 8);
+        assert_eq!(
+            views.last(),
+            Some(&"Two."),
+            "the sole remaining slot keeps the final new sentence"
+        );
+    }
+
+    #[test]
+    fn sentence_views_preserve_quoted_strings_code_paths_decimals_and_apostrophes() {
+        let question = r#"We're reading src/module.rs with threshold 3.14 safely. Keep "quoted? words." and 'quoted! words' literal. Preserve `value.one? next!` unchanged. End."#;
+        let views = generic_retrieval_queries(question);
+        assert_eq!(
+            &views[1..],
+            &[
+                "We're reading src/module.rs with threshold 3.14 safely.",
+                r#"Keep "quoted? words." and 'quoted! words' literal."#,
+                "Preserve `value.one? next!` unchanged.",
+                "End.",
+            ]
+        );
+        let escaped = r#"Keep "inner \"quote?\" remains. inside" literal. Then finish!"#;
+        assert_eq!(
+            literal_sentences(escaped),
+            [
+                r#"Keep "inner \"quote?\" remains. inside" literal."#,
+                "Then finish!"
+            ]
+        );
+        assert_eq!(
+            literal_sentences("Unclosed `one? two. three!"),
+            ["Unclosed `one? two. three!"]
+        );
+        assert_eq!(
+            literal_sentences("Unclosed \"one? two. three!"),
+            ["Unclosed \"one? two. three!"]
+        );
+        assert_eq!(
+            literal_sentences("1. first? 2. next!"),
+            ["1. first?", "2. next!"]
+        );
+    }
+
+    #[test]
+    fn sentence_views_keep_possessives_literal_and_close_quoted_strings() {
+        let plural = "Operators' settings change. Validate counts. Show configuration.";
+        assert_eq!(
+            generic_retrieval_queries(plural),
+            [
+                plural,
+                "Operators' settings change.",
+                "Validate counts.",
+                "Show configuration."
+            ]
+        );
+        let singular = "Operator's settings change. It works.";
+        assert_eq!(
+            generic_retrieval_queries(singular),
+            [singular, "Operator's settings change.", "It works."]
+        );
+        let quoted = "Keep 'inner! word' literal. Finish.";
+        assert_eq!(
+            generic_retrieval_queries(quoted),
+            [quoted, "Keep 'inner! word' literal.", "Finish."]
+        );
+    }
+
+    #[test]
+    fn sentence_views_do_not_split_matching_fenced_code_or_create_exact_selectors() {
+        let question = "Before.\n````text\nvalue.one? next!\n\n```\nvalue.two. next?\n````\nAfter.\n~~~text\nvalue.three! next?\n~~~\nEnd.";
+        let slices = literal_sentences(question);
+        assert_eq!(
+            slices,
+            [
+                "Before.",
+                "````text\nvalue.one? next!\n\n```\nvalue.two. next?\n````\nAfter.",
+                "~~~text\nvalue.three! next?\n~~~\nEnd.",
+            ]
+        );
+        assert!(slices.iter().all(|slice| question.contains(slice)));
+        assert!(
+            build_retrieval_seed_plan(question, &[])
+                .exact_selectors
+                .is_empty()
+        );
+    }
 
     #[test]
     fn generic_paragraph_views_keep_original_and_literal_unicode_text() {

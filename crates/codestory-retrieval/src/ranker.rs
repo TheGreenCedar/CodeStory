@@ -15,7 +15,7 @@ struct RrfLaneWeights {
 }
 
 const RRF_K: f32 = 20.0;
-pub const RANKING_POLICY_VERSION: &str = "weighted_rrf_v3_present_lanes_scaled";
+pub const RANKING_POLICY_VERSION: &str = "weighted_rrf_v4_present_lanes_scaled_broad_eligible";
 const FUSED_RRF_WEIGHT: f32 = 0.70;
 const GRAPH_SUPPORT_WEIGHT: f32 = 0.15;
 const TEXT_QUALITY_WEIGHT: f32 = 0.05;
@@ -78,10 +78,15 @@ pub(crate) fn retain_primary_candidates_for_query(
     features: &QueryFeatures,
     candidates: &mut Vec<CandidateHit>,
 ) {
-    let query_tokens = tokenize(&features.raw_query);
     for candidate in candidates.iter_mut() {
         candidate.file_role = Some(effective_file_role(candidate));
     }
+    // Broad views share one eligibility policy. Adding a source candidate must
+    // not delete an already retrieved identity because of its repository role.
+    if features.lexical_policy == crate::query_policy::LexicalAdmissionPolicy::BroadQuestionV1 {
+        return;
+    }
+    let query_tokens = tokenize(&features.raw_query);
     if candidates
         .iter()
         .all(|candidate| candidate.file_role.is_some_and(non_primary_search_role))
@@ -840,6 +845,105 @@ mod tests {
             ranked.first().map(|hit| hit.symbol_name.as_deref()),
             Some(Some("codestory::IndexManifest"))
         );
+    }
+
+    #[test]
+    fn broad_role_eligibility_is_monotone_when_primary_candidates_are_added() {
+        let strict = classify_query("explain value handling");
+        let mut broad = strict.clone();
+        broad.lexical_policy = crate::query_policy::LexicalAdmissionPolicy::BroadQuestionV1;
+        for source in [CandidateSource::Lexical, CandidateSource::Semantic] {
+            let non_primary = [
+                FileRole::Test,
+                FileRole::Benchmark,
+                FileRole::Generated,
+                FileRole::Vendor,
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, role)| {
+                let mut candidate = CandidateHit::with_source(
+                    format!("src/unit_{index}.rs"),
+                    Some(format!("operation_{index}")),
+                    0.8,
+                    source,
+                );
+                candidate.node_id = Some(index.to_string());
+                candidate.file_role = Some(role);
+                candidate
+            })
+            .collect::<Vec<_>>();
+            let mut isolated = non_primary.clone();
+            retain_primary_candidates_for_query(&broad, &mut isolated);
+            assert_eq!(isolated.len(), 4);
+            let mut mixed = non_primary.clone();
+            mixed.push(CandidateHit::with_source(
+                "src/primary.rs",
+                Some("primary".into()),
+                0.8,
+                source,
+            ));
+            retain_primary_candidates_for_query(&broad, &mut mixed);
+            assert_eq!(
+                mixed.len(),
+                5,
+                "broad eligibility cannot depend on other pool members"
+            );
+            for candidate in isolated {
+                assert!(
+                    mixed.iter().any(|row| row.node_id == candidate.node_id
+                        && row.file_role == candidate.file_role)
+                );
+            }
+            let mut legacy = non_primary;
+            legacy.push(CandidateHit::with_source(
+                "src/primary.rs",
+                Some("primary".into()),
+                0.8,
+                source,
+            ));
+            retain_primary_candidates_for_query(&strict, &mut legacy);
+            assert_eq!(
+                legacy.len(),
+                1,
+                "strict ordinary retrieval keeps its existing exclusion"
+            );
+            assert_eq!(legacy[0].file_path, "src/primary.rs");
+        }
+    }
+
+    #[test]
+    fn broad_eligibility_retains_effective_roles_without_changing_primary_scores() {
+        let strict = classify_query("explain value handling");
+        let mut broad = strict.clone();
+        broad.lexical_policy = crate::query_policy::LexicalAdmissionPolicy::BroadQuestionV1;
+        let mut nested = CandidateHit::with_source(
+            "src/value.rs",
+            Some("check_value".into()),
+            0.8,
+            CandidateSource::Lexical,
+        );
+        nested.file_role = Some(FileRole::Source);
+        nested.qualified_name = Some("crate::tests::check_value".into());
+        let mut eligible = vec![nested, CandidateHit::lexical_stub("src/primary.rs", 0.8)];
+        retain_primary_candidates_for_query(&broad, &mut eligible);
+        assert_eq!(eligible.len(), 2);
+        assert_eq!(eligible[0].file_role, Some(FileRole::Test));
+        let candidates = vec![
+            CandidateHit::lexical_stub("src/value.rs", 0.8),
+            CandidateHit::lexical_stub("src/primary.rs", 0.7),
+        ];
+        let strict_ranked = rank_candidates(&strict, candidates.clone());
+        let broad_ranked = rank_candidates(&broad, candidates);
+        assert_eq!(strict_ranked.len(), broad_ranked.len());
+        for (legacy, current) in strict_ranked.iter().zip(&broad_ranked) {
+            assert_eq!(legacy.file_path, current.file_path);
+            assert_eq!(legacy.score.to_bits(), current.score.to_bits());
+            assert_eq!(
+                current.rank_features.as_ref().unwrap().ranking_policy,
+                RANKING_POLICY_VERSION
+            );
+        }
     }
 
     #[test]

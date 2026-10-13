@@ -20,6 +20,60 @@ use crate::{
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+// This slot holds only the current measured floor refusal, never a progress
+// preview. The caller clears it before each projection, including failed ones.
+fn measured_packet_floor_refusal(
+    packet: &AgentPacketDto,
+    baseline: Option<&crate::evidence_projection_v3::PacketRepresentationBaselineV1>,
+    product: &crate::PacketEvidenceProductV3,
+) -> Option<crate::RepresentedPacketProductV3> {
+    let binding = baseline?;
+    if packet.packet_id != binding.packet.packet_id
+        || packet.support != binding.packet.support
+        || packet.disposition != binding.packet.disposition
+        || !binding.added_source_units.is_empty()
+        || !binding.resolved_gap_witnesses.is_empty()
+        || product.source_issuance_seal.is_some()
+    {
+        return None;
+    }
+    let codestory_contracts::packet_projection_v3::PacketProjectionV3Dto::BudgetExceeded {
+        maximum_bytes,
+        required_complete_bytes,
+        ..
+    } = &product.projection
+    else {
+        return None;
+    };
+    if *maximum_bytes != codestory_contracts::compilation::PUBLIC_PACKET_SERIALIZED_MAX_BYTES as u64
+        || required_complete_bytes <= maximum_bytes
+    {
+        return None;
+    }
+    Some(crate::RepresentedPacketProductV3 {
+        packet: packet.clone(),
+        product: product.clone(),
+    })
+}
+
+fn take_measured_packet_floor_refusal(
+    error: ApiError,
+    measured: Option<crate::RepresentedPacketProductV3>,
+    cancelled: bool,
+) -> Result<crate::RepresentedPacketProductV3, ApiError> {
+    if error.code != crate::agent::packet_compiler::REQUESTED_PAGE_CAPACITY_REFUSAL {
+        return Err(error);
+    }
+    if cancelled {
+        return Err(ApiError::new(
+            "cancelled",
+            "request cancelled before packet capacity refusal",
+        ));
+    }
+    // Exhaustion alone does not establish a measured public capacity refusal.
+    measured.ok_or_else(|| ApiError::internal(error.message))
+}
+
 /// The facade runs inside whatever public operation the transport already
 /// opened. Minting a fresh flag here replaced the caller's live cancellation
 /// with a permanently-false one, so a host that cancelled mid-tool-body was
@@ -273,6 +327,7 @@ impl ReadOnlyBrowserService {
         let mut full_product = None;
         let mut accepted_product = None;
         let mut baseline_product: Option<(AgentPacketDto, crate::PacketEvidenceProductV3)> = None;
+        let mut measured_floor_refusal = None;
         let mut issued_record: Option<
             Option<crate::agent::packet_served_sources::ServedSourceRecord>,
         > = None;
@@ -280,6 +335,8 @@ impl ReadOnlyBrowserService {
                                   baseline: Option<
             &crate::evidence_projection_v3::PacketRepresentationBaselineV1,
         >| {
+            // A later refused or failed preview cannot reuse an earlier capacity frame.
+            measured_floor_refusal = None;
             let product = crate::project_packet_v3_with_identity(
                 &self.public_operation,
                 caller_id,
@@ -295,6 +352,7 @@ impl ReadOnlyBrowserService {
                     &req,
                 )?);
             }
+            measured_floor_refusal = measured_packet_floor_refusal(packet, baseline, &product);
             if issued_record
                 .as_ref()
                 .and_then(|r| r.as_ref())
@@ -372,7 +430,28 @@ impl ReadOnlyBrowserService {
                 &mut measure_packet,
             )
         }) {
-            Some(result) => result?,
+            Some(Ok(packet)) => packet,
+            Some(Err(error)) => {
+                let mut refused = take_measured_packet_floor_refusal(
+                    error,
+                    measured_floor_refusal,
+                    inherited_cancellation().load(std::sync::atomic::Ordering::Acquire),
+                )?;
+                // The outer public operation still owns source/publication revalidation.
+                // Refusal cannot escape a changed or missing pinned packet owner.
+                self.public_operation
+                    .active_packet_representation_context_v3()
+                    .ok_or_else(|| {
+                        ApiError::new(
+                            "publication_changed",
+                            "packet owner changed before capacity refusal",
+                        )
+                    })?;
+                if let Some(Some(record)) = issued_record {
+                    refused.product.protected_source_witnesses = record.witnesses;
+                }
+                return Ok(refused);
+            }
             None => {
                 return Err(ApiError::internal(
                     "Representation selection requires the current pinned packet owner.",
@@ -1051,5 +1130,183 @@ mod source_response_budget_tests {
             && r.next_start_line == Some(1)
             && r.delivered_start_line.is_none()
             && r.source_range_sha256.is_none()));
+    }
+}
+
+#[cfg(test)]
+mod packet_capacity_refusal_tests {
+    use super::*;
+    use crate::evidence_projection_v3::{
+        PacketRepresentationBaselineV1, representation_budget_test_support as fixture,
+    };
+    use codestory_contracts::compilation::*;
+    use codestory_contracts::packet_projection_v3::PacketProjectionV3Dto;
+
+    fn floor() -> (AgentPacketRequestDto, AgentPacketDto) {
+        let request: AgentPacketRequestDto =
+            serde_json::from_value(serde_json::json!({"question":"Read source"})).unwrap();
+        let input = PacketCompilationInputV1 {
+            contract_version: PACKET_COMPILATION_CONTRACT_VERSION_V1,
+            publication: PacketCompilationPublicationV1 {
+                project_id: "project-1".into(),
+                core_generation_id: "core-generation-1".into(),
+                retrieval_generation: Some("retrieval-generation-1".into()),
+            },
+            admissions: vec![PacketAdmissionReceiptV1 {
+                packet_ordinal: 0,
+                stable_identity: "node:1".into(),
+                score_version: "test".into(),
+                reserved_source_bytes: 512,
+                origin: PacketAdmissionOriginV1::Retrieval,
+            }],
+            sources: vec![PacketHydratedSourceRangeV1 {
+                callable_body: None,
+                stable_identity: "node:1".into(),
+                path: "source.rs".into(),
+                symbol: Some("operation".into()),
+                start_line: 1,
+                end_line: 1,
+                source: "```text\n>1 | original();\n```".into(),
+                delivery: Some(PacketSourceDeliveryV1 {
+                    requested_range: PacketSourceRangeV1 {
+                        start_line: 1,
+                        end_line: 1,
+                    },
+                    source_sha256: "a".repeat(64),
+                    remaining_source_bytes: 0,
+                    next_start_line: None,
+                    blocked_line_rendered_bytes: None,
+                }),
+                parser_completeness: PacketParserCompletenessV1::Complete,
+            }],
+            relations: Vec::new(),
+            ambiguities: Vec::new(),
+            admission_gaps: Vec::new(),
+        };
+        (request.clone(), fixture::default_packet(input, &request).0)
+    }
+
+    fn baseline(packet: &AgentPacketDto) -> PacketRepresentationBaselineV1 {
+        PacketRepresentationBaselineV1 {
+            packet: packet.clone(),
+            resolved_gap_witnesses: Default::default(),
+            added_source_units: Vec::new(),
+        }
+    }
+
+    fn budget_product(
+        request: &AgentPacketRequestDto,
+        packet: &AgentPacketDto,
+    ) -> crate::PacketEvidenceProductV3 {
+        let projected = fixture::project_packet(request, packet, |projection| {
+            Ok(
+                if matches!(projection, PacketProjectionV3Dto::Complete { .. }) {
+                    16_385
+                } else {
+                    serde_json::to_vec(projection).unwrap().len()
+                },
+            )
+        })
+        .unwrap();
+        assert!(matches!(
+            projected.projection,
+            PacketProjectionV3Dto::BudgetExceeded { .. }
+        ));
+        projected
+    }
+
+    #[test]
+    fn measured_floor_budget_refusal_has_no_source_issuance() {
+        let (request, packet) = floor();
+        let product = budget_product(&request, &packet);
+        let measured =
+            measured_packet_floor_refusal(&packet, Some(&baseline(&packet)), &product).unwrap();
+        let returned = take_measured_packet_floor_refusal(
+            ApiError::new(
+                crate::agent::packet_compiler::REQUESTED_PAGE_CAPACITY_REFUSAL,
+                "capacity exhausted",
+            ),
+            Some(measured),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            returned.product, product,
+            "return the exact measured public refusal"
+        );
+        assert_eq!(
+            returned.packet.support, packet.support,
+            "private protected floor remains intact"
+        );
+        assert!(returned.product.source_issuance_seal.is_none());
+        let cache = tempfile::tempdir().unwrap();
+        let old_record = cache.path().join("original-served-record");
+        std::fs::write(&old_record, b"unchanged parent").unwrap();
+        let controller = AppController::new_with_owned_cache_root(cache.path());
+        crate::agent::packet_served_sources::commit(
+            &controller,
+            "codestory-cli",
+            &returned.product,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&old_record).unwrap(), b"unchanged parent");
+        assert_eq!(
+            std::fs::read_dir(cache.path()).unwrap().count(),
+            1,
+            "refusal creates no history"
+        );
+    }
+
+    #[test]
+    fn complete_source_loss_and_changed_floor_cannot_become_capacity_refusal() {
+        let (request, packet) = floor();
+        let binding = baseline(&packet);
+        let complete = fixture::project_packet(&request, &packet, |_| Ok(0)).unwrap();
+        assert!(measured_packet_floor_refusal(&packet, Some(&binding), &complete).is_none());
+        let product = budget_product(&request, &packet);
+        assert!(measured_packet_floor_refusal(&packet, None, &product).is_none());
+        let mut changed = packet.clone();
+        changed.support[0].snippet = Some("replaced source".into());
+        assert!(measured_packet_floor_refusal(&changed, Some(&binding), &product).is_none());
+        changed.support.clear();
+        assert!(measured_packet_floor_refusal(&changed, Some(&binding), &product).is_none());
+        let mut added = baseline(&packet);
+        added.added_source_units.push(packet.support[0].clone());
+        assert!(measured_packet_floor_refusal(&packet, Some(&added), &product).is_none());
+    }
+
+    #[test]
+    fn capacity_refusal_never_masks_other_errors_or_reuses_a_missing_preview() {
+        let (request, packet) = floor();
+        let product = budget_product(&request, &packet);
+        for code in [
+            "internal",
+            "cancelled",
+            "publication_changed",
+            "invalid_argument",
+        ] {
+            let error = ApiError::new(code, "original failure");
+            let measured =
+                measured_packet_floor_refusal(&packet, Some(&baseline(&packet)), &product);
+            assert_eq!(
+                take_measured_packet_floor_refusal(error.clone(), measured, false).unwrap_err(),
+                error
+            );
+        }
+        let capacity = ApiError::new(
+            crate::agent::packet_compiler::REQUESTED_PAGE_CAPACITY_REFUSAL,
+            "capacity exhausted",
+        );
+        assert_eq!(
+            take_measured_packet_floor_refusal(capacity.clone(), None, false).unwrap_err(),
+            ApiError::internal(capacity.message.clone())
+        );
+        let measured = measured_packet_floor_refusal(&packet, Some(&baseline(&packet)), &product);
+        assert_eq!(
+            take_measured_packet_floor_refusal(capacity, measured, true)
+                .unwrap_err()
+                .code,
+            "cancelled"
+        );
     }
 }

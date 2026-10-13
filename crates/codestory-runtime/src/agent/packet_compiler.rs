@@ -43,6 +43,9 @@ use std::fmt::Write as _;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+/// Only the exhausted requested-page fallback may signal a measured capacity refusal.
+pub(crate) const REQUESTED_PAGE_CAPACITY_REFUSAL: &str = "packet_output_budget_exceeded";
+
 const FILE_NAVIGATION_VERIFICATION_MAX_BYTES: usize = 1024 * 1024;
 const SOURCE_PAGE_FENCE_BYTES: usize = "```text\n".len() + "```".len();
 
@@ -505,7 +508,8 @@ impl PreparedPacketCompilationV1 {
             let fits = bounded_measure(&self, &floor, Some(&floor))?
                 .is_some_and(|bytes| bytes <= PUBLIC_PACKET_SERIALIZED_MAX_BYTES);
             if !fits {
-                return Err(codestory_contracts::api::ApiError::internal(
+                return Err(codestory_contracts::api::ApiError::new(
+                    REQUESTED_PAGE_CAPACITY_REFUSAL,
                     "No requested page fits without losing authenticated context.",
                 ));
             }
@@ -3950,6 +3954,128 @@ mod tests {
                 .count()
                 <= 7
         );
+    }
+
+    #[test]
+    fn exhausted_requested_page_preserves_the_measured_capacity_refusal() {
+        use crate::evidence_projection_v3::representation_budget_test_support as fixture;
+        use codestory_contracts::packet_projection_v3::PacketProjectionV3Dto;
+        let sources = (0..2)
+            .map(|id| {
+                let body = format!("fn operation_{id}() {{\n    process(value);\n}}\n");
+                let hash = format!("{:x}", Sha256::digest(body.as_bytes()));
+                let (source, end_line, delivery) = complete_node_page(
+                    &body,
+                    PacketSourceRangeV1 {
+                        start_line: 1,
+                        end_line: 3,
+                    },
+                    512,
+                    &hash,
+                )
+                .unwrap();
+                PacketHydratedSourceRangeV1 {
+                    callable_body: None,
+                    stable_identity: format!("node:{id}"),
+                    path: format!("source_{id}.rs"),
+                    symbol: Some(format!("operation_{id}")),
+                    start_line: 1,
+                    end_line,
+                    source,
+                    delivery: Some(delivery),
+                    parser_completeness: PacketParserCompletenessV1::Complete,
+                }
+            })
+            .collect::<Vec<_>>();
+        let old = sources[0].clone();
+        let input = PacketCompilationInputV1 {
+            contract_version: PACKET_COMPILATION_CONTRACT_VERSION_V1,
+            publication: PacketCompilationPublicationV1 {
+                project_id: "project-1".into(),
+                core_generation_id: "core-generation-1".into(),
+                retrieval_generation: Some("retrieval-generation-1".into()),
+            },
+            admissions: sources
+                .iter()
+                .enumerate()
+                .map(|(id, source)| PacketAdmissionReceiptV1 {
+                    packet_ordinal: id as u32,
+                    stable_identity: source.stable_identity.clone(),
+                    score_version: "capacity-control".into(),
+                    reserved_source_bytes: 512,
+                    origin: if id == 1 {
+                        PacketAdmissionOriginV1::ExactTypedSelector
+                    } else {
+                        PacketAdmissionOriginV1::Retrieval
+                    },
+                })
+                .collect(),
+            sources,
+            relations: Vec::new(),
+            ambiguities: Vec::new(),
+            admission_gaps: Vec::new(),
+        };
+        let request: AgentPacketRequestDto =
+            serde_json::from_value(serde_json::json!({"question":"Read repository evidence"}))
+                .unwrap();
+        let (base, _) = fixture::default_packet(input.clone(), &request);
+        let mut prepared = PreparedPacketCompilationV1::from_fixture_input(input);
+        prepared.requested_source_identities.insert("node:1".into());
+        prepared
+            .requested_source_minimum_ends
+            .insert("node:1".into(), 1);
+        prepared.issued_context_sources = Some(vec![old.clone()]);
+        let mut floor_fit = false;
+        let mut progress_refused = false;
+        let mut final_refusal = None;
+        let error = prepared.select_for_representation_with_baseline(|prepared, product, baseline| {
+            let mut packet = base.clone();
+            prepared.apply_proposal(&mut packet, Some(&request), product);
+            let progress = product.support.iter().any(|row| row.symbol_id.as_deref() == Some("1")
+                && row.kind == SupportUnitKindDto::SourceRange);
+            let terminal = !prepared.source_refusals.is_empty();
+            let unbounded = fixture::project_packet(&request, &packet, |_| Ok(0))?.projection;
+            let PacketProjectionV3Dto::Complete {
+                schema_version, identity, publication, retrieval, diagnostics, ..
+            } = unbounded else { panic!("unbounded fixture must retain complete evidence") };
+            let fallback = crate::evidence_projection_v3::packet_budget_exceeded_projection_v3_from_envelope(
+                schema_version, identity, publication, retrieval, diagnostics,
+                PUBLIC_PACKET_SERIALIZED_MAX_BYTES + 1,
+            );
+            let padding = if progress || terminal {
+                PUBLIC_PACKET_SERIALIZED_MAX_BYTES - serde_json::to_vec(&fallback).unwrap().len() - 1
+            } else { 0 };
+            let projected = fixture::project_packet(&request, &packet, |projection| {
+                Ok(serde_json::to_vec(projection).unwrap().len() + padding)
+            })?;
+            match projected.projection {
+                PacketProjectionV3Dto::Complete { .. } => {
+                    assert!(!progress && !terminal, "only the initial protected floor fits");
+                    floor_fit = true;
+                    Ok(Some(serde_json::to_vec(&projected.projection).unwrap().len()))
+                }
+                PacketProjectionV3Dto::BudgetExceeded {
+                    maximum_bytes, required_complete_bytes, ..
+                } => {
+                    assert!(required_complete_bytes > maximum_bytes);
+                    assert!(serde_json::to_vec(&projected.projection).unwrap().len() + padding
+                        <= PUBLIC_PACKET_SERIALIZED_MAX_BYTES);
+                    if terminal {
+                        assert!(baseline.is_some());
+                        assert_eq!(product.support, baseline.unwrap().support);
+                        assert!(product.support.iter().any(|row| row.snippet.as_deref() == Some(old.source.as_str())
+                            && row.source_delivery == old.delivery));
+                        final_refusal = Some(projected.projection);
+                    } else { progress_refused = true; }
+                    Ok(None)
+                }
+            }
+        }).err().expect("requested page must exhaust measured capacity");
+        assert!(
+            floor_fit && progress_refused && final_refusal.is_some(),
+            "exercise all three causal stages"
+        );
+        assert_eq!(error.code, REQUESTED_PAGE_CAPACITY_REFUSAL);
     }
 
     #[test]
