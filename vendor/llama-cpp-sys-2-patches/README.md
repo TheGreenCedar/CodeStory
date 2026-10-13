@@ -35,3 +35,8 @@ retains the existing native completion/device-placement changes; bootstrap does
 not add a runtime feature. Repository CI does not currently invoke this
 handoff bootstrap, so Cargo jobs may fail until the source packaging strategy
 is integrated. That integration and all product qualification remain WIP.
+
+The patch is immutable data. Unified-diff blank context lines contain a required
+space; the first container whitespace check flagged those lines. The scoped
+`.gitattributes` rule preserves them without weakening source-file checks or
+changing the patch hash.
