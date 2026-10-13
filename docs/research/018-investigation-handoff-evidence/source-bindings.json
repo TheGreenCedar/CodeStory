@@ -1,0 +1,1426 @@
+{
+  "historical_source_HEAD": "5e42cd99707025e17d577b7dcda8f32fb764cb8c",
+  "installed_v494_binary_SHA256": "66443951c3abfadcb660a66a851b112b86c523207b870392e9089e90005a8ddb",
+  "v493_serving_selected_source_bindings": [
+    {
+      "path": "CHANGELOG.md",
+      "SHA256": "6bb4ce7b96afee13321ed704d6aee52479ad93a47cb34f3c52747431335bd6d1",
+      "bytes": 98254
+    },
+    {
+      "path": "crates/codestory-cli/src/stdio_catalog.rs",
+      "SHA256": "3cb1ae1b860e1266581de13777304834319f0c071123f1c2f64ff57abbe8285d",
+      "bytes": 130597
+    },
+    {
+      "path": "crates/codestory-cli/src/stdio_root_symbols.rs",
+      "SHA256": "585bc19bedfbffe28900207afa8558d7d0c6554a4d80af32f8109e05557b3ee1",
+      "bytes": 6676
+    },
+    {
+      "path": "crates/codestory-cli/src/stdio_root_symbols_independent_tests.rs",
+      "SHA256": "c469aebd9313d8ec954aa383ab93d56aa66924cb4ecd0075977c643729f31943",
+      "bytes": 11718
+    },
+    {
+      "path": "crates/codestory-cli/src/stdio_root_symbols_integration_tests.rs",
+      "SHA256": "8d483384d75b1bae3ee940ffc4542ae433ff2db3e2d1d247b70687418584b61d",
+      "bytes": 3494
+    },
+    {
+      "path": "crates/codestory-cli/src/stdio_transport.rs",
+      "SHA256": "0677214dab40baa6ff3848e48812e319cf5c663751a94daa894e6654fafb91ba",
+      "bytes": 752771
+    },
+    {
+      "path": "crates/codestory-cli/tests/stdio_protocol_contracts.rs",
+      "SHA256": "8d34822fc41e1e734d2e41986757a5fa6f78b0016cb8c2785acdb6bc1faee959",
+      "bytes": 318747
+    },
+    {
+      "path": "crates/codestory-runtime/src/browser.rs",
+      "SHA256": "8a3b68c51cbee9b5400574029cb0aa94ecb0b9e452b8b1cf8ef70bf2a327f621",
+      "bytes": 40594
+    },
+    {
+      "path": "crates/codestory-runtime/src/controller_symbols.rs",
+      "SHA256": "ec97938fff2db7d6edcf84ef7a37b1ae8ab23f2bf556b1f09bd709c2b0c95bbb",
+      "bytes": 34218
+    },
+    {
+      "path": "crates/codestory-runtime/src/tests.rs",
+      "SHA256": "b5b379d1c60cf73ad997260e719f54171ad9d2f0d69426236156cf19da0b77fa",
+      "bytes": 552421
+    },
+    {
+      "path": "crates/codestory-runtime/src/tests/root_symbol_pages.rs",
+      "SHA256": "7b12152ec1ee01a5ae20d932694f9eedab3154c99bc03b02ccc0c420390cb222",
+      "bytes": 2359
+    },
+    {
+      "path": "docs/architecture/subsystems/cli.md",
+      "SHA256": "691293372a1e2e56356fa9df98cace2e07d8d1115fcb542aabf8fe40fe054fe8",
+      "bytes": 7650
+    },
+    {
+      "path": "plugins/codestory/generated-mcp-catalog.json",
+      "SHA256": "0ff22f027077daade2b8f1e5bad32cd3eff62709155d66c016e02c84ac9547b5",
+      "bytes": 1432673
+    },
+    {
+      "path": "plugins/codestory/tests/plugin-static.test.mjs",
+      "SHA256": "38eef9e646dccb3e31dbe559ce7a9147de292e9686652d0a23ee8dd2b40a495c",
+      "bytes": 389385
+    },
+    {
+      "path": ".cargo/config.toml",
+      "SHA256": "c839605c3dcad981369f53a2c11408059352e30e336b49ff0d72e831b2f97b12",
+      "bytes": 738
+    },
+    {
+      "path": "Cargo.lock",
+      "SHA256": "196166ffd3d7d1a3b8be0b55c4b5ec519b4b9091d2943413089057c13ba8833c",
+      "bytes": 142345
+    },
+    {
+      "path": "Cargo.toml",
+      "SHA256": "849d4da294eec637173b4f317668afec60d6fa258de329b74ac3edd60231d83b",
+      "bytes": 3493
+    },
+    {
+      "path": "crates/codestory-agent/src/evidence_compiler.rs",
+      "SHA256": "6ef639a23d2e92dc18ca72c1d8a7eaf16d4e8293971f6e6418b2f34e5331f091",
+      "bytes": 171468
+    },
+    {
+      "path": "crates/codestory-agent/src/packet_plan.rs",
+      "SHA256": "d54318812c66906538219086c5b05389ab0ef2ed681ea6f91d5e8b165c25d107",
+      "bytes": 16805
+    },
+    {
+      "path": "crates/codestory-agent/tests/repository_evidence_metamorphic.rs",
+      "SHA256": "572663061f53d755f4370645d067d4e038692a2964b5fdf2624272d8aa7cc6af",
+      "bytes": 16432
+    },
+    {
+      "path": "crates/codestory-cli/Cargo.toml",
+      "SHA256": "e456b739cbe9d308021c079e30c714e90ecf0933383f3b9d68c95195209b4a66",
+      "bytes": 2985
+    },
+    {
+      "path": "crates/codestory-cli/src/app/agent_context/packet.rs",
+      "SHA256": "3dffe22c461f7958bde7cd1e56e42d288561d9cbf816b9c4814891bbe6d59c7f",
+      "bytes": 41312
+    },
+    {
+      "path": "crates/codestory-cli/src/app/search_command.rs",
+      "SHA256": "88f7360c155cb647eac5a9da4c9193b2bc1fe721a0d48c89abb58efb2446fc16",
+      "bytes": 4998
+    },
+    {
+      "path": "crates/codestory-cli/src/app/source_commands/source_read.rs",
+      "SHA256": "de0ef9047c6f88ec5c06b6b13cd09bd3175a614f679ac7e22313dd5da31a8195",
+      "bytes": 5674
+    },
+    {
+      "path": "crates/codestory-cli/src/app/tests/drill.rs",
+      "SHA256": "db596cb29c13b8551127ee08481f80c07913032ddf4f66e86c10d3f5fdeea65a",
+      "bytes": 21631
+    },
+    {
+      "path": "crates/codestory-cli/src/app/tests/rendering/task_brief.rs",
+      "SHA256": "51db1fb4ca88e4d73ba58e0d943bb7b00f193df840cb8d29a9ceb5a74b0539bb",
+      "bytes": 5476
+    },
+    {
+      "path": "crates/codestory-cli/src/embedding_server_transport.rs",
+      "SHA256": "5fbbc37ee2359174447699ff0d7b546ccaea0ddbe53703570faadf39c77824d7",
+      "bytes": 230153
+    },
+    {
+      "path": "crates/codestory-cli/src/stdio_v3/catalog.rs",
+      "SHA256": "112fcae7d9e0503043d2c24a3efb54a7533ed92067c1c3505b016175503f9ed3",
+      "bytes": 47417
+    },
+    {
+      "path": "crates/codestory-contracts/src/api.rs",
+      "SHA256": "d10ff57f4fd1c5dcb865cf6deb39ea4948333232ccc6c94a39a31f6ff593d3ad",
+      "bytes": 7024
+    },
+    {
+      "path": "crates/codestory-contracts/src/api/dto.rs",
+      "SHA256": "d8786131a0f39c76d89c2c189fe4788b25ce00baac754fd95fcf4afa58b34697",
+      "bytes": 167029
+    },
+    {
+      "path": "crates/codestory-contracts/src/compilation.rs",
+      "SHA256": "c68d49278d56b31811f273c6b8a8deb4f0e8ed9f05f1ef042c8ffac0848e38d2",
+      "bytes": 17328
+    },
+    {
+      "path": "crates/codestory-contracts/src/packet_projection_v3.rs",
+      "SHA256": "19a49dacb8e7016758a35081d372e5219a7b90919f16960f77e3d62cceb5457d",
+      "bytes": 36231
+    },
+    {
+      "path": "crates/codestory-indexer/src/lib.rs",
+      "SHA256": "b955f3a767365a08658b07d52bb2ea199ebad7691b529d7d7ef315c4ef75a348",
+      "bytes": 635084
+    },
+    {
+      "path": "crates/codestory-indexer/src/projection.rs",
+      "SHA256": "978ae21d81b144072f1ef5a995c6c7c2c616d1d28e1f2a1caad980c400218089",
+      "bytes": 36155
+    },
+    {
+      "path": "crates/codestory-llama-sys/build.rs",
+      "SHA256": "21189f2e0efce4f05a9770c72391312989d780ce083308630fcbfa3205f42b20",
+      "bytes": 32407
+    },
+    {
+      "path": "crates/codestory-llama-sys/src/lib.rs",
+      "SHA256": "b9504349d5612c96d17622b8e950daa78205f03060f106e1efe5f090b91c0acc",
+      "bytes": 134853
+    },
+    {
+      "path": "crates/codestory-llama-sys/tests/native_completed_eval_mock.cpp",
+      "SHA256": "3c283e01584a11558405c9651d00f6767bd6eb1ce053f3e11c3fa6461f6e2f35",
+      "bytes": 11082
+    },
+    {
+      "path": "crates/codestory-retrieval/Cargo.toml",
+      "SHA256": "764b4e2de7fa3deb08e00122c69ed20509bf9b0f97d38a129887e21b28126cb1",
+      "bytes": 1407
+    },
+    {
+      "path": "crates/codestory-retrieval/src/cache.rs",
+      "SHA256": "8aaec53f6a2257c63d084fc8afb78428165413a10798f9c752e08109867306fb",
+      "bytes": 14014
+    },
+    {
+      "path": "crates/codestory-retrieval/src/cache_clean.rs",
+      "SHA256": "3ec112226cda64b464159715abfce53a931e18e262aeddb4a9d4a0d49a534b9c",
+      "bytes": 57413
+    },
+    {
+      "path": "crates/codestory-retrieval/src/cache_inventory.rs",
+      "SHA256": "d8734b712d210532254dbca31ba40358b4a3844b973c3e09394524b69f4edf7c",
+      "bytes": 42188
+    },
+    {
+      "path": "crates/codestory-retrieval/src/candidate.rs",
+      "SHA256": "caf74d8e9ca210b9cd48e37bf70e8edad60492c8e4e698e132bd057861e13110",
+      "bytes": 21050
+    },
+    {
+      "path": "crates/codestory-retrieval/src/config.rs",
+      "SHA256": "b58e955d827e1dc22bf74ccdc0330d6fbc4ce63b7e955e063ed4bac13b05a03c",
+      "bytes": 40499
+    },
+    {
+      "path": "crates/codestory-retrieval/src/embedded_vector.rs",
+      "SHA256": "3b20bb2cefbb70d0ef6e852a649b2173dffc1db18cad0c342da4f431fe39dad9",
+      "bytes": 214213
+    },
+    {
+      "path": "crates/codestory-retrieval/src/embedding_server_compat.rs",
+      "SHA256": "9fa4d1b0a82b8a761d78f9cb66ec4fcd777bfa905ead18e9bc8c84c4fc022c6f",
+      "bytes": 8897
+    },
+    {
+      "path": "crates/codestory-retrieval/src/embeddings.rs",
+      "SHA256": "ea1268d8aa1bdf91666ade0c05d3c623b2fc5b2918abe2f3e68066d74a22a812",
+      "bytes": 33536
+    },
+    {
+      "path": "crates/codestory-retrieval/src/executor.rs",
+      "SHA256": "95a4436793a7af24458c17f8087ea4be912205d482010a537bf93600410ebf2b",
+      "bytes": 143348
+    },
+    {
+      "path": "crates/codestory-retrieval/src/generation.rs",
+      "SHA256": "80b120936b6a032646d98e5e2aa1a506f2b3215e1deb2323fa75d9a5186a9fb9",
+      "bytes": 18570
+    },
+    {
+      "path": "crates/codestory-retrieval/src/health.rs",
+      "SHA256": "537f2a474609b162de2c92a42793e8ca4515009140a68a804dd4cecff1fb711c",
+      "bytes": 52635
+    },
+    {
+      "path": "crates/codestory-retrieval/src/index.rs",
+      "SHA256": "5bc3da8e2394bce1a117809a7b7d856676c0c479f7a2a350d65e3ed2f270551b",
+      "bytes": 354967
+    },
+    {
+      "path": "crates/codestory-retrieval/src/inventory.rs",
+      "SHA256": "610e2a864a90b4c389a1ff6ea18493c10b7e4e86443b2f162008bee07c8078ae",
+      "bytes": 15362
+    },
+    {
+      "path": "crates/codestory-retrieval/src/lexical_client.rs",
+      "SHA256": "bb2a44562d766b9b9e3a202866665c0d26efcf2c4164f9fddd42cf1a83c5e7c2",
+      "bytes": 9864
+    },
+    {
+      "path": "crates/codestory-retrieval/src/lexical_index.rs",
+      "SHA256": "edbb112e2b9b43276e16308beb0261f8354d225ba297caac0ba35830af60b845",
+      "bytes": 377128
+    },
+    {
+      "path": "crates/codestory-retrieval/src/lib.rs",
+      "SHA256": "6d288db649980df7004ba517cee562cf1b63599a27cb39376775d42f63750375",
+      "bytes": 17074
+    },
+    {
+      "path": "crates/codestory-retrieval/src/per_user_embedding/protocol.rs",
+      "SHA256": "91b3332e3d4c11137be4cad084148033816e9afbd6c43c45a2e56667dca235ba",
+      "bytes": 17930
+    },
+    {
+      "path": "crates/codestory-retrieval/src/per_user_embedding/server/operation.rs",
+      "SHA256": "eb11afae978241d7437de00e8dc6ff2a9e662de5aabe111e89f2ee93eb47ee1b",
+      "bytes": 17851
+    },
+    {
+      "path": "crates/codestory-retrieval/src/per_user_embedding/server/response.rs",
+      "SHA256": "1fa33994e250e6a2e626547a47ad5dcf1d7f506e4d9ecc30498ddf0cf1517b5a",
+      "bytes": 13415
+    },
+    {
+      "path": "crates/codestory-retrieval/src/per_user_embedding/tests/identities.rs",
+      "SHA256": "2e393c3e66e1b1e48fbf0bb7518349e2e14e4ddf689dd7a8448dae1c73e66831",
+      "bytes": 11243
+    },
+    {
+      "path": "crates/codestory-retrieval/src/publication_scope.rs",
+      "SHA256": "139a0033c7bfeb1cff0e298d869675e30861c695a9f256c9bd5eed9a199f8138",
+      "bytes": 22997
+    },
+    {
+      "path": "crates/codestory-retrieval/src/query.rs",
+      "SHA256": "9ccf8a1ce2e5dbafc08669c2038e843653511515dc6f26a8a88e7d30ab50254d",
+      "bytes": 137545
+    },
+    {
+      "path": "crates/codestory-retrieval/src/ranker.rs",
+      "SHA256": "c0f1310d7eb8cd2aed247be19da3e88424312f80a5a931fe84a5b17aba1c355b",
+      "bytes": 48102
+    },
+    {
+      "path": "crates/codestory-retrieval/src/retention.rs",
+      "SHA256": "a944765b78a225455efb291fccc6d2be677473dbd92d03536cb3f0ad4e0c483e",
+      "bytes": 123768
+    },
+    {
+      "path": "crates/codestory-retrieval/src/rollback.rs",
+      "SHA256": "057ea9f91750f9218cc97eb587c15d104183ee3a17ab64292ac79c25e97ca18b",
+      "bytes": 30884
+    },
+    {
+      "path": "crates/codestory-retrieval/src/scip_client.rs",
+      "SHA256": "c225e7037e8035b237a76994d279467660e27e7629f5983892269fcfbe377dfa",
+      "bytes": 67776
+    },
+    {
+      "path": "crates/codestory-retrieval/src/sidecar.rs",
+      "SHA256": "079093a184772d1f7bf66ba0c278407c5f39e0d29ec6c7a7048004916b944fdf",
+      "bytes": 34616
+    },
+    {
+      "path": "crates/codestory-retrieval/src/sidecar_search.rs",
+      "SHA256": "cc21536364dcce9763a4d1726cd3bdd851100b6126ae8a680364a03d6443d4f4",
+      "bytes": 26718
+    },
+    {
+      "path": "crates/codestory-retrieval/src/test_support.rs",
+      "SHA256": "a0d86697614eeeaab34c27b0ce8ccc7026d441250cfb96aaf66eb85d89b582c4",
+      "bytes": 24724
+    },
+    {
+      "path": "crates/codestory-runtime/Cargo.toml",
+      "SHA256": "ab69136a8dc6a3197f7f9f1ddd1683620d11cd8b88ac392c525c10dd82b8d584",
+      "bytes": 1641
+    },
+    {
+      "path": "crates/codestory-runtime/src/activation_retrieval.rs",
+      "SHA256": "5d1409e55afefb355d73cf2a7513636a689c892565402874cb6498b770767ee6",
+      "bytes": 47915
+    },
+    {
+      "path": "crates/codestory-runtime/src/agent/mod.rs",
+      "SHA256": "033d0cf45281409dad0d1b4d32a3000b0784a773a02584899a0b729c83ad95de",
+      "bytes": 4273
+    },
+    {
+      "path": "crates/codestory-runtime/src/agent/orchestrator.rs",
+      "SHA256": "0a1710ba76a41acb588a0de0728f9d62f6ca2c7836a4a5f1982ac886dd5e3c67",
+      "bytes": 85102
+    },
+    {
+      "path": "crates/codestory-runtime/src/agent/packet_batch.rs",
+      "SHA256": "b0f7551d8ff16b84a0dee95d49c392ac563c4eb1b549818ec233cf6e7a88dd78",
+      "bytes": 74801
+    },
+    {
+      "path": "crates/codestory-runtime/src/agent/packet_budget.rs",
+      "SHA256": "c9f23a3cf9195b8052339db24d4a651864ac4d535ba81d5bcbbc0fa34fc184cf",
+      "bytes": 46516
+    },
+    {
+      "path": "crates/codestory-runtime/src/agent/packet_candidate.rs",
+      "SHA256": "e8b18e4607c11e4e75c125a138061f03c0ca24d13acea38148ebdac5459a2847",
+      "bytes": 71301
+    },
+    {
+      "path": "crates/codestory-runtime/src/agent/packet_compiler.rs",
+      "SHA256": "7f2ab39bde33b71aaccb57f544f6cc2859c519520a76c6327b06b2d061c6b096",
+      "bytes": 369663
+    },
+    {
+      "path": "crates/codestory-runtime/src/agent/packet_execution_record_v3.rs",
+      "SHA256": "6f5c5b29f17992b921b22f4ee8ab940cd68996151224c4d2d6cd5e0b898d09e0",
+      "bytes": 84173
+    },
+    {
+      "path": "crates/codestory-runtime/src/agent/packet_probe.rs",
+      "SHA256": "6de00a2fab25de7f8178ebd7cfbf4dad3a754be6c4cd155c8ce6c9b923dde8d9",
+      "bytes": 41468
+    },
+    {
+      "path": "crates/codestory-runtime/src/agent/packet_projection_v3.rs",
+      "SHA256": "3681e79c0088a08b8266008b52e21e10606dd1f15603986d3efa57dd49f43a07",
+      "bytes": 90044
+    },
+    {
+      "path": "crates/codestory-runtime/src/agent/packet_replay.rs",
+      "SHA256": "e14a0084b159b3d375e4e2a37cb9bebaeab67acd9058942179bac29f1f13facd",
+      "bytes": 22693
+    },
+    {
+      "path": "crates/codestory-runtime/src/agent/packet_served_sources.rs",
+      "SHA256": "7a9292994bdbe9d796912d787ad6f03819ee98ccc6f6ce7fb07cc58a0bd2b820",
+      "bytes": 47550
+    },
+    {
+      "path": "crates/codestory-runtime/src/agent/retrieval_primary.rs",
+      "SHA256": "ed5003348668abff77bfd43bd39ddedeecae62397ef3f2b368e01a5b4495f0c9",
+      "bytes": 353112
+    },
+    {
+      "path": "crates/codestory-runtime/src/cache_rehydrate.rs",
+      "SHA256": "c4ac305fdf6d8bfd401afc8408873e7522e909b299df376641b19b19dce68e78",
+      "bytes": 103560
+    },
+    {
+      "path": "crates/codestory-runtime/src/controller_core.rs",
+      "SHA256": "130782544ef1153332f39a421d2522ac94c4df0f7aa75b85d2cd748433638185",
+      "bytes": 23958
+    },
+    {
+      "path": "crates/codestory-runtime/src/evidence_projection_v3.rs",
+      "SHA256": "e4176999a4ead0898b72937b914080f2be4d8396ab0bfbe650363cc74007f812",
+      "bytes": 212501
+    },
+    {
+      "path": "crates/codestory-runtime/src/grounding.rs",
+      "SHA256": "4ed2d0b344aab4a9206dc34b8dfcd013d8c605b1b0eae8cd86ac819c1fe54aa3",
+      "bytes": 223312
+    },
+    {
+      "path": "crates/codestory-runtime/src/index_full.rs",
+      "SHA256": "565145d6ffcb1433ddec64148bf807c46a737140baacbf06edd7737a24e43252",
+      "bytes": 48758
+    },
+    {
+      "path": "crates/codestory-runtime/src/index_incremental.rs",
+      "SHA256": "27496fe173a56fd9d758f7ccbfed6ab6c957b97181cc302ca05df7b76ae2f7a5",
+      "bytes": 70171
+    },
+    {
+      "path": "crates/codestory-runtime/src/lib.rs",
+      "SHA256": "687c3a207ea93fbe44bc24d061e52f8091cbc3a61fe1ac9cdedd791edab1646d",
+      "bytes": 34873
+    },
+    {
+      "path": "crates/codestory-runtime/src/search_plan.rs",
+      "SHA256": "1a56ec3373ec7ce2a8a2da62c09af82399db072713bd1c06e25db70662804f85",
+      "bytes": 82486
+    },
+    {
+      "path": "crates/codestory-runtime/src/search_scoring.rs",
+      "SHA256": "517c5eb30eacaab7bd07e5e0e9082ae6cce0c04d135a66545c749e13d2bc17c9",
+      "bytes": 11753
+    },
+    {
+      "path": "crates/codestory-runtime/src/semantic_projection.rs",
+      "SHA256": "31fd829ada4f727319af14ae956fb37bcc61af5d5847a3d541636682ee544a33",
+      "bytes": 181655
+    },
+    {
+      "path": "crates/codestory-runtime/src/semantic_republish.rs",
+      "SHA256": "fad65ee1ce432edf1da6760fee8b65050cf00e44eaa23bd9183c2faf45e9956c",
+      "bytes": 21232
+    },
+    {
+      "path": "crates/codestory-runtime/src/services.rs",
+      "SHA256": "6b3701a81c157b8627c7e287df947f57d95be0945ddc20a87685bf09c3dbfefc",
+      "bytes": 438796
+    },
+    {
+      "path": "crates/codestory-runtime/src/snippets.rs",
+      "SHA256": "3deea90d49d63a17cf4e3ef5f7225c48d9b2a903bd8615ac083fdc8c4ec31fd4",
+      "bytes": 20976
+    },
+    {
+      "path": "crates/codestory-runtime/src/target_resolution.rs",
+      "SHA256": "87ca83b1e0d3c50efd66e2fc1c023510178cba81933387ba8baf1f0897dff13c",
+      "bytes": 57903
+    },
+    {
+      "path": "crates/codestory-runtime/src/tests/search_scoring.rs",
+      "SHA256": "032e2b48850c7978a581b11c13554c208c1270159d3834dd04d8e9989c7733ea",
+      "bytes": 120256
+    },
+    {
+      "path": "crates/codestory-store/Cargo.toml",
+      "SHA256": "d59e4fe1ecd88996eff9dc69d49e9e3032c0b092122382c5ec86a99ee923517c",
+      "bytes": 657
+    },
+    {
+      "path": "crates/codestory-store/src/lib.rs",
+      "SHA256": "b635fff5b26b3c8fdfa26f7bc3abb55ecddd8ae86cdf51684e5d22e21788d7b0",
+      "bytes": 5950
+    },
+    {
+      "path": "crates/codestory-store/src/storage_impl/mod.rs",
+      "SHA256": "49fafb69e015b4c0739e88af23b101ce51af4e5db59cf9249afce73d8270aae6",
+      "bytes": 607742
+    },
+    {
+      "path": "crates/codestory-store/src/storage_impl/retrieval_manifest.rs",
+      "SHA256": "d4567c7616146084deb0a00040ce8fca88adaca9db1b584e2a1b0de53b224bdc",
+      "bytes": 61638
+    },
+    {
+      "path": "crates/codestory-store/src/storage_impl/tests/mod.rs",
+      "SHA256": "d0f17592b8e69c5478ade3f11907720909752ea83b60feb46809409d68e428d2",
+      "bytes": 557284
+    },
+    {
+      "path": "crates/codestory-store/src/storage_impl/trail.rs",
+      "SHA256": "5e86bd64a1846e5bf36dfd8bf7947030b11108a38d1c20f9ffe5037143785312",
+      "bytes": 19146
+    },
+    {
+      "path": "docs/architecture/packet-generalization.md",
+      "SHA256": "dfbe58117d6c54848882430e3e6255aa3a47027826f043ff0ec3ffb195a3bc94",
+      "bytes": 17767
+    },
+    {
+      "path": "docs/architecture/retrieval-design.md",
+      "SHA256": "90e188adede2bdd434b82173f16072a885b5208da5fe8270fa8c6846295f6a9a",
+      "bytes": 13987
+    },
+    {
+      "path": "docs/architecture/subsystems/agent.md",
+      "SHA256": "ea8ccca3057b8795f0c7a73f13a4c618fcdd8cbf2f380caea480d1a0db2d7a6b",
+      "bytes": 4446
+    },
+    {
+      "path": "docs/architecture/subsystems/runtime.md",
+      "SHA256": "8f68e52feffba7b553612df22886053c70fdb5bde57e3cadfe6412a9397661e5",
+      "bytes": 8881
+    },
+    {
+      "path": "docs/architecture/subsystems/store.md",
+      "SHA256": "11bc67e4e51a25b0860d0cd8be7a3aea7f95b949f4eb6ad2496ba032daedbc56",
+      "bytes": 17926
+    },
+    {
+      "path": "crates/codestory-cli/src/args.rs",
+      "SHA256": "64b7a67fd59531df2c510f0fb6b191445f32d5b4187b691b099c014ca2efe2c0",
+      "bytes": 129529
+    },
+    {
+      "path": "crates/codestory-cli/src/app/server.rs",
+      "SHA256": "bff2954ba9e0bc94cc5e2894e7cb022a262954cba69e190c1e6dbbf698b4c020",
+      "bytes": 4437
+    }
+  ],
+  "v495_selected_source_bindings": [
+    {
+      "path": "CHANGELOG.md",
+      "SHA256": "6bb4ce7b96afee13321ed704d6aee52479ad93a47cb34f3c52747431335bd6d1",
+      "bytes": 98254,
+      "prior_v493_SHA256": "6bb4ce7b96afee13321ed704d6aee52479ad93a47cb34f3c52747431335bd6d1",
+      "expected": "6bb4ce7b96afee13321ed704d6aee52479ad93a47cb34f3c52747431335bd6d1",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-cli/src/stdio_catalog.rs",
+      "SHA256": "3cb1ae1b860e1266581de13777304834319f0c071123f1c2f64ff57abbe8285d",
+      "bytes": 130597,
+      "prior_v493_SHA256": "3cb1ae1b860e1266581de13777304834319f0c071123f1c2f64ff57abbe8285d",
+      "expected": "3cb1ae1b860e1266581de13777304834319f0c071123f1c2f64ff57abbe8285d",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-cli/src/stdio_root_symbols.rs",
+      "SHA256": "585bc19bedfbffe28900207afa8558d7d0c6554a4d80af32f8109e05557b3ee1",
+      "bytes": 6676,
+      "prior_v493_SHA256": "585bc19bedfbffe28900207afa8558d7d0c6554a4d80af32f8109e05557b3ee1",
+      "expected": "585bc19bedfbffe28900207afa8558d7d0c6554a4d80af32f8109e05557b3ee1",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-cli/src/stdio_root_symbols_independent_tests.rs",
+      "SHA256": "c469aebd9313d8ec954aa383ab93d56aa66924cb4ecd0075977c643729f31943",
+      "bytes": 11718,
+      "prior_v493_SHA256": "c469aebd9313d8ec954aa383ab93d56aa66924cb4ecd0075977c643729f31943",
+      "expected": "c469aebd9313d8ec954aa383ab93d56aa66924cb4ecd0075977c643729f31943",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-cli/src/stdio_root_symbols_integration_tests.rs",
+      "SHA256": "8d483384d75b1bae3ee940ffc4542ae433ff2db3e2d1d247b70687418584b61d",
+      "bytes": 3494,
+      "prior_v493_SHA256": "8d483384d75b1bae3ee940ffc4542ae433ff2db3e2d1d247b70687418584b61d",
+      "expected": "8d483384d75b1bae3ee940ffc4542ae433ff2db3e2d1d247b70687418584b61d",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-cli/src/stdio_transport.rs",
+      "SHA256": "0677214dab40baa6ff3848e48812e319cf5c663751a94daa894e6654fafb91ba",
+      "bytes": 752771,
+      "prior_v493_SHA256": "0677214dab40baa6ff3848e48812e319cf5c663751a94daa894e6654fafb91ba",
+      "expected": "0677214dab40baa6ff3848e48812e319cf5c663751a94daa894e6654fafb91ba",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-cli/tests/stdio_protocol_contracts.rs",
+      "SHA256": "8d34822fc41e1e734d2e41986757a5fa6f78b0016cb8c2785acdb6bc1faee959",
+      "bytes": 318747,
+      "prior_v493_SHA256": "8d34822fc41e1e734d2e41986757a5fa6f78b0016cb8c2785acdb6bc1faee959",
+      "expected": "8d34822fc41e1e734d2e41986757a5fa6f78b0016cb8c2785acdb6bc1faee959",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-runtime/src/browser.rs",
+      "SHA256": "ab7928f8823296f7fbd6e3069bc4fcfce04b0f5605ff42c3f2bae6858744c73a",
+      "bytes": 50979,
+      "prior_v493_SHA256": "8a3b68c51cbee9b5400574029cb0aa94ecb0b9e452b8b1cf8ef70bf2a327f621",
+      "expected": "ab7928f8823296f7fbd6e3069bc4fcfce04b0f5605ff42c3f2bae6858744c73a",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-runtime/src/controller_symbols.rs",
+      "SHA256": "ec97938fff2db7d6edcf84ef7a37b1ae8ab23f2bf556b1f09bd709c2b0c95bbb",
+      "bytes": 34218,
+      "prior_v493_SHA256": "ec97938fff2db7d6edcf84ef7a37b1ae8ab23f2bf556b1f09bd709c2b0c95bbb",
+      "expected": "ec97938fff2db7d6edcf84ef7a37b1ae8ab23f2bf556b1f09bd709c2b0c95bbb",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-runtime/src/tests.rs",
+      "SHA256": "b5b379d1c60cf73ad997260e719f54171ad9d2f0d69426236156cf19da0b77fa",
+      "bytes": 552421,
+      "prior_v493_SHA256": "b5b379d1c60cf73ad997260e719f54171ad9d2f0d69426236156cf19da0b77fa",
+      "expected": "b5b379d1c60cf73ad997260e719f54171ad9d2f0d69426236156cf19da0b77fa",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-runtime/src/tests/root_symbol_pages.rs",
+      "SHA256": "7b12152ec1ee01a5ae20d932694f9eedab3154c99bc03b02ccc0c420390cb222",
+      "bytes": 2359,
+      "prior_v493_SHA256": "7b12152ec1ee01a5ae20d932694f9eedab3154c99bc03b02ccc0c420390cb222",
+      "expected": "7b12152ec1ee01a5ae20d932694f9eedab3154c99bc03b02ccc0c420390cb222",
+      "unexpected": false
+    },
+    {
+      "path": "docs/architecture/subsystems/cli.md",
+      "SHA256": "691293372a1e2e56356fa9df98cace2e07d8d1115fcb542aabf8fe40fe054fe8",
+      "bytes": 7650,
+      "prior_v493_SHA256": "691293372a1e2e56356fa9df98cace2e07d8d1115fcb542aabf8fe40fe054fe8",
+      "expected": "691293372a1e2e56356fa9df98cace2e07d8d1115fcb542aabf8fe40fe054fe8",
+      "unexpected": false
+    },
+    {
+      "path": "plugins/codestory/generated-mcp-catalog.json",
+      "SHA256": "0ff22f027077daade2b8f1e5bad32cd3eff62709155d66c016e02c84ac9547b5",
+      "bytes": 1432673,
+      "prior_v493_SHA256": "0ff22f027077daade2b8f1e5bad32cd3eff62709155d66c016e02c84ac9547b5",
+      "expected": "0ff22f027077daade2b8f1e5bad32cd3eff62709155d66c016e02c84ac9547b5",
+      "unexpected": false
+    },
+    {
+      "path": "plugins/codestory/tests/plugin-static.test.mjs",
+      "SHA256": "38eef9e646dccb3e31dbe559ce7a9147de292e9686652d0a23ee8dd2b40a495c",
+      "bytes": 389385,
+      "prior_v493_SHA256": "38eef9e646dccb3e31dbe559ce7a9147de292e9686652d0a23ee8dd2b40a495c",
+      "expected": "38eef9e646dccb3e31dbe559ce7a9147de292e9686652d0a23ee8dd2b40a495c",
+      "unexpected": false
+    },
+    {
+      "path": ".cargo/config.toml",
+      "SHA256": "c839605c3dcad981369f53a2c11408059352e30e336b49ff0d72e831b2f97b12",
+      "bytes": 738,
+      "prior_v493_SHA256": "c839605c3dcad981369f53a2c11408059352e30e336b49ff0d72e831b2f97b12",
+      "expected": "c839605c3dcad981369f53a2c11408059352e30e336b49ff0d72e831b2f97b12",
+      "unexpected": false
+    },
+    {
+      "path": "Cargo.lock",
+      "SHA256": "196166ffd3d7d1a3b8be0b55c4b5ec519b4b9091d2943413089057c13ba8833c",
+      "bytes": 142345,
+      "prior_v493_SHA256": "196166ffd3d7d1a3b8be0b55c4b5ec519b4b9091d2943413089057c13ba8833c",
+      "expected": "196166ffd3d7d1a3b8be0b55c4b5ec519b4b9091d2943413089057c13ba8833c",
+      "unexpected": false
+    },
+    {
+      "path": "Cargo.toml",
+      "SHA256": "849d4da294eec637173b4f317668afec60d6fa258de329b74ac3edd60231d83b",
+      "bytes": 3493,
+      "prior_v493_SHA256": "849d4da294eec637173b4f317668afec60d6fa258de329b74ac3edd60231d83b",
+      "expected": "849d4da294eec637173b4f317668afec60d6fa258de329b74ac3edd60231d83b",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-agent/src/evidence_compiler.rs",
+      "SHA256": "6ef639a23d2e92dc18ca72c1d8a7eaf16d4e8293971f6e6418b2f34e5331f091",
+      "bytes": 171468,
+      "prior_v493_SHA256": "6ef639a23d2e92dc18ca72c1d8a7eaf16d4e8293971f6e6418b2f34e5331f091",
+      "expected": "6ef639a23d2e92dc18ca72c1d8a7eaf16d4e8293971f6e6418b2f34e5331f091",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-agent/src/packet_plan.rs",
+      "SHA256": "898c4f43dfd7ac5018c033bd17a81a0b2fbd7c57a7782f34ead84b32bf225ea7",
+      "bytes": 26442,
+      "prior_v493_SHA256": "d54318812c66906538219086c5b05389ab0ef2ed681ea6f91d5e8b165c25d107",
+      "expected": "898c4f43dfd7ac5018c033bd17a81a0b2fbd7c57a7782f34ead84b32bf225ea7",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-agent/tests/repository_evidence_metamorphic.rs",
+      "SHA256": "572663061f53d755f4370645d067d4e038692a2964b5fdf2624272d8aa7cc6af",
+      "bytes": 16432,
+      "prior_v493_SHA256": "572663061f53d755f4370645d067d4e038692a2964b5fdf2624272d8aa7cc6af",
+      "expected": "572663061f53d755f4370645d067d4e038692a2964b5fdf2624272d8aa7cc6af",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-cli/Cargo.toml",
+      "SHA256": "e456b739cbe9d308021c079e30c714e90ecf0933383f3b9d68c95195209b4a66",
+      "bytes": 2985,
+      "prior_v493_SHA256": "e456b739cbe9d308021c079e30c714e90ecf0933383f3b9d68c95195209b4a66",
+      "expected": "e456b739cbe9d308021c079e30c714e90ecf0933383f3b9d68c95195209b4a66",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-cli/src/app/agent_context/packet.rs",
+      "SHA256": "3dffe22c461f7958bde7cd1e56e42d288561d9cbf816b9c4814891bbe6d59c7f",
+      "bytes": 41312,
+      "prior_v493_SHA256": "3dffe22c461f7958bde7cd1e56e42d288561d9cbf816b9c4814891bbe6d59c7f",
+      "expected": "3dffe22c461f7958bde7cd1e56e42d288561d9cbf816b9c4814891bbe6d59c7f",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-cli/src/app/search_command.rs",
+      "SHA256": "88f7360c155cb647eac5a9da4c9193b2bc1fe721a0d48c89abb58efb2446fc16",
+      "bytes": 4998,
+      "prior_v493_SHA256": "88f7360c155cb647eac5a9da4c9193b2bc1fe721a0d48c89abb58efb2446fc16",
+      "expected": "88f7360c155cb647eac5a9da4c9193b2bc1fe721a0d48c89abb58efb2446fc16",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-cli/src/app/source_commands/source_read.rs",
+      "SHA256": "de0ef9047c6f88ec5c06b6b13cd09bd3175a614f679ac7e22313dd5da31a8195",
+      "bytes": 5674,
+      "prior_v493_SHA256": "de0ef9047c6f88ec5c06b6b13cd09bd3175a614f679ac7e22313dd5da31a8195",
+      "expected": "de0ef9047c6f88ec5c06b6b13cd09bd3175a614f679ac7e22313dd5da31a8195",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-cli/src/app/tests/drill.rs",
+      "SHA256": "db596cb29c13b8551127ee08481f80c07913032ddf4f66e86c10d3f5fdeea65a",
+      "bytes": 21631,
+      "prior_v493_SHA256": "db596cb29c13b8551127ee08481f80c07913032ddf4f66e86c10d3f5fdeea65a",
+      "expected": "db596cb29c13b8551127ee08481f80c07913032ddf4f66e86c10d3f5fdeea65a",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-cli/src/app/tests/rendering/task_brief.rs",
+      "SHA256": "51db1fb4ca88e4d73ba58e0d943bb7b00f193df840cb8d29a9ceb5a74b0539bb",
+      "bytes": 5476,
+      "prior_v493_SHA256": "51db1fb4ca88e4d73ba58e0d943bb7b00f193df840cb8d29a9ceb5a74b0539bb",
+      "expected": "51db1fb4ca88e4d73ba58e0d943bb7b00f193df840cb8d29a9ceb5a74b0539bb",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-cli/src/embedding_server_transport.rs",
+      "SHA256": "5fbbc37ee2359174447699ff0d7b546ccaea0ddbe53703570faadf39c77824d7",
+      "bytes": 230153,
+      "prior_v493_SHA256": "5fbbc37ee2359174447699ff0d7b546ccaea0ddbe53703570faadf39c77824d7",
+      "expected": "5fbbc37ee2359174447699ff0d7b546ccaea0ddbe53703570faadf39c77824d7",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-cli/src/stdio_v3/catalog.rs",
+      "SHA256": "112fcae7d9e0503043d2c24a3efb54a7533ed92067c1c3505b016175503f9ed3",
+      "bytes": 47417,
+      "prior_v493_SHA256": "112fcae7d9e0503043d2c24a3efb54a7533ed92067c1c3505b016175503f9ed3",
+      "expected": "112fcae7d9e0503043d2c24a3efb54a7533ed92067c1c3505b016175503f9ed3",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-contracts/src/api.rs",
+      "SHA256": "d10ff57f4fd1c5dcb865cf6deb39ea4948333232ccc6c94a39a31f6ff593d3ad",
+      "bytes": 7024,
+      "prior_v493_SHA256": "d10ff57f4fd1c5dcb865cf6deb39ea4948333232ccc6c94a39a31f6ff593d3ad",
+      "expected": "d10ff57f4fd1c5dcb865cf6deb39ea4948333232ccc6c94a39a31f6ff593d3ad",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-contracts/src/api/dto.rs",
+      "SHA256": "d8786131a0f39c76d89c2c189fe4788b25ce00baac754fd95fcf4afa58b34697",
+      "bytes": 167029,
+      "prior_v493_SHA256": "d8786131a0f39c76d89c2c189fe4788b25ce00baac754fd95fcf4afa58b34697",
+      "expected": "d8786131a0f39c76d89c2c189fe4788b25ce00baac754fd95fcf4afa58b34697",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-contracts/src/compilation.rs",
+      "SHA256": "c68d49278d56b31811f273c6b8a8deb4f0e8ed9f05f1ef042c8ffac0848e38d2",
+      "bytes": 17328,
+      "prior_v493_SHA256": "c68d49278d56b31811f273c6b8a8deb4f0e8ed9f05f1ef042c8ffac0848e38d2",
+      "expected": "c68d49278d56b31811f273c6b8a8deb4f0e8ed9f05f1ef042c8ffac0848e38d2",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-contracts/src/packet_projection_v3.rs",
+      "SHA256": "19a49dacb8e7016758a35081d372e5219a7b90919f16960f77e3d62cceb5457d",
+      "bytes": 36231,
+      "prior_v493_SHA256": "19a49dacb8e7016758a35081d372e5219a7b90919f16960f77e3d62cceb5457d",
+      "expected": "19a49dacb8e7016758a35081d372e5219a7b90919f16960f77e3d62cceb5457d",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-indexer/src/lib.rs",
+      "SHA256": "b955f3a767365a08658b07d52bb2ea199ebad7691b529d7d7ef315c4ef75a348",
+      "bytes": 635084,
+      "prior_v493_SHA256": "b955f3a767365a08658b07d52bb2ea199ebad7691b529d7d7ef315c4ef75a348",
+      "expected": "b955f3a767365a08658b07d52bb2ea199ebad7691b529d7d7ef315c4ef75a348",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-indexer/src/projection.rs",
+      "SHA256": "978ae21d81b144072f1ef5a995c6c7c2c616d1d28e1f2a1caad980c400218089",
+      "bytes": 36155,
+      "prior_v493_SHA256": "978ae21d81b144072f1ef5a995c6c7c2c616d1d28e1f2a1caad980c400218089",
+      "expected": "978ae21d81b144072f1ef5a995c6c7c2c616d1d28e1f2a1caad980c400218089",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-llama-sys/build.rs",
+      "SHA256": "21189f2e0efce4f05a9770c72391312989d780ce083308630fcbfa3205f42b20",
+      "bytes": 32407,
+      "prior_v493_SHA256": "21189f2e0efce4f05a9770c72391312989d780ce083308630fcbfa3205f42b20",
+      "expected": "21189f2e0efce4f05a9770c72391312989d780ce083308630fcbfa3205f42b20",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-llama-sys/src/lib.rs",
+      "SHA256": "b9504349d5612c96d17622b8e950daa78205f03060f106e1efe5f090b91c0acc",
+      "bytes": 134853,
+      "prior_v493_SHA256": "b9504349d5612c96d17622b8e950daa78205f03060f106e1efe5f090b91c0acc",
+      "expected": "b9504349d5612c96d17622b8e950daa78205f03060f106e1efe5f090b91c0acc",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-llama-sys/tests/native_completed_eval_mock.cpp",
+      "SHA256": "3c283e01584a11558405c9651d00f6767bd6eb1ce053f3e11c3fa6461f6e2f35",
+      "bytes": 11082,
+      "prior_v493_SHA256": "3c283e01584a11558405c9651d00f6767bd6eb1ce053f3e11c3fa6461f6e2f35",
+      "expected": "3c283e01584a11558405c9651d00f6767bd6eb1ce053f3e11c3fa6461f6e2f35",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-retrieval/Cargo.toml",
+      "SHA256": "764b4e2de7fa3deb08e00122c69ed20509bf9b0f97d38a129887e21b28126cb1",
+      "bytes": 1407,
+      "prior_v493_SHA256": "764b4e2de7fa3deb08e00122c69ed20509bf9b0f97d38a129887e21b28126cb1",
+      "expected": "764b4e2de7fa3deb08e00122c69ed20509bf9b0f97d38a129887e21b28126cb1",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-retrieval/src/cache.rs",
+      "SHA256": "8aaec53f6a2257c63d084fc8afb78428165413a10798f9c752e08109867306fb",
+      "bytes": 14014,
+      "prior_v493_SHA256": "8aaec53f6a2257c63d084fc8afb78428165413a10798f9c752e08109867306fb",
+      "expected": "8aaec53f6a2257c63d084fc8afb78428165413a10798f9c752e08109867306fb",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-retrieval/src/cache_clean.rs",
+      "SHA256": "3ec112226cda64b464159715abfce53a931e18e262aeddb4a9d4a0d49a534b9c",
+      "bytes": 57413,
+      "prior_v493_SHA256": "3ec112226cda64b464159715abfce53a931e18e262aeddb4a9d4a0d49a534b9c",
+      "expected": "3ec112226cda64b464159715abfce53a931e18e262aeddb4a9d4a0d49a534b9c",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-retrieval/src/cache_inventory.rs",
+      "SHA256": "d8734b712d210532254dbca31ba40358b4a3844b973c3e09394524b69f4edf7c",
+      "bytes": 42188,
+      "prior_v493_SHA256": "d8734b712d210532254dbca31ba40358b4a3844b973c3e09394524b69f4edf7c",
+      "expected": "d8734b712d210532254dbca31ba40358b4a3844b973c3e09394524b69f4edf7c",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-retrieval/src/candidate.rs",
+      "SHA256": "caf74d8e9ca210b9cd48e37bf70e8edad60492c8e4e698e132bd057861e13110",
+      "bytes": 21050,
+      "prior_v493_SHA256": "caf74d8e9ca210b9cd48e37bf70e8edad60492c8e4e698e132bd057861e13110",
+      "expected": "caf74d8e9ca210b9cd48e37bf70e8edad60492c8e4e698e132bd057861e13110",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-retrieval/src/config.rs",
+      "SHA256": "b58e955d827e1dc22bf74ccdc0330d6fbc4ce63b7e955e063ed4bac13b05a03c",
+      "bytes": 40499,
+      "prior_v493_SHA256": "b58e955d827e1dc22bf74ccdc0330d6fbc4ce63b7e955e063ed4bac13b05a03c",
+      "expected": "b58e955d827e1dc22bf74ccdc0330d6fbc4ce63b7e955e063ed4bac13b05a03c",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-retrieval/src/embedded_vector.rs",
+      "SHA256": "3b20bb2cefbb70d0ef6e852a649b2173dffc1db18cad0c342da4f431fe39dad9",
+      "bytes": 214213,
+      "prior_v493_SHA256": "3b20bb2cefbb70d0ef6e852a649b2173dffc1db18cad0c342da4f431fe39dad9",
+      "expected": "3b20bb2cefbb70d0ef6e852a649b2173dffc1db18cad0c342da4f431fe39dad9",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-retrieval/src/embedding_server_compat.rs",
+      "SHA256": "9fa4d1b0a82b8a761d78f9cb66ec4fcd777bfa905ead18e9bc8c84c4fc022c6f",
+      "bytes": 8897,
+      "prior_v493_SHA256": "9fa4d1b0a82b8a761d78f9cb66ec4fcd777bfa905ead18e9bc8c84c4fc022c6f",
+      "expected": "9fa4d1b0a82b8a761d78f9cb66ec4fcd777bfa905ead18e9bc8c84c4fc022c6f",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-retrieval/src/embeddings.rs",
+      "SHA256": "ea1268d8aa1bdf91666ade0c05d3c623b2fc5b2918abe2f3e68066d74a22a812",
+      "bytes": 33536,
+      "prior_v493_SHA256": "ea1268d8aa1bdf91666ade0c05d3c623b2fc5b2918abe2f3e68066d74a22a812",
+      "expected": "ea1268d8aa1bdf91666ade0c05d3c623b2fc5b2918abe2f3e68066d74a22a812",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-retrieval/src/executor.rs",
+      "SHA256": "95a4436793a7af24458c17f8087ea4be912205d482010a537bf93600410ebf2b",
+      "bytes": 143348,
+      "prior_v493_SHA256": "95a4436793a7af24458c17f8087ea4be912205d482010a537bf93600410ebf2b",
+      "expected": "95a4436793a7af24458c17f8087ea4be912205d482010a537bf93600410ebf2b",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-retrieval/src/generation.rs",
+      "SHA256": "80b120936b6a032646d98e5e2aa1a506f2b3215e1deb2323fa75d9a5186a9fb9",
+      "bytes": 18570,
+      "prior_v493_SHA256": "80b120936b6a032646d98e5e2aa1a506f2b3215e1deb2323fa75d9a5186a9fb9",
+      "expected": "80b120936b6a032646d98e5e2aa1a506f2b3215e1deb2323fa75d9a5186a9fb9",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-retrieval/src/health.rs",
+      "SHA256": "537f2a474609b162de2c92a42793e8ca4515009140a68a804dd4cecff1fb711c",
+      "bytes": 52635,
+      "prior_v493_SHA256": "537f2a474609b162de2c92a42793e8ca4515009140a68a804dd4cecff1fb711c",
+      "expected": "537f2a474609b162de2c92a42793e8ca4515009140a68a804dd4cecff1fb711c",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-retrieval/src/index.rs",
+      "SHA256": "5bc3da8e2394bce1a117809a7b7d856676c0c479f7a2a350d65e3ed2f270551b",
+      "bytes": 354967,
+      "prior_v493_SHA256": "5bc3da8e2394bce1a117809a7b7d856676c0c479f7a2a350d65e3ed2f270551b",
+      "expected": "5bc3da8e2394bce1a117809a7b7d856676c0c479f7a2a350d65e3ed2f270551b",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-retrieval/src/inventory.rs",
+      "SHA256": "610e2a864a90b4c389a1ff6ea18493c10b7e4e86443b2f162008bee07c8078ae",
+      "bytes": 15362,
+      "prior_v493_SHA256": "610e2a864a90b4c389a1ff6ea18493c10b7e4e86443b2f162008bee07c8078ae",
+      "expected": "610e2a864a90b4c389a1ff6ea18493c10b7e4e86443b2f162008bee07c8078ae",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-retrieval/src/lexical_client.rs",
+      "SHA256": "bb2a44562d766b9b9e3a202866665c0d26efcf2c4164f9fddd42cf1a83c5e7c2",
+      "bytes": 9864,
+      "prior_v493_SHA256": "bb2a44562d766b9b9e3a202866665c0d26efcf2c4164f9fddd42cf1a83c5e7c2",
+      "expected": "bb2a44562d766b9b9e3a202866665c0d26efcf2c4164f9fddd42cf1a83c5e7c2",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-retrieval/src/lexical_index.rs",
+      "SHA256": "edbb112e2b9b43276e16308beb0261f8354d225ba297caac0ba35830af60b845",
+      "bytes": 377128,
+      "prior_v493_SHA256": "edbb112e2b9b43276e16308beb0261f8354d225ba297caac0ba35830af60b845",
+      "expected": "edbb112e2b9b43276e16308beb0261f8354d225ba297caac0ba35830af60b845",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-retrieval/src/lib.rs",
+      "SHA256": "6d288db649980df7004ba517cee562cf1b63599a27cb39376775d42f63750375",
+      "bytes": 17074,
+      "prior_v493_SHA256": "6d288db649980df7004ba517cee562cf1b63599a27cb39376775d42f63750375",
+      "expected": "6d288db649980df7004ba517cee562cf1b63599a27cb39376775d42f63750375",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-retrieval/src/per_user_embedding/protocol.rs",
+      "SHA256": "91b3332e3d4c11137be4cad084148033816e9afbd6c43c45a2e56667dca235ba",
+      "bytes": 17930,
+      "prior_v493_SHA256": "91b3332e3d4c11137be4cad084148033816e9afbd6c43c45a2e56667dca235ba",
+      "expected": "91b3332e3d4c11137be4cad084148033816e9afbd6c43c45a2e56667dca235ba",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-retrieval/src/per_user_embedding/server/operation.rs",
+      "SHA256": "eb11afae978241d7437de00e8dc6ff2a9e662de5aabe111e89f2ee93eb47ee1b",
+      "bytes": 17851,
+      "prior_v493_SHA256": "eb11afae978241d7437de00e8dc6ff2a9e662de5aabe111e89f2ee93eb47ee1b",
+      "expected": "eb11afae978241d7437de00e8dc6ff2a9e662de5aabe111e89f2ee93eb47ee1b",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-retrieval/src/per_user_embedding/server/response.rs",
+      "SHA256": "1fa33994e250e6a2e626547a47ad5dcf1d7f506e4d9ecc30498ddf0cf1517b5a",
+      "bytes": 13415,
+      "prior_v493_SHA256": "1fa33994e250e6a2e626547a47ad5dcf1d7f506e4d9ecc30498ddf0cf1517b5a",
+      "expected": "1fa33994e250e6a2e626547a47ad5dcf1d7f506e4d9ecc30498ddf0cf1517b5a",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-retrieval/src/per_user_embedding/tests/identities.rs",
+      "SHA256": "2e393c3e66e1b1e48fbf0bb7518349e2e14e4ddf689dd7a8448dae1c73e66831",
+      "bytes": 11243,
+      "prior_v493_SHA256": "2e393c3e66e1b1e48fbf0bb7518349e2e14e4ddf689dd7a8448dae1c73e66831",
+      "expected": "2e393c3e66e1b1e48fbf0bb7518349e2e14e4ddf689dd7a8448dae1c73e66831",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-retrieval/src/publication_scope.rs",
+      "SHA256": "139a0033c7bfeb1cff0e298d869675e30861c695a9f256c9bd5eed9a199f8138",
+      "bytes": 22997,
+      "prior_v493_SHA256": "139a0033c7bfeb1cff0e298d869675e30861c695a9f256c9bd5eed9a199f8138",
+      "expected": "139a0033c7bfeb1cff0e298d869675e30861c695a9f256c9bd5eed9a199f8138",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-retrieval/src/query.rs",
+      "SHA256": "9ccf8a1ce2e5dbafc08669c2038e843653511515dc6f26a8a88e7d30ab50254d",
+      "bytes": 137545,
+      "prior_v493_SHA256": "9ccf8a1ce2e5dbafc08669c2038e843653511515dc6f26a8a88e7d30ab50254d",
+      "expected": "9ccf8a1ce2e5dbafc08669c2038e843653511515dc6f26a8a88e7d30ab50254d",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-retrieval/src/ranker.rs",
+      "SHA256": "e2eb591dd9d73bc502f1bf45a9cfd2f5dafc3d5314ba926126ca4b074846eebd",
+      "bytes": 52479,
+      "prior_v493_SHA256": "c0f1310d7eb8cd2aed247be19da3e88424312f80a5a931fe84a5b17aba1c355b",
+      "expected": "e2eb591dd9d73bc502f1bf45a9cfd2f5dafc3d5314ba926126ca4b074846eebd",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-retrieval/src/retention.rs",
+      "SHA256": "a944765b78a225455efb291fccc6d2be677473dbd92d03536cb3f0ad4e0c483e",
+      "bytes": 123768,
+      "prior_v493_SHA256": "a944765b78a225455efb291fccc6d2be677473dbd92d03536cb3f0ad4e0c483e",
+      "expected": "a944765b78a225455efb291fccc6d2be677473dbd92d03536cb3f0ad4e0c483e",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-retrieval/src/rollback.rs",
+      "SHA256": "057ea9f91750f9218cc97eb587c15d104183ee3a17ab64292ac79c25e97ca18b",
+      "bytes": 30884,
+      "prior_v493_SHA256": "057ea9f91750f9218cc97eb587c15d104183ee3a17ab64292ac79c25e97ca18b",
+      "expected": "057ea9f91750f9218cc97eb587c15d104183ee3a17ab64292ac79c25e97ca18b",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-retrieval/src/scip_client.rs",
+      "SHA256": "c225e7037e8035b237a76994d279467660e27e7629f5983892269fcfbe377dfa",
+      "bytes": 67776,
+      "prior_v493_SHA256": "c225e7037e8035b237a76994d279467660e27e7629f5983892269fcfbe377dfa",
+      "expected": "c225e7037e8035b237a76994d279467660e27e7629f5983892269fcfbe377dfa",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-retrieval/src/sidecar.rs",
+      "SHA256": "079093a184772d1f7bf66ba0c278407c5f39e0d29ec6c7a7048004916b944fdf",
+      "bytes": 34616,
+      "prior_v493_SHA256": "079093a184772d1f7bf66ba0c278407c5f39e0d29ec6c7a7048004916b944fdf",
+      "expected": "079093a184772d1f7bf66ba0c278407c5f39e0d29ec6c7a7048004916b944fdf",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-retrieval/src/sidecar_search.rs",
+      "SHA256": "cc21536364dcce9763a4d1726cd3bdd851100b6126ae8a680364a03d6443d4f4",
+      "bytes": 26718,
+      "prior_v493_SHA256": "cc21536364dcce9763a4d1726cd3bdd851100b6126ae8a680364a03d6443d4f4",
+      "expected": "cc21536364dcce9763a4d1726cd3bdd851100b6126ae8a680364a03d6443d4f4",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-retrieval/src/test_support.rs",
+      "SHA256": "a0d86697614eeeaab34c27b0ce8ccc7026d441250cfb96aaf66eb85d89b582c4",
+      "bytes": 24724,
+      "prior_v493_SHA256": "a0d86697614eeeaab34c27b0ce8ccc7026d441250cfb96aaf66eb85d89b582c4",
+      "expected": "a0d86697614eeeaab34c27b0ce8ccc7026d441250cfb96aaf66eb85d89b582c4",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-runtime/Cargo.toml",
+      "SHA256": "ab69136a8dc6a3197f7f9f1ddd1683620d11cd8b88ac392c525c10dd82b8d584",
+      "bytes": 1641,
+      "prior_v493_SHA256": "ab69136a8dc6a3197f7f9f1ddd1683620d11cd8b88ac392c525c10dd82b8d584",
+      "expected": "ab69136a8dc6a3197f7f9f1ddd1683620d11cd8b88ac392c525c10dd82b8d584",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-runtime/src/activation_retrieval.rs",
+      "SHA256": "5d1409e55afefb355d73cf2a7513636a689c892565402874cb6498b770767ee6",
+      "bytes": 47915,
+      "prior_v493_SHA256": "5d1409e55afefb355d73cf2a7513636a689c892565402874cb6498b770767ee6",
+      "expected": "5d1409e55afefb355d73cf2a7513636a689c892565402874cb6498b770767ee6",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-runtime/src/agent/mod.rs",
+      "SHA256": "033d0cf45281409dad0d1b4d32a3000b0784a773a02584899a0b729c83ad95de",
+      "bytes": 4273,
+      "prior_v493_SHA256": "033d0cf45281409dad0d1b4d32a3000b0784a773a02584899a0b729c83ad95de",
+      "expected": "033d0cf45281409dad0d1b4d32a3000b0784a773a02584899a0b729c83ad95de",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-runtime/src/agent/orchestrator.rs",
+      "SHA256": "0a1710ba76a41acb588a0de0728f9d62f6ca2c7836a4a5f1982ac886dd5e3c67",
+      "bytes": 85102,
+      "prior_v493_SHA256": "0a1710ba76a41acb588a0de0728f9d62f6ca2c7836a4a5f1982ac886dd5e3c67",
+      "expected": "0a1710ba76a41acb588a0de0728f9d62f6ca2c7836a4a5f1982ac886dd5e3c67",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-runtime/src/agent/packet_batch.rs",
+      "SHA256": "b0f7551d8ff16b84a0dee95d49c392ac563c4eb1b549818ec233cf6e7a88dd78",
+      "bytes": 74801,
+      "prior_v493_SHA256": "b0f7551d8ff16b84a0dee95d49c392ac563c4eb1b549818ec233cf6e7a88dd78",
+      "expected": "b0f7551d8ff16b84a0dee95d49c392ac563c4eb1b549818ec233cf6e7a88dd78",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-runtime/src/agent/packet_budget.rs",
+      "SHA256": "c9f23a3cf9195b8052339db24d4a651864ac4d535ba81d5bcbbc0fa34fc184cf",
+      "bytes": 46516,
+      "prior_v493_SHA256": "c9f23a3cf9195b8052339db24d4a651864ac4d535ba81d5bcbbc0fa34fc184cf",
+      "expected": "c9f23a3cf9195b8052339db24d4a651864ac4d535ba81d5bcbbc0fa34fc184cf",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-runtime/src/agent/packet_candidate.rs",
+      "SHA256": "e8b18e4607c11e4e75c125a138061f03c0ca24d13acea38148ebdac5459a2847",
+      "bytes": 71301,
+      "prior_v493_SHA256": "e8b18e4607c11e4e75c125a138061f03c0ca24d13acea38148ebdac5459a2847",
+      "expected": "e8b18e4607c11e4e75c125a138061f03c0ca24d13acea38148ebdac5459a2847",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-runtime/src/agent/packet_compiler.rs",
+      "SHA256": "431df8c98931716a3e98398357c62be6322f93bf6cf9174c40715b55a63d6173",
+      "bytes": 376050,
+      "prior_v493_SHA256": "7f2ab39bde33b71aaccb57f544f6cc2859c519520a76c6327b06b2d061c6b096",
+      "expected": "431df8c98931716a3e98398357c62be6322f93bf6cf9174c40715b55a63d6173",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-runtime/src/agent/packet_execution_record_v3.rs",
+      "SHA256": "6f5c5b29f17992b921b22f4ee8ab940cd68996151224c4d2d6cd5e0b898d09e0",
+      "bytes": 84173,
+      "prior_v493_SHA256": "6f5c5b29f17992b921b22f4ee8ab940cd68996151224c4d2d6cd5e0b898d09e0",
+      "expected": "6f5c5b29f17992b921b22f4ee8ab940cd68996151224c4d2d6cd5e0b898d09e0",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-runtime/src/agent/packet_probe.rs",
+      "SHA256": "6de00a2fab25de7f8178ebd7cfbf4dad3a754be6c4cd155c8ce6c9b923dde8d9",
+      "bytes": 41468,
+      "prior_v493_SHA256": "6de00a2fab25de7f8178ebd7cfbf4dad3a754be6c4cd155c8ce6c9b923dde8d9",
+      "expected": "6de00a2fab25de7f8178ebd7cfbf4dad3a754be6c4cd155c8ce6c9b923dde8d9",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-runtime/src/agent/packet_projection_v3.rs",
+      "SHA256": "3681e79c0088a08b8266008b52e21e10606dd1f15603986d3efa57dd49f43a07",
+      "bytes": 90044,
+      "prior_v493_SHA256": "3681e79c0088a08b8266008b52e21e10606dd1f15603986d3efa57dd49f43a07",
+      "expected": "3681e79c0088a08b8266008b52e21e10606dd1f15603986d3efa57dd49f43a07",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-runtime/src/agent/packet_replay.rs",
+      "SHA256": "e14a0084b159b3d375e4e2a37cb9bebaeab67acd9058942179bac29f1f13facd",
+      "bytes": 22693,
+      "prior_v493_SHA256": "e14a0084b159b3d375e4e2a37cb9bebaeab67acd9058942179bac29f1f13facd",
+      "expected": "e14a0084b159b3d375e4e2a37cb9bebaeab67acd9058942179bac29f1f13facd",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-runtime/src/agent/packet_served_sources.rs",
+      "SHA256": "7a9292994bdbe9d796912d787ad6f03819ee98ccc6f6ce7fb07cc58a0bd2b820",
+      "bytes": 47550,
+      "prior_v493_SHA256": "7a9292994bdbe9d796912d787ad6f03819ee98ccc6f6ce7fb07cc58a0bd2b820",
+      "expected": "7a9292994bdbe9d796912d787ad6f03819ee98ccc6f6ce7fb07cc58a0bd2b820",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-runtime/src/agent/retrieval_primary.rs",
+      "SHA256": "ed5003348668abff77bfd43bd39ddedeecae62397ef3f2b368e01a5b4495f0c9",
+      "bytes": 353112,
+      "prior_v493_SHA256": "ed5003348668abff77bfd43bd39ddedeecae62397ef3f2b368e01a5b4495f0c9",
+      "expected": "ed5003348668abff77bfd43bd39ddedeecae62397ef3f2b368e01a5b4495f0c9",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-runtime/src/cache_rehydrate.rs",
+      "SHA256": "c4ac305fdf6d8bfd401afc8408873e7522e909b299df376641b19b19dce68e78",
+      "bytes": 103560,
+      "prior_v493_SHA256": "c4ac305fdf6d8bfd401afc8408873e7522e909b299df376641b19b19dce68e78",
+      "expected": "c4ac305fdf6d8bfd401afc8408873e7522e909b299df376641b19b19dce68e78",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-runtime/src/controller_core.rs",
+      "SHA256": "130782544ef1153332f39a421d2522ac94c4df0f7aa75b85d2cd748433638185",
+      "bytes": 23958,
+      "prior_v493_SHA256": "130782544ef1153332f39a421d2522ac94c4df0f7aa75b85d2cd748433638185",
+      "expected": "130782544ef1153332f39a421d2522ac94c4df0f7aa75b85d2cd748433638185",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-runtime/src/evidence_projection_v3.rs",
+      "SHA256": "e4176999a4ead0898b72937b914080f2be4d8396ab0bfbe650363cc74007f812",
+      "bytes": 212501,
+      "prior_v493_SHA256": "e4176999a4ead0898b72937b914080f2be4d8396ab0bfbe650363cc74007f812",
+      "expected": "e4176999a4ead0898b72937b914080f2be4d8396ab0bfbe650363cc74007f812",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-runtime/src/grounding.rs",
+      "SHA256": "4ed2d0b344aab4a9206dc34b8dfcd013d8c605b1b0eae8cd86ac819c1fe54aa3",
+      "bytes": 223312,
+      "prior_v493_SHA256": "4ed2d0b344aab4a9206dc34b8dfcd013d8c605b1b0eae8cd86ac819c1fe54aa3",
+      "expected": "4ed2d0b344aab4a9206dc34b8dfcd013d8c605b1b0eae8cd86ac819c1fe54aa3",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-runtime/src/index_full.rs",
+      "SHA256": "565145d6ffcb1433ddec64148bf807c46a737140baacbf06edd7737a24e43252",
+      "bytes": 48758,
+      "prior_v493_SHA256": "565145d6ffcb1433ddec64148bf807c46a737140baacbf06edd7737a24e43252",
+      "expected": "565145d6ffcb1433ddec64148bf807c46a737140baacbf06edd7737a24e43252",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-runtime/src/index_incremental.rs",
+      "SHA256": "27496fe173a56fd9d758f7ccbfed6ab6c957b97181cc302ca05df7b76ae2f7a5",
+      "bytes": 70171,
+      "prior_v493_SHA256": "27496fe173a56fd9d758f7ccbfed6ab6c957b97181cc302ca05df7b76ae2f7a5",
+      "expected": "27496fe173a56fd9d758f7ccbfed6ab6c957b97181cc302ca05df7b76ae2f7a5",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-runtime/src/lib.rs",
+      "SHA256": "687c3a207ea93fbe44bc24d061e52f8091cbc3a61fe1ac9cdedd791edab1646d",
+      "bytes": 34873,
+      "prior_v493_SHA256": "687c3a207ea93fbe44bc24d061e52f8091cbc3a61fe1ac9cdedd791edab1646d",
+      "expected": "687c3a207ea93fbe44bc24d061e52f8091cbc3a61fe1ac9cdedd791edab1646d",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-runtime/src/search_plan.rs",
+      "SHA256": "1a56ec3373ec7ce2a8a2da62c09af82399db072713bd1c06e25db70662804f85",
+      "bytes": 82486,
+      "prior_v493_SHA256": "1a56ec3373ec7ce2a8a2da62c09af82399db072713bd1c06e25db70662804f85",
+      "expected": "1a56ec3373ec7ce2a8a2da62c09af82399db072713bd1c06e25db70662804f85",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-runtime/src/search_scoring.rs",
+      "SHA256": "517c5eb30eacaab7bd07e5e0e9082ae6cce0c04d135a66545c749e13d2bc17c9",
+      "bytes": 11753,
+      "prior_v493_SHA256": "517c5eb30eacaab7bd07e5e0e9082ae6cce0c04d135a66545c749e13d2bc17c9",
+      "expected": "517c5eb30eacaab7bd07e5e0e9082ae6cce0c04d135a66545c749e13d2bc17c9",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-runtime/src/semantic_projection.rs",
+      "SHA256": "31fd829ada4f727319af14ae956fb37bcc61af5d5847a3d541636682ee544a33",
+      "bytes": 181655,
+      "prior_v493_SHA256": "31fd829ada4f727319af14ae956fb37bcc61af5d5847a3d541636682ee544a33",
+      "expected": "31fd829ada4f727319af14ae956fb37bcc61af5d5847a3d541636682ee544a33",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-runtime/src/semantic_republish.rs",
+      "SHA256": "fad65ee1ce432edf1da6760fee8b65050cf00e44eaa23bd9183c2faf45e9956c",
+      "bytes": 21232,
+      "prior_v493_SHA256": "fad65ee1ce432edf1da6760fee8b65050cf00e44eaa23bd9183c2faf45e9956c",
+      "expected": "fad65ee1ce432edf1da6760fee8b65050cf00e44eaa23bd9183c2faf45e9956c",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-runtime/src/services.rs",
+      "SHA256": "6b3701a81c157b8627c7e287df947f57d95be0945ddc20a87685bf09c3dbfefc",
+      "bytes": 438796,
+      "prior_v493_SHA256": "6b3701a81c157b8627c7e287df947f57d95be0945ddc20a87685bf09c3dbfefc",
+      "expected": "6b3701a81c157b8627c7e287df947f57d95be0945ddc20a87685bf09c3dbfefc",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-runtime/src/snippets.rs",
+      "SHA256": "3deea90d49d63a17cf4e3ef5f7225c48d9b2a903bd8615ac083fdc8c4ec31fd4",
+      "bytes": 20976,
+      "prior_v493_SHA256": "3deea90d49d63a17cf4e3ef5f7225c48d9b2a903bd8615ac083fdc8c4ec31fd4",
+      "expected": "3deea90d49d63a17cf4e3ef5f7225c48d9b2a903bd8615ac083fdc8c4ec31fd4",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-runtime/src/target_resolution.rs",
+      "SHA256": "87ca83b1e0d3c50efd66e2fc1c023510178cba81933387ba8baf1f0897dff13c",
+      "bytes": 57903,
+      "prior_v493_SHA256": "87ca83b1e0d3c50efd66e2fc1c023510178cba81933387ba8baf1f0897dff13c",
+      "expected": "87ca83b1e0d3c50efd66e2fc1c023510178cba81933387ba8baf1f0897dff13c",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-runtime/src/tests/search_scoring.rs",
+      "SHA256": "032e2b48850c7978a581b11c13554c208c1270159d3834dd04d8e9989c7733ea",
+      "bytes": 120256,
+      "prior_v493_SHA256": "032e2b48850c7978a581b11c13554c208c1270159d3834dd04d8e9989c7733ea",
+      "expected": "032e2b48850c7978a581b11c13554c208c1270159d3834dd04d8e9989c7733ea",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-store/Cargo.toml",
+      "SHA256": "d59e4fe1ecd88996eff9dc69d49e9e3032c0b092122382c5ec86a99ee923517c",
+      "bytes": 657,
+      "prior_v493_SHA256": "d59e4fe1ecd88996eff9dc69d49e9e3032c0b092122382c5ec86a99ee923517c",
+      "expected": "d59e4fe1ecd88996eff9dc69d49e9e3032c0b092122382c5ec86a99ee923517c",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-store/src/lib.rs",
+      "SHA256": "b635fff5b26b3c8fdfa26f7bc3abb55ecddd8ae86cdf51684e5d22e21788d7b0",
+      "bytes": 5950,
+      "prior_v493_SHA256": "b635fff5b26b3c8fdfa26f7bc3abb55ecddd8ae86cdf51684e5d22e21788d7b0",
+      "expected": "b635fff5b26b3c8fdfa26f7bc3abb55ecddd8ae86cdf51684e5d22e21788d7b0",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-store/src/storage_impl/mod.rs",
+      "SHA256": "49fafb69e015b4c0739e88af23b101ce51af4e5db59cf9249afce73d8270aae6",
+      "bytes": 607742,
+      "prior_v493_SHA256": "49fafb69e015b4c0739e88af23b101ce51af4e5db59cf9249afce73d8270aae6",
+      "expected": "49fafb69e015b4c0739e88af23b101ce51af4e5db59cf9249afce73d8270aae6",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-store/src/storage_impl/retrieval_manifest.rs",
+      "SHA256": "d4567c7616146084deb0a00040ce8fca88adaca9db1b584e2a1b0de53b224bdc",
+      "bytes": 61638,
+      "prior_v493_SHA256": "d4567c7616146084deb0a00040ce8fca88adaca9db1b584e2a1b0de53b224bdc",
+      "expected": "d4567c7616146084deb0a00040ce8fca88adaca9db1b584e2a1b0de53b224bdc",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-store/src/storage_impl/tests/mod.rs",
+      "SHA256": "d0f17592b8e69c5478ade3f11907720909752ea83b60feb46809409d68e428d2",
+      "bytes": 557284,
+      "prior_v493_SHA256": "d0f17592b8e69c5478ade3f11907720909752ea83b60feb46809409d68e428d2",
+      "expected": "d0f17592b8e69c5478ade3f11907720909752ea83b60feb46809409d68e428d2",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-store/src/storage_impl/trail.rs",
+      "SHA256": "5e86bd64a1846e5bf36dfd8bf7947030b11108a38d1c20f9ffe5037143785312",
+      "bytes": 19146,
+      "prior_v493_SHA256": "5e86bd64a1846e5bf36dfd8bf7947030b11108a38d1c20f9ffe5037143785312",
+      "expected": "5e86bd64a1846e5bf36dfd8bf7947030b11108a38d1c20f9ffe5037143785312",
+      "unexpected": false
+    },
+    {
+      "path": "docs/architecture/packet-generalization.md",
+      "SHA256": "dfbe58117d6c54848882430e3e6255aa3a47027826f043ff0ec3ffb195a3bc94",
+      "bytes": 17767,
+      "prior_v493_SHA256": "dfbe58117d6c54848882430e3e6255aa3a47027826f043ff0ec3ffb195a3bc94",
+      "expected": "dfbe58117d6c54848882430e3e6255aa3a47027826f043ff0ec3ffb195a3bc94",
+      "unexpected": false
+    },
+    {
+      "path": "docs/architecture/retrieval-design.md",
+      "SHA256": "90e188adede2bdd434b82173f16072a885b5208da5fe8270fa8c6846295f6a9a",
+      "bytes": 13987,
+      "prior_v493_SHA256": "90e188adede2bdd434b82173f16072a885b5208da5fe8270fa8c6846295f6a9a",
+      "expected": "90e188adede2bdd434b82173f16072a885b5208da5fe8270fa8c6846295f6a9a",
+      "unexpected": false
+    },
+    {
+      "path": "docs/architecture/subsystems/agent.md",
+      "SHA256": "ea8ccca3057b8795f0c7a73f13a4c618fcdd8cbf2f380caea480d1a0db2d7a6b",
+      "bytes": 4446,
+      "prior_v493_SHA256": "ea8ccca3057b8795f0c7a73f13a4c618fcdd8cbf2f380caea480d1a0db2d7a6b",
+      "expected": "ea8ccca3057b8795f0c7a73f13a4c618fcdd8cbf2f380caea480d1a0db2d7a6b",
+      "unexpected": false
+    },
+    {
+      "path": "docs/architecture/subsystems/runtime.md",
+      "SHA256": "8f68e52feffba7b553612df22886053c70fdb5bde57e3cadfe6412a9397661e5",
+      "bytes": 8881,
+      "prior_v493_SHA256": "8f68e52feffba7b553612df22886053c70fdb5bde57e3cadfe6412a9397661e5",
+      "expected": "8f68e52feffba7b553612df22886053c70fdb5bde57e3cadfe6412a9397661e5",
+      "unexpected": false
+    },
+    {
+      "path": "docs/architecture/subsystems/store.md",
+      "SHA256": "11bc67e4e51a25b0860d0cd8be7a3aea7f95b949f4eb6ad2496ba032daedbc56",
+      "bytes": 17926,
+      "prior_v493_SHA256": "11bc67e4e51a25b0860d0cd8be7a3aea7f95b949f4eb6ad2496ba032daedbc56",
+      "expected": "11bc67e4e51a25b0860d0cd8be7a3aea7f95b949f4eb6ad2496ba032daedbc56",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-cli/src/args.rs",
+      "SHA256": "64b7a67fd59531df2c510f0fb6b191445f32d5b4187b691b099c014ca2efe2c0",
+      "bytes": 129529,
+      "prior_v493_SHA256": "64b7a67fd59531df2c510f0fb6b191445f32d5b4187b691b099c014ca2efe2c0",
+      "expected": "64b7a67fd59531df2c510f0fb6b191445f32d5b4187b691b099c014ca2efe2c0",
+      "unexpected": false
+    },
+    {
+      "path": "crates/codestory-cli/src/app/server.rs",
+      "SHA256": "bff2954ba9e0bc94cc5e2894e7cb022a262954cba69e190c1e6dbbf698b4c020",
+      "bytes": 4437,
+      "prior_v493_SHA256": "bff2954ba9e0bc94cc5e2894e7cb022a262954cba69e190c1e6dbbf698b4c020",
+      "expected": "bff2954ba9e0bc94cc5e2894e7cb022a262954cba69e190c1e6dbbf698b4c020",
+      "unexpected": false
+    }
+  ],
+  "scope": "109 selected source/manifests; not a full-tree build attestation or exact reproducible-build proof"
+}

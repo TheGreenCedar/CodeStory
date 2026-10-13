@@ -1,0 +1,113 @@
+{
+  "_meta": {
+    "codestory_publication": {
+      "contract_runtime": {
+        "cli_sha256": null,
+        "cli_source": "direct_cli_launch",
+        "cli_version": "0.17.7",
+        "known_override_skew_channel": false,
+        "pinned_pair_matches": null,
+        "plugin_cli_version": null,
+        "plugin_version": null
+      },
+      "core_publication": {
+        "generation": 1,
+        "generation_id": "1731ee82-b30e-4c5f-8ced-9d87c6a809c5",
+        "mode": "full",
+        "published_at_epoch_ms": 1791502992064,
+        "run_id": "b5714e8a-1fa0-4acc-a69d-0d6d4baa390c"
+      },
+      "freshness": {
+        "served_generation": "1731ee82-b30e-4c5f-8ced-9d87c6a809c5",
+        "state": "fresh"
+      },
+      "minimum_compatible_schema_version": 3,
+      "operation": {
+        "attempt": 1,
+        "operation_id": "public-1"
+      },
+      "publication": {
+        "generation": 1,
+        "generation_id": "1731ee82-b30e-4c5f-8ced-9d87c6a809c5",
+        "mode": "full",
+        "published_at_epoch_ms": 1791502992064,
+        "run_id": "b5714e8a-1fa0-4acc-a69d-0d6d4baa390c"
+      },
+      "retrieval_publication": null,
+      "schema_version": 4,
+      "served_from": "complete_publication"
+    }
+  },
+  "resolution": {
+    "requested": "dayMatches",
+    "resolved": {
+      "display_name": "dayMatches",
+      "evidence_producer": "lexical_source",
+      "evidence_tier": "lexical_source",
+      "file_path": "spec.go",
+      "kind": "FUNCTION",
+      "line": 179,
+      "match_quality": "exact",
+      "node_id": "8089220873576269830",
+      "node_ref": "spec.go:179:dayMatches",
+      "origin": "indexed_symbol",
+      "primary_occurrence_kind": "definition",
+      "resolution_status": "resolved",
+      "resolvable": true,
+      "score": 270.0,
+      "score_breakdown": {
+        "graph": 0.0,
+        "lexical": 270.0,
+        "provenance": [
+          "lexical_source"
+        ],
+        "semantic": 0.0,
+        "total": 270.0
+      },
+      "symbol_role": "definition",
+      "verification_targets": [
+        {
+          "line": 179,
+          "node_ref": "spec.go:179:dayMatches",
+          "path": "spec.go",
+          "reason": "primary source occurrence selected for this symbol",
+          "role": "definition"
+        }
+      ]
+    },
+    "selector": "query"
+  },
+  "snippet": {
+    "line": 179,
+    "max_snippet_bytes": 65536,
+    "node": {
+      "canonical_id": "<CRON_ROOT>/spec.go:dayMatches#0",
+      "display_name": "dayMatches",
+      "end_col": 2,
+      "end_line": 188,
+      "file_path": "<CRON_ROOT>/spec.go",
+      "id": "8089220873576269830",
+      "kind": "FUNCTION",
+      "member_access": null,
+      "qualified_name": "dayMatches",
+      "serialized_name": "dayMatches",
+      "start_col": 1,
+      "start_line": 179
+    },
+    "path": "<CRON_ROOT>/spec.go",
+    "range_source": "indexed_symbol_range",
+    "requested_context": 0,
+    "scope": "function_body",
+    "snippet": "```text\n>  179 | func dayMatches(s *SpecSchedule, t time.Time) bool {\n   180 | \tvar (\n   181 | \t\tdomMatch bool = 1<<uint(t.Day())&s.Dom > 0\n   182 | \t\tdowMatch bool = 1<<uint(t.Weekday())&s.Dow > 0\n   183 | \t)\n   184 | \tif s.Dom&starBit > 0 || s.Dow&starBit > 0 {\n   185 | \t\treturn domMatch && dowMatch\n   186 | \t}\n   187 | \treturn domMatch || dowMatch\n   188 | }\n```",
+    "snippet_truncated": false
+  },
+  "verification_targets": [
+    {
+      "line": 179,
+      "node_ref": "spec.go:179:dayMatches",
+      "path": "spec.go",
+      "reason": "primary source occurrence selected for this symbol",
+      "role": "definition"
+    }
+  ]
+}
