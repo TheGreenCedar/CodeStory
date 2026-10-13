@@ -15,6 +15,8 @@
 - Packet JSON uses compact formatting when indentation would exceed its byte limit, preserving source evidence and publication metadata within the same limit.
 - Graph indexing no longer initializes optional embedding transport to report its result. Retrieval readiness remains unobserved until you request retrieval status or a full retrieval operation.
 - Symbol source excerpts retain complete lines and report unread bytes. A bounded follow-up advances to the next unread line in the same verified index.
+- Windows runtime setup and startup work from long installation paths, including Codex's managed plugin-data directories.
+
 - Child-symbol lists retain distinct declarations with the same name, so you can navigate each declaration in a file.
 - Search reports retrieval deadlines and cancellations while retaining located matches, so you can see when additional matches may exist.
 - Repository-text search reports when scan limits or skipped oversized files leave source uninspected, so missing matches do not appear exhaustive.
