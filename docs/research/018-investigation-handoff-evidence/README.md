@@ -25,6 +25,8 @@ small, sanitized development records, not formal acceptance or exact raw receipt
 - `sanitization-manifest.json`: original/published SHA-256 and byte counts for
   copied records; only machine-root substitutions were applied.
 - `CRON-LICENSE.txt`: attribution/license for public source excerpts.
+- `native-reconstruction.json`: successful checksum-pinned source reconstruction
+  and verification commands/identity, with no native execution.
 
 No raw caches, model assets, executable packages, private settings, chat, or gold
 references are included. Old generation/cursor IDs are historical evidence;

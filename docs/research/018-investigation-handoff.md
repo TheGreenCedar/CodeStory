@@ -1,8 +1,8 @@
 # CodeStory 0.18 investigation WIP handoff
 
-This branch preserves the known Rust/plugin research candidate, including previously
-uncommitted source, and the unfinished retrieval changes. The native dependency
-preservation described below is pending at this initial publication. It is a draft handoff,
+This branch preserves the complete known authored research candidate, including
+previously uncommitted Rust/plugin source, the reproducible native dependency
+patch, and the unfinished retrieval changes. It is a draft handoff,
 not a release, acceptance result, or instruction to install. The product goal in
 [issue 2173](https://github.com/TheGreenCedar/CodeStory/issues/2173) remains open.
 The source/package version is still **0.17.7**; “0.18” names this research effort.
@@ -96,7 +96,10 @@ remain distinct from internal forecasts. No formal study was admitted here.
 The original research worktree/index and primary checkout were not reset or
 rewritten. A fresh 109-file check found exactly the four expected v495 changes;
 all other selected files matched the serving binding. This is a scoped inventory,
-not an audit of every unrelated file on the machine. Publishing only the four
+not an audit of every unrelated file on the machine. An additional 1,016 visible
+tracked files outside that inventory matched their Git index blobs. The only
+other visible untracked source was the native dependency described below.
+Publishing only the four
 latest files on old HEAD would have lost earlier work; this branch preserves the
 full known composed candidate and its history.
 
@@ -183,12 +186,19 @@ The candidate's Cargo manifest uses a local path override for `llama-cpp-sys-2`
 0.1.151. Its previously untracked upstream-plus-patch tree is a material dependency,
 not a generated executable. The upstream crate SHA-256 is
 `23c676b02f8f2bdd9d7df7bcca0bd176b27964440998e7aa31c6fe32552964d0`.
-Its 1,072 visible local files are being compared against that exact archive.
-The authored scheduler/completion and model-placement changes must be preserved
-before calling the source handoff complete. This initial publication excludes
-that tree; Cargo commands will fail until it is reconstructed. A small source
-patch, strict cached-crate bootstrap and complete content digest are being
-prepared, with no build, download, model or install execution.
+All 1,070 upstream files were compared. The final source has 1,071 regular files:
+1,067 unchanged, three modified and one added header. The `.cargo-ok` cache marker
+is excluded. All authored changes are preserved in the
+[5,605-byte patch and manifest](../../vendor/llama-cpp-sys-2-patches/README.md),
+patch SHA-256 `108dc72d03ef7e9f3df11da9234d450d1c5758ac4b5fff2ea881d184b36f067a`.
+The complete regular-file postimage digest is
+`2d24f6ebdd8eb5f979f6af989aef76d1a34a8d06077a0d3d0cfe2bfb65b1b5a1`.
+The 22,969,666-byte reconstructed source copy is excluded from Git and recreated
+from the pinned archive plus patch. The bootstrap and separate verification
+actually reconstructed and matched that digest, without build, download, model
+or install activity. Existing trees are preserved; files publish exclusively,
+and verification rejects symlinks/special entries. Digest scope is regular-file
+content, not timestamps/modes/empty directories.
 
 The existing native repair rejects nontrivial operations on unknown/unselected
 devices before compute, records successful compute/synchronization completion,
@@ -203,7 +213,9 @@ timeline, vector-file physical checksum binding, or hard host isolation.
 The local native source, caches, models and old binary packages remain untouched.
 Do not remove the Cargo override, weaken CPU/device guards or silently substitute
 upstream bytes merely to get a green build. The native source preservation is a
-handoff gap, separate from unfinished product qualification.
+reconstruction requirement, separate from unfinished product qualification.
+Current CI does not run the bootstrap, so its Cargo checks fail at the missing
+path dependency; integrate a deliberate source-packaging policy during resumption.
 
 ## Unfinished v495 changes
 
@@ -304,6 +316,8 @@ git switch -c resume-018-investigation origin/codex/wip-018-investigation-handof
 git switch --detach FINAL_PR_SHA
 git rev-parse HEAD
 git submodule update --init --recursive
+python3 scripts/bootstrap-research-native-vendor.py
+python3 scripts/bootstrap-research-native-vendor.py --verify
 ```
 
 1. Review the full diff and WIP semantics first. Run final browser controls and
@@ -335,9 +349,22 @@ git submodule update --init --recursive
    distinguished its normal artifact from test support. Do not overwrite the
    installed 66443951… baseline. For a separate rebuilt baseline, make an isolated
    checkout at `cd3125e8e9634ebc2c2aaa89c243ea6e5406e50f`, bootstrap the same pinned
-   native patch described below, and use the saved normal build flags. Name its
+   native patch, and use the saved normal build flags. That old checkout predates
+   the bootstrap bundle: copy `scripts/bootstrap-research-native-vendor.py` and
+   `vendor/llama-cpp-sys-2-patches/` from the final handoff checkout into it first.
+   This is an explicitly identified build-input reconstruction overlay; it does
+   not change the baseline Rust logic. Name its
    new binary hash explicitly; rebuilding does not recreate or replace the
    original 66443951… receipt. Exact binary-byte reproduction is not established.
+
+   ```sh
+   git worktree add --detach ../CodeStory-baseline cd3125e8e9634ebc2c2aaa89c243ea6e5406e50f
+   git archive FINAL_PR_SHA scripts/bootstrap-research-native-vendor.py vendor/llama-cpp-sys-2-patches | tar -x -C ../CodeStory-baseline
+   (cd ../CodeStory-baseline && python3 scripts/bootstrap-research-native-vendor.py)
+   ```
+
+   Replace `FINAL_PR_SHA` with the verified handoff SHA. Cached source is used by
+   default; `--download` is a separately explicit source download on a new machine.
 3. Reproduce the deliberate two-question baseline/changed comparison before
    claiming retrieval improvement. Clone the exact public fixture:
 
@@ -385,13 +412,14 @@ git submodule update --init --recursive
 
 ## Excluded material and reproducibility limits
 
-This preserves the **known intended Rust/plugin candidate**; native dependency
-preservation is pending as explicitly listed above. It is not a
+This preserves all **known authored candidate source**, including the native
+patch and reproducible bootstrap. It is not a
 public mirror of the private research workspace. The following remain local:
 
 | Exclusion | Reason and how to resume without it |
 | --- | --- |
 | Large target trees, native libraries, GGUF assets, archived CLIs and full rollback plugin packages | Generated/platform-specific storage. Rebuild from the source checkpoints using documented setup; use current canonical installer only under separate install authority. Original binary hashes/normal-artifact identities are recorded, but old byte identity and rollback packages require the originating retained archive. |
+| Unchanged upstream native source copy | About 23 MB; all authored differences are checked in as the pinned source patch. The bootstrap reconstructs 1,071 regular files and verifies the complete content digest from the original checksum-pinned crate. No native authored change is left only local. CI packaging/bootstrap integration is still unfinished. |
 | SQLite/WAL, Core/retrieval caches, pointers, leases and CAS inventories | Machine/publication state, potentially private source; no raw DB or authority state published. Recreate an isolated publication from pinned public fixtures with normal supported preparation. Old UUIDs/timing/pointer-before-after results cannot be recreated exactly and remain historical. Never privately rewrite state to match receipts. |
 | Raw supervisor/installation/host receipts, configuration snapshots and global environment | Contain machine paths or private state. Relevant assertions, commands, hashes and failures are consolidated here. Exact historical lifecycle, physical-allocation and native-proof audit still requires local originals; no stronger proof is claimed. |
 | Withheld v495 references and other evaluator banks/keys | Preserve evaluator separation; do not ship expected answers into production. The original v495 reference seal is `e883015f14cff2bc399d6c6fc873de5fe005535129e8bf1c62bca412fac23427`. For an independent resumed development grade, use the retained sealed reference or have a new source-only evaluator author a rubric before seeing changed answers. Public cases are already exposed. |
@@ -419,3 +447,22 @@ free-space samples and internal forecasts are not permanent capacity or approval
 The draft PR/linked handoff issue carry the final remote SHA, cross-links and
 current CI state. A CI pass on this handoff, if obtained, cannot substitute for
 the unfinished packet comparison, broad independent acceptance or release gates.
+
+## Handoff publication checks and CI
+
+The handoff's documentation-link and whitespace checks passed. Its native
+bootstrap/verification round trip passed; this is source reconstruction, not
+native execution. Independent review corrected omitted small supporting frames,
+byte-count disclosure, baseline checkout reconstruction and no-clobber/symlink
+handling. No additional Rust/product qualification was run.
+
+The first published handoff head was
+`e0eb4ab03c7ee04bed452deda93be4f4086d772f`. Its hosted checks had five failures,
+two passes and one skip: draft source, durability, retrieval smoke and rustdoc
+fail at the absent native path dependency; plugin static had 156 passes,
+one skip and a timeout in `release asset downloader retries a transient failure`
+under its 100 ms total fixture budget. Docs links and closing-issue guard passed;
+the Windows missing-manifest lane skipped. Original logs remain retained. The
+native packaging and plugin fixture failures were not fixed or rerun as an
+implementation project. The final head's new CI state is reported separately in
+the PR and issue; do not transfer earlier green checks to that head.

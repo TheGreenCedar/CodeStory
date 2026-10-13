@@ -1,0 +1,43 @@
+{
+  "crate": "llama-cpp-sys-2",
+  "version": "0.1.151",
+  "crate_SHA256": "23c676b02f8f2bdd9d7df7bcca0bd176b27964440998e7aa31c6fe32552964d0",
+  "crate_download": "https://static.crates.io/crates/llama-cpp-sys-2/llama-cpp-sys-2-0.1.151.crate",
+  "patch_SHA256": "108dc72d03ef7e9f3df11da9234d450d1c5758ac4b5fff2ea881d184b36f067a",
+  "patch_bytes": 5605,
+  "compared_upstream_files": 1070,
+  "current_source_logical_bytes": 22969666,
+  "unchanged_files": 1067,
+  "changed_files": [
+    {
+      "path": "llama.cpp/ggml/include/ggml-backend.h",
+      "before_SHA256": "a620e815b43a44cc72d5f216629a3a91980335b61bc37eb6b2d0813368c3704f",
+      "SHA256": "70428edcae4387508585b981da62cbad2e62a1a1ca1e080c92c98dc13f30bb12",
+      "bytes": 25680
+    },
+    {
+      "path": "llama.cpp/ggml/src/ggml-backend.cpp",
+      "before_SHA256": "a96b54377e2b66732dcc5ed7ede82b6e0e873de53d515ac9fd6aa118b716bdd3",
+      "SHA256": "b87e8578738db932505d4588c5fc1104058a69b16c4d03ebef6ec5825cd577e1",
+      "bytes": 94610
+    },
+    {
+      "path": "llama.cpp/src/llama-model-offload.h",
+      "before_SHA256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "SHA256": "6c042fe662720176e3c60bd9991974acbf4101fc7ffe63f526bda8e3283829b2",
+      "bytes": 514
+    },
+    {
+      "path": "llama.cpp/src/llama-model.cpp",
+      "before_SHA256": "524077e98d9079cf4d1646d6d6df415c63ca6cd6f35babed55561b916fb593da",
+      "SHA256": "3fe683c475806b9b68d86864134808b8f000e94f61723ef29849c8fd52ccacb3",
+      "bytes": 122585
+    }
+  ],
+  "source_tree_SHA256": "2d24f6ebdd8eb5f979f6af989aef76d1a34a8d06077a0d3d0cfe2bfb65b1b5a1",
+  "source_tree_files": 1071,
+  "excluded_non_source_marker": [
+    ".cargo-ok"
+  ],
+  "crate_bytes": 3479845
+}
