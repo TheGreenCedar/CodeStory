@@ -717,7 +717,9 @@ impl AppController {
                 Ok(resolve_id_target(id, &details))
             }
             TargetSelection::Query { query, choose } => {
-                self.resolve_query_target(query, choose, file_filter)
+                self.resolve_query_target(query, choose, file_filter, |query| {
+                    self.resolve_indexed_symbol_candidates(query, 50)
+                })
             }
         }
     }
@@ -726,7 +728,8 @@ impl AppController {
     ///
     /// Exact ids may name source-range-only diagnostic evidence from structural
     /// collectors or endpoint schemas. Query selectors still use typed graph
-    /// resolution so snippets cannot silently select diagnostic search hits.
+    /// resolution over the pinned Core, without attaching retrieval state,
+    /// so snippets cannot silently select diagnostic search hits.
     pub fn resolve_source_target(
         &self,
         target: TargetSelection,
@@ -738,7 +741,9 @@ impl AppController {
                 Ok(resolve_source_id_target(id, &details))
             }
             TargetSelection::Query { query, choose } => {
-                self.resolve_query_target(query, choose, file_filter)
+                self.resolve_query_target(query, choose, file_filter, |query| {
+                    self.resolve_core_symbol_candidates(query, 50)
+                })
             }
         }
     }
@@ -748,72 +753,78 @@ impl AppController {
         query: String,
         choose: Option<usize>,
         file_filter: Option<&str>,
+        candidates: impl FnMut(&str) -> Result<Vec<SearchHit>, ApiError>,
     ) -> Result<TargetResolution, ApiError> {
         let project_root = self.require_project_root()?;
-        let mut alternatives = self.query_resolution_alternatives(&query)?;
-        if alternatives.is_empty()
-            && let Some(stem) = command_query_resolution_stem(&query)
-        {
-            alternatives = self.query_resolution_alternatives(&stem)?;
-        }
-        alternatives.retain(|hit| is_resolvable_graph_target(&query, hit));
-        if let Some(file_filter) = file_filter {
-            alternatives
-                .retain(|hit| search_hit_matches_file_filter(&project_root, hit, file_filter));
-        }
-        if alternatives.is_empty() {
-            return Ok(TargetResolution::Rejected(no_query_match_error(
-                &project_root,
-                &query,
-                file_filter,
+        resolve_query_target_from_candidates(&project_root, query, choose, file_filter, candidates)
+    }
+}
+
+fn resolve_query_target_from_candidates(
+    project_root: &Path,
+    query: String,
+    choose: Option<usize>,
+    file_filter: Option<&str>,
+    mut candidates: impl FnMut(&str) -> Result<Vec<SearchHit>, ApiError>,
+) -> Result<TargetResolution, ApiError> {
+    let mut alternatives = candidates(&query)?;
+    alternatives.retain(|hit| is_resolvable_graph_target(&query, hit));
+    if alternatives.is_empty()
+        && let Some(stem) = command_query_resolution_stem(&query)
+    {
+        alternatives = candidates(&stem)?;
+        alternatives.retain(|hit| is_resolvable_graph_target(&stem, hit));
+    }
+    alternatives.retain(|hit| is_resolvable_graph_target(&query, hit));
+    if let Some(file_filter) = file_filter {
+        alternatives.retain(|hit| search_hit_matches_file_filter(&project_root, hit, file_filter));
+    }
+    if alternatives.is_empty() {
+        return Ok(TargetResolution::Rejected(no_query_match_error(
+            &project_root,
+            &query,
+            file_filter,
+        )));
+    }
+    alternatives.sort_by(|left, right| {
+        compare_resolution_candidates(&project_root, &query, file_filter, left, right)
+    });
+    let tied = tied_top_alternatives(&project_root, &query, file_filter, &alternatives);
+    if let Some(choice) = choose {
+        if choice == 0 || choice > tied.len() {
+            return Ok(TargetResolution::Rejected(format!(
+                "`--choose {choice}` is outside the displayed alternative range 1..={}. Re-run without `--choose` to inspect the current alternatives.",
+                tied.len()
             )));
         }
-        alternatives.sort_by(|left, right| {
-            compare_resolution_candidates(&project_root, &query, file_filter, left, right)
-        });
-        let tied = tied_top_alternatives(&project_root, &query, file_filter, &alternatives);
-        if let Some(choice) = choose {
-            if choice == 0 || choice > tied.len() {
-                return Ok(TargetResolution::Rejected(format!(
-                    "`--choose {choice}` is outside the displayed alternative range 1..={}. Re-run without `--choose` to inspect the current alternatives.",
-                    tied.len()
-                )));
-            }
-            let selected = tied[choice - 1].clone();
-            promote_selected_alternative(&mut alternatives, &selected);
-            return Ok(TargetResolution::Resolved(Box::new(query_resolved_target(
-                query,
-                file_filter,
-                selected,
-                alternatives,
-            ))));
-        }
-        if tied.len() > 1 {
-            return Ok(TargetResolution::Ambiguous(AmbiguousTarget {
-                query: query.clone(),
-                file_filter: file_filter.map(ToOwned::to_owned),
-                message: ambiguous_query_error(&project_root, &query, file_filter, &tied),
-                alternatives: tied,
-            }));
-        }
-        debug_assert_unique_top_candidate(&project_root, &query, file_filter, &alternatives);
-        let selected = alternatives
-            .first()
-            .cloned()
-            .expect("non-empty alternatives checked above");
-        Ok(TargetResolution::Resolved(Box::new(query_resolved_target(
+        let selected = tied[choice - 1].clone();
+        promote_selected_alternative(&mut alternatives, &selected);
+        return Ok(TargetResolution::Resolved(Box::new(query_resolved_target(
             query,
             file_filter,
             selected,
             alternatives,
-        ))))
+        ))));
     }
-
-    fn query_resolution_alternatives(&self, query: &str) -> Result<Vec<SearchHit>, ApiError> {
-        let mut alternatives = self.resolve_indexed_symbol_candidates(query, 50)?;
-        alternatives.retain(|hit| is_resolvable_graph_target(query, hit));
-        Ok(alternatives)
+    if tied.len() > 1 {
+        return Ok(TargetResolution::Ambiguous(AmbiguousTarget {
+            query: query.clone(),
+            file_filter: file_filter.map(ToOwned::to_owned),
+            message: ambiguous_query_error(&project_root, &query, file_filter, &tied),
+            alternatives: tied,
+        }));
     }
+    debug_assert_unique_top_candidate(&project_root, &query, file_filter, &alternatives);
+    let selected = alternatives
+        .first()
+        .cloned()
+        .expect("non-empty alternatives checked above");
+    Ok(TargetResolution::Resolved(Box::new(query_resolved_target(
+        query,
+        file_filter,
+        selected,
+        alternatives,
+    ))))
 }
 
 fn command_query_resolution_stem(query: &str) -> Option<String> {
@@ -1101,6 +1112,65 @@ mod tests {
     use super::*;
     use codestory_contracts::api::{NodeId, SearchHitOrigin};
     use tempfile::tempdir;
+
+    #[test]
+    fn source_candidate_resolution_keeps_ambiguity_filter_choose_and_no_fallback() {
+        let root = Path::new("/retained-source");
+        let rows = vec![
+            hit("a", "operation", NodeKind::FUNCTION, 1.0, "a.rs"),
+            hit("b", "operation", NodeKind::FUNCTION, 1.0, "b.rs"),
+        ];
+        let resolve = |choose, file| {
+            resolve_query_target_from_candidates(root, "operation".into(), choose, file, |_| {
+                Ok(rows.clone())
+            })
+            .unwrap()
+        };
+        assert!(matches!(
+            resolve(None, None),
+            TargetResolution::Ambiguous(_)
+        ));
+        assert!(matches!(
+            resolve(Some(3), None),
+            TargetResolution::Rejected(_)
+        ));
+        let TargetResolution::Resolved(selected) = resolve(Some(2), None) else {
+            panic!("choice")
+        };
+        assert_eq!(selected.selected.node_id.0, "b");
+        let TargetResolution::Resolved(selected) = resolve(None, Some("a.rs")) else {
+            panic!("file")
+        };
+        assert_eq!(selected.selected.node_id.0, "a");
+        let mut diagnostic = rows[0].clone();
+        diagnostic.resolvable = false;
+        let mut queries = Vec::new();
+        let result = resolve_query_target_from_candidates(
+            root,
+            "operation_command".into(),
+            None,
+            None,
+            |query| {
+                queries.push(query.to_string());
+                Ok(if query == "operation_command" {
+                    vec![diagnostic.clone()]
+                } else {
+                    vec![rows[0].clone()]
+                })
+            },
+        )
+        .unwrap();
+        assert!(matches!(result, TargetResolution::Resolved(_)));
+        assert_eq!(queries, ["operation_command", "operation"]);
+        let mut calls = 0;
+        let result =
+            resolve_query_target_from_candidates(root, "operation".into(), None, None, |_| {
+                calls += 1;
+                Err(ApiError::internal("Core unavailable"))
+            });
+        assert!(result.is_err());
+        assert_eq!(calls, 1, "no alternate retrieval provider");
+    }
 
     fn test_search_hit_defaults() -> SearchHit {
         SearchHit {

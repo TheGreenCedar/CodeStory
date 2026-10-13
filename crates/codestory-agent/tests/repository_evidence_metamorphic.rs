@@ -31,6 +31,7 @@ fn source(
     end_line: u32,
 ) -> PacketHydratedSourceRangeV1 {
     PacketHydratedSourceRangeV1 {
+        callable_body: None,
         stable_identity: identity.to_string(),
         path: path.to_string(),
         symbol: Some(identity.to_string()),

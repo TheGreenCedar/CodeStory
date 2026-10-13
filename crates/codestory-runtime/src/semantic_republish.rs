@@ -169,6 +169,7 @@ struct PreparedSemanticProjection {
 
 fn prepare_semantic_projection(
     staged: &mut StagedSnapshot,
+    root: &Path,
     publication: &IndexPublicationRecord,
     cancel_token: Option<&CancellationToken>,
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
@@ -193,6 +194,7 @@ fn prepare_semantic_projection(
 
     let stats = finalize_staged_semantic_docs_for_runtime(
         staged.store_mut(),
+        Some(root),
         None,
         None,
         &source_identity,
@@ -486,7 +488,7 @@ pub(super) fn semantic_projection_republish_for_runtime(
             &Uuid::new_v4().to_string(),
         )?;
         let prepared =
-            prepare_semantic_projection(&mut staged, &publication, cancel_token, runtime)?;
+            prepare_semantic_projection(&mut staged, root, &publication, cancel_token, runtime)?;
         let dense_anchor_count = stage_semantic_projection_publication(
             &mut staged,
             root,

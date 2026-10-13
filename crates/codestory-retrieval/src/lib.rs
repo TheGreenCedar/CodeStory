@@ -33,6 +33,7 @@ pub mod outbound_http;
 mod per_user_embedding;
 mod planner;
 mod process_identity;
+mod publication_scope;
 mod query;
 mod query_features;
 mod query_policy;
@@ -395,3 +396,6 @@ pub use sidecar_search::{
 pub use codestory_store::RetrievalIndexManifest;
 
 pub use query_policy::LexicalAdmissionPolicy;
+
+#[cfg(any(test, feature = "test-support"))]
+pub use lexical_index::replay_published_call_metadata;

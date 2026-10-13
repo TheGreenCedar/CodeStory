@@ -28,6 +28,8 @@ const MIN_PACKET_HANDOFF_MS: u128 = 1_000;
 /// top-N prefix, matching the telemetry-first co-presence design.
 const RAF_RANKED_RECORD_CAP: usize = 48;
 const RAF_IDENTITY_DIGEST_HEX_LEN: usize = 16;
+const RAF_QUERY_VIEW_CAP: usize = 4;
+const RAF_QUERY_VIEW_ROW_CAP: usize = 16;
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PacketLatencyBudget {
     pub(crate) started_at: Instant,
@@ -100,6 +102,12 @@ struct PacketEntryObservation {
     descriptor_deferred_readiness_wall_ms: u64,
     descriptor_remaining_before_handoff_ms: u64,
     descriptor_preadmit_runtime_phases_observed_count: u64,
+    raf_query_views_observed_count: u64,
+    raf_query_view_attempt_ordinal: u64,
+    raf_ordering_observed_count: u64,
+    raf_ordering_attempt_ordinal: u64,
+    raf_ranked_attempt_ordinal: u64,
+    raf_promotion_recorded_count: u64,
     raf_ranked_admitted_observed_count: u64,
     raf_ranked_pool_count: u64,
     raf_ranked_recorded_count: u64,
@@ -237,6 +245,91 @@ pub(crate) fn observe_packet_descriptor_remaining_before_handoff(remaining_ms: u
     });
 }
 
+/// Content-free query-view ranks on the existing owned operation log. Stage 1
+/// records at most four views and sixteen eligible identities per view. Scores
+/// are versioned fused descriptor scores, encoded as their exact f32 bits.
+/// Neither queries, symbol names, paths nor source text enter this seam.
+pub(crate) fn observe_packet_raf_query_views(
+    views: &[Vec<(String, usize, u32)>],
+    eligible_counts: &[usize],
+    total_view_count: usize,
+) {
+    update_packet_operation_observation(|observation| {
+        if observation.raf_query_views_observed_count != 0 {
+            return;
+        }
+        observation.raf_query_views_observed_count = 1;
+        observation.raf_query_view_attempt_ordinal = observation.attempt_started_count;
+        for (view, rows) in views.iter().take(RAF_QUERY_VIEW_CAP).enumerate() {
+            for (identity, rank, score_bits) in rows.iter().take(RAF_QUERY_VIEW_ROW_CAP) {
+                let digest = raf_identity_digest(identity);
+                tracing::warn!(
+                    packet_entry_observation_id = observation.id,
+                    raf_stage_code = 1_u64,
+                    raf_attempt_ordinal = observation.raf_query_view_attempt_ordinal,
+                    raf_view_count = total_view_count as u64,
+                    raf_view_ordinal = view as u64,
+                    raf_view_eligible_count =
+                        eligible_counts.get(view).copied().unwrap_or(0) as u64,
+                    raf_view_recorded_count = rows.len().min(RAF_QUERY_VIEW_ROW_CAP) as u64,
+                    raf_view_rank = *rank as u64,
+                    raf_descriptor_score_f32_bits = u64::from(*score_bits),
+                    raf_ranked_identity_digests = digest.as_str(),
+                );
+            }
+        }
+    });
+}
+
+/// Freeze ordering metadata to the same first observed query attempt. Retry
+/// attempts cannot append masks against a stale retained ranked seed prefix.
+pub(crate) fn begin_packet_raf_ordering_observation() -> bool {
+    let mut record = false;
+    update_packet_operation_observation(|observation| {
+        if observation.raf_ordering_observed_count != 0
+            || (observation.raf_query_views_observed_count != 0
+                && observation.raf_query_view_attempt_ordinal != observation.attempt_started_count)
+        {
+            return;
+        }
+        observation.raf_ordering_observed_count = 1;
+        observation.raf_ordering_attempt_ordinal = observation.attempt_started_count;
+        record = true;
+    });
+    record
+}
+
+/// Stage 2 records an ordering promotion, not a successful admission or new retrieval hit.
+/// Seed masks use the already recorded aggregate ranked prefix (at most16).
+/// The positive marginal gain is reproducible from the uncovered-seed mask.
+pub(crate) fn observe_packet_raf_promotion(
+    identity: &str,
+    original_rank: usize,
+    seed_mask: u64,
+    uncovered_seed_mask: u64,
+) {
+    update_packet_operation_observation(|observation| {
+        if observation.raf_promotion_recorded_count >= 16
+            || observation.raf_ordering_observed_count == 0
+            || observation.raf_ordering_attempt_ordinal != observation.attempt_started_count
+        {
+            return;
+        }
+        observation.raf_promotion_recorded_count += 1;
+        let digest = raf_identity_digest(identity);
+        tracing::warn!(
+            packet_entry_observation_id = observation.id,
+            raf_stage_code = 2_u64,
+            raf_attempt_ordinal = observation.raf_ordering_attempt_ordinal,
+            raf_promotion_ordinal = observation.raf_promotion_recorded_count - 1,
+            raf_original_rank = original_rank as u64,
+            raf_seed_mask = seed_mask,
+            raf_uncovered_seed_mask = uncovered_seed_mask,
+            raf_ranked_identity_digests = digest.as_str(),
+        );
+    });
+}
+
 /// Retain private ranked/admitted identity digests for offline co-presence analysis.
 ///
 /// Digests are SHA-256 prefixes of stable packet identities only. Prompt text,
@@ -252,6 +345,7 @@ pub(crate) fn observe_packet_raf_ranked_admitted(
         }
         let recorded = capped_raf_ranked_identities(ranked_identities, admitted_identities);
         observation.raf_ranked_admitted_observed_count = 1;
+        observation.raf_ranked_attempt_ordinal = observation.attempt_started_count;
         observation.raf_ranked_pool_count =
             u64::try_from(ranked_identities.len()).unwrap_or(u64::MAX);
         observation.raf_ranked_recorded_count = u64::try_from(recorded.len()).unwrap_or(u64::MAX);
@@ -695,6 +789,9 @@ impl Drop for PacketLatencyScopeGuard {
                         observation.descriptor_preadmit_runtime_phases_observed_count,
                     raf_ranked_admitted_observed_count =
                         observation.raf_ranked_admitted_observed_count,
+                    raf_ranked_attempt_ordinal = observation.raf_ranked_attempt_ordinal,
+                    raf_query_view_attempt_ordinal = observation.raf_query_view_attempt_ordinal,
+                    raf_ordering_attempt_ordinal = observation.raf_ordering_attempt_ordinal,
                     raf_ranked_pool_count = observation.raf_ranked_pool_count,
                     raf_ranked_recorded_count = observation.raf_ranked_recorded_count,
                     raf_admitted_count = observation.raf_admitted_count,
@@ -1101,6 +1198,66 @@ mod packet_latency_budget_tests {
             ACTIVE_PACKET_ENTRY_OBSERVATION.with(Cell::get).is_none(),
             "outer latency-scope drop must clear the descriptor observation"
         );
+    }
+
+    #[test]
+    fn packet_raf_query_views_and_promotions_require_the_owned_operation() {
+        {
+            let _latency = enter_packet_latency_scope(Some(2_000));
+            let views = vec![vec![("node:7".into(), 3, 0.25_f32.to_bits())]];
+            observe_packet_raf_query_views(&views, &[1], 1);
+            observe_packet_raf_promotion("node:7", 3, 4, 4);
+            let before = ACTIVE_PACKET_ENTRY_OBSERVATION.with(Cell::get).unwrap();
+            assert_eq!(before.raf_query_views_observed_count, 0);
+            assert_eq!(before.raf_promotion_recorded_count, 0);
+            {
+                let _owner = enter_packet_public_operation_observation("packet");
+                observe_packet_attempt_started();
+                observe_packet_raf_query_views(&views, &[1], 1);
+                assert!(begin_packet_raf_ordering_observation());
+                {
+                    let _nested = enter_packet_public_operation_observation("packet");
+                    observe_packet_raf_promotion("node:foreign", 99, 1, 1);
+                }
+                for _ in 0..40 {
+                    observe_packet_raf_promotion("node:7", 3, 4, 4);
+                }
+                let after = ACTIVE_PACKET_ENTRY_OBSERVATION.with(Cell::get).unwrap();
+                assert_eq!(after.raf_query_views_observed_count, 1);
+                assert_eq!(after.raf_promotion_recorded_count, 16);
+                assert_eq!(after.raf_ordering_attempt_ordinal, 1);
+                observe_packet_attempt_started();
+                observe_packet_raf_query_views(&views, &[1], 1);
+                assert!(!begin_packet_raf_ordering_observation());
+                observe_packet_raf_promotion("node:retry", 0, 2, 2);
+                let retry = ACTIVE_PACKET_ENTRY_OBSERVATION.with(Cell::get).unwrap();
+                assert_eq!(retry.raf_query_view_attempt_ordinal, 1);
+                assert_eq!(retry.raf_ordering_attempt_ordinal, 1);
+                assert_eq!(retry.raf_promotion_recorded_count, 16);
+            }
+        }
+        assert!(ACTIVE_PACKET_ENTRY_OBSERVATION.with(Cell::get).is_none());
+    }
+
+    #[test]
+    fn packet_raf_retry_cannot_join_new_promotions_to_an_old_view() {
+        let _latency = enter_packet_latency_scope(Some(2_000));
+        let _owner = enter_packet_public_operation_observation("packet");
+        observe_packet_attempt_started();
+        observe_packet_raf_query_views(&[], &[], 0);
+        assert!(begin_packet_raf_ordering_observation());
+        observe_packet_raf_promotion("node:first", 1, 2, 2);
+        observe_packet_raf_ranked_admitted(&["node:first".into()], &["node:first".into()]);
+        observe_packet_attempt_started();
+        observe_packet_raf_query_views(&[vec![("node:retry".into(), 0, 1_f32.to_bits())]], &[1], 1);
+        assert!(!begin_packet_raf_ordering_observation());
+        observe_packet_raf_promotion("node:retry", 0, 1, 1);
+        let observed = ACTIVE_PACKET_ENTRY_OBSERVATION.with(Cell::get).unwrap();
+        assert_eq!(observed.attempt_started_count, 2);
+        assert_eq!(observed.raf_query_view_attempt_ordinal, 1);
+        assert_eq!(observed.raf_ordering_attempt_ordinal, 1);
+        assert_eq!(observed.raf_ranked_attempt_ordinal, 1);
+        assert_eq!(observed.raf_promotion_recorded_count, 1);
     }
 
     #[test]

@@ -244,6 +244,11 @@ pub enum GapKindV3Dto {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PacketEvidenceRowV3Dto {
+    /// Replace these fields on the original packet request, retaining its
+    /// question, budget, project and transport configuration. This bounded
+    /// packet operation can perform retrieval; it is not a source-only read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packet_request_patch: Option<PacketRequestPatchV3Dto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_delivery: Option<crate::compilation::PacketSourceDeliveryV1>,
     pub identity: EvidenceIdentityV3Dto,
@@ -263,8 +268,125 @@ pub struct ProjectionGapRowV3Dto {
     pub message: Option<MessageTextV3>,
 }
 
+/// Executable replacement fields for the same public packet operation.
+/// Clearing fields are deliberately serialized: JSON merge and CLI flag
+/// replacement must remove previous probes/parent/options/pins, never append.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, try_from = "PacketRequestPatchV3Wire")]
+pub struct PacketRequestPatchV3Dto {
+    pub probes: BoundedVecV3<crate::api::PacketProbeDto, 1>,
+    pub parent_packet_id: Option<IdentityTextV3>,
+    pub option_ids: BoundedVecV3<IdentityTextV3, 8>,
+    pub core_generation_id: IdentityTextV3,
+    pub retrieval_generation: Option<IdentityTextV3>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PacketRequestPatchV3Wire {
+    probes: BoundedVecV3<crate::api::PacketProbeDto, 1>,
+    parent_packet_id: Option<IdentityTextV3>,
+    option_ids: BoundedVecV3<IdentityTextV3, 8>,
+    core_generation_id: IdentityTextV3,
+    retrieval_generation: Option<IdentityTextV3>,
+}
+
+impl TryFrom<PacketRequestPatchV3Wire> for PacketRequestPatchV3Dto {
+    type Error = String;
+    fn try_from(wire: PacketRequestPatchV3Wire) -> Result<Self, Self::Error> {
+        let value = Self {
+            probes: wire.probes,
+            parent_packet_id: wire.parent_packet_id,
+            option_ids: wire.option_ids,
+            core_generation_id: wire.core_generation_id,
+            retrieval_generation: wire.retrieval_generation,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+}
+
+impl PacketRequestPatchV3Dto {
+    pub fn apply_to(
+        &self,
+        original: &crate::api::AgentPacketRequestDto,
+    ) -> Result<crate::api::AgentPacketRequestDto, String> {
+        self.validate()?;
+        let mut request = original.clone();
+        request.probes = self.probes.as_slice().to_vec();
+        request.parent_packet_id = self
+            .parent_packet_id
+            .as_ref()
+            .map(|id| id.as_str().to_owned());
+        request.option_ids = self
+            .option_ids
+            .as_slice()
+            .iter()
+            .map(|id| id.as_str().to_owned())
+            .collect();
+        request.core_generation_id = Some(self.core_generation_id.as_str().to_owned());
+        request.retrieval_generation = self
+            .retrieval_generation
+            .as_ref()
+            .map(|id| id.as_str().to_owned());
+        Ok(request)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.core_generation_id.as_str().trim().is_empty()
+            || self
+                .parent_packet_id
+                .as_ref()
+                .is_some_and(|id| id.as_str().trim().is_empty())
+            || self
+                .retrieval_generation
+                .as_ref()
+                .is_some_and(|id| id.as_str().trim().is_empty())
+            || self
+                .option_ids
+                .as_slice()
+                .iter()
+                .any(|id| id.as_str().trim().is_empty())
+        {
+            return Err("packet request patch identities must be nonempty".into());
+        }
+        match (
+            self.parent_packet_id.as_ref(),
+            self.probes.as_slice(),
+            self.option_ids.as_slice(),
+        ) {
+            (Some(_), [], options) if !options.is_empty() => Ok(()),
+            (
+                None,
+                [
+                    probe @ crate::api::PacketProbeDto::Continuation {
+                        core_generation_id,
+                        retrieval_generation,
+                        selector,
+                        ..
+                    },
+                ],
+                [],
+            ) if core_generation_id == self.core_generation_id.as_str()
+                && retrieval_generation.as_deref()
+                    == self.retrieval_generation.as_ref().map(|id| id.as_str())
+                && selector.stable_identity.starts_with("node:")
+                && selector.source_range.is_some() =>
+            {
+                crate::api::validate_packet_probe(probe)
+            }
+            _ => Err(
+                "packet request patch must be one pinned source page or one broad continuation"
+                    .into(),
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ContinuationStateV3Dto {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packet_request_patch: Option<PacketRequestPatchV3Dto>,
     pub continuation_id: IdentityTextV3,
     pub remaining_rounds: u16,
     pub gap_ids: BoundedVecV3<GapIdentityV3Dto, REFERENCE_ROWS_MAX_V3>,
@@ -277,6 +399,7 @@ impl ContinuationStateV3Dto {
         gap_ids: BoundedVecV3<GapIdentityV3Dto, REFERENCE_ROWS_MAX_V3>,
     ) -> Result<Self, ContinuationStateViolationV3> {
         let value = Self {
+            packet_request_patch: None,
             continuation_id,
             remaining_rounds,
             gap_ids,
@@ -311,6 +434,8 @@ impl fmt::Display for ContinuationStateViolationV3 {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ContinuationStateV3DtoWire {
+    #[serde(default)]
+    packet_request_patch: Option<PacketRequestPatchV3Dto>,
     continuation_id: IdentityTextV3,
     remaining_rounds: u16,
     gap_ids: BoundedVecV3<GapIdentityV3Dto, REFERENCE_ROWS_MAX_V3>,
@@ -322,8 +447,13 @@ impl<'de> Deserialize<'de> for ContinuationStateV3Dto {
         D: Deserializer<'de>,
     {
         let wire = ContinuationStateV3DtoWire::deserialize(deserializer)?;
-        Self::new(wire.continuation_id, wire.remaining_rounds, wire.gap_ids)
-            .map_err(D::Error::custom)
+        let mut value = Self::new(wire.continuation_id, wire.remaining_rounds, wire.gap_ids)
+            .map_err(D::Error::custom)?;
+        if let Some(patch) = &wire.packet_request_patch {
+            patch.validate().map_err(D::Error::custom)?;
+        }
+        value.packet_request_patch = wire.packet_request_patch;
+        Ok(value)
     }
 }
 
@@ -551,6 +681,7 @@ mod tests {
 
     fn packet_evidence(kind: EvidenceKindV3Dto) -> PacketEvidenceRowV3Dto {
         PacketEvidenceRowV3Dto {
+            packet_request_patch: None,
             source_delivery: None,
             identity: evidence_identity("evidence-1"),
             kind,
@@ -579,6 +710,7 @@ mod tests {
 
     fn continuation() -> ContinuationStateV3Dto {
         ContinuationStateV3Dto {
+            packet_request_patch: None,
             continuation_id: text("continuation-1"),
             remaining_rounds: 1,
             gap_ids: list(vec![gap_identity("gap-1")]),

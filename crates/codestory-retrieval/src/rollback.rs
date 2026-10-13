@@ -277,12 +277,33 @@ pub(crate) fn activate_retained_rollback_generation_with_embedding(
     } else {
         None
     };
+    let _observed_global = if apply {
+        None
+    } else {
+        Some(
+            crate::publication_scope::observe_publication_global(runtime)
+                .map_err(RollbackActivationError::Failed)?,
+        )
+    };
+    let _writer_lock = if apply {
+        Some(
+            GenerationRetentionLock::acquire(
+                &global_generation_gc_state_file(runtime),
+                &format!("writer-{project_id}"),
+            )
+            .map_err(RollbackActivationError::Failed)?,
+        )
+    } else {
+        None
+    };
     let validated = validate_retained_rollback(
+        project_root,
         storage_path,
         runtime,
         embedding_device,
         live_identity,
         &project_id,
+        apply,
     )?;
     let mut outcome = RollbackActivationOutcome {
         project_id: project_id.clone(),
@@ -333,7 +354,7 @@ pub(crate) fn activate_retained_rollback_generation_with_embedding(
         .map_err(RollbackActivationError::Failed)?;
     refresh_retention_marker_after_activation(
         &storage,
-        runtime,
+        &validated.runtime,
         project_root,
         &project_id,
         &validated.rollback.manifest,
@@ -347,14 +368,19 @@ struct ValidatedRollback {
     current: RetrievalIndexManifest,
     rollback: RetrievalIndexRollbackRecord,
     retrieval_mode: String,
+    runtime: SidecarRuntimeConfig,
+    _origin_guard: Option<crate::retention::ObservedRetentionLock>,
+    _origin_write_guard: Option<GenerationRetentionLock>,
 }
 
 fn validate_retained_rollback(
+    project_root: &Path,
     storage_path: &Path,
     runtime: &SidecarRuntimeConfig,
     embedding_device: &EmbeddingDeviceReadiness,
     live_identity: Option<&ProductEmbeddingIdentity>,
     project_id: &str,
+    apply: bool,
 ) -> Result<ValidatedRollback, RollbackActivationError> {
     // Validation is strictly observational: an operator inspecting the lever
     // must never up-migrate or recover a database as a side effect.
@@ -385,6 +411,30 @@ fn validate_retained_rollback(
     let Some(core_publication) = core_publication else {
         return Err(RollbackActivationRefusal::CorePublicationIncomplete.into());
     };
+    let resolved = crate::publication_scope::resolve_publication_runtime(
+        project_root,
+        &storage,
+        &candidate,
+        runtime,
+    )
+    .map_err(RollbackActivationError::Failed)?;
+    let _origin_guard = if apply {
+        None
+    } else {
+        Some(
+            crate::publication_scope::observe_publication_origin(&resolved, project_id)
+                .map_err(RollbackActivationError::Failed)?,
+        )
+    };
+    let _origin_write_guard = if apply {
+        Some(
+            GenerationRetentionLock::acquire(&resolved.layout.state_file, project_id)
+                .map_err(RollbackActivationError::Failed)?,
+        )
+    } else {
+        None
+    };
+    let runtime = &resolved;
     crate::embedded_vector::validate_generation_evidence_for_publication(
         &runtime.layout,
         &storage,
@@ -416,6 +466,9 @@ fn validate_retained_rollback(
         current,
         rollback,
         retrieval_mode: status.retrieval_mode,
+        runtime: resolved,
+        _origin_guard,
+        _origin_write_guard,
     })
 }
 

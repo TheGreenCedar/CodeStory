@@ -1054,15 +1054,11 @@ pub(crate) fn packet_budget_usage(answer: &AgentAnswerDto) -> PacketBudgetUsageD
 
 #[cfg(test)]
 pub(super) mod tests {
-    use std::fs;
-    use std::sync::{Arc, atomic::AtomicBool};
-
     use codestory_contracts::api::{
         AgentAnswerDto, AgentPacketDto, AgentPacketRequestDto, AgentResponseBlockDto,
         AgentResponseSectionDto, AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto,
-        AgentRetrievalTraceDto, IndexMode, PacketBudgetDto, PacketBudgetLimitsDto,
-        PacketBudgetModeDto, PacketBudgetUsageDto, PacketDispositionDto, PacketPlanDto,
-        PacketRetrievalTraceSummaryDto,
+        AgentRetrievalTraceDto, PacketBudgetDto, PacketBudgetLimitsDto, PacketBudgetModeDto,
+        PacketBudgetUsageDto, PacketDispositionDto, PacketPlanDto, PacketRetrievalTraceSummaryDto,
     };
 
     pub(in crate::agent) fn test_packet(question: &str, max_output_bytes: u32) -> AgentPacketDto {
@@ -1162,20 +1158,9 @@ pub(super) mod tests {
 
     #[test]
     fn hard_budget_minimizer_cannot_destroy_the_v3_request_identity() {
-        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
-        let project = tempfile::tempdir().expect("project");
-        fs::write(project.path().join("lib.rs"), "pub fn retained() {}\n").expect("source");
-        let controller = crate::AppController::new_with_owned_cache_root(process_cache.path());
-        controller
-            .open_project_summary_with_storage_path(
-                project.path().to_path_buf(),
-                project.path().join("codestory.db"),
-            )
-            .expect("open project");
-        controller
-            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
-            .expect("index project");
-        let service = crate::services::PublicOperationService::new(controller);
+        // This owns the minimizer-to-production-conversion identity seam.
+        // Frozen fixtures prove conversion; real public readiness remains a
+        // separate qualification and is never relaxed to satisfy this control.
         let request = AgentPacketRequestDto {
             question: "Locate retained".to_owned(),
             budget: PacketBudgetModeDto::Standard,
@@ -1192,37 +1177,43 @@ pub(super) mod tests {
         assert!(packet.answer.retrieval_trace.request_id.is_empty());
         assert!(!packet.packet_id.is_empty());
 
-        let product = service
-            .run_observational_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
-                crate::evidence_projection_v3::project_packet_v3(
-                    &service,
-                    "test",
+        let current_request_id = packet.packet_id.clone();
+        for historical_trace_id in ["", "unrelated-historical-request"] {
+            let mut challenged = packet.clone();
+            // Challenge after minimization: it cannot erase this diagnostic
+            // poison before the production conversion reads the current ID.
+            challenged.answer.retrieval_trace.request_id = historical_trace_id.to_owned();
+            let product =
+                crate::evidence_projection_v3::representation_budget_test_support::project_packet(
                     &request,
-                    &packet,
+                    &challenged,
                     |candidate| {
                         serde_json::to_vec(candidate)
                             .map(|bytes| bytes.len())
                             .map_err(|_| ())
                     },
                 )
-            })
-            .expect("hard-budget packet should retain an authoritative request identity")
-            .value;
-        let serialized = serde_json::to_vec(&product.projection).expect("serialize projection");
-        assert!(
-            serialized.len()
-                <= crate::agent::packet_projection_v3::PACKET_PUBLIC_RESULT_MAX_BYTES_V3
-        );
-        let identity = match product.projection {
-            codestory_contracts::packet_projection_v3::PacketProjectionV3Dto::Complete {
-                identity,
-                ..
-            }
-            | codestory_contracts::packet_projection_v3::PacketProjectionV3Dto::BudgetExceeded {
-                identity,
-                ..
-            } => identity,
-        };
-        assert_eq!(identity.request_id.as_str(), "packet-budget-test");
+                .expect("hard-budget conversion retains the immutable current request identity");
+            let serialized = serde_json::to_vec(&product.projection).expect("serialize projection");
+            assert!(
+                serialized.len()
+                    <= crate::agent::packet_projection_v3::PACKET_PUBLIC_RESULT_MAX_BYTES_V3
+            );
+            let (identity, retrieval, publication) = match product.projection {
+                codestory_contracts::packet_projection_v3::PacketProjectionV3Dto::Complete {
+                    identity, retrieval, publication, ..
+                } | codestory_contracts::packet_projection_v3::PacketProjectionV3Dto::BudgetExceeded {
+                    identity, retrieval, publication, ..
+                } => (identity, retrieval, publication),
+            };
+            assert_eq!(identity.request_id.as_str(), current_request_id);
+            assert_eq!(identity.request_id.as_str(), "packet-budget-test");
+            assert_eq!(
+                retrieval.state,
+                codestory_contracts::packet_projection_v3::RetrievalStateV3Dto::Degraded
+            );
+            assert!(retrieval.generation_id.is_none());
+            assert!(publication.retrieval.is_none());
+        }
     }
 }

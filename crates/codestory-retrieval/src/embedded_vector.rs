@@ -2727,8 +2727,15 @@ fn scored_hits_to_candidates(scored: Vec<ScoredHit>) -> Vec<CandidateHit> {
                     CandidateSource::Semantic,
                 );
                 hit.node_id = Some(node_id);
-                hit.source_bytes_upper_bound =
-                    Some(codestory_contracts::compilation::INTERIM_SOURCE_ROW_UPPER_BOUND as u32);
+                // A component summary has no canonical source span. Keep
+                // its navigation score without manufacturing a source budget.
+                // Source anchors retain their legacy bound: the published
+                // dense schema does not yet carry line metadata.
+                if dense_reason.as_deref() != Some("component_report") {
+                    hit.source_bytes_upper_bound = Some(
+                        codestory_contracts::compilation::INTERIM_SOURCE_ROW_UPPER_BOUND as u32,
+                    );
+                }
                 hit.file_role = file_role
                     .as_deref()
                     .map(codestory_store::FileRole::from_db_value);
@@ -2829,6 +2836,35 @@ fn cosine_similarity_bytes(query: &[f32], query_norm: f64, bytes: &[u8]) -> Resu
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dense_summary_does_not_reserve_source_but_semantic_anchor_does() {
+        let rows = super::scored_hits_to_candidates(vec![
+            (
+                0.9,
+                "41".into(),
+                "component summary".into(),
+                Some("src/service.rs".into()),
+                None,
+                Some("component_report".into()),
+            ),
+            (
+                0.8,
+                "42".into(),
+                "Service".into(),
+                Some("src/service.rs".into()),
+                None,
+                Some("entry_point".into()),
+            ),
+        ]);
+        assert!(rows[0].packet_descriptor().is_none());
+        assert!(rows[0].provenance.iter().any(|p| p == "component_report"));
+        assert_eq!(rows[1].start_line, None);
+        assert!(
+            rows[1].packet_descriptor().is_some(),
+            "legacy semantic-only source metadata remains admissible"
+        );
+    }
+
     use super::*;
     use crate::config::SidecarLayout;
     use codestory_contracts::graph::{Node, NodeId, NodeKind};
@@ -3062,6 +3098,7 @@ mod tests {
             execution_observation_source: "ggml_eval_callback",
             encode_count: 1,
             execution_node_count: 1,
+            completed_operator_counts: std::collections::BTreeMap::from([("MUL_MAT".into(), 1)]),
             resident_accelerator_tensor_count: 1,
             resident_accelerator_tensor_bytes: 1,
             model_layer_count: 13,
@@ -3090,6 +3127,7 @@ mod tests {
 
     fn reader_manifest(embedding_backend: &str) -> RetrievalIndexManifest {
         RetrievalIndexManifest {
+            artifact_scope: None,
             project_id: "reader-project".into(),
             lexical_version: crate::lexical_index::LEXICAL_INDEX_VERSION.into(),
             semantic_generation: "codestory_reader_admission".into(),

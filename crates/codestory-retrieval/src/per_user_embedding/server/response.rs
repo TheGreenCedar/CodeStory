@@ -53,6 +53,7 @@ pub(in crate::per_user_embedding) fn engine_identity(
         execution_observation_source: identity.execution_observation_source.into(),
         encode_count: identity.encode_count,
         execution_node_count: identity.execution_node_count,
+        completed_operator_counts: identity.completed_operator_counts.clone(),
         resident_accelerator_tensor_count: identity.resident_accelerator_tensor_count,
         resident_accelerator_tensor_bytes: identity.resident_accelerator_tensor_bytes,
         model_layer_count: identity.model_layer_count,

@@ -412,6 +412,7 @@ mod source_window_tests {
 /// Path windows use a separate renderer: symbol windows intentionally retain
 /// their existing partial-line contract. A shared physical line is decoded once
 /// and retained only while at least one requested window can still fit it.
+#[derive(Clone)]
 pub(crate) struct PathSourceWindow {
     lines: Vec<(u32, std::sync::Arc<str>)>,
     source_total_lines: Option<u32>,

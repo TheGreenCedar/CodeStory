@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Multi-project stdio refuses an exact `--cache-dir` override. To use one retained cache, bind stdio to its `--project`; multi-project requests use separate per-project caches.
+
+- Root-symbol MCP resources return bounded, complete JSON pages with remaining counts and continuation links. Custom resource clients must read the versioned page object’s `symbols` array instead of a bare array and follow `continuation_uri` for the remaining symbols.
+
+- Packet continuation labels show available source paths, symbol names and exact requested ranges to help you choose a follow-up.
+
 - Managed tools can refresh once after a content check catches a delayed filesystem notification, within the original call deadline. Source-backed reads still refuse stale bytes; retained graph results remain labelled historical.
 
 - Packet retrieval considers matching source when an ordinary question includes example values absent from the code. Explicit search queries retain their quoted-term requirements.

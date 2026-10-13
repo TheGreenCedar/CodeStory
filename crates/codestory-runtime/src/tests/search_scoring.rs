@@ -130,6 +130,42 @@ fn build_search_hit_prefers_declaration_coordinates_and_filters_unknown_nodes() 
 }
 
 #[test]
+fn build_search_hit_classifies_component_reports_without_forging_source() {
+    use codestory_contracts::api::{PacketEvidenceResolutionDto, PacketEvidenceTierDto};
+    let mut storage = Storage::new_in_memory().expect("storage");
+    storage
+        .insert_nodes_batch(&[Node {
+            id: CoreNodeId(700),
+            kind: NodeKind::MODULE,
+            serialized_name: "component_report:dir:src".into(),
+            canonical_id: Some("codestory:component_report:dir:src".into()),
+            ..Default::default()
+        }])
+        .expect("derived report");
+    let mut report =
+        AppController::build_search_hit(&storage, &HashMap::new(), CoreNodeId(700), 1.0)
+            .expect("report lookup")
+            .expect("graph diagnostic retained");
+    crate::agent::packet_evidence::decorate_search_hit_evidence(&mut report);
+    assert!(report.file_path.is_none());
+    assert_eq!(
+        report.evidence_tier,
+        Some(PacketEvidenceTierDto::ComponentReport)
+    );
+    assert_eq!(
+        report.resolution_status,
+        Some(PacketEvidenceResolutionDto::DiagnosticOnly)
+    );
+    assert_eq!(
+        report.evidence_producer.as_deref(),
+        Some("component_report")
+    );
+    assert!(crate::search_scoring::is_diagnostic_component_report_hit(
+        &report
+    ));
+}
+
+#[test]
 fn build_search_hit_fails_closed_when_structural_provenance_cannot_be_read() {
     let mut storage = Storage::new_in_memory().expect("storage");
     storage

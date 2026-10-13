@@ -95,8 +95,29 @@ fn main() {
     let model_source = resolve_model_source();
     let model_embedded = model_source.is_some();
     let embedding_contract_sha256 = embedding_contract_digest(&contract);
+    // Bind the owning completion/rejection seam separately from the upstream
+    // llama commit. Old native producers must not share this build identity.
+    let native_completion_sha256 = ordered_contract_digest(
+        "codestory-completed-native-v1",
+        &[
+            &file_sha256("../../vendor/llama-cpp-sys-2/llama.cpp/ggml/src/ggml-backend.cpp"),
+            &file_sha256("../../vendor/llama-cpp-sys-2/llama.cpp/ggml/include/ggml-backend.h"),
+            &file_sha256("../../vendor/llama-cpp-sys-2/llama.cpp/src/llama-model.cpp"),
+            &file_sha256("../../vendor/llama-cpp-sys-2/llama.cpp/src/llama-model-offload.h"),
+            &file_sha256("src/lib.rs"),
+        ],
+    );
+    for path in [
+        "../../vendor/llama-cpp-sys-2/llama.cpp/ggml/src/ggml-backend.cpp",
+        "../../vendor/llama-cpp-sys-2/llama.cpp/ggml/include/ggml-backend.h",
+        "../../vendor/llama-cpp-sys-2/llama.cpp/src/llama-model.cpp",
+        "../../vendor/llama-cpp-sys-2/llama.cpp/src/llama-model-offload.h",
+        "src/lib.rs",
+    ] {
+        println!("cargo:rerun-if-changed={path}");
+    }
     let ggml_build_identity = format!(
-        "codestory-native-engine-v1|target={target}|os={target_os}|arch={target_arch}|linkage={engine_linkage}|backend_loading={backend_loading}|backends={}|llama_cpp_crate={}|llama_cpp_commit={}|model_sha256={}|embedding_contract_sha256={embedding_contract_sha256}|model_embedded={model_embedded}|producer={}@{}|end",
+        "codestory-native-engine-v1|target={target}|os={target_os}|arch={target_arch}|linkage={engine_linkage}|backend_loading={backend_loading}|backends={}|llama_cpp_crate={}|llama_cpp_commit={}|model_sha256={}|embedding_contract_sha256={embedding_contract_sha256}|model_embedded={model_embedded}|completed_native_sha256={native_completion_sha256}|producer={}@{}|end",
         compiled_backends.join(","),
         contract.llama_cpp_crate_version,
         contract.llama_cpp_source_commit,

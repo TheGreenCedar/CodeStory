@@ -2907,8 +2907,6 @@ dependencies = [
 [[package]]
 name = "llama-cpp-sys-2"
 version = "0.1.151"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23c676b02f8f2bdd9d7df7bcca0bd176b27964440998e7aa31c6fe32552964d0"
 dependencies = [
  "bindgen",
  "cc",

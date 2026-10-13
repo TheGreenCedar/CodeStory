@@ -366,6 +366,7 @@ mod tests {
 
     fn retained_manifest(project_id: &str) -> RetrievalIndexManifest {
         RetrievalIndexManifest {
+            artifact_scope: None,
             project_id: project_id.into(),
             lexical_version: "lexical-v1".into(),
             semantic_generation: "semantic-one".into(),

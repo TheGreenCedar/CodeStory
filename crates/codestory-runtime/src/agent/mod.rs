@@ -40,6 +40,8 @@ pub(crate) mod packet_candidate;
 pub(crate) mod packet_capping;
 pub(crate) mod packet_compiler;
 pub(crate) mod packet_follow_up;
+pub(crate) mod packet_replay;
+pub(crate) mod packet_served_sources;
 
 pub(crate) mod packet_execution_record_v3;
 

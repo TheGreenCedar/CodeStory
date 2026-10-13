@@ -31,6 +31,7 @@ fn sample_v3_packet_projection(
         .support
         .iter()
         .map(|unit| PacketEvidenceRowV3Dto {
+            packet_request_patch: None,
             source_delivery: unit.source_delivery.clone(),
             identity: EvidenceIdentityV3Dto {
                 evidence_id: IdentityTextV3::new(format!("packet-{}", unit.id))

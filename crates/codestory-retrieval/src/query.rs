@@ -210,7 +210,8 @@ impl PinnedQuerySession {
         }
 
         let project_id = sidecar_project_id_for_runtime(project_root, runtime)?;
-        let generation_lease = GenerationRetentionLease::acquire_for_query(runtime, &project_id)?;
+        let mut generation_lease =
+            GenerationRetentionLease::acquire_for_query(runtime, &project_id)?;
         let publication_storage =
             Store::open_read_only(storage_path).context("open retrieval publication pointer")?;
         let bound_manifest = publication_storage
@@ -264,6 +265,28 @@ impl PinnedQuerySession {
         {
             bail!("retrieval publication core binding does not match immutable core contents");
         }
+
+        let producer_runtime = crate::publication_scope::resolve_publication_runtime(
+            project_root,
+            &storage,
+            &manifest,
+            runtime,
+        )?;
+        generation_lease.retain_origin(runtime, &producer_runtime, &project_id)?;
+        let observed =
+            Store::open_read_only(storage_path)?.get_bound_retrieval_index_manifest(&project_id)?;
+        if observed.as_ref() != Some(&bound_manifest) {
+            return Err(RetrievalPublicationChanged::changed(
+                "resolve publication artifact origin",
+                &retrieval_publication_identity_from_bound(&bound_manifest)?,
+                observed
+                    .as_ref()
+                    .map(retrieval_publication_identity_from_bound)
+                    .transpose()?,
+            )
+            .into());
+        }
+        let runtime = &producer_runtime;
 
         // Acquire residency before strict readiness and keep it through candidate resolution.
         let embedding_residency = acquire_product_embedding_residency_for_runtime(runtime)
@@ -1572,6 +1595,7 @@ fn retrieval_publication_identity_from_bound(
 ) -> Result<RetrievalPublicationIdentity> {
     let manifest = &bound.manifest;
     Ok(RetrievalPublicationIdentity {
+        artifact_scope: manifest.artifact_scope.clone(),
         core_generation_id: bound.core.generation_id.clone(),
         core_run_id: bound.core.run_id.clone(),
         sidecar_generation: manifest
@@ -2035,6 +2059,7 @@ mod tests {
 
     fn publication_identity(label: &str) -> RetrievalPublicationIdentity {
         RetrievalPublicationIdentity {
+            artifact_scope: None,
             core_generation_id: format!("core-{label}"),
             core_run_id: format!("run-{label}"),
             sidecar_generation: format!("sidecar-{label}"),
@@ -3333,6 +3358,7 @@ mod tests {
             let mut storage = Store::open(&storage_path).expect("open db");
             storage
                 .upsert_retrieval_index_manifest(&codestory_store::RetrievalIndexManifest {
+                    artifact_scope: None,
                     project_id,
                     lexical_version: crate::lexical_index::LEXICAL_INDEX_VERSION.into(),
                     semantic_generation: "codestory_legacy".into(),

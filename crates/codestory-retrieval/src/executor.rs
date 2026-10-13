@@ -95,6 +95,8 @@ pub struct QueryTrace {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetrievalPublicationIdentity {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_scope: Option<codestory_store::RetrievalArtifactScope>,
     pub core_generation_id: String,
     pub core_run_id: String,
     pub sidecar_generation: String,
@@ -372,7 +374,19 @@ impl<'a> QueryExecutor<'a> {
             sanitize_descriptor_candidates(&mut candidates);
         }
         let ranked = rank_candidates(&features, candidates);
-        let hits = ranked;
+        let mut hits = ranked;
+        if payload.is_descriptor()
+            && cancel_reason.is_none()
+            && !self.cancelled.load(Ordering::Acquire)
+            && Instant::now() < deadline
+        {
+            let context = SearchExecutionContext::new(
+                deadline,
+                Arc::clone(&self.cancelled),
+                Arc::new(AtomicBool::new(false)),
+            );
+            self.sidecars.enrich_packet_calls(&mut hits, &context)?;
+        }
 
         if self.cancelled.load(Ordering::Acquire) {
             cancel_reason = Some("cancelled".into());
@@ -1181,6 +1195,25 @@ fn merge_candidates(acc: &mut Vec<CandidateHit>, incoming: Vec<CandidateHit>) ->
             .find(|existing| fused_candidate_identity_matches(existing, &hit));
         if let Some(existing) = duplicate {
             let replace_graph_evidence = graph_evidence_should_replace(existing, &hit);
+            // Bounds belong to compatible source metadata, not merely a
+            // shared display name or a merged lane score. Never hydrate Core
+            // to repair a descriptor. Preserve the conservative larger bound.
+            let compatible_source = existing.packet_stable_identity().is_some()
+                && existing.packet_stable_identity() == hit.packet_stable_identity()
+                && existing.file_path == hit.file_path
+                && match (existing.start_line, hit.start_line) {
+                    (Some(left), Some(right)) => left == right,
+                    _ => true,
+                };
+            if compatible_source {
+                existing.source_bytes_upper_bound = match (
+                    existing.source_bytes_upper_bound.filter(|bytes| *bytes > 0),
+                    hit.source_bytes_upper_bound.filter(|bytes| *bytes > 0),
+                ) {
+                    (Some(left), Some(right)) => Some(left.max(right)),
+                    (left, right) => left.or(right),
+                };
+            }
             existing.merge_lane_scores(&hit.lane_scores);
             if existing.node_id.is_none() {
                 existing.node_id = hit.node_id.clone();
@@ -1199,6 +1232,30 @@ fn merge_candidates(acc: &mut Vec<CandidateHit>, incoming: Vec<CandidateHit>) ->
             }
             if existing.source_excerpt.is_none() {
                 existing.source_excerpt = hit.source_excerpt.clone();
+            }
+            if existing
+                .provenance
+                .iter()
+                .chain(hit.provenance.iter())
+                .any(|p| p == "published-call-descriptors-conflict")
+            {
+                existing.published_calls = None;
+                existing.add_provenance("published-call-descriptors-conflict");
+            }
+            match (&existing.published_calls, &hit.published_calls) {
+                (None, Some(_))
+                    if !existing
+                        .provenance
+                        .iter()
+                        .any(|p| p == "published-call-descriptors-conflict") =>
+                {
+                    existing.published_calls = hit.published_calls.clone()
+                }
+                (Some(a), Some(b)) if a != b => {
+                    existing.published_calls = None;
+                    existing.add_provenance("published-call-descriptors-conflict");
+                }
+                _ => {}
             }
             if existing.file_role.is_none() {
                 existing.file_role = hit.file_role;
@@ -1219,6 +1276,13 @@ fn merge_candidates(acc: &mut Vec<CandidateHit>, incoming: Vec<CandidateHit>) ->
         added += 1;
     }
     added
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn replay_fuse_published_calls(hits: Vec<CandidateHit>) -> Vec<CandidateHit> {
+    let mut result = Vec::new();
+    merge_candidates(&mut result, hits);
+    result
 }
 
 fn graph_evidence_should_replace(existing: &CandidateHit, incoming: &CandidateHit) -> bool {
@@ -1315,8 +1379,93 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
+    #[test]
+    fn published_call_metadata_conflict_survives_nested_fusion_and_export() {
+        use codestory_contracts::compilation::*;
+        let make = |hash: &str| {
+            let mut hit = CandidateHit::lexical_stub("src/worker.rs", 0.8);
+            hit.node_id = Some("7".into());
+            hit.start_line = Some(1);
+            hit.source_bytes_upper_bound = Some(512);
+            hit.published_calls = Some(PacketPublishedCallsV1 {
+                sidecar_input_hash: hash.into(),
+                neighborhood: PacketCallNeighborhoodV1 {
+                    schema_version: PACKET_CALL_DESCRIPTOR_SCHEMA_V1,
+                    source_identity: "node:7".into(),
+                    truncated: false,
+                    targets: Vec::new(),
+                },
+            });
+            hit
+        };
+        let a = make("a");
+        let b = make("b");
+        let conflicted = replay_fuse_published_calls(vec![a.clone(), b.clone()])
+            .pop()
+            .unwrap();
+        for rows in [
+            vec![a.clone(), conflicted.clone(), b.clone()],
+            vec![conflicted.clone(), a.clone(), b.clone()],
+            vec![b.clone(), a.clone(), conflicted.clone()],
+        ] {
+            let result = replay_fuse_published_calls(rows);
+            assert_eq!(result.len(), 1);
+            assert!(result[0].published_calls.is_none());
+            let descriptor = result[0].packet_descriptor().unwrap();
+            assert!(descriptor.published_calls.is_none());
+            assert!(descriptor.published_calls_conflicted);
+        }
+        let mut semantic = a.clone();
+        semantic.source = CandidateSource::Semantic;
+        semantic.published_calls = None;
+        let result = replay_fuse_published_calls(vec![semantic, a.clone()]);
+        assert_eq!(result[0].published_calls, a.published_calls);
+    }
+
+    #[test]
+    fn descriptor_fusion_preserves_only_compatible_source_reservations() {
+        let mut unlocated = CandidateHit::with_source(
+            "src/service.rs",
+            Some("Service".into()),
+            0.8,
+            CandidateSource::Lexical,
+        );
+        unlocated.node_id = Some("41".into());
+        let mut anchor = unlocated.clone();
+        anchor.source = CandidateSource::Semantic;
+        anchor.source_bytes_upper_bound = Some(512);
+        let mut merged = vec![unlocated.clone()];
+        merge_candidates(&mut merged, vec![anchor.clone()]);
+        assert!(
+            merged[0].packet_descriptor().is_some(),
+            "valid semantic-only source bound survives lexical-first fusion"
+        );
+        let mut larger = anchor.clone();
+        larger.source_bytes_upper_bound = Some(1024);
+        merge_candidates(&mut merged, vec![larger]);
+        assert_eq!(merged[0].source_bytes_upper_bound, Some(1024));
+        for conflict in ["path", "line"] {
+            let mut left = unlocated.clone();
+            left.start_line = Some(4);
+            let mut right = anchor.clone();
+            right.start_line = Some(4);
+            if conflict == "path" {
+                right.file_path = "src/other.rs".into();
+            } else {
+                right.start_line = Some(9);
+            }
+            let mut merged = vec![left];
+            merge_candidates(&mut merged, vec![right]);
+            assert!(
+                merged[0].source_bytes_upper_bound.is_none(),
+                "conflicting {conflict} cannot transfer source authority"
+            );
+        }
+    }
+
     fn sample_manifest() -> RetrievalIndexManifest {
         RetrievalIndexManifest {
+            artifact_scope: None,
             project_id: "testproj".into(),
             lexical_version: "v1".into(),
             semantic_generation: "codestory_testproj".into(),
@@ -3142,6 +3291,18 @@ mod tests {
     #[test]
     fn executor_merges_duplicate_candidate_provenance() {
         let query = "how extension service starts";
+        // Raw lane scores are not comparable with fused ranking scores.
+        // Keep the fusion quality assertion in the same versioned units.
+        let lexical_only_score = rank_candidates(
+            &classify_query(query),
+            vec![CandidateHit::with_source(
+                "src/service.rs",
+                Some("ExtensionService".into()),
+                0.70,
+                CandidateSource::Lexical,
+            )],
+        )[0]
+        .score;
         let mut adjacency_hit = CandidateHit::with_source(
             "src/service.rs",
             Some("ExtensionService".into()),
@@ -3187,8 +3348,8 @@ mod tests {
             .find(|hit| hit.file_path == "src/service.rs")
             .expect("merged candidate");
         assert!(
-            hit.score > 0.70,
-            "merged candidate should keep ranker-adjusted score above lexical-only input: {hit:?}"
+            hit.score > lexical_only_score,
+            "merged candidate should exceed ranked lexical-only evidence ({lexical_only_score}): {hit:?}"
         );
         assert!(hit.provenance.iter().any(|label| label == "lexical_source"));
         assert!(hit.provenance.iter().any(|label| label == "graph_neighbor"));

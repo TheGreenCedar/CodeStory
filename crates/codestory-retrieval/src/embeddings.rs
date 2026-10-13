@@ -688,6 +688,12 @@ fn validate_identity(identity: &ProductEmbeddingIdentity, allow_cpu: bool) -> Re
         || identity.execution_observation_source != "ggml_eval_callback"
         || identity.encode_count == 0
         || identity.execution_node_count == 0
+        || identity
+            .completed_operator_counts
+            .get("MUL_MAT")
+            .copied()
+            .unwrap_or(0)
+            == 0
         || identity.execution_device_names.is_empty()
         || identity.execution_backend_names.is_empty()
         || identity.offloaded_layer_count != identity.model_layer_count
@@ -836,6 +842,10 @@ mod tests {
             execution_observation_source: "ggml_eval_callback",
             encode_count: 1,
             execution_node_count: usize::from(policy == "accelerated") as u64,
+            completed_operator_counts: std::collections::BTreeMap::from([(
+                "MUL_MAT".into(),
+                usize::from(policy == "accelerated") as u64,
+            )]),
             resident_accelerator_tensor_count: usize::from(policy == "accelerated") as u64,
             resident_accelerator_tensor_bytes: usize::from(policy == "accelerated") as u64,
             model_layer_count: 13,
@@ -860,6 +870,16 @@ mod tests {
         let mut no_resident_tensors = identity("accelerated");
         no_resident_tensors.resident_accelerator_tensor_count = 0;
         assert!(validate_identity(&no_resident_tensors, false).is_err());
+    }
+
+    #[test]
+    fn completed_operator_evidence_cannot_be_replaced_by_placement() {
+        let mut observed = identity("accelerated");
+        assert!(validate_identity(&observed, false).is_ok());
+        observed.completed_operator_counts.clear();
+        assert!(validate_identity(&observed, false).is_err());
+        observed.completed_operator_counts.insert("VIEW".into(), 1);
+        assert!(validate_identity(&observed, false).is_err());
     }
 
     #[test]

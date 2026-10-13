@@ -254,6 +254,7 @@ pub(crate) fn test_engine_identity() -> EmbeddingEngineIdentity {
         execution_observation_source: "ggml_eval_callback".into(),
         encode_count: 1,
         execution_node_count: 0,
+        completed_operator_counts: Default::default(),
         resident_accelerator_tensor_count: 0,
         resident_accelerator_tensor_bytes: 0,
         model_layer_count: 13,

@@ -160,12 +160,15 @@ pub(in crate::per_user_embedding) fn serve_embedding_request(
         match handle.try_recv_with_completion() {
             Ok(Some(Ok(completion))) => {
                 let native_completion_sequence = completion.completion_sequence;
+                let snapshot = completion
+                    .verified_snapshot()
+                    .map_err(engine_error)?
+                    .clone();
                 let normalization_started = std::time::Instant::now();
                 let vectors = normalize_and_validate_vectors(completion.vectors)?;
                 let normalization_ns =
                     u64::try_from(normalization_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 let payload = encode_vectors(&vectors)?;
-                let snapshot = engine.snapshot().map_err(engine_error)?;
                 let identity = engine_identity(&state.process.server_instance_id, &snapshot)?;
                 if deadline.cancel_if_elapsed(state.clock.as_ref(), &context) {
                     let _ = handle.cancel();

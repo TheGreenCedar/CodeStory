@@ -277,6 +277,8 @@ pub struct EmbeddingEngineIdentity {
     pub execution_observation_source: String,
     pub encode_count: u64,
     pub execution_node_count: u64,
+    #[serde(default)]
+    pub completed_operator_counts: std::collections::BTreeMap<String, u64>,
     pub resident_accelerator_tensor_count: u64,
     pub resident_accelerator_tensor_bytes: u64,
     pub model_layer_count: u32,

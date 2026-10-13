@@ -8,8 +8,8 @@
 //!
 //! Items are `pub(crate)` because `lib.rs` calls into them; a child module's
 //! private items are not visible to its parent. Nothing here is public API
-//! except the two signature tags, which `lib.rs` re-exports at their original
-//! paths.
+//! except the signature tags and bounded callable-body observation, which
+//! `lib.rs` re-exports.
 
 use super::*;
 
@@ -683,5 +683,234 @@ pub(crate) fn classify_projection_update(
             ProjectionUpdateMode::NoChanges
         }
         FileStructuralVerdict::Unchanged => ProjectionUpdateMode::Delta { changed_callers },
+    }
+}
+
+/// Exact parser spans, using the Core graph's one-based byte columns and
+/// exclusive end position. No names, question text or graph reach classify bodies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParsedCallableBodySpan {
+    pub start_line: u32,
+    pub start_column: u32,
+    pub end_line: u32,
+    pub end_column: u32,
+    pub body_start_line: u32,
+    pub body_end_line: u32,
+}
+
+/// Bounded observational parsing over already verified bytes. Unsupported,
+/// erroneous, cancelled or over-cap files have unknown body metadata.
+pub fn parsed_callable_body_spans(
+    path: &Path,
+    source: &str,
+) -> Option<Vec<ParsedCallableBodySpan>> {
+    if source.len() > 1024 * 1024 {
+        return None;
+    }
+    let language = get_language_for_ext(path.extension()?.to_str()?)?;
+    let mut parser = Parser::new();
+    parser.set_language(&language.language).ok()?;
+    let began = std::time::Instant::now();
+    let mut progress_calls = 0usize;
+    let mut progress = |_: &tree_sitter::ParseState| {
+        progress_calls += 1;
+        if progress_calls > 5000 || began.elapsed() > std::time::Duration::from_millis(50) {
+            std::ops::ControlFlow::Break(())
+        } else {
+            std::ops::ControlFlow::Continue(())
+        }
+    };
+    let mut input = |offset: usize, _: tree_sitter::Point| &source.as_bytes()[offset..];
+    let tree = parser.parse_with_options(
+        &mut input,
+        None,
+        Some(tree_sitter::ParseOptions::new().progress_callback(&mut progress)),
+    )?;
+    if tree.root_node().has_error() {
+        return None;
+    }
+    let mut stack = vec![tree.root_node()];
+    let mut visited = 0usize;
+    let mut bodies = Vec::new();
+    while let Some(node) = stack.pop() {
+        visited += 1;
+        if visited > 200_000 || began.elapsed() > std::time::Duration::from_millis(75) {
+            return None;
+        }
+        // Grammar node kinds are syntax facts, never software-question roles.
+        if matches!(
+            node.kind(),
+            "function_definition"
+                | "function_declaration"
+                | "method_definition"
+                | "method_declaration"
+                | "fn_item"
+                | "function_item"
+                | "constructor_declaration"
+                | "destructor_definition"
+                | "lambda_expression"
+                | "lambda"
+                | "arrow_function"
+                | "function_expression"
+                | "anonymous_function"
+                | "closure_expression"
+                | "local_function_statement"
+                | "method"
+                | "singleton_method"
+        ) && let Some(body) = node.child_by_field_name("body")
+            && body.is_named()
+            && !body.is_missing()
+            && !body.has_error()
+        {
+            let span = ts_node_graph_span(node);
+            let body_span = ts_node_graph_span(body);
+            bodies.push(ParsedCallableBodySpan {
+                start_line: span.start_line,
+                start_column: span.start_col,
+                end_line: span.end_line,
+                end_column: span.end_col,
+                body_start_line: body_span.start_line,
+                body_end_line: body_span.end_line,
+            });
+            if bodies.len() > 4096 {
+                return None;
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    Some(bodies)
+}
+
+#[cfg(test)]
+mod callable_body_span_controls {
+    use super::*;
+
+    #[test]
+    fn grammar_bodies_keep_empty_workers_and_exclude_declarations_with_type_references() {
+        let cases = [
+            (
+                "a.go",
+                "package p\ntype I interface { F(x T) T }\nfunc worker() {}\n",
+                1,
+            ),
+            ("a.rs", "trait I { fn f(&self) -> T; }\nfn worker() {}\n", 1),
+            (
+                "a.java",
+                "abstract class I { abstract T f(T x); T worker() { return null; } }",
+                1,
+            ),
+            ("a.py", "def worker():\n    pass\n", 1),
+            ("a.c", "int f(int x);\nint worker(void) { return 0; }\n", 1),
+            ("a.js", "function worker() {}\nconst other = () => 7;\n", 2),
+        ];
+        for (path, text, count) in cases {
+            let spans = parsed_callable_body_spans(Path::new(path), text).expect(path);
+            assert_eq!(spans.len(), count, "{path}");
+            assert!(
+                spans
+                    .iter()
+                    .all(|s| s.start_line <= s.body_start_line && s.body_end_line <= s.end_line)
+            );
+        }
+    }
+
+    #[test]
+    fn normal_core_producer_coordinates_join_methods_nested_and_expression_bodies() {
+        let cases = [
+            (
+                "a.go",
+                "package p\ntype I interface { F() }\ntype T struct{}\nfunc (t T) worker() {}\n",
+            ),
+            (
+                "a.rs",
+                "trait I { fn f(&self); }\nstruct T; impl T { fn worker(&self) {} }\n",
+            ),
+            (
+                "a.java",
+                "abstract class I { abstract void f(); void worker() {} }",
+            ),
+            ("a.py", "class T:\n    def worker(self):\n        pass\n"),
+            ("a.c", "int f(void);\nint worker(void) { return 0; }\n"),
+            (
+                "a.js",
+                "function worker(){ function inner(){} return () => 7; }",
+            ),
+            ("b.js", "const worker = () => 7;"),
+        ];
+        for (name, text) in cases {
+            let path = Path::new(name);
+            let config = get_language_for_ext(path.extension().unwrap().to_str().unwrap()).unwrap();
+            let core = index_file(path, text, &config, None, None).unwrap();
+            let bodies = parsed_callable_body_spans(path, text).unwrap();
+            if matches!(
+                path.extension().and_then(|s| s.to_str()),
+                Some("go" | "rs" | "java" | "c")
+            ) {
+                assert!(
+                    core.nodes
+                        .iter()
+                        .any(|n| node_matches_name(n, "f") || node_matches_name(n, "F")),
+                    "{name}: declaration-negative control requires a normal Core declaration"
+                );
+            }
+            let worker = core
+                .nodes
+                .iter()
+                .filter(|n| {
+                    matches!(n.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                        && node_matches_name(n, "worker")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                worker.len(),
+                1,
+                "{name}: normal producer must identify the worker"
+            );
+            let node = worker[0];
+            let matches = bodies
+                .iter()
+                .filter(|span| {
+                    Some(span.start_line) == node.start_line
+                        && Some(span.start_column) == node.start_col
+                        && Some(span.end_line) == node.end_line
+                        && Some(span.end_column) == node.end_col
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                matches.len(),
+                1,
+                "{name}: exact normal Core/body coordinate join"
+            );
+            for declaration in core
+                .nodes
+                .iter()
+                .filter(|n| node_matches_name(n, "f") || node_matches_name(n, "F"))
+            {
+                assert!(
+                    !bodies
+                        .iter()
+                        .any(|span| Some(span.start_line) == declaration.start_line
+                            && Some(span.start_column) == declaration.start_col
+                            && Some(span.end_line) == declaration.end_line
+                            && Some(span.end_column) == declaration.end_col),
+                    "declaration cannot acquire a body: {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nested_same_line_callables_have_distinct_byte_columns_and_bad_input_is_unknown() {
+        let bodies =
+            parsed_callable_body_spans(Path::new("a.js"), "function a(){ return () => 7; }")
+                .unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert_ne!(bodies[0].start_column, bodies[1].start_column);
+        assert!(parsed_callable_body_spans(Path::new("a.go"), "package p\nfunc bad( {").is_none());
+        assert!(parsed_callable_body_spans(Path::new("a.unknown"), "fn a(){}").is_none());
+        assert!(
+            parsed_callable_body_spans(Path::new("a.go"), &"x".repeat(1024 * 1024 + 1)).is_none()
+        );
     }
 }

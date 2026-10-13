@@ -1888,6 +1888,10 @@ pub(crate) fn packet_source_delivery_schema() -> Value {
     PACKET_SOURCE_DELIVERY_SCHEMA.to_json()
 }
 
+pub(crate) fn packet_continuation_probe_schema() -> Value {
+    PACKET_CONTINUATION_PROBE_SCHEMA.to_json()
+}
+
 static SUPPORT_UNIT_SCHEMA: SchemaObject = SchemaObject::object(
     "Compiled evidence atom the agent judges.",
     &[
@@ -2097,6 +2101,9 @@ static SOURCE_RANGE_SCHEMA: SchemaObject = SchemaObject::object(
 static SNIPPET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     "Return bounded source: either resolve one symbol, or read line ranges from files named by earlier evidence.",
     &[
+        SchemaProperty::integer("max_tool_result_bytes",
+            "Optional path-read allowance for UTF-8 serialized served MCP tool result, including revision text/structured mirroring and publication metadata. Excludes JSON-RPC and host framing; does not bound an investigation. Whole-line receipts may be partial; a receipt that cannot fit refuses.")
+            .with_bounds(256, 524_288),
         SchemaProperty::array(
             "paths",
             "File ranges to read in one call, instead of resolving a symbol. Line-numbered and bounded in total; use exact paths from files, search, trail, or packet; filenames are paths, not symbol IDs.",
@@ -2674,7 +2681,7 @@ static RESOURCE_TEMPLATES: &[ResourceTemplateSpec] = &[
         mime_type: "application/json",
     },
     ResourceTemplateSpec {
-        uri_template: "codestory://symbols/root{?project}",
+        uri_template: "codestory://symbols/root{?project,limit,cursor}",
         name: "Root symbols",
         mime_type: "application/json",
     },

@@ -194,6 +194,16 @@ pub trait SidecarSearch: Send + Sync {
         Ok(())
     }
 
+    /// Optional immutable descriptor metadata, after ranking and before cache.
+    /// Test sidecars retain a no-op; normal product readers bind one publication.
+    fn enrich_packet_calls(
+        &self,
+        _candidates: &mut [CandidateHit],
+        _context: &SearchExecutionContext,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     fn lexical_search(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>>;
     fn lexical_search_batch(
         &self,
@@ -445,6 +455,23 @@ impl LiveSidecarSearch {
 }
 
 impl SidecarSearch for LiveSidecarSearch {
+    fn enrich_packet_calls(
+        &self,
+        candidates: &mut [CandidateHit],
+        context: &SearchExecutionContext,
+    ) -> Result<()> {
+        context.check_cancelled()?;
+        let stop = context.clone();
+        self.lexical.enrich_packet_calls(
+            &self.layout,
+            &self.sidecar_generation,
+            &self.sidecar_input_hash,
+            candidates,
+            Arc::new(move || stop.is_cancelled()),
+        )?;
+        context.check_cancelled()
+    }
+
     fn layout(&self) -> Option<&SidecarLayout> {
         Some(&self.layout)
     }

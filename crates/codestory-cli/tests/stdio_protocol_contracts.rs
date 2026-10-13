@@ -1303,9 +1303,9 @@ fn unknown_proof_document() -> &'static str {
     "call-path/v1\nfrom symbol \"crate::missing::start\"\ndirect-call symbol \"crate::missing::target\"\n"
 }
 
-/// True when activation terminated instead of staying retryable.
+/// True when this request stopped rather than returning bounded preparation.
 ///
-/// Activation can end terminally for more than one environment reason: the package may
+/// A stopped request can retain an externally retryable operation. The package may
 /// carry no embedded model (`native_model_not_embedded`), or the host may be unable to
 /// produce the evidence a candidate generation requires — an accelerator proof, for
 /// instance, which needs a live per-user embedding server reporting an accelerated device.
@@ -1313,6 +1313,109 @@ fn unknown_proof_document() -> &'static str {
 /// degradation contract rather than assuming one of them.
 fn activation_terminated(error: &Value) -> bool {
     error["state"] == json!("unavailable")
+}
+
+/// A stopped request may retain an embedding operation that can be retried only
+/// after its stated environment condition changes. This is not a hot retry and
+/// must keep local navigation while preserving the complete typed retry receipt.
+fn assert_embedding_failure_after_core(error: &Value) {
+    assert_eq!(error["code"], json!("codestory_unavailable"), "{error}");
+    assert_eq!(error["state"], json!("unavailable"), "{error}");
+    assert_eq!(error["retry_tool"], Value::Null, "{error}");
+    assert_eq!(error["recommended_next_calls"], json!([]), "{error}");
+    assert_eq!(
+        error["operation"]["capabilities"]["local_navigation"],
+        json!("ready"),
+        "{error}"
+    );
+    match error["cause_code"].as_str() {
+        Some("native_model_not_embedded") => {
+            assert_eq!(
+                error["operation"]["capabilities"]["broad_search"],
+                json!("unavailable"),
+                "{error}"
+            );
+        }
+        Some("embedding_retryable") => {
+            assert_eq!(error["operation"]["state"], json!("retryable"), "{error}");
+            assert_eq!(
+                error["operation"]["failure_code"],
+                json!("activation_retryable"),
+                "{error}"
+            );
+            assert_eq!(
+                error["operation"]["capabilities"]["broad_search"],
+                json!("retryable"),
+                "{error}"
+            );
+            assert_eq!(
+                error["details"]["failed_layer"],
+                json!("embedding_runtime"),
+                "{error}"
+            );
+            assert_eq!(
+                error["details"]["cause_code"],
+                json!("embedding_retryable"),
+                "{error}"
+            );
+            let retry = &error["operation"]["embedding_retry"];
+            assert_eq!(retry, &error["details"]["embedding_retry"], "{error}");
+            assert!(
+                retry["code"].as_str().is_some_and(|code| !code.is_empty()),
+                "{error}"
+            );
+            assert!(
+                matches!(
+                    retry["retry_class"].as_str(),
+                    Some(
+                        "after_capacity_change"
+                            | "after_delay"
+                            | "after_owner_idle"
+                            | "after_server_change"
+                            | "same_rpc_once"
+                    )
+                ),
+                "{error}"
+            );
+            assert!(
+                retry["retry_condition"]
+                    .as_str()
+                    .is_some_and(|condition| !condition.is_empty()),
+                "{error}"
+            );
+            assert!(retry["retry_after_ms"].as_u64().is_some(), "{error}");
+        }
+        _ => panic!(
+            "expected a typed embedding limitation after core publication, not contention or another failure: {error}"
+        ),
+    }
+}
+
+#[test]
+fn embedding_failure_assertion_rejects_contention_and_incomplete_retry_receipts() {
+    let retry = json!({"code":"native_engine_config_invalid", "retry_class":"after_server_change", "retry_condition":"server engine evidence changes", "retry_after_ms":0});
+    let valid = json!({"code":"codestory_unavailable", "state":"unavailable", "retry_tool":null, "recommended_next_calls":[], "cause_code":"embedding_retryable", "details":{"failed_layer":"embedding_runtime", "cause_code":"embedding_retryable", "embedding_retry":retry}, "operation":{"state":"retryable", "failure_code":"activation_retryable", "capabilities":{"local_navigation":"ready", "broad_search":"retryable"}, "embedding_retry":retry}});
+    assert_embedding_failure_after_core(&valid);
+    let terminal = json!({"code":"codestory_unavailable", "state":"unavailable", "retry_tool":null, "recommended_next_calls":[], "cause_code":"native_model_not_embedded", "operation":{"capabilities":{"local_navigation":"ready", "broad_search":"unavailable"}}});
+    assert_embedding_failure_after_core(&terminal);
+    for mutation in 0..6 {
+        let mut invalid = valid.clone();
+        match mutation {
+            0 => invalid["cause_code"] = json!("writer_lock_busy"),
+            1 => invalid["operation"]["embedding_retry"]["retry_condition"] = json!(""),
+            2 => invalid["operation"]["capabilities"]["local_navigation"] = json!("unavailable"),
+            3 => invalid["retry_tool"] = json!("packet"),
+            4 => invalid["operation"]["embedding_retry"]["retry_class"] = json!("unknown"),
+            _ => invalid["details"]["failed_layer"] = json!("writer_lock"),
+        }
+        // Keep both mirrors equal so invalid condition/class checks cannot
+        // pass merely because the two receipts disagree.
+        invalid["details"]["embedding_retry"] = invalid["operation"]["embedding_retry"].clone();
+        assert!(
+            std::panic::catch_unwind(|| assert_embedding_failure_after_core(&invalid)).is_err(),
+            "invalid receipt accepted: {invalid}"
+        );
+    }
 }
 
 fn assert_search_repaired_before_terminal_activation(
@@ -3970,7 +4073,7 @@ fn resource_template_and_prompt_catalog_names_are_snapshot_stable() {
             "codestory://snippet/{node_id}{?project}",
             "codestory://status{?project}",
             "codestory://symbol/{node_id}{?project}",
-            "codestory://symbols/root{?project}",
+            "codestory://symbols/root{?project,limit,cursor}",
             "codestory://trail/{node_id}{?project}",
         ],
         "every advertised repository-reading resource template should carry an explicit project selector: {templates}"
@@ -6323,7 +6426,7 @@ fn independent_clients_serve_one_complete_generation_while_refresh_is_owned() {
         ),
         "codestory://symbols/root",
     );
-    let app_controller_id = pre_symbols
+    let app_controller_id = pre_symbols["symbols"]
         .as_array()
         .into_iter()
         .flatten()
@@ -6377,7 +6480,7 @@ fn independent_clients_serve_one_complete_generation_while_refresh_is_owned() {
         "codestory://symbols/root",
     );
     assert!(
-        root_symbols
+        root_symbols["symbols"]
             .as_array()
             .is_some_and(|symbols| symbols.iter().any(|symbol| {
                 symbol["display_name"] == json!("AppController")
@@ -6766,7 +6869,7 @@ fn warmup_reader_state(fixture: &StdioFixture) -> (StdioServer, String, u64, Str
         assert_success_envelope(&symbols_response, json!("peer-warmup-symbols")),
         "codestory://symbols/root",
     );
-    let symbol_id = root_symbols
+    let symbol_id = root_symbols["symbols"]
         .as_array()
         .into_iter()
         .flatten()
@@ -6915,17 +7018,11 @@ stderr:
     );
     let packet_result = assert_success_envelope(&packet_response, json!("peer-wait-packet"));
     if packet_result.get("isError").and_then(Value::as_bool) == Some(true) {
-        // This build carries no embedded embedding model, so a full
-        // activation can wait on the peer, adopt its publication, and still
-        // terminate at dense preparation. The wire answer must be that typed
-        // limitation — never a lock-contention refusal — and the observed
-        // operation proves the peer's publication was already in place.
+        // Dense activation may lack an embedded model or require an external
+        // engine change after adopting the peer's complete core. Neither case
+        // may hide contention or lose the retained publication/retry receipt.
         let error = assert_tool_error(&packet_response, json!("peer-wait-packet"));
-        assert_eq!(
-            error["cause_code"],
-            json!("native_model_not_embedded"),
-            "the waited packet must not fail on writer contention: {error}"
-        );
+        assert_embedding_failure_after_core(&error);
         assert_eq!(
             error["operation"]["retained_core_publication"]["generation"],
             json!(published),
@@ -7071,22 +7168,14 @@ stderr:
             continue;
         }
         if resume_result.get("isError").and_then(Value::as_bool) == Some(true) {
-            // A build without the embedded embedding model waits, adopts the
-            // peer's core, then ends at dense preparation. The wire answer is
-            // that typed limitation — never a contention error or an unknown
-            // operation.
+            // After adopting the peer's core, dense preparation may stop on
+            // a typed model limitation or an external engine retry condition.
+            // Neither case may become contention or an unknown operation.
             let error = assert_tool_error(
                 &resume_response,
                 json!(format!("peer-deadline-resume-{resume_attempt}")),
             );
-            let cause = error["cause_code"]
-                .as_str()
-                .or_else(|| error["details"]["cause_code"].as_str());
-            assert_eq!(
-                cause,
-                Some("native_model_not_embedded"),
-                "the resumed call must not fail on writer contention: {error}"
-            );
+            assert_embedding_failure_after_core(&error);
             break;
         }
         assert_tool_success(&resume_response, json!("peer-deadline-resume"));
@@ -7775,10 +7864,7 @@ fn cold_ground_uses_local_capability_while_search_prepares_embedding_runtime() {
             "a terminal activation failure must name its cause: {error}"
         );
         assert_eq!(error["retry_tool"], Value::Null);
-        assert_eq!(
-            error["operation"]["capabilities"]["broad_search"],
-            json!("unavailable")
-        );
+        assert_embedding_failure_after_core(&error);
     } else {
         assert_eq!(error["kind"], json!("preparing"));
         assert_eq!(error["state"], json!("preparing"));

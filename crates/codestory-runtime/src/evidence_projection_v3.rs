@@ -51,6 +51,10 @@ pub struct PacketDiagnosticProjectionV3 {
 /// One finalized packet projection plus its immutable diagnostic artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PacketEvidenceProductV3 {
+    pub(crate) protected_source_witnesses:
+        Vec<crate::agent::packet_served_sources::ServedSourceWitness>,
+    pub(crate) source_issuance_seal:
+        Option<crate::agent::packet_served_sources::PacketSourceIssuanceSeal>,
     pub projection: PacketProjectionV3Dto,
     pub diagnostics: PacketDiagnosticProjectionV3,
 }
@@ -118,9 +122,177 @@ pub fn project_packet_v3(
     packet: &AgentPacketDto,
     measure: impl FnMut(&PacketProjectionV3Dto) -> Result<usize, ()>,
 ) -> Result<PacketEvidenceProductV3, codestory_contracts::api::ApiError> {
-    project_packet_v3_using_record_builder(caller_id, request, packet, measure, |input| {
-        build_packet_execution_record_v3(service, input)
-    })
+    project_packet_v3_using_record_builder(
+        &service.active_project_identity_v3()?.project_id,
+        caller_id,
+        request,
+        packet,
+        measure,
+        |input| build_packet_execution_record_v3(service, input),
+    )
+}
+
+// Whole-request bound derived from the existing proposal bound and finalizer
+// bound (initial/all-label/minimal, bounded labels, bounded binary probes,
+// fallback and caller revalidation). One additional baseline projection is
+// allowed; these are transport probes, never neural or retrieval counters.
+pub(crate) const PACKET_TRANSPORT_MEASUREMENTS_MAX_V1: usize =
+    (8 * codestory_agent::evidence_compiler::REPOSITORY_EVIDENCE_MAX_MEASURED_CANDIDATES_V1 + 2)
+        * (codestory_contracts::packet_projection_v3::GAP_ROWS_MAX_V3 + 11);
+
+pub(crate) fn bounded_packet_transport_measure_v3(
+    mut measure: impl FnMut(&PacketProjectionV3Dto) -> Result<usize, ()>,
+) -> impl FnMut(&PacketProjectionV3Dto) -> Result<usize, ()> {
+    let mut calls = 0usize;
+    move |projection| {
+        if calls >= PACKET_TRANSPORT_MEASUREMENTS_MAX_V1 {
+            return Err(());
+        }
+        calls += 1;
+        measure(projection)
+    }
+}
+
+/// Private per-proposal baseline binding, never a public wire policy.
+pub(crate) struct PacketRepresentationBaselineV1 {
+    pub(crate) packet: AgentPacketDto,
+    pub(crate) resolved_gap_witnesses: std::collections::BTreeMap<String, SupportUnitDto>,
+    pub(crate) added_source_units: Vec<SupportUnitDto>,
+}
+
+/// Compare the final typed frame that the transport actually measures. Row
+/// ordinal IDs can change; full source/graph content and action authority cannot.
+pub(crate) fn packet_projection_preserves_baseline_v3(
+    baseline: &PacketProjectionV3Dto,
+    candidate: &PacketProjectionV3Dto,
+    resolved_witnesses: &std::collections::BTreeMap<String, SupportUnitDto>,
+    added_source_units: &[SupportUnitDto],
+) -> bool {
+    let PacketProjectionV3Dto::Complete {
+        identity: old_id,
+        publication: old_pub,
+        retrieval: old_retrieval,
+        evidence: old_rows,
+        gaps: old_gaps,
+        continuation: old_continuation,
+        ..
+    } = baseline
+    else {
+        return false;
+    };
+    let PacketProjectionV3Dto::Complete {
+        identity,
+        publication,
+        retrieval,
+        evidence: rows,
+        gaps,
+        continuation,
+        ..
+    } = candidate
+    else {
+        return false;
+    };
+    if old_id != identity || old_pub != publication || old_retrieval != retrieval {
+        return false;
+    }
+    // An internal support unit resolves an action or earns a gain only if
+    // its exact authenticated source content is delivered in this final frame.
+    let delivered = |unit: &SupportUnitDto| {
+        let Some(expected) = packet_evidence_row(0, unit) else {
+            return false;
+        };
+        if unit.kind != SupportUnitKindDto::SourceRange || unit.source_delivery.is_none() {
+            return false;
+        }
+        rows.as_slice().iter().any(|row| {
+            let mut normalized = row.clone();
+            normalized.identity = expected.identity.clone();
+            // A newly delivered partial page can carry its own normal next-page
+            // action. Existing baseline action authority is compared below.
+            normalized.packet_request_patch = None;
+            normalized == expected
+        })
+    };
+    if added_source_units.iter().any(|unit| !delivered(unit)) {
+        return false;
+    }
+    let resolved = resolved_witnesses
+        .iter()
+        .filter(|(_, witness)| delivered(witness))
+        .map(|(id, _)| id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    for old in old_rows.as_slice() {
+        if !rows.as_slice().iter().any(|row| {
+            let mut normalized = row.clone();
+            normalized.identity = old.identity.clone();
+            normalized == *old
+        }) {
+            return false;
+        }
+    }
+    let unresolved = old_gaps
+        .as_slice()
+        .iter()
+        .filter(|gap| {
+            gap.kind == GapKindV3Dto::ContinuationRequired
+                && !resolved.contains(gap.identity.gap_id.as_str())
+        })
+        .collect::<Vec<_>>();
+    for gap in old_gaps.as_slice() {
+        if gap.kind == GapKindV3Dto::OutputBudgetExceeded
+            || (gap.kind == GapKindV3Dto::ContinuationRequired
+                && resolved.contains(gap.identity.gap_id.as_str()))
+        {
+            continue;
+        }
+        if !gaps.as_slice().contains(gap) {
+            return false;
+        }
+    }
+    if !unresolved.is_empty() {
+        match (old_continuation, continuation) {
+            (None, None) => {}
+            (Some(old), Some(current)) => {
+                if old.continuation_id != current.continuation_id
+                    || old.remaining_rounds != current.remaining_rounds
+                {
+                    return false;
+                }
+                for gap in &unresolved {
+                    if old.gap_ids.as_slice().contains(&gap.identity)
+                        && !current.gap_ids.as_slice().contains(&gap.identity)
+                    {
+                        return false;
+                    }
+                }
+                match (&old.packet_request_patch, &current.packet_request_patch) {
+                    (None, None) => {}
+                    (Some(old_patch), Some(patch)) => {
+                        if old_patch.parent_packet_id != patch.parent_packet_id
+                            || old_patch.core_generation_id != patch.core_generation_id
+                            || old_patch.retrieval_generation != patch.retrieval_generation
+                            || old_patch.probes != patch.probes
+                        {
+                            return false;
+                        }
+                        for gap in &unresolved {
+                            if old_patch
+                                .option_ids
+                                .as_slice()
+                                .contains(&gap.identity.gap_id)
+                                && !patch.option_ids.as_slice().contains(&gap.identity.gap_id)
+                            {
+                                return false;
+                            }
+                        }
+                    }
+                    _ => return false,
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 pub fn project_packet_v3_with_identity(
@@ -131,12 +303,18 @@ pub fn project_packet_v3_with_identity(
     reserved: &PacketProjectionIdentityV3,
     measure: impl FnMut(&PacketProjectionV3Dto) -> Result<usize, ()>,
 ) -> Result<PacketEvidenceProductV3, codestory_contracts::api::ApiError> {
-    project_packet_v3_using_record_builder(caller_id, request, packet, measure, |input| {
-        build_packet_execution_record_v3_with_id(service, input, &reserved.0)
-    })
+    project_packet_v3_using_record_builder(
+        &service.active_project_identity_v3()?.project_id,
+        caller_id,
+        request,
+        packet,
+        measure,
+        |input| build_packet_execution_record_v3_with_id(service, input, &reserved.0),
+    )
 }
 
 fn project_packet_v3_using_record_builder(
+    project_id: &str,
     caller_id: &str,
     request: &AgentPacketRequestDto,
     packet: &AgentPacketDto,
@@ -148,11 +326,15 @@ fn project_packet_v3_using_record_builder(
         crate::agent::packet_execution_record_v3::RecordValidationErrorV3,
     >,
 ) -> Result<PacketEvidenceProductV3, codestory_contracts::api::ApiError> {
+    for unit in &packet.support {
+        validate_packet_source_page(unit)?;
+    }
     let PacketEvidenceSelectionV3 {
-        rows: evidence,
+        rows: mut evidence,
         was_bounded: evidence_was_bounded,
     } = packet_evidence_selection(&packet.support);
 
+    attach_source_page_actions(project_id, packet, &mut evidence)?;
     let mut gaps = packet_gaps(packet);
     if evidence_was_bounded {
         gaps.push(gap_row(
@@ -201,6 +383,8 @@ fn project_packet_v3_using_record_builder(
     )
     .map_err(|error| projection_error("packet projection", error))?;
     Ok(PacketEvidenceProductV3 {
+        protected_source_witnesses: Vec::new(),
+        source_issuance_seal: crate::agent::packet_served_sources::seal(caller_id, &projection),
         projection,
         diagnostics: PacketDiagnosticProjectionV3 {
             bytes,
@@ -616,6 +800,21 @@ pub fn project_search_v3(
         was_bounded,
     } = search_evidence_selection(results);
     let mut gaps = Vec::new();
+    if symbolic
+        && results.repo_text_mode == codestory_contracts::api::SearchRepoTextMode::Off
+        && !results.repo_text_enabled
+        && results.hits.is_empty()
+        && results.indexed_symbol_hits.is_empty()
+        && results.repo_text_hits.is_empty()
+        && evidence.is_empty()
+        && let Some(message) = results.retrieval.fallback_message.as_deref()
+    {
+        gaps.push(gap_row(
+            "search-core-name-no-match",
+            GapKindV3Dto::EvidenceMissing,
+            Some(message),
+        )?);
+    }
     if missing_source {
         gaps.push(gap_row(
             "search-source-unavailable",
@@ -696,6 +895,11 @@ fn search_evidence_selection(results: &SearchResultsDto) -> SearchEvidenceSelect
     let mut missing_source = false;
     let mut was_bounded = false;
     for hit in results.hits.iter().chain(&results.repo_text_hits) {
+        // A derived report has no physical source to lose. Ordinary unlocated
+        // source hits still produce the explicit source-unavailable gap.
+        if crate::search_scoring::is_diagnostic_component_report_hit(hit) {
+            continue;
+        }
         let Some(path) = hit.file_path.as_deref().filter(|path| !path.is_empty()) else {
             missing_source = true;
             continue;
@@ -773,7 +977,32 @@ fn projection_envelope(
     Ok((identity, publication, retrieval))
 }
 
+fn validate_packet_source_page(
+    unit: &SupportUnitDto,
+) -> Result<(), codestory_contracts::api::ApiError> {
+    let Some(delivery) = &unit.source_delivery else {
+        return Ok(());
+    };
+    let source_fits = unit.kind == SupportUnitKindDto::SourceRange
+        && unit.snippet.as_deref().is_some_and(|source| {
+            !source.trim().is_empty()
+                && source.len()
+                    <= codestory_contracts::compilation::INTERIM_SOURCE_CONTINUATION_UPPER_BOUND
+        })
+        && unit
+            .start_line
+            .zip(unit.end_line)
+            .is_some_and(|(start, end)| delivery.matches_delivery(start, end));
+    if !source_fits {
+        return Err(codestory_contracts::api::ApiError::internal(
+            "Packet source page and delivery receipt cannot be represented without loss.",
+        ));
+    }
+    Ok(())
+}
+
 fn packet_evidence_row(index: usize, unit: &SupportUnitDto) -> Option<PacketEvidenceRowV3Dto> {
+    validate_packet_source_page(unit).ok()?;
     if unit.kind == SupportUnitKindDto::CompleteQueryNegative {
         return None;
     }
@@ -781,6 +1010,7 @@ fn packet_evidence_row(index: usize, unit: &SupportUnitDto) -> Option<PacketEvid
         return None;
     }
     Some(PacketEvidenceRowV3Dto {
+        packet_request_patch: None,
         source_delivery: unit.source_delivery.clone(),
         // The execution record canonicalizes by identity. A fixed-width rank
         // prefix keeps that canonical order equal to the projection's useful-
@@ -811,8 +1041,15 @@ fn packet_evidence_summary(unit: &SupportUnitDto) -> Option<SummaryTextV3> {
             .snippet
             .as_deref()
             .filter(|value| !value.trim().is_empty())
-            .unwrap_or(&unit.summary)
-            .to_owned(),
+            .map(|text| {
+                unit.source_delivery
+                    .as_ref()
+                    .and_then(|_| {
+                        compact_numbered_source_page(text, unit.start_line?, unit.end_line?)
+                    })
+                    .unwrap_or_else(|| text.to_owned())
+            })
+            .unwrap_or_else(|| unit.summary.clone()),
         SupportUnitKindDto::TypedGraphEdge => {
             match (
                 unit.from_symbol.as_deref(),
@@ -826,10 +1063,47 @@ fn packet_evidence_summary(unit: &SupportUnitDto) -> Option<SummaryTextV3> {
         SupportUnitKindDto::SymbolLocation => packet_symbol_location_summary(unit),
         SupportUnitKindDto::CompleteQueryNegative => return None,
     };
+    if unit.kind == SupportUnitKindDto::SourceRange && unit.source_delivery.is_some() {
+        // The receipt describes the complete retained page, not a summary.
+        // The response measurement owns whole-row omission; never clip source
+        // text while carrying its original delivery range and cursor.
+        return SummaryTextV3::new(text).ok();
+    }
     Some(summary_text_bounded(
         &text,
         PACKET_EVIDENCE_SUMMARY_MAX_BYTES_V3,
     ))
+}
+
+/// Remove display alignment only. Every line number, focus marker, physical
+/// source byte after the delimiter, and the page fence remain intact.
+pub(crate) fn compact_numbered_source_page(text: &str, start: u32, end: u32) -> Option<String> {
+    let body = text.strip_prefix("```text\n")?.strip_suffix("\n```")?;
+    let mut compact = String::from("```text\n");
+    let mut count = 0u32;
+    for line in body.split('\n') {
+        let (prefix, source) = line.split_once(" | ")?;
+        let marker = prefix.get(..1)?;
+        if marker != ">" && marker != " " {
+            return None;
+        }
+        let number = prefix.get(1..)?.trim();
+        let actual = number.parse::<u32>().ok()?;
+        if actual != start.checked_add(count)? || actual > end || number != actual.to_string() {
+            return None;
+        }
+        compact.push_str(marker);
+        compact.push_str(number);
+        compact.push_str(" | ");
+        compact.push_str(source);
+        compact.push('\n');
+        count = count.checked_add(1)?;
+    }
+    if start.checked_add(count.checked_sub(1)?)? != end {
+        return None;
+    }
+    compact.push_str("```");
+    Some(compact)
 }
 
 fn packet_symbol_location_summary(unit: &SupportUnitDto) -> String {
@@ -849,6 +1123,27 @@ fn packet_symbol_location_summary(unit: &SupportUnitDto) -> String {
         (Some(path), None) => path.to_owned(),
         _ => "project source location".to_owned(),
     }
+}
+
+fn continuation_source_message(
+    option: &codestory_contracts::api::DrillOptionDto,
+) -> Option<String> {
+    let label = option.source_label.as_ref()?;
+    let mut text = label.path.clone().unwrap_or_default();
+    if let Some(range) = option.source_range {
+        if text.is_empty() {
+            text = format!("lines:{}-{}", range.start_line, range.end_line);
+        } else {
+            text.push_str(&format!(":{}-{}", range.start_line, range.end_line));
+        }
+    }
+    if let Some(symbol) = &label.symbol {
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(symbol);
+    }
+    (!text.is_empty()).then_some(text)
 }
 
 fn packet_gaps(packet: &AgentPacketDto) -> Vec<ProjectionGapRowV3Dto> {
@@ -879,7 +1174,7 @@ fn packet_gaps(packet: &AgentPacketDto) -> Vec<ProjectionGapRowV3Dto> {
         if let Some(delivery) = &unit.source_delivery
             && delivery.remaining_source_bytes > 0
         {
-            let blocked = delivery.blocked_line_rendered_bytes.map_or_else(String::new, |bytes| format!("; next complete line requires {bytes} rendered bytes, exceeding the 512-byte row cap"));
+            let blocked = delivery.blocked_line_rendered_bytes.map_or_else(String::new, |bytes| format!("; next complete line requires {bytes} rendered bytes, exceeding the reserved source-page cap"));
             gaps.push(gap_row(
                 &format!("packet-source-unread-{index}"),
                 GapKindV3Dto::EvidenceMissing,
@@ -898,7 +1193,9 @@ fn packet_gaps(packet: &AgentPacketDto) -> Vec<ProjectionGapRowV3Dto> {
                     gap_row(
                         &option.id,
                         GapKindV3Dto::ContinuationRequired,
-                        packet.disposition.reason.as_deref(),
+                        continuation_source_message(option)
+                            .as_deref()
+                            .or(packet.disposition.reason.as_deref()),
                     )
                     .expect("bounded disposition gap")
                 }));
@@ -966,13 +1263,114 @@ fn packet_continuation(
             .take(codestory_contracts::packet_projection_v3::REFERENCE_ROWS_MAX_V3)
             .collect()
     };
-    ContinuationStateV3Dto::new(
+    let mut continuation = ContinuationStateV3Dto::new(
         identity(&drill.parent_packet_id, "continuation_id")?,
         u16::try_from(drill.remaining_rounds).unwrap_or(u16::MAX),
         BoundedVecV3::new(references).expect("bounded continuation references"),
     )
-    .map(Some)
-    .map_err(|error| projection_error("packet continuation", error))
+    .map_err(|error| projection_error("packet continuation", error))?;
+    if drill.options.is_empty() || drill.core_generation_id.is_empty() {
+        return Ok(Some(continuation));
+    }
+    let patch = codestory_contracts::packet_projection_v3::PacketRequestPatchV3Dto {
+        probes: BoundedVecV3::new(Vec::new()).expect("empty probes"),
+        parent_packet_id: Some(identity(&drill.parent_packet_id, "parent_packet_id")?),
+        option_ids: BoundedVecV3::new(
+            continuation
+                .gap_ids
+                .as_slice()
+                .iter()
+                .map(|gap| gap.gap_id.clone())
+                .collect(),
+        )
+        .map_err(|error| projection_error("packet options", error))?,
+        core_generation_id: identity(&drill.core_generation_id, "core_generation_id")?,
+        retrieval_generation: drill
+            .retrieval_generation
+            .as_deref()
+            .map(|id| identity(id, "retrieval_generation"))
+            .transpose()?,
+    };
+    patch
+        .validate()
+        .map_err(|error| projection_error("packet request patch", error))?;
+    continuation.packet_request_patch = Some(patch);
+    Ok(Some(continuation))
+}
+
+fn attach_source_page_actions(
+    project_id: &str,
+    packet: &AgentPacketDto,
+    rows: &mut [PacketEvidenceRowV3Dto],
+) -> Result<(), codestory_contracts::api::ApiError> {
+    use codestory_contracts::{
+        api::PacketProbeDto,
+        compilation::{
+            PacketContinuationSelectorV1, PacketSourceRangeV1, PacketStructuralGapReasonV1,
+        },
+        packet_projection_v3::PacketRequestPatchV3Dto,
+    };
+    let Some(publication) = packet.answer.retrieval_trace.retrieval_publication.as_ref() else {
+        return Ok(());
+    };
+    for row in rows {
+        let (Some(delivery), Some(symbol_id)) = (&row.source_delivery, &row.symbol_id) else {
+            continue;
+        };
+        let Some(next) = delivery.next_start_line else {
+            continue;
+        };
+        let probe = PacketProbeDto::Continuation {
+            contract_version: codestory_contracts::api::PACKET_PROBE_CONTRACT_VERSION,
+            project_id: project_id.to_owned(),
+            core_generation_id: publication.core_generation_id.clone(),
+            retrieval_generation: Some(publication.retrieval_generation.clone()),
+            selector: PacketContinuationSelectorV1 {
+                stable_identity: format!("node:{}", symbol_id.as_str()),
+                symbol_id: Some(symbol_id.as_str().to_owned()),
+                // Stable node identity authenticates the file independently.
+                // Public paths can exceed the probe's smaller text limit.
+                path: None,
+                source_range: Some(PacketSourceRangeV1 {
+                    start_line: next,
+                    end_line: delivery.requested_range.end_line,
+                }),
+                reason: PacketStructuralGapReasonV1::SourceBudgetExceeded,
+            },
+        };
+        let mut patch = PacketRequestPatchV3Dto {
+            probes: BoundedVecV3::new(vec![probe]).expect("one source probe"),
+            parent_packet_id: None,
+            option_ids: BoundedVecV3::new(Vec::new()).expect("empty options"),
+            core_generation_id: identity(&publication.core_generation_id, "core_generation_id")?,
+            retrieval_generation: Some(identity(
+                &publication.retrieval_generation,
+                "retrieval_generation",
+            )?),
+        };
+        // The existing numeric range reference dispatches the same pinned
+        // typed source probe without repeating its publication envelope.
+        // Other node spellings retain the original typed action.
+        let option = codestory_contracts::api::DrillOptionDto::omitted_symbol(
+            "source-page",
+            symbol_id.as_str(),
+        )
+        .with_source_range(PacketSourceRangeV1 {
+            start_line: next,
+            end_line: delivery.requested_range.end_line,
+        });
+        if option.id.starts_with("ms1:") {
+            patch.probes = BoundedVecV3::new(Vec::new()).expect("empty probes");
+            patch.parent_packet_id = Some(identity(&packet.packet_id, "parent_packet_id")?);
+            patch.option_ids = BoundedVecV3::new(vec![identity(&option.id, "source_option_id")?])
+                .expect("one source option");
+        }
+        patch
+            .validate()
+            .map_err(|error| projection_error("source page action", error))?;
+        row.packet_request_patch = Some(patch);
+    }
+    Ok(())
 }
 
 fn diagnostic_rows(
@@ -1211,6 +1609,210 @@ mod tests {
         .expect("internal packet envelope")
     }
 
+    #[test]
+    fn joint_served_guard_requires_delivered_gain_and_resolution() {
+        use codestory_contracts::api::{
+            DrillOptionDto, DrillSourceLabelDto, EmbeddingVectorPublicationIdentityDto,
+        };
+        use codestory_contracts::compilation::{PacketSourceDeliveryV1, PacketSourceRangeV1};
+        let make_source = |id: &str| {
+            let mut source = support_unit(SupportUnitKindDto::SourceRange);
+            source.path = Some(format!("src/{id}.rs"));
+            source.symbol_id = Some(id.into());
+            source.start_line = Some(1);
+            source.end_line = Some(1);
+            source.snippet = Some(format!("```text\n>    1 | fn {id}() {{}}\n```"));
+            source.source_delivery = Some(PacketSourceDeliveryV1 {
+                requested_range: PacketSourceRangeV1 {
+                    start_line: 1,
+                    end_line: 1,
+                },
+                source_sha256: "a".repeat(64),
+                remaining_source_bytes: 0,
+                next_start_line: None,
+                blocked_line_rendered_bytes: None,
+            });
+            source
+        };
+        let old_source = make_source("a");
+        let incoming = make_source("b");
+        let mut packet = continuation_progress_packet();
+        packet.support = vec![old_source];
+        packet.answer.retrieval_trace.retrieval_publication =
+            Some(EmbeddingVectorPublicationIdentityDto {
+                core_generation_id: "core-generation-1".into(),
+                core_run_id: "core-run-1".into(),
+                retrieval_generation: "retrieval-generation-1".into(),
+                retrieval_input_hash: "a".repeat(64),
+                semantic_generation: "semantic-generation-1".into(),
+            });
+        let request: AgentPacketRequestDto =
+            serde_json::from_value(json!({"question":"inspect"})).unwrap();
+        let mut baseline = project_packet_v3_using_record_builder(
+            "project-1",
+            "test",
+            &request,
+            &packet,
+            |_| Ok(0),
+            |input| {
+                crate::agent::packet_execution_record_v3::build_packet_execution_record_fixture_v3(
+                    input, true,
+                )
+            },
+        )
+        .unwrap()
+        .projection;
+        // Failed renderer attempts also consume the finite transport bound;
+        // exhaustion must refuse before invoking the caller again.
+        let invocations = std::cell::Cell::new(0usize);
+        let mut meter = bounded_packet_transport_measure_v3(|_| {
+            invocations.set(invocations.get() + 1);
+            Err(())
+        });
+        for _ in 0..PACKET_TRANSPORT_MEASUREMENTS_MAX_V1 {
+            assert!(meter(&baseline).is_err());
+        }
+        assert_eq!(invocations.get(), PACKET_TRANSPORT_MEASUREMENTS_MAX_V1);
+        assert!(meter(&baseline).is_err());
+        assert_eq!(invocations.get(), PACKET_TRANSPORT_MEASUREMENTS_MAX_V1);
+        let mut option = DrillOptionDto::omitted_symbol("source_budget_exceeded:node:b", "b")
+            .with_source_range(PacketSourceRangeV1 {
+                start_line: 1,
+                end_line: 1,
+            });
+        option.source_label = Some(DrillSourceLabelDto {
+            path: Some("src/b.rs".into()),
+            symbol: Some("b".into()),
+        });
+        packet.disposition = codestory_contracts::api::PacketDispositionDto::drill_once(
+            "bounded",
+            continuation_progress_plan(vec![option.clone()]),
+        );
+        let mut labels = packet_gaps(&packet);
+        let action = packet_continuation(&packet, &mut labels).unwrap();
+        let PacketProjectionV3Dto::Complete {
+            gaps, continuation, ..
+        } = &mut baseline
+        else {
+            panic!("baseline complete")
+        };
+        *gaps = BoundedVecV3::new(labels).unwrap();
+        *continuation = action;
+        let none = std::collections::BTreeMap::new();
+        assert!(packet_projection_preserves_baseline_v3(
+            &baseline,
+            &baseline,
+            &none,
+            &[]
+        ));
+        // Identical baseline remains valid even with a truthful non-executable gap.
+        let mut no_action = baseline.clone();
+        if let PacketProjectionV3Dto::Complete { continuation, .. } = &mut no_action {
+            *continuation = None;
+        }
+        assert!(packet_projection_preserves_baseline_v3(
+            &no_action,
+            &no_action,
+            &none,
+            &[]
+        ));
+        let witnesses = std::collections::BTreeMap::from([(option.id.clone(), incoming.clone())]);
+        let mut lost = baseline.clone();
+        if let PacketProjectionV3Dto::Complete {
+            gaps, continuation, ..
+        } = &mut lost
+        {
+            *gaps = BoundedVecV3::new(vec![]).unwrap();
+            *continuation = None;
+        }
+        // Internal resolution without delivered source must keep the old action.
+        assert!(!packet_projection_preserves_baseline_v3(
+            &baseline,
+            &lost,
+            &witnesses,
+            &[]
+        ));
+        // Internal gain without delivered source earns no admission, even if gaps remain.
+        assert!(!packet_projection_preserves_baseline_v3(
+            &baseline,
+            &baseline,
+            &none,
+            std::slice::from_ref(&incoming)
+        ));
+        let mut served = lost.clone();
+        if let PacketProjectionV3Dto::Complete { evidence, .. } = &mut served {
+            let mut rows = evidence.as_slice().to_vec();
+            rows.push(packet_evidence_row(1, &incoming).unwrap());
+            *evidence = BoundedVecV3::new(rows).unwrap();
+        }
+        assert!(packet_projection_preserves_baseline_v3(
+            &baseline,
+            &served,
+            &witnesses,
+            std::slice::from_ref(&incoming)
+        ));
+        for hostile in [
+            "source-text",
+            "digest",
+            "baseline-text",
+            "label",
+            "authority",
+        ] {
+            let mut bad = if hostile == "label" || hostile == "authority" {
+                baseline.clone()
+            } else {
+                served.clone()
+            };
+            if let PacketProjectionV3Dto::Complete {
+                evidence,
+                gaps,
+                continuation,
+                ..
+            } = &mut bad
+            {
+                if hostile == "label" {
+                    let mut rows = gaps.as_slice().to_vec();
+                    rows[0].message = Some(
+                        codestory_contracts::packet_projection_v3::MessageTextV3::new("changed")
+                            .unwrap(),
+                    );
+                    *gaps = BoundedVecV3::new(rows).unwrap();
+                } else if hostile == "authority" {
+                    continuation
+                        .as_mut()
+                        .unwrap()
+                        .packet_request_patch
+                        .as_mut()
+                        .unwrap()
+                        .core_generation_id = identity_text("other");
+                } else {
+                    let mut rows = evidence.as_slice().to_vec();
+                    let index = if hostile == "baseline-text" { 0 } else { 1 };
+                    if hostile == "digest" {
+                        rows[index].source_delivery.as_mut().unwrap().source_sha256 =
+                            "b".repeat(64);
+                    } else {
+                        rows[index].summary = Some(SummaryTextV3::new("changed").unwrap());
+                    }
+                    *evidence = BoundedVecV3::new(rows).unwrap();
+                }
+            }
+            assert!(
+                !packet_projection_preserves_baseline_v3(
+                    &baseline,
+                    &bad,
+                    &witnesses,
+                    if hostile == "label" || hostile == "authority" {
+                        &[]
+                    } else {
+                        std::slice::from_ref(&incoming)
+                    }
+                ),
+                "{hostile}"
+            );
+        }
+    }
+
     fn continuation_progress_plan(
         options: Vec<codestory_contracts::api::DrillOptionDto>,
     ) -> codestory_contracts::api::BoundedDrillPlanDto {
@@ -1226,6 +1828,145 @@ mod tests {
             max_depth: PACKET_DRILL_MAX_DEPTH,
             remaining_rounds: 1,
         }
+    }
+
+    #[test]
+    fn continuation_source_labels_only_change_gap_messages_and_fit_mirrored_serialization() {
+        use codestory_contracts::{
+            api::{DrillOptionDto, DrillSourceLabelDto, PacketDispositionDto},
+            compilation::PacketSourceRangeV1,
+        };
+        let mut packet = continuation_progress_packet();
+        let mut source = support_unit(SupportUnitKindDto::SourceRange);
+        source.path = Some("src/worker.rs".into());
+        source.symbol_id = Some("7".into());
+        source.start_line = Some(12);
+        source.end_line = Some(12);
+        source.snippet = Some("fn run() {}".into());
+        packet.support = vec![source];
+        let option = DrillOptionDto::omitted_symbol("source_budget_exceeded:node:7", "7")
+            .with_source_range(PacketSourceRangeV1 {
+                start_line: 12,
+                end_line: 20,
+            });
+        packet.disposition = PacketDispositionDto::drill_once(
+            "bounded structural continuation available",
+            continuation_progress_plan(vec![option]),
+        );
+        let mut baseline_gaps = packet_gaps(&packet);
+        let baseline_patch = packet_continuation(&packet, &mut baseline_gaps).unwrap();
+        packet.disposition.drill.as_mut().unwrap().options[0].source_label =
+            Some(DrillSourceLabelDto {
+                path: Some("src/worker.rs".into()),
+                symbol: Some("Worker.run".into()),
+            });
+        let mut labeled_gaps = packet_gaps(&packet);
+        assert_eq!(
+            labeled_gaps[0].message.as_ref().unwrap().as_str(),
+            "src/worker.rs:12-20 Worker.run"
+        );
+        assert_eq!(
+            packet_continuation(&packet, &mut labeled_gaps).unwrap(),
+            baseline_patch
+        );
+        labeled_gaps[0].message = baseline_gaps[0].message.clone();
+        assert_eq!(labeled_gaps, baseline_gaps);
+        packet.answer.retrieval_trace.retrieval_publication = Some(
+            codestory_contracts::api::EmbeddingVectorPublicationIdentityDto {
+                core_generation_id: "core".into(),
+                core_run_id: "core-run".into(),
+                retrieval_generation: "retrieval".into(),
+                retrieval_input_hash: "a".repeat(64),
+                semantic_generation: "semantic".into(),
+            },
+        );
+        let retrieval_publication = packet
+            .answer
+            .retrieval_trace
+            .retrieval_publication
+            .clone()
+            .unwrap();
+        let compilation_publication =
+            codestory_contracts::compilation::PacketCompilationPublicationV1 {
+                project_id: "project-1".into(),
+                core_generation_id: retrieval_publication.core_generation_id.clone(),
+                retrieval_generation: Some(retrieval_publication.retrieval_generation.clone()),
+            };
+        let request: AgentPacketRequestDto =
+            serde_json::from_value(json!({"question":"inspect"})).unwrap();
+        let mirror_size = |projection: &PacketProjectionV3Dto| -> Result<usize, ()> {
+            Ok(serde_json::to_vec(&json!({
+                "content":[{"type":"text","text":serde_json::to_string(projection).unwrap()}],
+                "structuredContent":projection, "isError":false
+            }))
+            .unwrap()
+            .len())
+        };
+        for path in ["src/worker.rs".to_owned(), "é\\\"".repeat(2500)] {
+            let short_label = path == "src/worker.rs";
+            packet.disposition.drill.as_mut().unwrap().options[0]
+                .source_label
+                .as_mut()
+                .unwrap()
+                .path = Some(path);
+            let product = project_packet_v3_using_record_builder("project-1", "test", &request,
+                &packet, mirror_size,
+                |input| crate::agent::packet_execution_record_v3::build_packet_execution_record_replay_v3(
+                    input, &compilation_publication, &retrieval_publication.core_run_id,
+                    Some(retrieval_publication.clone()), "00000000-0000-4000-8000-000000000001")).unwrap();
+            assert!(
+                mirror_size(&product.projection).unwrap()
+                    <= codestory_contracts::compilation::PUBLIC_PACKET_SERIALIZED_MAX_BYTES
+            );
+            if short_label {
+                let PacketProjectionV3Dto::Complete {
+                    gaps,
+                    evidence,
+                    continuation,
+                    ..
+                } = &product.projection
+                else {
+                    panic!("short label fits with existing evidence");
+                };
+                assert_eq!(
+                    gaps.as_slice()[0].message.as_ref().unwrap().as_str(),
+                    "src/worker.rs:12-20 Worker.run"
+                );
+                assert_eq!(evidence.as_slice().len(), 1);
+                assert_eq!(
+                    evidence.as_slice()[0].path.as_ref().unwrap().as_str(),
+                    "src/worker.rs"
+                );
+                assert_eq!(evidence.as_slice()[0].start_line, Some(12));
+                assert_eq!(continuation, &baseline_patch);
+            }
+        }
+    }
+
+    #[test]
+    fn continuation_source_labels_leave_unknown_fields_and_ranges_unknown() {
+        use codestory_contracts::api::{DrillOptionDto, DrillSourceLabelDto};
+        let mut option = DrillOptionDto::omitted_symbol("gap", "7");
+        assert!(continuation_source_message(&option).is_none());
+        option.source_label = Some(DrillSourceLabelDto {
+            path: Some("src/a.rs".into()),
+            symbol: None,
+        });
+        assert_eq!(
+            continuation_source_message(&option).as_deref(),
+            Some("src/a.rs")
+        );
+        assert!(option.source_range.is_none());
+        option.source_label = Some(DrillSourceLabelDto {
+            path: None,
+            symbol: Some("run".into()),
+        });
+        assert_eq!(continuation_source_message(&option).as_deref(), Some("run"));
+        option.source_label = Some(DrillSourceLabelDto {
+            path: None,
+            symbol: None,
+        });
+        assert!(continuation_source_message(&option).is_none());
     }
 
     #[test]
@@ -1303,9 +2044,26 @@ mod tests {
         packet.disposition =
             PacketDispositionDto::drill_once("structural gap", continuation_progress_plan(options));
         let mut gaps = packet_gaps(&packet);
-        let bounded = packet_continuation(&packet, &mut gaps).unwrap().unwrap();
+        // An invalid internal plan cannot advertise a broad action exceeding
+        // the real packet request's eight-option limit. Gap bounds remain intact.
+        assert!(packet_continuation(&packet, &mut gaps).is_err());
         assert_eq!(gaps.len(), GAP_ROWS_MAX_V3);
-        assert_eq!(bounded.gap_ids.as_slice().len(), REFERENCE_ROWS_MAX_V3);
+        let drill = packet.disposition.drill.as_mut().unwrap();
+        drill
+            .options
+            .truncate(codestory_contracts::api::PACKET_DRILL_MAX_OPTIONS);
+        drill.gap_ids = drill
+            .options
+            .iter()
+            .map(|option| option.gap_id.clone())
+            .collect();
+        let mut gaps = packet_gaps(&packet);
+        let bounded = packet_continuation(&packet, &mut gaps).unwrap().unwrap();
+        assert!(bounded.gap_ids.as_slice().len() <= REFERENCE_ROWS_MAX_V3);
+        assert_eq!(
+            bounded.gap_ids.as_slice().len(),
+            codestory_contracts::api::PACKET_DRILL_MAX_OPTIONS
+        );
         assert!(
             bounded
                 .gap_ids
@@ -1334,6 +2092,19 @@ mod tests {
         crate::AppController,
         crate::services::PublicOperationService,
     ) {
+        indexed_search_fixture_with_file_contents(file_count, "body { color: blue; }\n")
+    }
+
+    fn indexed_search_fixture_with_file_contents(
+        file_count: usize,
+        additional_source: &str,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        crate::AppController,
+        crate::services::PublicOperationService,
+    ) {
         let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project = tempfile::tempdir().expect("project");
         let state = tempfile::tempdir().expect("isolated cache");
@@ -1343,7 +2114,7 @@ mod tests {
         for index in 1..file_count {
             fs::write(
                 project.path().join(format!("src/file_{index:04}.css")),
-                "body { color: blue; }\n",
+                additional_source,
             )
             .expect("additional source");
         }
@@ -1361,6 +2132,86 @@ mod tests {
         (project, state, process_cache, controller, service)
     }
 
+    /// Supply real pinned test publications for projection tests whose public
+    /// operation requires Full. No retrieval execution or model activation runs.
+    fn full_projection_fixture_services(
+        project: &std::path::Path,
+        storage_path: &std::path::Path,
+        process_cache: &std::path::Path,
+    ) -> (
+        crate::AppController,
+        crate::services::PublicOperationService,
+    ) {
+        use codestory_retrieval::{SidecarProfile, SidecarRuntimeConfig, test_support};
+
+        let config =
+            codestory_retrieval::with_test_cache_root(&process_cache.join("retrieval"), || {
+                SidecarRuntimeConfig::for_project_profile(Some(project), SidecarProfile::Agent)
+            });
+        let manifest =
+            test_support::publish_zero_dense_pinned_query_fixture(project, storage_path, &config)
+                .expect("test-only zero-dense Full publication");
+        assert_eq!(manifest.dense_projection_count, Some(0));
+        let controller = crate::AppController::new_with_config(config);
+        controller
+            .open_project_summary_with_storage_path(
+                project.to_path_buf(),
+                storage_path.to_path_buf(),
+            )
+            .expect("bind matching owned Full projection fixture");
+        let service = crate::services::PublicOperationService::new(controller.clone());
+        // The real Full operation pin validates owner, source coverage, vector
+        // proof and generation coherence. This is an observer, not a query.
+        let operation = service
+            .run_observational_with_cancel("search", Arc::new(AtomicBool::new(false)), || Ok(()))
+            .expect("strict Full fixture pin");
+        let core = operation
+            .core_publication
+            .expect("complete fixture Core pin");
+        let retrieval = operation
+            .retrieval_publication
+            .expect("complete fixture retrieval pin");
+        assert_eq!(retrieval.core_generation_id, core.generation_id);
+        assert_eq!(retrieval.core_run_id, core.run_id);
+        assert_eq!(
+            Some(retrieval.retrieval_generation.as_str()),
+            manifest.sidecar_generation.as_deref(),
+        );
+        (controller, service)
+    }
+
+    fn indexed_full_search_fixture_with_files(
+        file_count: usize,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        crate::AppController,
+        crate::services::PublicOperationService,
+    ) {
+        // Empty unrelated fillers retain the actual 2,003-file scan boundary
+        // without allocating a data block per file. The queried source remains.
+        let (project, state, process_cache, core_controller, core_service) =
+            indexed_search_fixture_with_file_contents(file_count, "");
+        assert_eq!(
+            core_controller
+                .open_storage_read_only()
+                .unwrap()
+                .get_files()
+                .unwrap()
+                .len(),
+            file_count,
+        );
+        drop(core_service);
+        drop(core_controller);
+        let (controller, service) = full_projection_fixture_services(
+            project.path(),
+            &state.path().join("codestory.db"),
+            process_cache.path(),
+        );
+        (project, state, process_cache, controller, service)
+    }
+
     fn core_search_request(query: &str) -> SearchRequest {
         SearchRequest {
             query: query.to_owned(),
@@ -1370,6 +2221,168 @@ mod tests {
             hybrid_weights: None,
             hybrid_limits: None,
         }
+    }
+
+    #[test]
+    fn compound_core_name_miss_preserves_separate_target_lookups() {
+        use codestory_contracts::packet_projection_v3::EvidenceAvailabilityV3Dto;
+
+        let (_project, _state, _process_cache, controller, service) =
+            indexed_search_fixture_with_files(2);
+        service
+            .run_observational_with_cancel("exact_search", Arc::new(AtomicBool::new(false)), || {
+                let query = "layout.css file_0001.css";
+                let missed = controller.search_results(core_search_request(query))?;
+                assert_eq!(missed.query, query);
+                assert!(missed.hits.is_empty());
+                let projected = project_search_v3(&service, "test", &missed)?;
+                assert_eq!(
+                    projected.status,
+                    EvidenceAvailabilityV3Dto::NoUsefulEvidence
+                );
+                assert_eq!(projected.gaps.as_slice().len(), 1);
+                assert_eq!(
+                    projected.gaps.as_slice()[0].identity.gap_id.as_str(),
+                    "search-core-name-no-match"
+                );
+                assert!(projected.publication.retrieval.is_none());
+
+                for target in ["layout.css", "file_0001.css"] {
+                    let found = controller.search_results(core_search_request(target))?;
+                    assert_eq!(found.query, target);
+                    assert!(!found.hits.is_empty());
+                    let projected = project_search_v3(&service, "test", &found)?;
+                    assert!(!projected.evidence.as_slice().is_empty());
+                    assert!(
+                        !projected
+                            .gaps
+                            .as_slice()
+                            .iter()
+                            .any(|gap| gap.identity.gap_id.as_str() == "search-core-name-no-match")
+                    );
+                    assert!(projected.publication.retrieval.is_none());
+                }
+                Ok(())
+            })
+            .expect("compound miss and separate targets remain Core-only");
+    }
+
+    #[test]
+    fn search_projection_discloses_empty_core_name_scope_without_claiming_unavailability() {
+        use codestory_contracts::api::RetrievalModeDto;
+        use codestory_contracts::packet_projection_v3::{
+            EvidenceAvailabilityV3Dto, SearchProjectionKindV3Dto,
+        };
+
+        let (_project, _state, _process_cache, controller, service) = indexed_search_fixture();
+        service
+            .run_observational_with_cancel("exact_search", Arc::new(AtomicBool::new(false)), || {
+                // The fixture contains this source literal, but it is not a
+                // core name. An empty name search cannot prove its absence.
+                let results = controller.search_results(core_search_request("REPO_TEXT_TOKEN"))?;
+                assert!(results.hits.is_empty());
+                let expected_message = results
+                    .retrieval
+                    .fallback_message
+                    .as_deref()
+                    .expect("core search describes its actual scope");
+                let projected = project_search_v3(&service, "test", &results)?;
+                let gaps = projected.gaps.as_slice();
+                assert_eq!(gaps.len(), 1);
+                assert_eq!(
+                    gaps[0].identity.gap_id.as_str(),
+                    "search-core-name-no-match"
+                );
+                assert_eq!(gaps[0].kind, GapKindV3Dto::EvidenceMissing);
+                assert_eq!(gaps[0].message.as_ref().unwrap().as_str(), expected_message);
+                assert_eq!(
+                    projected.status,
+                    EvidenceAvailabilityV3Dto::NoUsefulEvidence
+                );
+                assert_eq!(projected.kind, SearchProjectionKindV3Dto::Complete);
+                assert_eq!(projected.retrieval.state, RetrievalStateV3Dto::Symbolic);
+                assert!(projected.evidence.as_slice().is_empty());
+                assert!(projected.continuation.is_none());
+                assert_eq!(
+                    projected.diagnostics,
+                    DiagnosticsCapabilityV3Dto::Unavailable
+                );
+                let serialized = serde_json::to_value(&projected).expect("public JSON");
+                assert_eq!(serialized["gaps"][0]["message"], expected_message);
+                assert_eq!(serialized["status"], "no_useful_evidence");
+                assert!(projected.publication.retrieval.is_none());
+                assert!(
+                    serialized["publication"]
+                        .get("retrieval")
+                        .unwrap()
+                        .is_null()
+                );
+
+                // A returned core FILE lead remains useful evidence and must
+                // not inherit the empty-result notice.
+                let found = controller.search_results(core_search_request("layout.css"))?;
+                assert!(!found.hits.is_empty());
+                let found_projection = project_search_v3(&service, "test", &found)?;
+                assert!(!found_projection.evidence.as_slice().is_empty());
+                assert_eq!(
+                    found_projection.status,
+                    EvidenceAvailabilityV3Dto::Available
+                );
+                assert_eq!(found_projection.publication, projected.publication);
+                assert!(
+                    !found_projection
+                        .gaps
+                        .as_slice()
+                        .iter()
+                        .any(|gap| { gap.identity.gap_id.as_str() == "search-core-name-no-match" })
+                );
+
+                // Projection-only negative metadata cases; these do not
+                // execute or claim full retrieval readiness.
+                for (mode, enabled, retrieval_mode) in [
+                    (SearchRepoTextMode::Auto, false, RetrievalModeDto::Symbolic),
+                    (SearchRepoTextMode::Off, true, RetrievalModeDto::Symbolic),
+                    (SearchRepoTextMode::Off, false, RetrievalModeDto::Hybrid),
+                ] {
+                    let mut other_lane = results.clone();
+                    other_lane.repo_text_mode = mode;
+                    other_lane.repo_text_enabled = enabled;
+                    other_lane.retrieval.mode = retrieval_mode;
+                    let other_projection = project_search_v3(&service, "test", &other_lane)?;
+                    assert!(!other_projection.gaps.as_slice().iter().any(|gap| {
+                        gap.identity.gap_id.as_str() == "search-core-name-no-match"
+                    }));
+                }
+
+                // Missing source for an existing hit is a different failure;
+                // empty projected rows must not masquerade as no core match.
+                let mut missing_source = found.clone();
+                for hit in &mut missing_source.hits {
+                    hit.file_path = None;
+                }
+                let missing_projection = project_search_v3(&service, "test", &missing_source)?;
+                assert!(missing_projection.evidence.as_slice().is_empty());
+                assert_eq!(
+                    missing_projection.status,
+                    EvidenceAvailabilityV3Dto::Unavailable
+                );
+                assert!(
+                    missing_projection
+                        .gaps
+                        .as_slice()
+                        .iter()
+                        .any(|gap| { gap.kind == GapKindV3Dto::SourceUnavailable })
+                );
+                assert!(
+                    !missing_projection
+                        .gaps
+                        .as_slice()
+                        .iter()
+                        .any(|gap| { gap.identity.gap_id.as_str() == "search-core-name-no-match" })
+                );
+                Ok(())
+            })
+            .expect("real core result and public projection contract");
     }
 
     #[test]
@@ -1632,7 +2645,7 @@ mod tests {
     fn search_projection_discloses_real_bounded_repo_text_scan() {
         for file_count in [1, crate::repo_text::REPO_TEXT_SCAN_FILE_CAP + 3] {
             let (project, _state, _process_cache, controller, service) =
-                indexed_search_fixture_with_files(file_count);
+                indexed_full_search_fixture_with_files(file_count);
             let projected = service
                 .run_observational_with_cancel("search", Arc::new(AtomicBool::new(false)), || {
                     let mut results =
@@ -1652,6 +2665,13 @@ mod tests {
                     results.repo_text_stats = Some(scan.stats);
                     results.repo_text_mode = SearchRepoTextMode::On;
                     results.repo_text_enabled = true;
+                    // Bind projection-only data to this operation's actual Full pin.
+                    results.retrieval.mode = codestory_contracts::api::RetrievalModeDto::Hybrid;
+                    results.retrieval_publication = service
+                        .active_publication()
+                        .expect("Full operation publication")
+                        .retrieval_publication;
+                    assert!(results.retrieval_publication.is_some());
                     project_search_v3(&service, "test", &results)
                 })
                 .expect("schema-3 projection")
@@ -1669,7 +2689,8 @@ mod tests {
 
     #[test]
     fn search_projection_discloses_skipped_files_only_for_requested_text_lane() {
-        let (_project, _state, _process_cache, controller, service) = indexed_search_fixture();
+        let (_project, _state, _process_cache, controller, service) =
+            indexed_full_search_fixture_with_files(1);
         for (enabled, truncated, expected_gap) in [(true, false, true), (false, true, false)] {
             let projected = service
                 .run_observational_with_cancel("search", Arc::new(AtomicBool::new(false)), || {
@@ -1689,6 +2710,13 @@ mod tests {
                             reason: None,
                             action: None,
                         });
+                    // Bind projection-only data to this operation's actual Full pin.
+                    results.retrieval.mode = codestory_contracts::api::RetrievalModeDto::Hybrid;
+                    results.retrieval_publication = service
+                        .active_publication()
+                        .expect("Full operation publication")
+                        .retrieval_publication;
+                    assert!(results.retrieval_publication.is_some());
                     project_search_v3(&service, "test", &results)
                 })
                 .expect("schema-3 projection")
@@ -1711,7 +2739,8 @@ mod tests {
 
     #[test]
     fn search_projection_keeps_real_repo_text_only_match() {
-        let (project, _state, _process_cache, controller, service) = indexed_search_fixture();
+        let (project, _state, _process_cache, controller, service) =
+            indexed_full_search_fixture_with_files(1);
         let projected = service
             .run_observational_with_cancel("search", Arc::new(AtomicBool::new(false)), || {
                 let mut results =
@@ -1733,6 +2762,13 @@ mod tests {
                 results.repo_text_hits = scan.hits;
                 results.repo_text_mode = SearchRepoTextMode::On;
                 results.repo_text_enabled = true;
+                // Bind projection-only data to this operation's actual Full pin.
+                results.retrieval.mode = codestory_contracts::api::RetrievalModeDto::Hybrid;
+                results.retrieval_publication = service
+                    .active_publication()
+                    .expect("Full operation publication")
+                    .retrieval_publication;
+                assert!(results.retrieval_publication.is_some());
                 project_search_v3(&service, "test", &results)
             })
             .expect("schema-3 projection")
@@ -1749,25 +2785,29 @@ mod tests {
     fn search_projection_keeps_parentless_core_file_match() {
         let (_project, _state, _process_cache, controller, service) = indexed_search_fixture();
         let projected = service
-            .run_observational_with_cancel("search", Arc::new(AtomicBool::new(false)), || {
-                let results = controller.search_results(core_search_request("layout.css"))?;
-                let file_hit = results
-                    .hits
-                    .iter()
-                    .find(|hit| hit.kind == codestory_contracts::api::NodeKind::FILE)
-                    .expect("core search found indexed FILE");
-                let storage = controller.open_storage_read_only()?;
-                let file_node = storage
-                    .get_node(file_hit.node_id.to_core()?)
-                    .expect("indexed FILE lookup")
-                    .expect("indexed FILE node");
-                assert_eq!(file_node.file_node_id, None, "FILE has no parent file");
-                assert!(
-                    file_hit.file_path.is_some(),
-                    "pinned FILE path: {file_hit:#?}"
-                );
-                project_search_v3(&service, "test", &results)
-            })
+            .run_observational_with_cancel(
+                crate::services::search_operation_name(SearchRepoTextMode::Off),
+                Arc::new(AtomicBool::new(false)),
+                || {
+                    let results = controller.search_results(core_search_request("layout.css"))?;
+                    let file_hit = results
+                        .hits
+                        .iter()
+                        .find(|hit| hit.kind == codestory_contracts::api::NodeKind::FILE)
+                        .expect("core search found indexed FILE");
+                    let storage = controller.open_storage_read_only()?;
+                    let file_node = storage
+                        .get_node(file_hit.node_id.to_core()?)
+                        .expect("indexed FILE lookup")
+                        .expect("indexed FILE node");
+                    assert_eq!(file_node.file_node_id, None, "FILE has no parent file");
+                    assert!(
+                        file_hit.file_path.is_some(),
+                        "pinned FILE path: {file_hit:#?}"
+                    );
+                    project_search_v3(&service, "test", &results)
+                },
+            )
             .expect("schema-3 projection")
             .value;
         assert!(
@@ -1781,12 +2821,62 @@ mod tests {
     }
 
     #[test]
+    fn search_projection_does_not_turn_component_diagnostics_into_source_or_missing_source() {
+        use codestory_contracts::api::{PacketEvidenceResolutionDto, PacketEvidenceTierDto};
+        let (_project, _state, _process_cache, controller, service) = indexed_search_fixture();
+        service
+            .run_observational_with_cancel(
+                crate::services::search_operation_name(SearchRepoTextMode::Off),
+                Arc::new(AtomicBool::new(false)),
+                || {
+                    let mut results =
+                        controller.search_results(core_search_request("layout.css"))?;
+                    let source = results.hits[0].clone();
+                    let mut report = source.clone();
+                    report.node_id.0 = "derived-report".into();
+                    report.file_path = None;
+                    report.evidence_tier = Some(PacketEvidenceTierDto::ComponentReport);
+                    report.resolution_status = Some(PacketEvidenceResolutionDto::DiagnosticOnly);
+                    results.hits.insert(0, report.clone());
+                    // A representative path is report metadata, never source truth.
+                    report.file_path = source.file_path.clone();
+                    results.repo_text_hits = vec![report];
+                    let projected = project_search_v3(&service, "test", &results)?;
+                    assert_eq!(projected.evidence.as_slice().len(), 1);
+                    assert!(
+                        !projected
+                            .gaps
+                            .as_slice()
+                            .iter()
+                            .any(|gap| gap.kind == GapKindV3Dto::SourceUnavailable)
+                    );
+                    let mut missing = source;
+                    missing.node_id.0 = "ordinary-missing-source".into();
+                    missing.file_path = None;
+                    results.hits.push(missing);
+                    let projected = project_search_v3(&service, "test", &results)?;
+                    assert!(
+                        projected
+                            .gaps
+                            .as_slice()
+                            .iter()
+                            .any(|gap| gap.kind == GapKindV3Dto::SourceUnavailable)
+                    );
+                    Ok(())
+                },
+            )
+            .expect("pinned search projection");
+    }
+
+    #[test]
     fn search_projection_deduplicates_mixed_hits_and_accounts_for_missing_or_bounded_rows() {
         let (_project, _state, _process_cache, controller, service) = indexed_search_fixture();
         let results = service
-            .run_observational_with_cancel("search", Arc::new(AtomicBool::new(false)), || {
-                controller.search_results(core_search_request("layout.css"))
-            })
+            .run_observational_with_cancel(
+                crate::services::search_operation_name(SearchRepoTextMode::Off),
+                Arc::new(AtomicBool::new(false)),
+                || controller.search_results(core_search_request("layout.css")),
+            )
             .expect("core search")
             .value;
         let file_hit = results
@@ -1811,9 +2901,11 @@ mod tests {
         missing.hits[0].file_path = None;
         missing.repo_text_hits.clear();
         let missing_projection = service
-            .run_observational_with_cancel("search", Arc::new(AtomicBool::new(false)), || {
-                project_search_v3(&service, "test", &missing)
-            })
+            .run_observational_with_cancel(
+                crate::services::search_operation_name(SearchRepoTextMode::Off),
+                Arc::new(AtomicBool::new(false)),
+                || project_search_v3(&service, "test", &missing),
+            )
             .expect("source-unavailable projection")
             .value;
         assert!(missing_projection.evidence.as_slice().is_empty());
@@ -1836,9 +2928,11 @@ mod tests {
             .collect();
         bounded.repo_text_hits = vec![bounded.hits[0].clone()];
         let bounded_projection = service
-            .run_observational_with_cancel("search", Arc::new(AtomicBool::new(false)), || {
-                project_search_v3(&service, "test", &bounded)
-            })
+            .run_observational_with_cancel(
+                crate::services::search_operation_name(SearchRepoTextMode::Off),
+                Arc::new(AtomicBool::new(false)),
+                || project_search_v3(&service, "test", &bounded),
+            )
             .expect("bounded projection")
             .value;
         assert_eq!(
@@ -1941,6 +3035,257 @@ mod tests {
             relation.summary.as_ref().unwrap().as_str(),
             "caller -[CALL]-> callee"
         );
+    }
+
+    #[test]
+    fn source_page_actions_survive_long_paths_and_exhausted_broad_round() {
+        use codestory_contracts::{
+            api::EmbeddingVectorPublicationIdentityDto,
+            compilation::{PacketSourceDeliveryV1, PacketSourceRangeV1},
+        };
+        for path in [
+            format!("src/{}reader.rs", "component/".repeat(40)),
+            format!("src/{}reader.rs", "ééé/".repeat(70)),
+        ] {
+            let mut packet = continuation_progress_packet();
+            packet.answer.retrieval_trace.retrieval_publication =
+                Some(EmbeddingVectorPublicationIdentityDto {
+                    core_generation_id: "core-generation-1".into(),
+                    core_run_id: "core-run-1".into(),
+                    retrieval_generation: "retrieval-generation-1".into(),
+                    retrieval_input_hash: "a".repeat(64),
+                    semantic_generation: "semantic-generation-1".into(),
+                });
+            let mut source = support_unit(SupportUnitKindDto::SourceRange);
+            source.path = Some(path.clone());
+            source.symbol_id = Some("7".into());
+            source.start_line = Some(1);
+            source.end_line = Some(1);
+            source.snippet = Some("```text\n>    1 | fn reader() {\n```".into());
+            source.source_delivery = Some(PacketSourceDeliveryV1 {
+                requested_range: PacketSourceRangeV1 {
+                    start_line: 1,
+                    end_line: 20,
+                },
+                source_sha256: "a".repeat(64),
+                remaining_source_bytes: 700,
+                next_start_line: Some(2),
+                blocked_line_rendered_bytes: None,
+            });
+            packet.support = vec![source];
+            let request: AgentPacketRequestDto =
+                serde_json::from_value(json!({"question":"inspect source"})).unwrap();
+            let product = project_packet_v3_using_record_builder("project-1", "test", &request, &packet, |projection| Ok(serde_json::to_vec(projection).unwrap().len()), |input| crate::agent::packet_execution_record_v3::build_packet_execution_record_fixture_v3(input, true)).unwrap();
+            let PacketProjectionV3Dto::Complete {
+                evidence,
+                continuation,
+                ..
+            } = product.projection
+            else {
+                panic!("long path action fits");
+            };
+            assert!(continuation.is_none());
+            let row = &evidence.as_slice()[0];
+            assert_eq!(row.path.as_ref().unwrap().as_str(), path);
+            let patch = row.packet_request_patch.as_ref().unwrap();
+            let applied = patch.apply_to(&request).unwrap();
+            assert_eq!(
+                applied.parent_packet_id.as_deref(),
+                Some(packet.packet_id.as_str())
+            );
+            assert!(applied.probes.is_empty());
+            let dispatched = crate::agent::packet_compiler::continuation_probes_from_options(
+                &applied,
+                "project-1",
+            )
+            .unwrap();
+            let codestory_contracts::api::PacketProbeDto::Continuation { selector, .. } =
+                &dispatched[0]
+            else {
+                panic!("typed exact page action");
+            };
+            assert!(selector.path.is_none());
+            assert_eq!(
+                selector.source_range,
+                Some(PacketSourceRangeV1 {
+                    start_line: 2,
+                    end_line: 20
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn packet_source_number_compaction_keeps_source_indentation_and_rejects_bad_receipts() {
+        let page = "```text\n>   99 |     café()\n   100 | \tassert(x)\n```";
+        assert_eq!(
+            compact_numbered_source_page(page, 99, 100).as_deref(),
+            Some("```text\n>99 |     café()\n 100 | \tassert(x)\n```")
+        );
+        for (text, start, end) in [
+            (page, 98, 100),
+            (page, 99, 101),
+            ("```text\n>   99 | a\n   101 | b\n```", 99, 100),
+            ("```text\nsource without numbered lines\n```", 1, 1),
+        ] {
+            assert!(compact_numbered_source_page(text, start, end).is_none());
+        }
+    }
+
+    #[test]
+    #[ignore = "requires retained v429 public packet fixture paths"]
+    fn packet_source_retained_v429_context_and_assertion_fit_without_coverage_loss() {
+        let path = std::env::var("CODESTORY_CPU_LABEL_REPRESENTATION").unwrap();
+        let fixture: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(
+            fixture["schema"],
+            "CodeStory-v429-source-coverage-regression/v430"
+        );
+        let initial: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(fixture["initial"].as_str().unwrap()).unwrap())
+                .unwrap();
+        let mut continued: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(fixture["continued"].as_str().unwrap()).unwrap())
+                .unwrap();
+        assert_eq!(initial["publication"], continued["publication"]);
+        let context = initial["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["path"] == "cron.go" && row["start_line"] == 239)
+            .unwrap();
+        assert_eq!(context["end_line"], 265);
+        let rows = continued["evidence"].as_array_mut().unwrap();
+        let current = rows
+            .iter_mut()
+            .find(|row| row["path"] == "cron.go" && row["start_line"] == 239)
+            .unwrap();
+        assert_eq!(
+            current["end_line"], 258,
+            "retained regression reproduces seven missing lines"
+        );
+        let identity = current["identity"].clone();
+        *current = context.clone();
+        current["identity"] = identity;
+        let full_before = serde_json::to_vec(&continued).unwrap().len() + 1;
+        assert!(
+            full_before > 16384,
+            "restoring old accepted context exceeds the original wire limit before compaction"
+        );
+        let source_lines = |text: &str| {
+            text.strip_prefix("```text\n")
+                .unwrap()
+                .strip_suffix("\n```")
+                .unwrap()
+                .split('\n')
+                .map(|line| {
+                    let (prefix, source) = line.split_once(" | ").unwrap();
+                    (
+                        prefix
+                            .trim_start_matches('>')
+                            .trim()
+                            .parse::<u32>()
+                            .unwrap(),
+                        source.to_owned(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        for row in continued["evidence"].as_array_mut().unwrap() {
+            if row["kind"] != "exact_source" {
+                continue;
+            }
+            let original = row["summary"].as_str().unwrap();
+            let compact = compact_numbered_source_page(
+                original,
+                row["start_line"].as_u64().unwrap() as u32,
+                row["end_line"].as_u64().unwrap() as u32,
+            )
+            .unwrap();
+            assert_eq!(source_lines(original), source_lines(&compact));
+            row["summary"] = compact.into();
+        }
+        let bytes = serde_json::to_vec(&continued).unwrap().len() + 1;
+        assert!(bytes <= 16384);
+        let assertion = continued["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["symbol_id"] == "7339483592651562902")
+            .unwrap();
+        assert_eq!(
+            (
+                assertion["start_line"].as_u64(),
+                assertion["end_line"].as_u64()
+            ),
+            (Some(101), Some(153))
+        );
+        assert_eq!(assertion["source_delivery"]["remaining_source_bytes"], 0);
+        println!(
+            "retained-v429 restored-context-and-complete-assertion: original_wire={full_before}, compact_wire={bytes}, source_lines_identical=true"
+        );
+    }
+
+    #[test]
+    fn packet_source_page_projection_preserves_text_and_refuses_loss() {
+        use codestory_contracts::compilation::{PacketSourceDeliveryV1, PacketSourceRangeV1};
+        let mut source = support_unit(SupportUnitKindDto::SourceRange);
+        source.path = Some("src/page.rs".into());
+        source.start_line = Some(1);
+        source.end_line = Some(2);
+        let page = format!("```text\n>    1 | {}\n     2 | done\n```", "é".repeat(300));
+        source.snippet = Some(page.clone());
+        source.source_delivery = Some(PacketSourceDeliveryV1 {
+            requested_range: PacketSourceRangeV1 {
+                start_line: 1,
+                end_line: 2,
+            },
+            source_sha256: "a".repeat(64),
+            remaining_source_bytes: 0,
+            next_start_line: None,
+            blocked_line_rendered_bytes: None,
+        });
+        let row = packet_evidence_row(0, &source).expect("bounded complete source page");
+        assert_eq!(
+            row.summary.as_ref().unwrap().as_str(),
+            format!("```text\n>1 | {}\n 2 | done\n```", "é".repeat(300))
+        );
+        assert_eq!(source.snippet.as_deref(), Some(page.as_str()));
+        assert_eq!(row.source_delivery, source.source_delivery);
+        assert_eq!(row.end_line, Some(2));
+
+        for hostile in ["oversized", "missing-source", "changed-bounds"] {
+            let mut unit = source.clone();
+            match hostile {
+                "oversized" => {
+                    unit.snippet = Some("x".repeat(
+                        codestory_contracts::compilation::INTERIM_SOURCE_CONTINUATION_UPPER_BOUND
+                            + 1,
+                    ))
+                }
+                "missing-source" => unit.snippet = None,
+                _ => unit.end_line = Some(1),
+            }
+            assert!(validate_packet_source_page(&unit).is_err(), "{hostile}");
+            assert!(packet_evidence_row(0, &unit).is_none(), "{hostile}");
+            let mut packet = continuation_progress_packet();
+            packet.support = vec![unit];
+            let request: AgentPacketRequestDto =
+                serde_json::from_value(json!({"question":"show repository source"})).unwrap();
+            assert!(
+                project_packet_v3_using_record_builder(
+                    "project-1",
+                    "test",
+                    &request,
+                    &packet,
+                    |_| Ok(0),
+                    |_| panic!("invalid page must fail before record construction")
+                )
+                .is_err(),
+                "{hostile}"
+            );
+        }
     }
 
     #[test]
@@ -3102,17 +4447,22 @@ mod tests {
     fn context_projection_keeps_the_resolved_target_with_or_without_citations() {
         let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project = tempfile::tempdir().expect("project");
-        let source = project.path().join("resolved.rs");
-        fs::write(&source, "pub fn resolved_target() {}\n").expect("source");
+        // This projection fixture consumes a resolved target; it does not resolve
+        // symbols. A source-only file gives a real zero-dense Full publication.
+        fs::create_dir_all(project.path().join("tests")).expect("test source directory");
+        let source = project.path().join("tests/resolved.rs");
+        fs::write(&source, "// source for the resolved request target\n").expect("source");
         let storage = project.path().join("codestory.db");
         let controller = crate::AppController::new_with_owned_cache_root(process_cache.path());
         controller
-            .open_project_summary_with_storage_path(project.path().to_path_buf(), storage)
+            .open_project_summary_with_storage_path(project.path().to_path_buf(), storage.clone())
             .expect("open project");
         controller
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
             .expect("index project");
-        let service = crate::services::PublicOperationService::new(controller);
+        drop(controller);
+        let (_controller, service) =
+            full_projection_fixture_services(project.path(), &storage, process_cache.path());
 
         for citations in [
             json!([]),
@@ -3156,10 +4506,16 @@ mod tests {
             .expect("answer fixture");
             let projection = service
                 .run_observational_with_cancel("context", Arc::new(AtomicBool::new(false)), || {
+                    let mut answer = answer.clone();
+                    answer.retrieval_trace.retrieval_publication = service
+                        .active_publication()
+                        .expect("Full operation publication")
+                        .retrieval_publication;
+                    assert!(answer.retrieval_trace.retrieval_publication.is_some());
                     project_context_v3(
                         &service,
                         "test",
-                        Some("resolved.rs"),
+                        Some("tests/resolved.rs"),
                         Some("resolved-node"),
                         &answer,
                     )
@@ -3169,7 +4525,7 @@ mod tests {
 
             assert_eq!(
                 projection.target.path.as_ref().map(PathTextV3::as_str),
-                Some("resolved.rs"),
+                Some("tests/resolved.rs"),
                 "a citation cannot replace the already resolved request target"
             );
             assert_eq!(
@@ -3187,17 +4543,22 @@ mod tests {
     fn context_projection_preserves_path_only_unresolved_uncertainty() {
         let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let project = tempfile::tempdir().expect("project");
-        let source = project.path().join("unresolved.rs");
-        fs::write(&source, "pub fn unresolved_target() {}\n").expect("source");
+        // This projection fixture consumes a resolved target; it does not resolve
+        // symbols. A source-only file gives a real zero-dense Full publication.
+        fs::create_dir_all(project.path().join("tests")).expect("test source directory");
+        let source = project.path().join("tests/unresolved.rs");
+        fs::write(&source, "// source for the path-only request target\n").expect("source");
         let storage = project.path().join("codestory.db");
         let controller = crate::AppController::new_with_owned_cache_root(process_cache.path());
         controller
-            .open_project_summary_with_storage_path(project.path().to_path_buf(), storage)
+            .open_project_summary_with_storage_path(project.path().to_path_buf(), storage.clone())
             .expect("open project");
         controller
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
             .expect("index project");
-        let service = crate::services::PublicOperationService::new(controller);
+        drop(controller);
+        let (_controller, service) =
+            full_projection_fixture_services(project.path(), &storage, process_cache.path());
         let answer: AgentAnswerDto = serde_json::from_value(json!({
             "answer_id":"context-answer",
             "prompt":"unresolved_target",
@@ -3208,7 +4569,7 @@ mod tests {
                 "node_id":"unresolved-node",
                 "display_name":"unresolved_target",
                 "kind":"FUNCTION",
-                "file_path":"unresolved.rs",
+                "file_path":"tests/unresolved.rs",
                 "line":null,
                 "score":1.0,
                 "origin":"indexed_symbol",
@@ -3236,14 +4597,20 @@ mod tests {
         .expect("answer fixture");
         let projection = service
             .run_observational_with_cancel("context", Arc::new(AtomicBool::new(false)), || {
-                project_context_v3(&service, "test", Some("unresolved.rs"), None, &answer)
+                let mut answer = answer.clone();
+                answer.retrieval_trace.retrieval_publication = service
+                    .active_publication()
+                    .expect("Full operation publication")
+                    .retrieval_publication;
+                assert!(answer.retrieval_trace.retrieval_publication.is_some());
+                project_context_v3(&service, "test", Some("tests/unresolved.rs"), None, &answer)
             })
             .expect("project context")
             .value;
         let serialized = serde_json::to_value(projection).expect("serialize context");
         let evidence = &serialized["evidence"][0];
 
-        assert_eq!(evidence["path"], json!("unresolved.rs"));
+        assert_eq!(evidence["path"], json!("tests/unresolved.rs"));
         assert_eq!(evidence["start_line"], serde_json::Value::Null);
         assert_eq!(evidence["end_line"], serde_json::Value::Null);
         assert_eq!(evidence["symbol_id"], serde_json::Value::Null);
@@ -3253,9 +4620,13 @@ mod tests {
 /// Fixtures use the production compiler, shared proposal application, normal
 /// validated record construction and public finalizer; only hydration and the
 /// captured publication are supplied by the test. No private runtime is opened.
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod representation_budget_test_support {
+    pub const MAX_TRANSPORT_MEASUREMENTS: usize = super::PACKET_TRANSPORT_MEASUREMENTS_MAX_V1;
+    pub const MAX_MEASURED_CANDIDATES: usize =
+        8 * codestory_agent::evidence_compiler::REPOSITORY_EVIDENCE_MAX_MEASURED_CANDIDATES_V1 + 1;
+
     use super::*;
     use crate::agent::packet_compiler::{
         PreparedPacketCompilationV1, commit_measured_packet_compilation,
@@ -3379,16 +4750,211 @@ pub mod representation_budget_test_support {
         measure: impl FnMut(&PacketProjectionV3Dto) -> Result<usize, ()>,
     ) -> Result<PacketEvidenceProductV3, ApiError> {
         project_packet_v3_using_record_builder(
+            "project-1",
             "codestory-stdio",
             request,
             packet,
             measure,
             |input| {
                 crate::agent::packet_execution_record_v3::build_packet_execution_record_fixture_v3(
-                    input, true,
+                    input,
+                    packet
+                        .answer
+                        .retrieval_trace
+                        .retrieval_publication
+                        .is_some(),
                 )
             },
         )
+    }
+
+    /// Full captured-state CPU consumer. No project/controller/service is opened.
+    pub fn replay_captured(
+        capture: &serde_json::Value,
+        public_packet_id: &str,
+        measure: impl FnMut(&PacketProjectionV3Dto) -> Result<usize, ()>,
+    ) -> Result<(RepresentedPacketProductV3, Vec<serde_json::Value>), ApiError> {
+        replay_captured_observed(capture, public_packet_id, measure, |_, _| {})
+    }
+
+    pub fn replay_captured_observed(
+        capture: &serde_json::Value,
+        public_packet_id: &str,
+        mut measure: impl FnMut(&PacketProjectionV3Dto) -> Result<usize, ()>,
+        mut observe: impl FnMut(&RepresentedPacketProductV3, usize),
+    ) -> Result<(RepresentedPacketProductV3, Vec<serde_json::Value>), ApiError> {
+        let mut measure = bounded_packet_transport_measure_v3(measure);
+        use crate::agent::{
+            orchestrator::append_compiled_source_evidence,
+            packet_budget::enforce_packet_output_budget, packet_replay::replay_digest,
+        };
+        let prepared: PreparedPacketCompilationV1 =
+            serde_json::from_value(capture["input"]["prepared"].clone())
+                .map_err(|e| ApiError::internal(e.to_string()))?;
+        let request: AgentPacketRequestDto =
+            serde_json::from_value(capture["input"]["request"].clone())
+                .map_err(|e| ApiError::internal(e.to_string()))?;
+        let base: AgentPacketDto = serde_json::from_value(capture["input"]["base_packet"].clone())
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+        let publication: codestory_contracts::compilation::PacketCompilationPublicationV1 =
+            serde_json::from_value(capture["input"]["scope"]["publication"].clone())
+                .map_err(|e| ApiError::internal(e.to_string()))?;
+        let run = capture["input"]["scope"]["core_run_id"]
+            .as_str()
+            .ok_or_else(|| ApiError::internal("replay Core run missing"))?;
+        let root = std::path::Path::new(
+            capture["input"]["scope"]["project_root"]
+                .as_str()
+                .ok_or_else(|| ApiError::internal("replay root missing"))?,
+        );
+        let navigation: Vec<codestory_contracts::compilation::PacketDirectedRelationV1> =
+            serde_json::from_value(
+                capture["input"]["prepared"]["call_navigation"]
+                    .as_array()
+                    .map(|rows| serde_json::json!(rows))
+                    .unwrap_or_else(|| serde_json::json!([])),
+            )
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+        let mut rows = Vec::new();
+        let mut full = None;
+        let mut accepted = None;
+        let mut baseline_projection = None;
+        let mut baseline_snapshot_recorded = false;
+        let frozen = prepared.select_for_representation_with_baseline(|prepared, compiled, baseline| {
+            let mut packet = base.clone();
+            prepared.apply_proposal(&mut packet, Some(&request), compiled);
+            append_compiled_source_evidence(&mut packet.answer, &compiled.support);
+            let before = packet.clone();
+            enforce_packet_output_budget(root, &mut packet);
+            if packet.support != compiled.support { return Err(ApiError::internal("replay internal support changed")); }
+            let baseline_packet = baseline.map(|compiled_baseline| {
+                let mut baseline_packet = base.clone();
+                prepared.apply_proposal(&mut baseline_packet, Some(&request), compiled_baseline);
+                append_compiled_source_evidence(&mut baseline_packet.answer, &compiled_baseline.support);
+                enforce_packet_output_budget(root, &mut baseline_packet);
+                if baseline_packet.support != compiled_baseline.support { return Err(ApiError::internal("replay baseline support changed")); }
+                Ok(baseline_packet)
+            }).transpose()?;
+            if baseline_packet.as_ref().is_some_and(|base| !prepared.retain_baseline_continuation_actions(base, &mut packet)) { return Ok(None); }
+            let product = project_packet_v3_using_record_builder(&publication.project_id, "codestory-stdio", &request, &packet, &mut measure,
+                |input| crate::agent::packet_execution_record_v3::build_packet_execution_record_replay_v3(input, &publication, run, packet.answer.retrieval_trace.retrieval_publication.clone(), public_packet_id))?;
+            let guard_ok = if let Some(baseline_packet) = baseline_packet.as_ref() {
+                if baseline_projection.is_none() {
+                    let projected = if baseline_packet.support == packet.support && baseline_packet.disposition == packet.disposition {
+                        product.clone()
+                    } else {
+                        project_packet_v3_using_record_builder(&publication.project_id, "codestory-stdio", &request,
+                            &baseline_packet, &mut measure, |input| crate::agent::packet_execution_record_v3::build_packet_execution_record_replay_v3(
+                                input, &publication, run, baseline_packet.answer.retrieval_trace.retrieval_publication.clone(), public_packet_id))?
+                    };
+                    baseline_projection = Some(projected.projection);
+                }
+                packet_projection_preserves_baseline_v3(baseline_projection.as_ref().unwrap(),
+                    &product.projection, &prepared.resolved_baseline_option_witnesses(&baseline_packet, &packet),
+                    &packet.support.iter().filter(|row| row.kind == SupportUnitKindDto::SourceRange && !baseline_packet.support.contains(row)).cloned().collect::<Vec<_>>())
+            } else { true };
+            let bytes = if guard_ok && matches!(product.projection, PacketProjectionV3Dto::Complete { .. }) {
+                Some(measure(&product.projection).map_err(|_| ApiError::internal("replay measurement error"))?)
+            } else { None };
+            let baseline_snapshot = if baseline.is_some() && !baseline_snapshot_recorded {
+                baseline_snapshot_recorded = true;
+                Some(product.projection.clone())
+            } else { None };
+            rows.push(serde_json::json!({"same_request_baseline_projection":baseline_snapshot,"ordinal":rows.len(), "extent_sha256":replay_digest(prepared.replay_input()),
+                "selection_phase":if baseline.is_some(){"joint"}else{"baseline"},"served_baseline_preserved":guard_ok,"support_rows":before.support.len(), "support_sha256":replay_digest(&before.support),
+                "selection_rank":format!("{:?}", codestory_agent::evidence_compiler::repository_evidence_selection_rank(prepared.replay_input(), &navigation, compiled)),
+                "support_frontier":before.support.iter().map(|row| serde_json::json!({"id":row.id,
+                    "symbol_id":row.symbol_id,"start":row.start_line,"end":row.end_line,
+                    "snippet_bytes":row.snippet.as_ref().map_or(0,String::len)})).collect::<Vec<_>>(),
+                "before_internal_budget_sha256":replay_digest(&before), "after_internal_budget_sha256":replay_digest(&packet),
+                "before_internal_budget_bytes":serde_json::to_vec(&before).unwrap().len(), "after_internal_budget_bytes":serde_json::to_vec(&packet).unwrap().len(),
+                "internal_support_unchanged":before.support==packet.support,
+                "outcome":bytes.map_or_else(||serde_json::json!({"kind":"refused"}),|n|serde_json::json!({"kind":"measured","bytes":n}))}));
+            let proposal = RepresentedPacketProductV3 {packet,product};
+            if full.is_none() { full=Some(proposal.clone()); }
+            if let Some(n)=bytes.filter(|n|*n<=16_384) {observe(&proposal,n);accepted=Some(proposal);}
+            Ok(bytes)
+        })?;
+        let selected = accepted
+            .or(full)
+            .ok_or_else(|| ApiError::internal("replay had no proposals"))?;
+        commit_measured_packet_compilation(&selected.packet, frozen)?;
+        Ok((selected, rows))
+    }
+
+    pub fn replay_with_published_call_metadata(
+        capture: &serde_json::Value,
+        core: &std::path::Path,
+        owned_fixture: &std::path::Path,
+    ) -> Result<serde_json::Value, ApiError> {
+        use codestory_contracts::compilation::*;
+        let root = std::path::Path::new(
+            capture["input"]["scope"]["project_root"]
+                .as_str()
+                .ok_or_else(|| ApiError::internal("root missing"))?,
+        );
+        let publication: PacketCompilationPublicationV1 =
+            serde_json::from_value(capture["input"]["scope"]["publication"].clone())
+                .map_err(|e| ApiError::internal(e.to_string()))?;
+        let ranked: Vec<PacketCandidateDescriptorV1> = serde_json::from_value(
+            capture["input"]["descriptor_queries"]["ranked_eligible_descriptors"].clone(),
+        )
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+        let input_hash=capture["input"]["descriptor_queries"]["queries"][0]["publication"]["sidecar_input_hash"].as_str().ok_or_else(||ApiError::internal("input hash missing"))?;
+        let queries = capture["input"]["descriptor_queries"]["queries"]
+            .as_array()
+            .ok_or_else(|| ApiError::internal("queries missing"))?
+            .iter()
+            .map(|q| {
+                let policy = match q["lexical_policy"].as_str() {
+                    Some("BroadQuestionV1") => {
+                        Ok(codestory_retrieval::LexicalAdmissionPolicy::BroadQuestionV1)
+                    }
+                    Some("StrictLiteralV1") => {
+                        Ok(codestory_retrieval::LexicalAdmissionPolicy::StrictLiteralV1)
+                    }
+                    _ => Err(ApiError::internal("captured policy unknown")),
+                }?;
+                Ok((
+                    q["query"]
+                        .as_str()
+                        .ok_or_else(|| ApiError::internal("query missing"))?
+                        .to_owned(),
+                    policy,
+                ))
+            })
+            .collect::<Result<Vec<_>, ApiError>>()?;
+        let metadata = codestory_retrieval::replay_published_call_metadata(
+            root,
+            core,
+            &owned_fixture.join("lexical"),
+            &publication.project_id,
+            input_hash,
+            &ranked,
+            &queries,
+        )
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+        let (admissions, call_navigation) =
+            crate::agent::retrieval_primary::replay_published_call_admissions(
+                &metadata, input_hash,
+            );
+        let prepared = crate::agent::packet_compiler::replay_prepare_from_sealed_admissions(
+            root,
+            core,
+            &owned_fixture.join("cache"),
+            publication,
+            admissions,
+            call_navigation,
+        )?;
+        let mut result = capture.clone();
+        result["input"]["prepared"] =
+            serde_json::to_value(prepared).map_err(|e| ApiError::internal(e.to_string()))?;
+        result["input"]["descriptor_queries"]["ranked_eligible_descriptors"] =
+            serde_json::to_value(metadata).map_err(|e| ApiError::internal(e.to_string()))?;
+        // CPU-only counterfactual: no leased/live publication is modified or
+        // declared Full. Core and scores remain captured; normal new metadata
+        // producer+reader, fusion, seal and hydration supply the changed input.
+        Ok(result)
     }
 
     pub fn select_prepared(
@@ -3396,31 +4962,76 @@ pub mod representation_budget_test_support {
         request: &AgentPacketRequestDto,
         mut measure: impl FnMut(&PacketProjectionV3Dto) -> Result<usize, ()>,
     ) -> Result<RepresentedPacketProductV3, ApiError> {
+        let mut measure = bounded_packet_transport_measure_v3(measure);
         let prepared = PreparedPacketCompilationV1::from_fixture_input(input);
         let shell = shell(request);
         let mut full = None;
         let mut accepted = None;
-        let frozen = prepared.select_for_representation(|prepared, compiled| {
-            let mut packet = shell.clone();
-            prepared.apply_proposal(&mut packet, Some(request), compiled);
-            let product = project_packet(request, &packet, &mut measure)?;
-            let bytes = if matches!(&product.projection, PacketProjectionV3Dto::Complete { .. }) {
-                Some(
-                    measure(&product.projection)
-                        .map_err(|_| ApiError::internal("fixture measure failed"))?,
-                )
-            } else {
-                None
-            };
-            let proposal = RepresentedPacketProductV3 { packet, product };
-            if full.is_none() {
-                full = Some(proposal.clone());
-            }
-            if bytes.is_some_and(|bytes| bytes <= 16_384) {
-                accepted = Some(proposal);
-            }
-            Ok(bytes)
-        })?;
+        let mut baseline_projection = None;
+        let frozen =
+            prepared.select_for_representation_with_baseline(|prepared, compiled, baseline| {
+                let mut packet = shell.clone();
+                prepared.apply_proposal(&mut packet, Some(request), compiled);
+                let baseline_packet = baseline
+                    .map(|compiled_baseline| {
+                        let mut base = shell.clone();
+                        prepared.apply_proposal(&mut base, Some(request), compiled_baseline);
+                        Ok(base)
+                    })
+                    .transpose()?;
+                if baseline_packet.as_ref().is_some_and(|base| {
+                    !prepared.retain_baseline_continuation_actions(base, &mut packet)
+                }) {
+                    return Ok(None);
+                }
+                let product = project_packet(request, &packet, &mut measure)?;
+                let preserved = if let Some(base) = baseline_packet.as_ref() {
+                    if baseline_projection.is_none() {
+                        let projected = if base.support == packet.support
+                            && base.disposition == packet.disposition
+                        {
+                            product.clone()
+                        } else {
+                            project_packet(request, &base, &mut measure)?
+                        };
+                        baseline_projection = Some(projected.projection);
+                    }
+                    packet_projection_preserves_baseline_v3(
+                        baseline_projection.as_ref().unwrap(),
+                        &product.projection,
+                        &prepared.resolved_baseline_option_witnesses(&base, &packet),
+                        &packet
+                            .support
+                            .iter()
+                            .filter(|row| {
+                                row.kind == SupportUnitKindDto::SourceRange
+                                    && !base.support.contains(row)
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                    )
+                } else {
+                    true
+                };
+                let bytes = if preserved
+                    && matches!(&product.projection, PacketProjectionV3Dto::Complete { .. })
+                {
+                    Some(
+                        measure(&product.projection)
+                            .map_err(|_| ApiError::internal("fixture measure failed"))?,
+                    )
+                } else {
+                    None
+                };
+                let proposal = RepresentedPacketProductV3 { packet, product };
+                if full.is_none() {
+                    full = Some(proposal.clone());
+                }
+                if bytes.is_some_and(|bytes| bytes <= 16_384) {
+                    accepted = Some(proposal);
+                }
+                Ok(bytes)
+            })?;
         let selected = accepted
             .or(full)
             .ok_or_else(|| ApiError::internal("fixture had no proposal"))?;

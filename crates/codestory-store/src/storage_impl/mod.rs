@@ -3820,6 +3820,7 @@ impl NormalizedRolePath {
             || marked.contains("_test_client/")
             || marked.contains(".test.")
             || marked.contains(".spec.")
+            || file_name.ends_with("_test.go")
             || file_name.ends_with("_test.rs")
             || file_name.ends_with("_tests.rs")
             || file_name.ends_with("_test.py")
@@ -5065,6 +5066,8 @@ impl std::ops::Deref for PinnedCoreConnection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NonmutatingOpenPolicy {
     StrictCurrentSchema,
+    RetentionPublications,
+    RetentionPointer,
     FreshnessFence,
     ProofValidation,
     SchemaVersion,
@@ -5212,6 +5215,104 @@ impl Storage {
     /// activating writer; an observer reports those states instead.
     pub fn open_observational<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
         Self::open_nonmutating(path.as_ref(), NonmutatingOpenPolicy::StrictCurrentSchema)
+    }
+
+    /// Observe only retrieval protection pointers without migrating the owning Core.
+    ///
+    /// The enumerated legacy schemas share this projection, not the general Store
+    /// contract. Unknown schemas or incomplete pointer rows remain unavailable
+    /// protection evidence. No old-schema Store escapes this narrow operation.
+    pub fn observe_retrieval_index_publications<P: AsRef<Path>>(
+        path: P,
+    ) -> Result<Vec<(RetrievalIndexManifest, Option<RetrievalIndexRollbackRecord>)>, StorageError>
+    {
+        let storage =
+            Self::open_nonmutating(path.as_ref(), NonmutatingOpenPolicy::RetentionPublications)?;
+        // Keep the pinned Core lease alive while reading its separately mutable
+        // pointer. Reuse the nonmutating journal/WAL fences rather than reopening
+        // that pointer through the ordinary publication connection helper.
+        let pointer;
+        let reader = if let Some(path) = storage.retrieval_publication_path.as_deref() {
+            // Preserve the ordinary external pointer reader's direct-file fence:
+            // the generic Core observer's is_file check follows symbolic links.
+            let metadata = fs::symlink_metadata(path).map_err(|error| {
+                StorageError::Other(format!(
+                    "Retrieval publication pointer is unavailable at {}: {error}",
+                    path.display()
+                ))
+            })?;
+            if !metadata.file_type().is_file() {
+                return Err(StorageError::Other(format!(
+                    "Retrieval publication pointer is not a regular file: {}",
+                    path.display()
+                )));
+            }
+            pointer = Self::open_nonmutating(path, NonmutatingOpenPolicy::RetentionPointer)?;
+            if pointer.retrieval_publication_path.is_some() {
+                return Err(StorageError::Other(
+                    "Retention pointer unexpectedly selects a Core publication".into(),
+                ));
+            }
+            let mut bindings = pointer.conn.prepare(
+                "SELECT core_generation_id, core_run_id, rollback_core_generation_id,
+                  rollback_core_run_id, rollback_record_json FROM retrieval_index_manifest",
+            )?;
+            let mut rows = bindings.query([])?;
+            while let Some(row) = rows.next()? {
+                let generation: String = row.get(0)?;
+                let run: String = row.get(1)?;
+                crate::core_generation::validate_generation_id(&generation)?;
+                if run.trim().is_empty() || run.len() > 128 {
+                    return Err(StorageError::Other(
+                        "Retention pointer has invalid Core run identity".into(),
+                    ));
+                }
+                let rollback_generation: Option<String> = row.get(2)?;
+                let rollback_run: Option<String> = row.get(3)?;
+                let rollback_record: Option<String> = row.get(4)?;
+                if rollback_generation.is_some() != rollback_run.is_some()
+                    || rollback_generation.is_some() != rollback_record.is_some()
+                {
+                    return Err(StorageError::Other(
+                        "Retention pointer has incomplete rollback Core binding".into(),
+                    ));
+                }
+                if let (Some(generation), Some(run)) = (rollback_generation, rollback_run) {
+                    crate::core_generation::validate_generation_id(&generation)?;
+                    if run.trim().is_empty() || run.len() > 128 {
+                        return Err(StorageError::Other(
+                            "Retention pointer has invalid rollback Core run identity".into(),
+                        ));
+                    }
+                }
+            }
+            &pointer
+        } else {
+            &storage
+        };
+        // The shared parser requires the mandatory manifest columns and validates
+        // scopes/rollback records. Missing tables or columns are errors, never an
+        // inferred empty protection set.
+        let publications = reader.list_retrieval_index_publications()?;
+        for (current, rollback) in &publications {
+            for manifest in
+                std::iter::once(current).chain(rollback.as_ref().map(|record| &record.manifest))
+            {
+                if manifest.project_id.trim().is_empty()
+                    || manifest.lexical_version.trim().is_empty()
+                    || manifest.semantic_generation.trim().is_empty()
+                    || manifest
+                        .sidecar_generation
+                        .as_deref()
+                        .is_none_or(|id| id.trim().is_empty())
+                {
+                    return Err(StorageError::Other(
+                        "Retention publication has an incomplete generation identity".into(),
+                    ));
+                }
+            }
+        }
+        Ok(publications)
     }
 
     /// Open the current database for one persistent proof-validation observer.
@@ -5367,7 +5468,12 @@ impl Storage {
                 OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
             )?
         };
-        if policy == NonmutatingOpenPolicy::FreshnessFence {
+        if matches!(
+            policy,
+            NonmutatingOpenPolicy::FreshnessFence
+                | NonmutatingOpenPolicy::RetentionPublications
+                | NonmutatingOpenPolicy::RetentionPointer
+        ) {
             // The freshness decision combines the schema sentinel, durable
             // fence, stored inventory, and workspace comparison. Pin one
             // SQLite snapshot before the first read so a concurrent writer
@@ -5378,6 +5484,20 @@ impl Storage {
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         let version = version.max(0) as u32;
         match policy {
+            // Explicitly enumerated: a future Core schema bump must prove this
+            // projection's compatibility before it can enter a retention scan.
+            NonmutatingOpenPolicy::RetentionPublications
+                if !matches!(version, 32 | 33 | 34 | 35 | 36) =>
+            {
+                return Err(StorageError::Other(format!(
+                    "Retention publication observation supports Core schemas 32–36, found {version}"
+                )));
+            }
+            NonmutatingOpenPolicy::RetentionPointer if version != 1 => {
+                return Err(StorageError::Other(format!(
+                    "Retention publication pointer requires schema 1, found {version}"
+                )));
+            }
             NonmutatingOpenPolicy::StrictCurrentSchema if version != SCHEMA_VERSION => {
                 return Err(schema_version_mismatch_error(
                     "Observational storage",
@@ -15416,8 +15536,8 @@ mod grounding_snapshot_fast_path_tests {
 }
 
 pub use retrieval_manifest::{
-    BoundRetrievalIndexManifest, RetrievalCoreGenerationBinding, RetrievalIndexManifest,
-    RetrievalIndexRollbackRecord, RetrievalPublicationTransaction,
+    BoundRetrievalIndexManifest, RetrievalArtifactScope, RetrievalCoreGenerationBinding,
+    RetrievalIndexManifest, RetrievalIndexRollbackRecord, RetrievalPublicationTransaction,
 };
 
 #[cfg(test)]

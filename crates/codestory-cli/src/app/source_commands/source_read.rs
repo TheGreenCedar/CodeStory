@@ -20,15 +20,11 @@ pub(in crate::app) fn run_snippet(cmd: SnippetCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "snippet")?;
     preflight_output_file(cmd.output_file.as_deref())?;
     let runtime = RuntimeContext::new(&cmd.project)?;
-    let opened = runtime.ensure_open(cmd.refresh)?;
+    let opened = runtime.ensure_core_open(cmd.refresh)?;
     ensure_index_ready(&opened, "snippet")?;
 
     let file_filter = cmd.target.file_filter();
-    let operation = if cmd.target.query.is_some() {
-        "graph_assisted"
-    } else {
-        "source_snippet"
-    };
+    let operation = "source_snippet";
     let colorize = cmd.format == args::OutputFormat::Markdown
         && cmd.output_file.is_none()
         && std::io::stdout().is_terminal();

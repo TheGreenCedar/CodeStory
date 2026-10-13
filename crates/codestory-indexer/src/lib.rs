@@ -17166,7 +17166,10 @@ fn call_edge_still_has_unresolved_placeholder(edge: &Edge, callable_ids: &HashSe
 
 pub(crate) mod projection;
 use projection::*;
-pub use projection::{CALLABLE_OUTLINE_SIGNATURE_TAG, CALLABLE_SHAPE_SIGNATURE_TAG};
+pub use projection::{
+    CALLABLE_OUTLINE_SIGNATURE_TAG, CALLABLE_SHAPE_SIGNATURE_TAG, ParsedCallableBodySpan,
+    parsed_callable_body_spans,
+};
 
 fn hash_parts<'a>(parts: impl IntoIterator<Item = &'a str>) -> i64 {
     let mut h: u64 = 0xcbf29ce484222325;

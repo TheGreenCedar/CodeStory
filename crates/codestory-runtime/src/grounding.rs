@@ -1510,45 +1510,42 @@ impl AppController {
         let source = self.verified_node_source(&node)?;
         let path = source.path.to_string_lossy().into_owned();
         let line = source.start_line;
-        let range = match source.end_line.filter(|end| *end >= line) {
-            Some(end_line) if end_line > line => Some(FunctionBodyRange {
-                end_line,
-                range_source: "indexed_symbol_range",
-                fallback_reason: None,
-            }),
-            Some(end_line) => {
-                match brace_balanced_function_body_end_line(&path, &source.content, line) {
-                    Some(fallback_end_line) if fallback_end_line > end_line => {
-                        Some(FunctionBodyRange {
-                            end_line: fallback_end_line,
-                            range_source: "brace_balanced_fallback",
-                            fallback_reason: Some(format!(
-                                "indexed function-body range ended at line {end_line}; expanded with bounded brace-balanced fallback"
-                            )),
-                        })
-                    }
-                    Some(_) => Some(FunctionBodyRange {
-                        end_line,
-                        range_source: "indexed_symbol_range",
-                        fallback_reason: None,
-                    }),
-                    None => None,
-                }
-            }
-            None => brace_balanced_function_body_end_line(&path, &source.content, line).map(
-                |end_line| FunctionBodyRange {
+        let indexed_end = source.end_line.filter(|end| *end >= line);
+        let range = if path_supports_brace_balanced_function_fallback(&path) {
+            // Indexed extents can stop at an inner block or include another
+            // symbol. Qualify once against the already verified source buffer.
+            brace_balanced_function_body_end_line(&path, &source.content, line).map(|end_line| {
+                FunctionBodyRange {
                     end_line,
-                    range_source: "brace_balanced_fallback",
-                    fallback_reason: Some(
-                        "indexed function-body range was unavailable; inferred a bounded brace-balanced range"
-                            .to_string(),
-                    ),
-                }),
+                    range_source: if indexed_end == Some(end_line) {
+                        "indexed_symbol_range"
+                    } else {
+                        "brace_balanced_fallback"
+                    },
+                    fallback_reason: match indexed_end {
+                        Some(indexed) if indexed == end_line => None,
+                        Some(indexed) => Some(format!(
+                            "indexed function-body range ended at line {indexed}; corrected to line {end_line} with bounded brace-balanced fallback"
+                        )),
+                        None => Some(
+                            "indexed function-body range was unavailable; inferred a bounded brace-balanced range".to_string()
+                        ),
+                    },
+                }
+            })
+        } else {
+            indexed_end
+                .filter(|end| *end > line)
+                .map(|end_line| FunctionBodyRange {
+                    end_line,
+                    range_source: "indexed_symbol_range",
+                    fallback_reason: None,
+                })
         };
         let Some(range) = range else {
             let mut context = self.snippet_context(node.id.clone(), context_lines)?;
             context.fallback_reason = Some(
-                "function-body range was unavailable and brace-balanced fallback did not find a supported body; fell back to line_context"
+                "function-body closure could not be established within supported syntax and bounded scan limits; fell back to line_context"
                     .to_string(),
             );
             context.range_source = Some("line_context".to_string());
@@ -1591,13 +1588,14 @@ fn brace_balanced_function_body_end_line(
     if !path_supports_brace_balanced_function_fallback(path) {
         return None;
     }
-    brace_balanced_body_end_line(
+    let extension = Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str());
+    brace_balanced_body_end_line_with_syntax(
         content,
         start_line,
-        Path::new(path)
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("rs")),
+        extension.is_some_and(|extension| extension.eq_ignore_ascii_case("rs")),
+        extension.is_some_and(|extension| extension.eq_ignore_ascii_case("go")),
     )
 }
 
@@ -1642,34 +1640,56 @@ fn path_supports_brace_balanced_function_fallback(path: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// String state the brace scanner has to carry across a newline.
-///
-/// Only the two forms that legally span lines in the languages this fallback
-/// accepts. A `'`-delimited literal stays line-local because Rust lifetimes
-/// (`&'a str`) open one that never closes, and persisting that would swallow
-/// the rest of the file; a `"`-delimited literal stays line-local for the same
-/// containment reason.
+/// Lexical state carried across physical lines in the bounded brace fallback.
 #[derive(Clone, Copy)]
 enum MultilineStringState {
     None,
-    /// A JavaScript/TypeScript template literal or a Go raw string literal.
+    DoubleQuoted,
     Backtick,
-    /// A Rust raw string literal, closed by `"` followed by `hashes` `#`.
-    RustRaw {
-        hashes: usize,
-    },
+    RustRaw { hashes: usize },
 }
 
+#[cfg(test)]
 fn brace_balanced_body_end_line(
     source: &str,
     start_line: u32,
     rust_literal_syntax: bool,
 ) -> Option<u32> {
+    brace_balanced_body_end_line_with_syntax(source, start_line, rust_literal_syntax, false)
+}
+
+fn brace_balanced_body_end_line_with_syntax(
+    source: &str,
+    start_line: u32,
+    rust_literal_syntax: bool,
+    go_literal_syntax: bool,
+) -> Option<u32> {
     let start_index = start_line.checked_sub(1)? as usize;
+    if go_literal_syntax {
+        // Go methods/functions begin with func. Type/interface/variable
+        // anchors must not borrow a later declaration's callable closure.
+        let first = source.lines().nth(start_index)?.trim_start();
+        let after_func = first.strip_prefix("func")?;
+        if after_func
+            .chars()
+            .next()
+            .is_some_and(|ch| !ch.is_whitespace() && ch != '(')
+        {
+            return None;
+        }
+    }
     let mut depth = 0usize;
     let mut saw_opening_brace = false;
-    let mut in_block_comment = false;
+    let mut block_comment_depth = 0usize;
     let mut multiline_string = MultilineStringState::None;
+    let mut signature_parens = 0usize;
+    let mut saw_signature_close = false;
+    let mut signature_type_nesting = 0usize;
+    let mut go_signature_type_braces = 0usize;
+    let mut go_type_keyword_pending = false;
+    // A branch may contain balanced nested blocks, but cannot independently
+    // open or close the function. Otherwise its active extent is ambiguous.
+    let mut conditional_depths = Vec::new();
 
     for (offset, line) in source
         .lines()
@@ -1677,16 +1697,69 @@ fn brace_balanced_body_end_line(
         .skip(start_index)
         .take(FUNCTION_BODY_FALLBACK_MAX_SCAN_LINES)
     {
-        scan_braces_in_line(
+        if !rust_literal_syntax
+            && block_comment_depth == 0
+            && matches!(multiline_string, MultilineStringState::None)
+            && let Some(directive) = line.trim_start().strip_prefix('#')
+        {
+            let directive_name = directive
+                .trim_start()
+                .split(|ch: char| !ch.is_ascii_alphabetic())
+                .next()?;
+            match directive_name {
+                "if" | "ifdef" | "ifndef" => conditional_depths.push(depth),
+                "else" | "elif" | "elifdef" | "elifndef" => {
+                    if conditional_depths.last().copied() != Some(depth) {
+                        return None;
+                    }
+                }
+                "endif" => {
+                    if conditional_depths.pop() != Some(depth) {
+                        return None;
+                    }
+                }
+                _ => {}
+            }
+            // Macro-expanded braces and continued directives are unsupported.
+            if directive.contains(['{', '}']) || directive.trim_end().ends_with('\\') {
+                return None;
+            }
+            if !saw_opening_brace
+                && offset.saturating_sub(start_index) >= FUNCTION_BODY_FALLBACK_BRACE_SEARCH_LINES
+            {
+                return None;
+            }
+            continue;
+        }
+        if !scan_braces_in_line(
             line,
             &mut depth,
             &mut saw_opening_brace,
-            &mut in_block_comment,
+            &mut block_comment_depth,
             &mut multiline_string,
             rust_literal_syntax,
-        );
+            go_literal_syntax,
+            &mut go_signature_type_braces,
+            &mut go_type_keyword_pending,
+            &mut signature_parens,
+            &mut saw_signature_close,
+            &mut signature_type_nesting,
+        ) {
+            return None;
+        }
+        // Go inserts a semicolon after a completed declaration signature.
+        // Its body opener must therefore occur on that same physical line;
+        // never borrow a following function's brace for a body-less declaration.
+        if go_literal_syntax
+            && !saw_opening_brace
+            && saw_signature_close
+            && signature_parens == 0
+            && go_signature_type_braces == 0
+        {
+            return None;
+        }
         if saw_opening_brace && depth == 0 {
-            return Some((offset + 1) as u32);
+            return conditional_depths.is_empty().then_some((offset + 1) as u32);
         }
         if !saw_opening_brace
             && offset.saturating_sub(start_index) >= FUNCTION_BODY_FALLBACK_BRACE_SEARCH_LINES
@@ -1697,45 +1770,53 @@ fn brace_balanced_body_end_line(
     None
 }
 
-/// Scan one line for braces, carrying block-comment and multiline-string state.
-///
-/// `multiline_string` is why this takes state rather than rediscovering it:
-/// string state used to be line-local, so a `}` inside a JavaScript template
-/// literal or a Rust raw string that spans lines was counted as real, closed
-/// the inferred function early, and the snippet was still reported as
-/// `scope=function_body` with a `brace_balanced_fallback` range — a truncated
-/// body presented as a whole one.
+/// Return false for encountered syntax whose braces cannot be qualified by
+/// this lexical fallback. The caller reports line_context rather than trusting
+/// an indexed extent in that case. This is deliberately not a language parser.
+#[allow(clippy::too_many_arguments)]
 fn scan_braces_in_line(
     line: &str,
     depth: &mut usize,
     saw_opening_brace: &mut bool,
-    in_block_comment: &mut bool,
+    block_comment_depth: &mut usize,
     multiline_string: &mut MultilineStringState,
     rust_literal_syntax: bool,
-) {
+    go_literal_syntax: bool,
+    go_signature_type_braces: &mut usize,
+    go_type_keyword_pending: &mut bool,
+    signature_parens: &mut usize,
+    saw_signature_close: &mut bool,
+    signature_type_nesting: &mut usize,
+) -> bool {
     let chars: Vec<char> = line.chars().collect();
     let mut index = 0usize;
-    let mut string_delimiter: Option<char> = None;
+    let mut single_quoted = false;
     let mut escaped = false;
-
     while index < chars.len() {
         let ch = chars[index];
         index += 1;
-
-        if *in_block_comment {
-            if ch == '*' && chars.get(index) == Some(&'/') {
+        if *block_comment_depth > 0 {
+            if rust_literal_syntax && ch == '/' && chars.get(index) == Some(&'*') {
                 index += 1;
-                *in_block_comment = false;
+                *block_comment_depth += 1;
+            } else if ch == '*' && chars.get(index) == Some(&'/') {
+                index += 1;
+                *block_comment_depth -= 1;
             }
             continue;
         }
         match *multiline_string {
-            MultilineStringState::Backtick => {
+            MultilineStringState::DoubleQuoted | MultilineStringState::Backtick => {
+                let delimiter = if matches!(*multiline_string, MultilineStringState::Backtick) {
+                    '`'
+                } else {
+                    '"'
+                };
                 if escaped {
                     escaped = false;
-                } else if ch == '\\' {
+                } else if ch == '\\' && !(go_literal_syntax && delimiter == '`') {
                     escaped = true;
-                } else if ch == '`' {
+                } else if ch == delimiter {
                     *multiline_string = MultilineStringState::None;
                 }
                 continue;
@@ -1749,17 +1830,13 @@ fn scan_braces_in_line(
             }
             MultilineStringState::None => {}
         }
-        if let Some(delimiter) = string_delimiter {
+        if single_quoted {
             if escaped {
                 escaped = false;
-                continue;
-            }
-            if ch == '\\' {
+            } else if ch == '\\' {
                 escaped = true;
-                continue;
-            }
-            if ch == delimiter {
-                string_delimiter = None;
+            } else if ch == '\'' {
+                single_quoted = false;
             }
             continue;
         }
@@ -1768,19 +1845,27 @@ fn scan_braces_in_line(
                 Some('/') => break,
                 Some('*') => {
                     index += 1;
-                    *in_block_comment = true;
+                    *block_comment_depth = 1;
                     continue;
                 }
+                // Regex and division ambiguity is not parsed by this fallback.
+                _ if !rust_literal_syntax && !go_literal_syntax => return false,
                 _ => {}
             }
+        }
+        if !rust_literal_syntax
+            && ((ch == 'R' && chars.get(index) == Some(&'"'))
+                || (ch == '@' && chars.get(index) == Some(&'"')))
+        {
+            return false;
         }
         if ch == '`' {
             *multiline_string = MultilineStringState::Backtick;
             escaped = false;
             continue;
         }
-        if let Some(hashes) = rust_raw_string_open_hashes(&chars, index - 1) {
-            // Skip `r`, the opening hashes, and the quote.
+        if rust_literal_syntax && let Some(hashes) = rust_raw_string_open_hashes(&chars, index - 1)
+        {
             index += hashes + 1;
             *multiline_string = MultilineStringState::RustRaw { hashes };
             continue;
@@ -1791,19 +1876,91 @@ fn scan_braces_in_line(
             }
             continue;
         }
-        if matches!(ch, '"' | '\'') {
-            string_delimiter = Some(ch);
+        if ch == '"' {
+            if chars.get(index) == Some(&'"') && chars.get(index + 1) == Some(&'"') {
+                return false;
+            }
+            *multiline_string = MultilineStringState::DoubleQuoted;
             continue;
+        }
+        if ch == '\'' {
+            single_quoted = true;
+            continue;
+        }
+        if go_literal_syntax && !*saw_opening_brace {
+            // Track lexical type keywords across whitespace/comments, then
+            // balance type literals independently from the callable body.
+            if *go_signature_type_braces > 0 {
+                if ch == '{' {
+                    *go_signature_type_braces += 1;
+                } else if ch == '}' {
+                    *go_signature_type_braces -= 1;
+                }
+                continue;
+            }
+            if ch.is_alphabetic() || ch == '_' {
+                let word_start = index - 1;
+                while chars
+                    .get(index)
+                    .is_some_and(|ch| ch.is_alphanumeric() || *ch == '_')
+                {
+                    index += 1;
+                }
+                let word: String = chars[word_start..index].iter().collect();
+                *go_type_keyword_pending = matches!(word.as_str(), "interface" | "struct");
+                continue;
+            }
+            if ch == '{' && *go_type_keyword_pending {
+                *go_signature_type_braces = 1;
+                *go_type_keyword_pending = false;
+                continue;
+            }
+            if !ch.is_whitespace() {
+                *go_type_keyword_pending = false;
+            }
+        }
+        if !*saw_opening_brace {
+            match ch {
+                '(' => *signature_parens += 1,
+                ')' => {
+                    let Some(remaining) = signature_parens.checked_sub(1) else {
+                        return false;
+                    };
+                    *signature_parens = remaining;
+                    *saw_signature_close = remaining == 0;
+                }
+                '[' | '<' if rust_literal_syntax => *signature_type_nesting += 1,
+                ']' | '>' if rust_literal_syntax => {
+                    *signature_type_nesting = signature_type_nesting.saturating_sub(1)
+                }
+                '!' if rust_literal_syntax => return false,
+                ';' => return false,
+                // Object return types and constructor initializer lists need
+                // semantic parsing before their first brace can mean a body.
+                ':' if !rust_literal_syntax && *saw_signature_close => return false,
+                _ => {}
+            }
         }
         if ch == '{' {
+            if !*saw_opening_brace
+                && (!*saw_signature_close || *signature_parens != 0 || *signature_type_nesting != 0)
+            {
+                return false;
+            }
             *saw_opening_brace = true;
             *depth = depth.saturating_add(1);
-            continue;
-        }
-        if ch == '}' && *saw_opening_brace {
-            *depth = depth.saturating_sub(1);
+        } else if ch == '}' && *saw_opening_brace {
+            let Some(remaining) = depth.checked_sub(1) else {
+                return false;
+            };
+            *depth = remaining;
+            // Never continue into another symbol after the first outer close.
+            if remaining == 0 {
+                return true;
+            }
         }
     }
+    !single_quoted
 }
 
 /// Return the byte-independent character index immediately after a Rust char
@@ -3509,6 +3666,199 @@ mod tests {
                 .is_some_and(|reason| reason.contains("fell back to line_context"))
         );
         assert!(snippet.snippet.contains("payload.create"));
+    }
+
+    #[test]
+    fn function_body_snippet_corrects_nested_and_overrunning_indexed_extents() {
+        let content = "fn route_handler() {\n    if ready() {\n        work();\n    }\n    finish();\n}\nfn unrelated() {}\n";
+        for indexed_end in [4, 6, 7] {
+            let (_temp, controller, _path) = snippet_source_fixture(content, 1, Some(indexed_end));
+            let snippet = controller
+                .snippet_function_body_context(NodeId("101".into()), 0)
+                .unwrap();
+            assert_eq!(
+                snippet.scope,
+                codestory_contracts::api::SnippetScopeDto::FunctionBody
+            );
+            assert_eq!(snippet.node.end_line, Some(indexed_end));
+            assert!(snippet.snippet.contains("finish();"));
+            assert!(!snippet.snippet.contains("unrelated"));
+            assert!(!snippet.snippet_truncated);
+            assert_eq!(
+                snippet.range_source.as_deref(),
+                Some(if indexed_end == 6 {
+                    "indexed_symbol_range"
+                } else {
+                    "brace_balanced_fallback"
+                })
+            );
+            assert_eq!(snippet.fallback_reason.is_some(), indexed_end != 6);
+        }
+    }
+
+    #[test]
+    fn function_body_snippet_rejects_unresolved_indexed_extents() {
+        for content in [
+            "fn route_handler();\nfn unrelated() {}\n",
+            "fn route_handler() {\n    work();\n",
+        ] {
+            let (_temp, controller, _path) = snippet_source_fixture(content, 1, Some(2));
+            let snippet = controller
+                .snippet_function_body_context(NodeId("101".into()), 0)
+                .unwrap();
+            assert_eq!(
+                snippet.scope,
+                codestory_contracts::api::SnippetScopeDto::LineContext
+            );
+            assert_eq!(snippet.range_source.as_deref(), Some("line_context"));
+            assert!(
+                snippet
+                    .fallback_reason
+                    .unwrap()
+                    .contains("bounded scan limits")
+            );
+        }
+    }
+
+    #[test]
+    fn function_body_scan_handles_go_arithmetic_and_signature_types() {
+        for source in [
+            "func ratio(n int) int {\n    return n / 2\n}\nfunc next() {}\n",
+            "func convert(values []interface{}) []interface{} {\n    return values\n}\nfunc next() {}\n",
+            "func compose(v struct { Inner interface { Read() int } }) struct { Value int } {\n    return struct { Value int }{1}\n}\nfunc next() {}\n",
+            "func quoted() string {\n    return `backslash \\` + \"tail\"\n}\nfunc next() {}\n",
+            "func factory() func() int {\n    return func() int { return 1 }\n}\nfunc next() {}\n",
+            "func typed() interface /* comment with } */ { Read() int } {\n    return nil\n}\nfunc next() {}\n",
+        ] {
+            assert_eq!(
+                brace_balanced_function_body_end_line("anonymous.go", source, 1),
+                Some(3),
+                "{source}"
+            );
+        }
+        for source in [
+            "func body(v interface{})\nfunc next() {}\n",
+            "func body() int\nfunc next() int { return 1 }\n",
+            "Read() int\n}\nfunc next() {}\n",
+            "type Thing struct { F int }\nfunc next() {\n    work()\n}\n",
+            "type Reader interface {\n    Read() int\n}\nfunc next() {}\n",
+            "var callback = func() {\n    work()\n}\n",
+            "func body(v interface { Read() int) {\n    return\n}\n",
+            "func body(v interface{}) {\n    work()\n",
+        ] {
+            assert_eq!(
+                brace_balanced_function_body_end_line("anonymous.go", source, 1),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn function_body_scan_keeps_its_line_boundary() {
+        let within = format!(
+            "fn body() {{\n{}}}\n",
+            "    work();\n".repeat(FUNCTION_BODY_FALLBACK_MAX_SCAN_LINES - 2)
+        );
+        assert_eq!(
+            brace_balanced_body_end_line(&within, 1, true),
+            Some(FUNCTION_BODY_FALLBACK_MAX_SCAN_LINES as u32)
+        );
+        let beyond = format!(
+            "fn body() {{\n{}}}\n",
+            "    work();\n".repeat(FUNCTION_BODY_FALLBACK_MAX_SCAN_LINES - 1)
+        );
+        assert_eq!(brace_balanced_body_end_line(&beyond, 1, true), None);
+        let (_temp, controller, _path) = snippet_source_fixture(&beyond, 1, Some(401));
+        assert_eq!(
+            controller
+                .snippet_function_body_context(NodeId("101".into()), 0)
+                .unwrap()
+                .scope,
+            codestory_contracts::api::SnippetScopeDto::LineContext
+        );
+    }
+
+    #[test]
+    fn function_body_scan_handles_rust_multiline_quotes_and_nested_comments() {
+        for content in [
+            "fn body() {\n    let text = \"first\n} still a string\nlast\";\n    finish();\n}\n",
+            "fn body() {\n    /* outer /* nested */\n    } still a comment */\n    finish();\n}\n",
+        ] {
+            let expected = content.lines().count() as u32;
+            assert_eq!(
+                brace_balanced_body_end_line(content, 1, true),
+                Some(expected)
+            );
+            let (_temp, controller, _path) = snippet_source_fixture(content, 1, Some(3));
+            let snippet = controller
+                .snippet_function_body_context(NodeId("101".into()), 0)
+                .unwrap();
+            assert_eq!(
+                snippet.scope,
+                codestory_contracts::api::SnippetScopeDto::FunctionBody
+            );
+            assert!(snippet.snippet.contains("finish();"));
+        }
+    }
+
+    #[test]
+    fn function_body_scan_qualifies_only_balanced_conditional_branches() {
+        let balanced = "int body() {\n#if ENABLED\n    if (ready()) { work(); }\n#else\n    other();\n#endif\n    return 0;\n}\n";
+        assert_eq!(brace_balanced_body_end_line(balanced, 1, false), Some(8));
+        for ambiguous in [
+            "int body() {\n#if(ENABLED)\n}\n#else\n    work();\n#endif\n}\n",
+            "int body() {\n#if ENABLED\n}\n#else\n    work();\n#endif\n}\n",
+            "int body() {\n#if ENABLED\n    if (ready()) {\n#else\n    work();\n#endif\n}\n",
+            "int body() {\n#if ENABLED\n    work();\n}\n",
+        ] {
+            assert_eq!(brace_balanced_body_end_line(ambiguous, 1, false), None);
+        }
+    }
+
+    #[test]
+    fn function_body_scan_rejects_raw_regex_and_signature_ambiguity() {
+        for content in [
+            "void body() {\n    auto text = R\"(first\n} raw\n)\";\n}\n",
+            "function body() {\n    const pattern = /}/;\n}\n",
+            "function body(): {\n    result: string;\n} {\n    return { result: 'ok' };\n}\n",
+        ] {
+            assert_eq!(brace_balanced_body_end_line(content, 1, false), None);
+        }
+    }
+
+    #[test]
+    fn function_body_scan_rejects_rust_braces_in_return_type() {
+        let content = "fn body() -> [u8;\n{ 2 }]\n{\n    [0, 0]\n}\n";
+        assert_eq!(brace_balanced_body_end_line(content, 1, true), None);
+        let (_temp, controller, _path) = snippet_source_fixture(content, 1, Some(2));
+        assert_eq!(
+            controller
+                .snippet_function_body_context(NodeId("101".into()), 0)
+                .unwrap()
+                .scope,
+            codestory_contracts::api::SnippetScopeDto::LineContext
+        );
+    }
+
+    #[test]
+    fn function_body_snippet_reports_oversize_body_without_claiming_delivered_closure() {
+        let content = format!(
+            "fn body() {{\n    let text = \"{}\";\n    finish();\n}}\n",
+            "x".repeat(crate::DIRECT_SNIPPET_MAX_BYTES + 1024)
+        );
+        let (_temp, controller, _path) = snippet_source_fixture(&content, 1, Some(2));
+        let snippet = controller
+            .snippet_function_body_context(NodeId("101".into()), 0)
+            .unwrap();
+        assert_eq!(
+            snippet.scope,
+            codestory_contracts::api::SnippetScopeDto::FunctionBody
+        );
+        assert_eq!(snippet.node.end_line, Some(2));
+        assert!(snippet.snippet_truncated);
+        assert!(snippet.truncation_guidance.is_some());
+        assert!(snippet.snippet.len() <= crate::DIRECT_SNIPPET_MAX_BYTES);
+        assert!(!snippet.snippet.contains("finish();"));
     }
 
     /// One-function project fixture. `insert_file_node` binds the indexed

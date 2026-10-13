@@ -63,3 +63,24 @@ retrieval, or filesystem access.
 
 See [runtime](runtime.md) for assembly and retry, and
 [retrieval](retrieval.md) for fail-closed query execution.
+
+
+Runtime may supply an optional original callable/body extent from bounded parsing
+of the same verified source bytes. Exact Core line/byte-column matching and the
+source digest bind that observation; unsupported, erroneous, conflicting or
+missing observations stay unknown. Selection credits direct delivered body
+progress before speculative call reach, with completion credited only over the
+original callable extent. A fully delivered declaration or requested subrange
+is not evidence of a complete executable body. This does not assert behavior
+or answer sufficiency. Public projection retains exact continuation locators
+individually within its unchanged measured byte cap and routing identities.
+
+The existing complete-first proposal family uses that same body-progress
+objective while preserving exact requests and the prior order on ties. Unknown
+metadata retains ordinary source and navigation credit; it does not establish
+that a body is absent. Authenticated body progress nevertheless ranks ahead of
+unknown ordinary context, which can bias selection across languages or legacy
+publications. The bounded prefix/exchange search does not guarantee a global
+optimum, and a large early body can still block a better combination. Executed
+normal-producer coordinate controls and the captured full-frame replay are
+required before claiming a packet-quality improvement.

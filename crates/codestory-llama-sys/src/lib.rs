@@ -28,7 +28,7 @@ use llama_cpp_2::{
 };
 use llama_cpp_sys_2 as llama_sys;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::ffi::{CStr, c_void};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read, Write};
@@ -348,12 +348,49 @@ struct EncodeObservation {
     resident_tensor_count: u64,
     resident_tensor_bytes: u64,
     execution_node_count: u64,
+    completed_operator_counts: BTreeMap<String, u64>,
+}
+
+/// A successful native encode must still prove accelerator execution before
+/// any vector can leave the batch. Startup evidence cannot admit later batches.
+fn require_accelerator_observation(
+    observation: &EncodeObservation,
+    model_layer_count: u32,
+) -> Result<(), EngineError> {
+    if observation.encode_count == 0
+        || observation.execution_node_count == 0
+        || observation
+            .completed_operator_counts
+            .get("MUL_MAT")
+            .copied()
+            .unwrap_or(0)
+            == 0
+        || observation.execution_device_names.is_empty()
+        || model_layer_count == 0
+        || observation.observed_layer_count != model_layer_count
+        || observation.resident_tensor_count == 0
+        || observation.resident_tensor_bytes == 0
+    {
+        return Err(EngineError::AcceleratorExecutionUnverified(format!(
+            "completed batch (devices={:?} layers={}/{} tensors={} bytes={} nodes={} encodes={})",
+            observation.execution_device_names,
+            observation.observed_layer_count,
+            model_layer_count,
+            observation.resident_tensor_count,
+            observation.resident_tensor_bytes,
+            observation.execution_node_count,
+            observation.encode_count,
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Default)]
 struct EvalTelemetryState {
     encode_count: u64,
     target_device_name: String,
+    target_device_handle: usize,
+    rejected_operation: Option<String>,
     execution_device_names: BTreeSet<String>,
     execution_backend_names: BTreeSet<String>,
     observed_tensors: HashSet<usize>,
@@ -362,6 +399,7 @@ struct EvalTelemetryState {
     resident_tensors: HashSet<usize>,
     resident_tensor_bytes: u64,
     execution_node_count: u64,
+    completed_operator_counts: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Default)]
@@ -391,6 +429,8 @@ impl EvalTelemetry {
         state.resident_tensors.clear();
         state.resident_tensor_bytes = 0;
         state.execution_node_count = 0;
+        state.completed_operator_counts.clear();
+        state.rejected_operation = None;
         Ok(())
     }
 
@@ -419,7 +459,23 @@ fn observation_from_state(state: &EvalTelemetryState) -> EncodeObservation {
         resident_tensor_count: state.resident_tensors.len() as u64,
         resident_tensor_bytes: state.resident_tensor_bytes,
         execution_node_count: state.execution_node_count,
+        completed_operator_counts: state.completed_operator_counts.clone(),
     }
+}
+
+fn is_compute_operation(op: llama_sys::ggml_op) -> bool {
+    !matches!(
+        op,
+        llama_sys::GGML_OP_NONE
+            | llama_sys::GGML_OP_VIEW
+            | llama_sys::GGML_OP_RESHAPE
+            | llama_sys::GGML_OP_PERMUTE
+            | llama_sys::GGML_OP_TRANSPOSE
+    )
+}
+
+fn selected_callback_device(state: &EvalTelemetryState, device: usize) -> bool {
+    state.target_device_handle != 0 && state.target_device_handle == device
 }
 
 unsafe extern "C" fn observe_eval_tensor(
@@ -427,25 +483,54 @@ unsafe extern "C" fn observe_eval_tensor(
     ask: bool,
     user_data: *mut c_void,
 ) -> bool {
-    // The callback's return value has two meanings in llama.cpp: during the
-    // ask phase, true requests that the scheduler compute and synchronize up
-    // to this tensor; during the observation phase, true lets execution
-    // continue. Placement metadata is available during ask, so telemetry never
-    // needs tensor data or a per-node synchronization.
-    if !ask {
+    if tensor.is_null() || user_data.is_null() {
+        unsafe { llama_sys::ggml_backend_sched_abort_current_eval() };
         return true;
     }
-    if tensor.is_null() || user_data.is_null() {
-        return false;
-    }
-    // The callback pointer is installed from a boxed EvalTelemetry before the
-    // context is created. The box outlives and is dropped after the context.
+    // The box outlives its context; the scheduler scopes the actual executor.
     let telemetry = unsafe { &*(user_data.cast::<EvalTelemetry>()) };
     let Ok(mut state) = telemetry.state.lock() else {
-        return false;
+        unsafe { llama_sys::ggml_backend_sched_abort_current_eval() };
+        return true;
     };
-    unsafe { observe_scheduled_tensor(tensor, &mut state) };
-    false
+    if ask {
+        // Placement/residency is descriptive, never completed compute proof.
+        unsafe { observe_scheduled_tensor(tensor, &mut state) };
+    }
+    if !is_compute_operation(unsafe { (*tensor).op }) {
+        return !ask;
+    }
+    let backend = unsafe { llama_sys::ggml_backend_sched_current_eval_backend() };
+    let device = if backend.is_null() {
+        std::ptr::null_mut()
+    } else {
+        unsafe { llama_sys::ggml_backend_get_device(backend) }
+    };
+    let operator = unsafe { c_string_lossy(llama_sys::ggml_op_name((*tensor).op)) }
+        .unwrap_or_else(|| "unknown".into());
+    if !selected_callback_device(&state, device as usize) {
+        state.rejected_operation = Some(format!("{operator} on unselected device (ask={ask})"));
+        unsafe { llama_sys::ggml_backend_sched_abort_current_eval() };
+        return true;
+    }
+    if !ask {
+        // This phase is reached only after SUCCESS and executor synchronization.
+        let device_name = unsafe { c_string_lossy(llama_sys::ggml_backend_dev_name(device)) };
+        let backend_name = unsafe { c_string_lossy(llama_sys::ggml_backend_name(backend)) };
+        let (Some(device_name), Some(backend_name)) = (device_name, backend_name) else {
+            state.rejected_operation = Some("completed backend identity unavailable".into());
+            unsafe { llama_sys::ggml_backend_sched_abort_current_eval() };
+            return true;
+        };
+        if state.execution_tensors.insert(tensor as usize) {
+            state.execution_device_names.insert(device_name);
+            state.execution_backend_names.insert(backend_name);
+            state.execution_node_count = state.execution_node_count.saturating_add(1);
+            *state.completed_operator_counts.entry(operator).or_default() += 1;
+        }
+    }
+    // Ask requests the matched post-completion callback for nontrivial work.
+    true
 }
 
 unsafe fn tensor_device_identity(tensor: *mut llama_sys::ggml_tensor) -> Option<(String, String)> {
@@ -490,7 +575,7 @@ unsafe fn observe_scheduled_tensor(
     root: *mut llama_sys::ggml_tensor,
     state: &mut EvalTelemetryState,
 ) {
-    let mut pending = vec![(root, true)];
+    let mut pending = vec![(root, false)];
     while let Some((tensor, scheduled)) = pending.pop() {
         if tensor.is_null() {
             continue;
@@ -632,6 +717,7 @@ pub struct EngineIdentity {
     pub execution_observation_source: &'static str,
     pub encode_count: u64,
     pub execution_node_count: u64,
+    pub completed_operator_counts: BTreeMap<String, u64>,
     pub resident_accelerator_tensor_count: u64,
     pub resident_accelerator_tensor_bytes: u64,
     pub model_layer_count: u32,
@@ -644,6 +730,7 @@ fn apply_live_observation(identity: &mut EngineIdentity, observation: EncodeObse
     identity.execution_backend_names = observation.execution_backend_names;
     identity.encode_count = observation.encode_count;
     identity.execution_node_count = observation.execution_node_count;
+    identity.completed_operator_counts = observation.completed_operator_counts;
     if identity.selected_device_class == NativeDeviceClass::Accelerator {
         identity.offloaded_layer_count = observation.observed_layer_count;
         identity.resident_accelerator_tensor_count = observation.resident_tensor_count;
@@ -710,6 +797,72 @@ pub struct EmbeddingRequestCompletion {
     pub vectors: Vec<Vec<f32>>,
     pub completion_sequence: u64,
     pub timings: EmbeddingRequestTimings,
+    pub batch_evidence: Vec<EmbeddingBatchExecutionEvidence>,
+}
+
+/// Each span's evidence was captured before queued-query reentrancy.
+#[derive(Debug, Clone)]
+pub struct EmbeddingBatchExecutionEvidence {
+    pub vector_start: usize,
+    pub vector_end: usize,
+    pub snapshot: EngineLifecycleSnapshot,
+}
+
+impl EmbeddingRequestCompletion {
+    /// Return only the immutable completion-bound evidence for these vectors.
+    /// No live/global lifecycle sampling is needed or permitted here.
+    pub fn verified_snapshot(&self) -> Result<&EngineLifecycleSnapshot, EngineError> {
+        let invalid = || {
+            EngineError::AcceleratorExecutionUnverified(
+                "completed request evidence missing or inconsistent".into(),
+            )
+        };
+        let matched = &self.batch_evidence.last().ok_or_else(invalid)?.snapshot;
+        if self.completion_sequence == 0 || self.vectors.is_empty() {
+            return Err(invalid());
+        }
+        let mut end = 0;
+        let mut previous_encode = 0;
+        for batch in &self.batch_evidence {
+            let proof = &batch.snapshot.identity;
+            if batch.vector_start != end
+                || batch.vector_end <= end
+                || batch.vector_end > self.vectors.len()
+                || batch.snapshot.load_generation != matched.load_generation
+                || batch.snapshot.model_load_count != matched.model_load_count
+                || proof.model_digest != matched.identity.model_digest
+                || proof.ggml_build_identity != matched.identity.ggml_build_identity
+                || proof.backend != matched.identity.backend
+                || proof.adapter_name != matched.identity.adapter_name
+                || proof.selected_device_class != NativeDeviceClass::Accelerator
+                || !proof.accelerator_execution_verified
+                || proof.encode_count <= previous_encode
+                || proof
+                    .completed_operator_counts
+                    .get("MUL_MAT")
+                    .copied()
+                    .unwrap_or(0)
+                    == 0
+            {
+                return Err(invalid());
+            }
+            end = batch.vector_end;
+            previous_encode = proof.encode_count;
+        }
+        if end != self.vectors.len() {
+            return Err(invalid());
+        }
+        Ok(matched)
+    }
+}
+
+fn snapshot_with_observation(
+    resident: &EngineLifecycleSnapshot,
+    observation: EncodeObservation,
+) -> EngineLifecycleSnapshot {
+    let mut matched = resident.clone();
+    apply_live_observation(&mut matched.identity, observation);
+    matched
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1159,6 +1312,7 @@ impl EmbeddingEngine {
                 vectors: Vec::new(),
                 completion_sequence: 0,
                 timings: EmbeddingRequestTimings::default(),
+                batch_evidence: Vec::new(),
             }));
             return Ok(EmbeddingRequestHandle { context, result });
         }
@@ -1347,6 +1501,7 @@ fn run_resident_generation(
 ) -> ResidentRunResult {
     let mut pending_wake = Some(wake);
     let result = (|| -> Result<ResidentRunResult, EngineError> {
+        validate_engine_config(config)?;
         let started = Instant::now();
         admission.set_owner_state(EmbeddingOwnerState::Waking);
         let materialized = materialize_embedded_model(cache_root)?;
@@ -1378,6 +1533,12 @@ fn run_resident_generation(
         let model_layer_count = model.n_layer();
 
         let telemetry = Box::new(EvalTelemetry::new(device.name.clone()));
+        telemetry
+            .state
+            .lock()
+            .map_err(|_| llama_error("telemetry mutex poisoned"))?
+            .target_device_handle =
+            unsafe { llama_sys::ggml_backend_dev_get(device.index) } as usize;
         let mut context_params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(config.embedding.context_tokens))
             .with_n_batch(config.embedding.batch_tokens)
@@ -1397,7 +1558,7 @@ fn run_resident_generation(
         let smoke_started = Instant::now();
         let smoke_context = EmbeddingRequestContext::new("engine-startup-smoke", "engine-owner", 0);
         let _ = smoke_context.activate();
-        let (smoke, _) = embed_inputs(
+        let (smoke, _, _) = embed_inputs(
             &model,
             &mut context,
             &telemetry,
@@ -1407,6 +1568,7 @@ fn run_resident_generation(
             &config.embedding,
             admission,
             &smoke_context,
+            None,
         )?;
         let _ = smoke_context.commit();
         if smoke
@@ -1479,6 +1641,7 @@ fn run_resident_generation(
             execution_observation_source: EXECUTION_OBSERVATION_SOURCE,
             encode_count: observation.encode_count,
             execution_node_count: observation.execution_node_count,
+            completed_operator_counts: observation.completed_operator_counts.clone(),
             resident_accelerator_tensor_count,
             resident_accelerator_tensor_bytes,
             model_layer_count,
@@ -1520,6 +1683,7 @@ fn run_resident_generation(
                     query_queue,
                     &config.embedding,
                     admission,
+                    &snapshot,
                 );
                 if let Ok(observation) = telemetry.observation() {
                     apply_live_observation(&mut live_snapshot.identity, observation);
@@ -1767,6 +1931,7 @@ fn handle_request(
     query_queue: &CancellableRequestQueue,
     config: &NativeEmbeddingRequest,
     admission: &EmbeddingAdmissionTracker,
+    resident_snapshot: &EngineLifecycleSnapshot,
 ) {
     let request_class = match priority {
         RequestPriority::Query => EmbeddingRequestClass::Query,
@@ -1794,6 +1959,7 @@ fn handle_request(
         config,
         admission,
         &request.context,
+        Some(resident_snapshot),
     );
     let cancelled = request.context.is_cancelled();
     let result = if cancelled || !request.context.commit() {
@@ -1805,10 +1971,23 @@ fn handle_request(
         admission.finish(&request.context, request_class, result.is_ok(), cancelled);
     let _ = request
         .response
-        .send(result.map(|(vectors, timings)| EmbeddingRequestCompletion {
-            vectors,
-            completion_sequence,
-            timings,
+        .send(result.map(|(vectors, timings, observations)| {
+            let batch_evidence: Vec<_> = observations
+                .into_iter()
+                .map(
+                    |(vector_start, vector_end, observation)| EmbeddingBatchExecutionEvidence {
+                        vector_start,
+                        vector_end,
+                        snapshot: snapshot_with_observation(resident_snapshot, observation),
+                    },
+                )
+                .collect();
+            EmbeddingRequestCompletion {
+                vectors,
+                completion_sequence,
+                timings,
+                batch_evidence,
+            }
         }));
 }
 
@@ -1823,9 +2002,17 @@ fn embed_inputs(
     config: &NativeEmbeddingRequest,
     admission: &EmbeddingAdmissionTracker,
     request_context: &EmbeddingRequestContext,
-) -> Result<(Vec<Vec<f32>>, EmbeddingRequestTimings), EngineError> {
+    resident_snapshot: Option<&EngineLifecycleSnapshot>,
+) -> Result<
+    (
+        Vec<Vec<f32>>,
+        EmbeddingRequestTimings,
+        Vec<(usize, usize, EncodeObservation)>,
+    ),
+    EngineError,
+> {
     if inputs.is_empty() {
-        return Ok((Vec::new(), EmbeddingRequestTimings::default()));
+        return Ok((Vec::new(), EmbeddingRequestTimings::default(), Vec::new()));
     }
     if inputs.iter().any(|input| input.trim().is_empty()) {
         return Err(EngineError::EmptyInput);
@@ -1840,6 +2027,7 @@ fn embed_inputs(
     let completed_tokens = tokenized.iter().map(Vec::len).sum::<usize>();
     let mut output = Vec::with_capacity(inputs.len());
     let mut native_encode_ns = 0_u64;
+    let mut matched_observations = Vec::new();
     let mut offset = 0;
     while offset < tokenized.len() {
         ensure_embedding_request_live(request_context)?;
@@ -1849,15 +2037,17 @@ fn embed_inputs(
             config.max_batch_sequences as usize,
             config.batch_tokens as usize,
         );
-        let encode_elapsed = embed_token_batch(
+        let (encode_elapsed, observation) = embed_token_batch(
             context,
             telemetry,
             &tokenized[offset..end],
             &mut output,
             config.dimension,
+            model.n_layer(),
         )?;
         native_encode_ns = native_encode_ns
             .saturating_add(u64::try_from(encode_elapsed.as_nanos()).unwrap_or(u64::MAX));
+        matched_observations.push((offset, end, observation));
         admission.progress(priority.request_class());
         offset = end;
         if priority == RequestPriority::Bulk && offset < tokenized.len() {
@@ -1871,6 +2061,7 @@ fn embed_inputs(
                     query_queue,
                     config,
                     admission,
+                    resident_snapshot.expect("bulk requests have a resident snapshot"),
                 );
             })?;
         }
@@ -1882,6 +2073,7 @@ fn embed_inputs(
             tokenization_ns,
             native_encode_ns,
         },
+        matched_observations,
     ))
 }
 
@@ -1940,7 +2132,8 @@ fn embed_token_batch(
     sequences: &[Vec<llama_cpp_2::token::LlamaToken>],
     output: &mut Vec<Vec<f32>>,
     expected_dimension: usize,
-) -> Result<Duration, EngineError> {
+    model_layer_count: u32,
+) -> Result<(Duration, EncodeObservation), EngineError> {
     let total_tokens = sequences.iter().map(Vec::len).sum();
     let mut batch = LlamaBatch::new(total_tokens, sequences.len() as i32);
     for (sequence_id, tokens) in sequences.iter().enumerate() {
@@ -1951,9 +2144,20 @@ fn embed_token_batch(
     context.clear_kv_cache();
     telemetry.begin_encode()?;
     let encode_started = Instant::now();
-    context.encode(&mut batch).map_err(llama_error)?;
+    if let Err(error) = context.encode(&mut batch) {
+        let rejection = telemetry
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.rejected_operation.clone());
+        return Err(rejection.map_or_else(
+            || llama_error(error),
+            EngineError::AcceleratorExecutionUnverified,
+        ));
+    }
     let encode_elapsed = encode_started.elapsed();
-    telemetry.complete_encode()?;
+    let observation = telemetry.complete_encode()?;
+    require_accelerator_observation(&observation, model_layer_count)?;
     for sequence_id in 0..sequences.len() {
         let vector = context
             .embeddings_seq_ith(sequence_id as i32)
@@ -1967,7 +2171,7 @@ fn embed_token_batch(
         }
         output.push(vector);
     }
-    Ok(encode_elapsed)
+    Ok((encode_elapsed, observation))
 }
 
 pub fn materialize_embedded_model(cache_root: &Path) -> Result<MaterializedModel, EngineError> {
@@ -2131,6 +2335,11 @@ fn validate_engine_config(config: &EmbeddingEngineConfig) -> Result<(), EngineEr
     if !class_matches_backend {
         return Err(EngineError::InvalidConfiguration {
             reason: "backend_device_class_mismatch",
+        });
+    }
+    if config.backend.device_class == NativeDeviceClass::Cpu {
+        return Err(EngineError::InvalidConfiguration {
+            reason: "cpu_inference_unsupported",
         });
     }
     let compiled = compiled_engine_capabilities();
@@ -2761,6 +2970,73 @@ mod tests {
     }
 
     #[test]
+    fn real_engine_config_rejects_cpu_before_initialization() {
+        let config = valid_config();
+        assert_eq!(config.backend.device_class, NativeDeviceClass::Cpu);
+        let error = validate_engine_config(&config).expect_err("CPU inference must fail closed");
+        assert!(matches!(
+            error,
+            EngineError::InvalidConfiguration {
+                reason: "cpu_inference_unsupported"
+            }
+        ));
+    }
+
+    #[test]
+    fn completed_batch_cannot_reuse_startup_accelerator_evidence() {
+        let startup = EncodeObservation {
+            encode_count: 1,
+            execution_device_names: vec!["Apple GPU".into()],
+            execution_backend_names: vec!["Metal".into()],
+            observed_layer_count: 2,
+            resident_tensor_count: 2,
+            resident_tensor_bytes: 4096,
+            execution_node_count: 2,
+            completed_operator_counts: BTreeMap::from([("MUL_MAT".into(), 2)]),
+        };
+        require_accelerator_observation(&startup, 2).expect("startup used the accelerator");
+        // Resident model weights alone cannot admit a later CPU-only batch.
+        let cpu_only = EncodeObservation {
+            encode_count: 2,
+            execution_device_names: vec!["CPU".into()],
+            execution_backend_names: vec!["CPU".into()],
+            execution_node_count: 0,
+            ..startup.clone()
+        };
+        assert!(matches!(
+            require_accelerator_observation(&cpu_only, 2),
+            Err(EngineError::AcceleratorExecutionUnverified(_))
+        ));
+    }
+
+    #[test]
+    fn completed_batch_requires_complete_target_layer_observation() {
+        let observation = EncodeObservation {
+            encode_count: 1,
+            execution_device_names: vec!["Apple GPU".into(), "CPU".into()],
+            execution_backend_names: vec!["Metal".into(), "CPU".into()],
+            observed_layer_count: 2,
+            resident_tensor_count: 2,
+            resident_tensor_bytes: 4096,
+            execution_node_count: 2,
+            completed_operator_counts: BTreeMap::from([("MUL_MAT".into(), 2)]),
+        };
+        require_accelerator_observation(&observation, 2)
+            .expect("mixed placement includes GPU work");
+        assert!(require_accelerator_observation(&observation, 3).is_err());
+        let no_execution = EncodeObservation {
+            encode_count: 0,
+            ..observation.clone()
+        };
+        assert!(require_accelerator_observation(&no_execution, 2).is_err());
+        let no_residency = EncodeObservation {
+            resident_tensor_bytes: 0,
+            ..observation
+        };
+        assert!(require_accelerator_observation(&no_residency, 2).is_err());
+    }
+
+    #[test]
     fn eval_telemetry_counter_advances_only_on_completed_encodes() {
         let telemetry = EvalTelemetry::new("test-device".into());
         telemetry.begin_encode().expect("begin first encode");
@@ -2782,6 +3058,140 @@ mod tests {
         );
         let second = telemetry.complete_encode().expect("complete second encode");
         assert_eq!(second.encode_count, 2);
+    }
+
+    #[test]
+    fn completed_callback_rejects_cpu_or_unknown_before_compute() {
+        let telemetry = EvalTelemetry::new("selected accelerator".into());
+        let mut tensor = unsafe { std::mem::zeroed::<llama_sys::ggml_tensor>() };
+        tensor.op = llama_sys::GGML_OP_MUL_MAT;
+        let pointer = std::ptr::from_mut(&mut tensor);
+        let data = std::ptr::from_ref(&telemetry).cast_mut().cast();
+        // No scheduler is active: this must reject, never infer an executor
+        // from output placement or a requested provider. No compute is invoked.
+        assert!(unsafe { observe_eval_tensor(pointer, true, data) });
+        let state = telemetry.state.lock().unwrap();
+        assert!(state.rejected_operation.is_some());
+        assert_eq!(state.execution_node_count, 0);
+        assert!(state.completed_operator_counts.is_empty());
+    }
+
+    #[test]
+    fn completed_callback_requires_exact_selected_device_handle() {
+        let state = EvalTelemetryState {
+            target_device_handle: 7,
+            ..Default::default()
+        };
+        assert!(selected_callback_device(&state, 7));
+        assert!(!selected_callback_device(&state, 8));
+        assert!(!selected_callback_device(&state, 0));
+        assert!(!selected_callback_device(&EvalTelemetryState::default(), 0));
+    }
+
+    #[test]
+    fn structural_only_work_cannot_prove_completed_model_compute() {
+        for op in [
+            llama_sys::GGML_OP_NONE,
+            llama_sys::GGML_OP_VIEW,
+            llama_sys::GGML_OP_RESHAPE,
+            llama_sys::GGML_OP_PERMUTE,
+            llama_sys::GGML_OP_TRANSPOSE,
+        ] {
+            assert!(!is_compute_operation(op));
+        }
+        assert!(is_compute_operation(llama_sys::GGML_OP_MUL_MAT));
+        let observation = EncodeObservation {
+            encode_count: 1,
+            execution_node_count: 1,
+            execution_device_names: vec!["GPU".into()],
+            observed_layer_count: 2,
+            resident_tensor_count: 2,
+            resident_tensor_bytes: 32,
+            ..Default::default()
+        };
+        assert!(require_accelerator_observation(&observation, 2).is_err());
+    }
+
+    #[test]
+    fn request_snapshot_retains_batch_evidence_across_later_observation() {
+        let mut resident = test_lifecycle_snapshot();
+        resident.identity.selected_device_class = NativeDeviceClass::Accelerator;
+        resident.identity.model_layer_count = 2;
+        let first = EncodeObservation {
+            encode_count: 3,
+            execution_node_count: 2,
+            completed_operator_counts: BTreeMap::from([("MUL_MAT".into(), 2)]),
+            execution_device_names: vec!["GPU".into()],
+            execution_backend_names: vec!["Metal".into()],
+            observed_layer_count: 2,
+            resident_tensor_count: 2,
+            resident_tensor_bytes: 64,
+        };
+        let captured = snapshot_with_observation(&resident, first);
+        let mut later = resident.clone();
+        apply_live_observation(&mut later.identity, EncodeObservation::default());
+        assert_eq!(captured.identity.encode_count, 3);
+        assert!(captured.identity.accelerator_execution_verified);
+        assert_eq!(captured.identity.completed_operator_counts["MUL_MAT"], 2);
+        assert_eq!(captured.load_generation, resident.load_generation);
+        assert_eq!(captured.model_load_count, resident.model_load_count);
+        assert_eq!(later.identity.encode_count, 0);
+    }
+
+    #[test]
+    fn completed_response_rejects_missing_gapped_or_cross_load_batch_proof() {
+        let mut resident = test_lifecycle_snapshot();
+        resident.identity.selected_device_class = NativeDeviceClass::Accelerator;
+        resident.identity.model_layer_count = 2;
+        let observation = |encode_count| EncodeObservation {
+            encode_count,
+            execution_node_count: 2,
+            completed_operator_counts: BTreeMap::from([("MUL_MAT".into(), 2)]),
+            execution_device_names: vec!["GPU".into()],
+            execution_backend_names: vec!["Metal".into()],
+            observed_layer_count: 2,
+            resident_tensor_count: 2,
+            resident_tensor_bytes: 64,
+        };
+        let mut completion = EmbeddingRequestCompletion {
+            vectors: vec![vec![1.0], vec![2.0]],
+            completion_sequence: 1,
+            timings: Default::default(),
+            batch_evidence: vec![
+                EmbeddingBatchExecutionEvidence {
+                    vector_start: 0,
+                    vector_end: 1,
+                    snapshot: snapshot_with_observation(&resident, observation(3)),
+                },
+                EmbeddingBatchExecutionEvidence {
+                    vector_start: 1,
+                    vector_end: 2,
+                    snapshot: snapshot_with_observation(&resident, observation(5)),
+                },
+            ],
+        };
+        assert_eq!(
+            completion
+                .verified_snapshot()
+                .unwrap()
+                .identity
+                .encode_count,
+            5
+        );
+        completion.batch_evidence[1].vector_start = 0;
+        assert!(completion.verified_snapshot().is_err());
+        completion.batch_evidence[1].vector_start = 1;
+        completion.batch_evidence[0].snapshot.load_generation += 1;
+        assert!(completion.verified_snapshot().is_err());
+        completion.batch_evidence[0].snapshot.load_generation -= 1;
+        completion.batch_evidence[0]
+            .snapshot
+            .identity
+            .completed_operator_counts
+            .clear();
+        assert!(completion.verified_snapshot().is_err());
+        completion.batch_evidence.clear();
+        assert!(completion.verified_snapshot().is_err());
     }
 
     #[test]
@@ -3117,6 +3527,7 @@ mod tests {
                 execution_observation_source: EXECUTION_OBSERVATION_SOURCE,
                 encode_count: 0,
                 execution_node_count: 0,
+                completed_operator_counts: BTreeMap::new(),
                 resident_accelerator_tensor_count: 0,
                 resident_accelerator_tensor_bytes: 0,
                 model_layer_count: 13,

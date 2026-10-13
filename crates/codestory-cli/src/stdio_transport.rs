@@ -5,6 +5,12 @@
 //! errors; tool execution failures are encoded as tool-call results so clients
 //! can display structured failure content without losing the response envelope.
 
+#[path = "stdio_root_symbols.rs"]
+mod root_symbols;
+#[cfg(test)]
+#[path = "stdio_root_symbols_integration_tests.rs"]
+mod root_symbols_integration_tests;
+
 use anyhow::{Context, Result, bail};
 use codestory_contracts::api::{
     AffectedAnalysisInput, AffectedAnalysisRequest, AffectedChangeKindDto, AffectedChangeRecordDto,
@@ -1131,6 +1137,7 @@ struct ParsedStdioResource {
     resource: StdioResource,
     project: Option<String>,
     uri: String,
+    root_symbols_page: Option<root_symbols::PageRequest>,
 }
 
 impl StdioResource {
@@ -1176,14 +1183,24 @@ impl StdioResource {
                 uri: resource.base_uri(),
                 resource,
                 project: None,
+                root_symbols_page: None,
             });
         }
-        let project = parse_resource_project_query(query)?;
-        let uri = resource.uri(project.as_deref());
+        let (project, root_symbols_page) = if matches!(resource, Self::RootSymbols) {
+            let (project, page) = root_symbols::PageRequest::parse(query)?;
+            (project, Some(page))
+        } else {
+            (parse_resource_project_query(query)?, None)
+        };
+        let base_uri = resource.uri(project.as_deref());
+        let uri = root_symbols_page
+            .as_ref()
+            .map_or(base_uri.clone(), |page| page.uri(&base_uri));
         Ok(ParsedStdioResource {
             resource,
             project,
             uri,
+            root_symbols_page,
         })
     }
 
@@ -1680,7 +1697,22 @@ fn handle_stdio_message(
     };
     let revision = session.protocol_v3.negotiated_revision();
     match crate::stdio_v3::process_jsonrpc_frame_v3(revision, &frame, |request| {
-        handle_stdio_request(session, request, cancelled).unwrap_or(serde_json::Value::Null)
+        let mut response =
+            handle_stdio_request(session, request, cancelled).unwrap_or(serde_json::Value::Null);
+        if request
+            .pointer("/method")
+            .and_then(serde_json::Value::as_str)
+            == Some("tools/call")
+            && request
+                .pointer("/params/name")
+                .and_then(serde_json::Value::as_str)
+                == Some("snippet")
+            && let Ok(snippet) = stdio_snippet_request(request)
+            && let Some(maximum_bytes) = snippet.max_tool_result_bytes
+        {
+            bound_source_tool_response(&mut response, maximum_bytes);
+        }
+        response
     }) {
         crate::stdio_v3::FrameResponseV3::None => None,
         crate::stdio_v3::FrameResponseV3::Single(response) => Some(response),
@@ -1688,6 +1720,24 @@ fn handle_stdio_message(
             Some(serde_json::Value::Array(responses))
         }
     }
+}
+
+/// Apply the same served-tool-result boundary to errors that happen before
+/// source projection (including admission/preparation). JSON-RPC errors and
+/// host framing are outside this allowance. Never clip a serialized payload.
+fn bound_source_tool_response(response: &mut serde_json::Value, maximum_bytes: usize) {
+    let Some(result) = response.get_mut("result") else {
+        return;
+    };
+    if v3_serialize_call_tool_result(result).is_ok_and(|bytes| bytes.len() <= maximum_bytes) {
+        return;
+    }
+    let message = if result.get("isError") == Some(&serde_json::json!(true)) {
+        "source_response_error_exceeds_budget: increase max_tool_result_bytes to read error details"
+    } else {
+        "source_response_budget_exceeded: tool result cannot fit allowance; increase max_tool_result_bytes"
+    };
+    *result = crate::stdio_v3::semantic_tool_error_v3(message);
 }
 
 fn handle_stdio_request(
@@ -1837,8 +1887,12 @@ fn handle_stdio_request(
                     return Some(stdio_jsonrpc_error(id, -32602, error.to_string()));
                 }
                 let (runtime, state) = session.active_project_mut();
-                let bound_uri =
+                let base_uri =
                     stdio_resource_uri_for_project(&parsed.resource, &runtime.project_root);
+                let bound_uri = parsed
+                    .root_symbols_page
+                    .as_ref()
+                    .map_or(base_uri.clone(), |page| page.uri(&base_uri));
                 if parsed.resource.reads_publication() {
                     if let Err(error) = runtime.inspect_project_summary().and_then(|summary| {
                         summary.context(
@@ -1856,6 +1910,8 @@ fn handle_stdio_request(
                                 state,
                                 &parsed.resource,
                                 &bound_uri,
+                                parsed.root_symbols_page.as_ref(),
+                                &id,
                             ))
                         },
                     ) {
@@ -1869,7 +1925,14 @@ fn handle_stdio_request(
                         }),
                     }
                 } else {
-                    read_stdio_resource(runtime, state, &parsed.resource, &bound_uri)
+                    read_stdio_resource(
+                        runtime,
+                        state,
+                        &parsed.resource,
+                        &bound_uri,
+                        parsed.root_symbols_page.as_ref(),
+                        &id,
+                    )
                 }
             }
         }
@@ -2102,23 +2165,10 @@ fn handle_stdio_request(
                 codestory_runtime::observe_packet_entry_phase(
                     codestory_runtime::PacketEntryObservationPhase::ActivationStarted,
                 );
-                // PinnedObserver and source-backed reads need only the
-                // complete core, never the retrieval sidecars. A CoreOnly run
-                // stops at the core publication; allows_operation still
-                // requires a fresh Ready core for them, so Retained no longer
-                // admits.
-                let goal = if matches!(public_operation, "exact_search" | "source_snippet")
-                    || codestory_runtime::operation_read_class(public_operation)
-                        == codestory_runtime::OperationReadClass::PinnedObserver
-                {
-                    codestory_runtime::ActivationGoal::CoreOnly
-                } else {
-                    // Retrieval-class operations (`packet`, `search`,
-                    // `context`, `drill`, `resolution`, `graph_assisted`) need
-                    // managed retrieval preparation, and allows_operation
-                    // requires `broad_search` Ready for them.
-                    codestory_runtime::ActivationGoal::Full
-                };
+                // Read classes own preparation scope. Graph browsing and
+                // source reads require Core; only retrieval tools prepare
+                // sidecars. CoreOnly does not grant broad-search readiness.
+                let goal = stdio_tool_read_class(name, &request).activation_goal();
                 let first_slice = preparation_deadline
                     .saturating_duration_since(Instant::now())
                     .min(Duration::from_secs(5));
@@ -2686,11 +2736,24 @@ fn stdio_status_is_live_ready(retrieval_mode: Option<&str>, degraded_reason: Opt
     retrieval_mode == Some("full") && degraded_reason.is_none()
 }
 
+// Private Rust-only handoff. It has no serialization implementation and never
+// enters response, projection, ToolResult, metadata, logs or public arguments.
+struct StdioPacketReplayJoinV3 {
+    question: String,
+    core_generation: String,
+    core_run: String,
+    retrieval_generation: String,
+    internal_packet_id: String,
+    wall_expiry_epoch_ms: u64,
+}
+
 struct StdioToolExecutionV3 {
     response: serde_json::Value,
     packet_diagnostics: Option<codestory_runtime::PacketDiagnosticProjectionV3>,
     publication_meta: Option<serde_json::Value>,
     packet_wall_expiry_epoch_ms: Option<u64>,
+    source_ranges_budget: Option<(codestory_runtime::PreparedSourceRanges, usize)>,
+    packet_replay: Option<StdioPacketReplayJoinV3>,
 }
 
 fn project_stdio_tool_execution_v3(
@@ -2704,6 +2767,21 @@ fn project_stdio_tool_execution_v3(
     if tool_name == "packet" {
         return project_stdio_packet_for_representation_v3(runtime, state, request, revision);
     }
+    if let PreparedStdioToolCall::Snippet(snippet) = prepared
+        && let Some(maximum_bytes) = snippet.max_tool_result_bytes
+    {
+        let ranges = runtime
+            .browser
+            .prepare_source_ranges(&snippet.paths, SOURCE_RANGES_MAX_TOTAL_BYTES)?;
+        return Ok(StdioToolExecutionV3 {
+            response: serde_json::json!({}),
+            packet_diagnostics: None,
+            publication_meta: None,
+            packet_wall_expiry_epoch_ms: None,
+            source_ranges_budget: Some((ranges, maximum_bytes)),
+            packet_replay: None,
+        });
+    }
     let mut response = if tool_name == "search" {
         handle_stdio_search_v3(runtime, request)
     } else {
@@ -2715,6 +2793,8 @@ fn project_stdio_tool_execution_v3(
             packet_diagnostics: None,
             publication_meta: None,
             packet_wall_expiry_epoch_ms: None,
+            source_ranges_budget: None,
+            packet_replay: None,
         });
     };
     let packet_diagnostics = None;
@@ -2739,6 +2819,8 @@ fn project_stdio_tool_execution_v3(
                 packet_diagnostics: None,
                 publication_meta: None,
                 packet_wall_expiry_epoch_ms: None,
+                source_ranges_budget: None,
+                packet_replay: None,
             });
         }
     };
@@ -2748,6 +2830,8 @@ fn project_stdio_tool_execution_v3(
         packet_diagnostics,
         publication_meta: None,
         packet_wall_expiry_epoch_ms: None,
+        source_ranges_budget: None,
+        packet_replay: None,
     })
 }
 
@@ -2759,6 +2843,27 @@ struct StdioPacketRepresentationPlanV3 {
 }
 
 impl StdioPacketRepresentationPlanV3 {
+    fn replay_payload(
+        &self,
+        projection: &codestory_contracts::packet_projection_v3::PacketProjectionV3Dto,
+    ) -> Option<serde_json::Value> {
+        let mut root = serde_json::to_value(projection).ok()?;
+        reserve_packet_diagnostics_capability_v3(&mut root, self.wall_expiry_epoch_ms).ok()?;
+        let result = build_served_tool_result_v3(
+            self.revision,
+            "packet",
+            &root,
+            Some(&self.publication_meta),
+        )
+        .ok()?;
+        let bytes = v3_serialize_call_tool_result(&result).ok()?;
+        Some(
+            serde_json::json!({"revision":self.revision.as_str(), "publication_meta":self.publication_meta,
+            "wall_expiry_epoch_ms":self.wall_expiry_epoch_ms,
+            "projection":projection, "measured_result":result, "measured_bytes":bytes.len(), "cache_hit":false}),
+        )
+    }
+
     fn measure(
         &self,
         projection: &codestory_contracts::packet_projection_v3::PacketProjectionV3Dto,
@@ -2899,6 +3004,7 @@ fn project_stdio_packet_for_representation_v3(
     let cached = state.packet_cache.get(&cache_key).and_then(|value| {
         stdio_bind_cached_publication(value, StdioCachedProduct::Packet, &publication)
     });
+    let mut replay_packet_id = None;
     let product = if let Some(cached) = cached {
         let packet = serde_json::from_value::<codestory_contracts::api::AgentPacketDto>(
             cached["result"].clone(),
@@ -2921,16 +3027,31 @@ fn project_stdio_packet_for_representation_v3(
             "codestory-stdio",
             &mut |candidate| plan.measure(candidate),
         )?;
+        if std::env::var_os(codestory_contracts::config_registry::PACKET_STEP_TRACE_OUT_ENV)
+            .is_some()
+        {
+            replay_packet_id = Some(represented.packet.packet_id.clone());
+        }
         state
             .packet_cache
             .insert(cache_key, serde_json::json!({"result": represented.packet}));
         represented.product
     };
+    let packet_replay = replay_packet_id.map(|internal_packet_id| StdioPacketReplayJoinV3 {
+        question: request.question.clone(),
+        core_generation: publication.core_generation_id.clone(),
+        core_run: publication.core_run_id.clone(),
+        retrieval_generation: publication.retrieval.retrieval_generation.clone(),
+        internal_packet_id,
+        wall_expiry_epoch_ms: plan.wall_expiry_epoch_ms,
+    });
     Ok(StdioToolExecutionV3 {
         response: serde_json::json!({"result": product.projection}),
         packet_diagnostics: Some(product.diagnostics),
         publication_meta: Some(plan.publication_meta),
         packet_wall_expiry_epoch_ms: Some(plan.wall_expiry_epoch_ms),
+        source_ranges_budget: None,
+        packet_replay,
     })
 }
 
@@ -3190,6 +3311,38 @@ fn stdio_jsonrpc_tool_execution_v3(
     mut execution: StdioToolExecutionV3,
     diagnostics_registry: &Arc<std::sync::Mutex<crate::stdio_v3::DiagnosticsRegistryV3>>,
 ) -> serde_json::Value {
+    if let Some((ranges, maximum_bytes)) = execution.source_ranges_budget.take() {
+        let projection = ranges.render_for_representation(maximum_bytes, |candidate| {
+            let root = serde_json::to_value(candidate)
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+            let result = build_served_tool_result_v3(
+                revision,
+                "snippet",
+                &root,
+                execution.publication_meta.as_ref(),
+            )
+            .map_err(|_| ApiError::internal("Invalid source response projection"))?;
+            v3_serialize_call_tool_result(&result)
+                .map(|bytes| bytes.len())
+                .map_err(|error| ApiError::internal(error.to_string()))
+        });
+        match projection {
+            Ok(projection) => {
+                execution.response = serde_json::json!({"result": projection});
+            }
+            Err(error) => {
+                if error.code != "source_response_budget_too_small" {
+                    return stdio_jsonrpc_error(id, -32603, "Internal error");
+                }
+                // A stable refusal also fits the minimum admitted allowance.
+                // Never replace an unfit page with a larger metadata envelope.
+                let result = crate::stdio_v3::semantic_tool_error_v3(
+                    "source_response_budget_too_small: allowance cannot fit source range receipts",
+                );
+                return stdio_jsonrpc_success(id, result);
+            }
+        }
+    }
     let mut expected_packet_bytes = None;
     let mut registered_diagnostics_uri = None;
     if let Some(diagnostics) = execution.packet_diagnostics.take() {
@@ -3281,6 +3434,37 @@ fn stdio_jsonrpc_tool_execution_v3(
                                 actual_bytes: actual,
                             },
                         );
+                    }
+                }
+                if tool_name == "packet" && expected_packet_bytes.is_some() {
+                    if let Some(join) = execution.packet_replay.as_ref() {
+                        if let Some(metadata) = execution.publication_meta.as_ref() {
+                            codestory_runtime::write_packet_stdio_replay_from_env(
+                                &join.question,
+                                &join.core_generation,
+                                &join.core_run,
+                                &join.retrieval_generation,
+                                &join.internal_packet_id,
+                                || {
+                                    let mut typed_root = root.clone();
+                                    typed_root
+                                        .pointer_mut("/diagnostics/reference")?
+                                        .as_object_mut()?
+                                        .remove("uri");
+                                    let projection = serde_json::from_value(typed_root).ok()?;
+                                    let plan = StdioPacketRepresentationPlanV3 {
+                                        revision,
+                                        publication_meta: metadata.clone(),
+                                        wall_expiry_epoch_ms: join.wall_expiry_epoch_ms,
+                                    };
+                                    let mut payload = plan.replay_payload(&projection)?;
+                                    payload["served_result"] = result.clone();
+                                    payload["served_bytes"] =
+                                        serde_json::json!(expected_packet_bytes);
+                                    Some(payload)
+                                },
+                            );
+                        }
                     }
                 }
                 stdio_jsonrpc_success(id, result)
@@ -3450,18 +3634,8 @@ fn stdio_public_operation_name<'a>(name: &'a str, request: &serde_json::Value) -
     if name == "search" {
         codestory_runtime::search_operation_name(stdio_search_repo_text_mode(request))
     } else if name == "snippet" {
-        // An id-selected snippet serves verified source bytes, so it is a
-        // source-backed read that waits for a fresh complete core. A snippet
-        // requested by query text is a graph-assisted selection instead.
-        if request
-            .pointer("/params/arguments/query")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|query| !query.trim().is_empty())
-        {
-            "graph_assisted"
-        } else {
-            "source_snippet"
-        }
+        // Both selectors resolve against Core and serve freshly verified source.
+        "source_snippet"
     } else if matches!(
         name,
         "symbol"
@@ -4314,6 +4488,7 @@ enum PreparedStdioToolCall {
 
 #[derive(Debug, Clone)]
 struct StdioSnippetRequest {
+    max_tool_result_bytes: Option<usize>,
     context: usize,
     function_body: bool,
     /// Batched file ranges, when the caller read by path instead of resolving a symbol.
@@ -4385,6 +4560,7 @@ fn stdio_snippet_request(
         "context",
         "lines",
         "function_body",
+        "max_tool_result_bytes",
         "paths",
         "path",
         "file_path",
@@ -4508,6 +4684,25 @@ fn stdio_snippet_request(
         });
     }
 
+    let max_tool_result_bytes = arguments
+        .get("max_tool_result_bytes")
+        .map(|value| {
+            value
+                .as_u64()
+                .filter(|bytes| (256..=524_288).contains(bytes))
+                .map(|bytes| bytes as usize)
+                .ok_or_else(|| {
+                    ApiError::invalid_argument(
+                        "snippet.max_tool_result_bytes must be an integer in 256..=524288",
+                    )
+                })
+        })
+        .transpose()?;
+    if max_tool_result_bytes.is_some() && paths.is_empty() {
+        return Err(ApiError::invalid_argument(
+            "snippet.max_tool_result_bytes requires path or paths",
+        ));
+    }
     let query = arguments.get("query");
     let id = arguments.get("id").or_else(|| arguments.get("symbol_id"));
     let query_present = query.is_some();
@@ -4526,6 +4721,7 @@ fn stdio_snippet_request(
             ));
         }
         return Ok(StdioSnippetRequest {
+            max_tool_result_bytes,
             context: 0,
             function_body: false,
             paths,
@@ -4622,6 +4818,7 @@ fn stdio_snippet_request(
         .unwrap_or(4);
 
     Ok(StdioSnippetRequest {
+        max_tool_result_bytes,
         context,
         function_body,
         paths: Vec::new(),
@@ -6342,7 +6539,38 @@ fn read_stdio_resource(
     state: &mut StdioServerState,
     resource: &StdioResource,
     uri: &str,
+    root_page: Option<&root_symbols::PageRequest>,
+    id: &serde_json::Value,
 ) -> serde_json::Value {
+    if matches!(resource, StdioResource::RootSymbols) {
+        let result = (|| -> Result<serde_json::Value> {
+            let page = root_page.context("root_symbols_page_missing")?;
+            let publication = runtime
+                .public_operation
+                .active_publication()
+                .context("root_symbols_publication_missing")?;
+            let (symbols, total, fingerprint) = runtime
+                .browser
+                .list_root_symbols_page(root_symbols::offset(page)?, page.limit)
+                .map_err(map_api_error)?;
+            root_symbols::render(
+                page,
+                id,
+                &stdio_resource_uri_for_project(resource, &runtime.project_root),
+                &runtime.context_key.project_id,
+                serde_json::to_value(publication.core_publication)?,
+                &fingerprint,
+                total,
+                symbols
+                    .into_iter()
+                    .map(serde_json::to_value)
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
+            )
+        })();
+        return result.unwrap_or_else(
+            |error| serde_json::json!({"error": stdio_typed_error_value(runtime, &error)}),
+        );
+    }
     let result = match resource {
         StdioResource::Status => read_stdio_status_resource_cached(runtime, state),
         StdioResource::RetrievalEngineDiagnostics => {
@@ -6412,13 +6640,9 @@ fn read_stdio_publication_resource(
             .grounding_snapshot(GroundingBudgetDto::Balanced)
             .map(|snapshot| serde_json::json!(snapshot))
             .map_err(map_api_error),
-        StdioResource::RootSymbols => runtime
-            .browser
-            .list_root_symbols(ListRootSymbolsRequest {
-                limit: Some(BROWSER_SYMBOLS_DEFAULT_LIMIT),
-            })
-            .map(|symbols| serde_json::json!(symbols))
-            .map_err(map_api_error),
+        StdioResource::RootSymbols => Err(anyhow::anyhow!(
+            "root_symbols_page_missing: use paged resource dispatcher"
+        )),
         _ => read_stdio_template_resource(runtime, resource),
     }
 }
@@ -6517,7 +6741,16 @@ fn stdio_status_with_activation(
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false)
     };
-    let local_allowed = allowed("ground");
+    // Admission may allow a cold call to prepare Core. Status reports what is
+    // readable now, so that permission alone cannot establish readiness.
+    let local_allowed = allowed("ground")
+        && status
+            .pointer("/allowed_surfaces/ground/activation_required")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        && status
+            .get("index_publication")
+            .is_some_and(|publication| !publication.is_null());
     let broad_allowed = allowed("packet");
     let local_updating = status
         .pointer("/local_refresh/state")
@@ -8439,6 +8672,223 @@ mod tests {
         )
     }
 
+    #[test]
+    fn source_response_budget_final_guard_bounds_admission_errors() {
+        let mut response = stdio_jsonrpc_success(
+            json!(1),
+            crate::stdio_v3::semantic_tool_error_v3(&"é🦀\\\"".repeat(2000)),
+        );
+        bound_source_tool_response(&mut response, 256);
+        assert_eq!(response["result"]["isError"], true);
+        assert!(
+            v3_serialize_call_tool_result(&response["result"])
+                .unwrap()
+                .len()
+                <= 256
+        );
+        assert!(
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("source_response_error_exceeds_budget:")
+        );
+        let original = response.clone();
+        bound_source_tool_response(&mut response, 256);
+        assert_eq!(response, original);
+        let mut rpc_error = stdio_jsonrpc_error(json!(1), -32602, "Invalid params");
+        let original = rpc_error.clone();
+        bound_source_tool_response(&mut rpc_error, 256);
+        assert_eq!(rpc_error, original);
+    }
+    #[test]
+    fn source_response_budget_public_frame_bounds_early_path_errors() {
+        let (project, _cache, runtime) = stdio_inspect_only_runtime();
+        std::fs::write(
+            project.path().join("source.rs"),
+            "// zero dense Core fixture\n",
+        )
+        .unwrap();
+        runtime
+            .project
+            .open_project_summary_with_storage_path(
+                project.path().to_path_buf(),
+                runtime.storage_path.clone(),
+            )
+            .unwrap();
+        runtime
+            .index
+            .run_indexing_blocking_without_runtime_refresh(
+                codestory_contracts::api::IndexMode::Full,
+            )
+            .unwrap();
+        let mut session = StdioServerSession::new(Some(runtime));
+        let frame = json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{
+            "name":"snippet","arguments":{"project":project.path(),
+                "path":format!("{}.rs", "unknown".repeat(1000)), "max_tool_result_bytes":256}}});
+        let response = handle_stdio_message(
+            &mut session,
+            &frame.to_string(),
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        assert_eq!(response["id"], 7);
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        assert!(
+            v3_serialize_call_tool_result(&response["result"])
+                .unwrap()
+                .len()
+                <= 256
+        );
+        assert!(
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("source_response_error_exceeds_budget:"),
+            "{response}"
+        );
+        drop(session); // Existing Drop cancels and joins all owned contexts.
+    }
+
+    #[test]
+    fn source_response_budget_input_and_defaults() {
+        let parse = |args| stdio_snippet_request(&json!({"params":{"arguments":args}}));
+        assert!(
+            parse(json!({"path":"source.rs"}))
+                .unwrap()
+                .max_tool_result_bytes
+                .is_none()
+        );
+        for limit in [256, 524288] {
+            for field in ["path", "file_path"] {
+                let mut args = json!({"max_tool_result_bytes":limit});
+                args[field] = json!("source.rs");
+                assert_eq!(parse(args).unwrap().max_tool_result_bytes, Some(limit));
+            }
+        }
+        for bad in [
+            json!(0),
+            json!(255),
+            json!(524289),
+            json!(-1),
+            json!(null),
+            json!(true),
+            json!(2048.5),
+        ] {
+            assert!(parse(json!({"path":"source.rs","max_tool_result_bytes":bad})).is_err());
+        }
+        assert!(parse(json!({"query":"callable","max_tool_result_bytes":2048})).is_err());
+    }
+
+    #[test]
+    fn source_response_budget_actual_envelope_revisions_metadata_and_tiny_refusal() {
+        let (project, _cache, runtime) = stdio_inspect_only_runtime();
+        let source = (0..100)
+            .map(|i| format!("// {i} β🦀 quote=\" slash=\\\r\n"))
+            .collect::<String>();
+        std::fs::write(project.path().join("source.rs"), &source).unwrap();
+        // Isolated zero-dense Core fixture; never touches a real user's index,
+        // managed Full publication or embedding engine.
+        runtime
+            .project
+            .open_project_summary_with_storage_path(
+                project.path().to_path_buf(),
+                runtime.storage_path.clone(),
+            )
+            .unwrap();
+        runtime
+            .index
+            .run_indexing_blocking_without_runtime_refresh(
+                codestory_contracts::api::IndexMode::Full,
+            )
+            .unwrap();
+        let request = codestory_runtime::SourceRangeRequest {
+            path: "source.rs".into(),
+            start_line: 1,
+            end_line: 100,
+        };
+        let metadata = json!({"refresh":{"phase":"quote=\" slash=\\ β🦀".repeat(200)},
+            "operation":{"operation_id":"source-budget-test","attempt":2}});
+        let registry = Arc::new(std::sync::Mutex::new(
+            crate::stdio_v3::DiagnosticsRegistryV3::new(),
+        ));
+        for revision in [
+            crate::stdio_v3::McpRevisionV3::November2024,
+            crate::stdio_v3::McpRevisionV3::March2025,
+            crate::stdio_v3::McpRevisionV3::June2025,
+            crate::stdio_v3::McpRevisionV3::November2025,
+        ] {
+            let read = || {
+                runtime
+                    .browser
+                    .prepare_source_ranges(&[request.clone()], 65536)
+                    .unwrap()
+            };
+            let original = read().render_default().unwrap();
+            let original_root = serde_json::to_value(&original).unwrap();
+            let complete =
+                build_served_tool_result_v3(revision, "snippet", &original_root, Some(&metadata))
+                    .unwrap();
+            let exact = v3_serialize_call_tool_result(&complete).unwrap().len();
+            for allowance in [exact, exact - 1, exact - 256, 256] {
+                let prepared = read();
+                let execution = StdioToolExecutionV3 {
+                    response: json!({}),
+                    packet_diagnostics: None,
+                    publication_meta: Some(metadata.clone()),
+                    packet_wall_expiry_epoch_ms: None,
+                    source_ranges_budget: Some((prepared, allowance)),
+                    packet_replay: None,
+                };
+                let response = stdio_jsonrpc_tool_execution_v3(
+                    json!(1),
+                    "snippet",
+                    revision,
+                    execution,
+                    &registry,
+                );
+                let result = &response["result"];
+                assert!(result.is_object(), "{response}");
+                let bytes = v3_serialize_call_tool_result(result).unwrap().len();
+                assert!(bytes <= allowance, "{revision:?}: {bytes} > {allowance}");
+                if allowance == 256 {
+                    assert_eq!(result["isError"], true);
+                    continue;
+                }
+                let root: serde_json::Value =
+                    serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+                if revision.profile().structured_content {
+                    assert_eq!(root, result["structuredContent"]);
+                    assert_eq!(result["_meta"]["codestory_publication"], metadata);
+                }
+                if allowance == exact {
+                    assert_eq!(root, original_root);
+                    assert_eq!(bytes, exact);
+                } else {
+                    if allowance == exact - 256 {
+                        assert_eq!(root["complete"], false);
+                    }
+                    assert_eq!(root["ranges"].as_array().unwrap().len(), 1);
+                    if root["complete"] == false {
+                        assert!(root["ranges"][0]["next_start_line"].as_u64().is_some());
+                    }
+                    let delivered = root["ranges"][0]["delivered_end_line"]
+                        .as_u64()
+                        .unwrap_or(0) as usize;
+                    let raw = source
+                        .split_inclusive('\n')
+                        .take(delivered)
+                        .collect::<String>();
+                    if delivered > 0 {
+                        assert_eq!(
+                            root["ranges"][0]["source_range_sha256"],
+                            format!("{:x}", Sha256::digest(raw.as_bytes()))
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     fn diagnostic_binding(packet_id: String) -> crate::stdio_v3::DiagnosticsBindingV3 {
         crate::stdio_v3::DiagnosticsBindingV3 {
             packet_id,
@@ -8506,6 +8956,8 @@ mod tests {
                     }),
                     publication_meta: None,
                     packet_wall_expiry_epoch_ms: None,
+                    source_ranges_budget: None,
+                    packet_replay: None,
                 },
                 &registry,
             );
@@ -8725,6 +9177,8 @@ mod tests {
                     packet_diagnostics: None,
                     publication_meta: None,
                     packet_wall_expiry_epoch_ms: None,
+                    source_ranges_budget: None,
+                    packet_replay: None,
                 },
                 &registry,
             );
@@ -8753,6 +9207,39 @@ mod tests {
             &Arc::new(AtomicBool::new(false)),
         )
         .expect("diagnostic resource response")
+    }
+
+    #[test]
+    fn graph_browsing_never_requests_full_stdio_activation() {
+        let empty = json!({"params": {"arguments": {}}});
+        for tool in [
+            "symbols",
+            "files",
+            "symbol",
+            "get_node",
+            "neighbors",
+            "definition",
+            "references",
+        ] {
+            assert_eq!(
+                stdio_tool_read_class(tool, &empty).activation_goal(),
+                codestory_runtime::ActivationGoal::CoreOnly,
+                "{tool}"
+            );
+        }
+        let selected = json!({"params": {"arguments": {"query": "arbitrary free query"}}});
+        assert_eq!(
+            stdio_tool_read_class("symbol", &selected).activation_goal(),
+            codestory_runtime::ActivationGoal::Full
+        );
+        assert_eq!(
+            stdio_tool_read_class("snippet", &selected).activation_goal(),
+            codestory_runtime::ActivationGoal::CoreOnly
+        );
+        assert_eq!(
+            stdio_tool_read_class("snippet", &empty).activation_goal(),
+            codestory_runtime::ActivationGoal::CoreOnly
+        );
     }
 
     #[test]
@@ -9300,6 +9787,8 @@ mod tests {
                         }),
                         publication_meta: Some(publication_meta.clone()),
                         packet_wall_expiry_epoch_ms: Some(1_725_000_600_123_u64),
+                        source_ranges_budget: None,
+                        packet_replay: None,
                     },
                     &registry,
                 );
@@ -9655,8 +10144,12 @@ mod tests {
             });
             assert_eq!(
                 stdio_public_operation_name(tool, &query),
-                "graph_assisted",
-                "{tool} query resolution must keep one retrieval pin through response assembly"
+                if tool == "snippet" {
+                    "source_snippet"
+                } else {
+                    "graph_assisted"
+                },
+                "{tool} query resolution keeps its owning publication capability"
             );
             assert_eq!(
                 stdio_public_operation_name(tool, &id),
@@ -14848,6 +15341,154 @@ version = "0.11.20"
     }
 
     #[test]
+    fn public_packet_dispatch_delivers_and_executes_source_page_patch() {
+        let cache = tempfile::tempdir().expect("cache");
+        let project = tempfile::tempdir().expect("project");
+        let source = (0..240)
+            .map(|line| {
+                format!(
+                    "// PAGE_DISPATCH_ANCHOR line {line:03} {}\n",
+                    "complete source ".repeat(8)
+                )
+            })
+            .collect::<String>();
+        std::fs::write(
+            project.path().join("metadata.rs"),
+            format!("mod metadata {{\n{source}}}\n"),
+        )
+        .expect("fixture source");
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "codestory-tests@example.com"],
+            vec!["config", "user.name", "CodeStory Tests"],
+            vec!["add", "metadata.rs"],
+            vec!["commit", "-qm", "public packet paging fixture"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(project.path())
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let mut session = StdioServerSession::new(None);
+        session.startup = crate::config::CliStartupConfig {
+            user_home: None,
+            allow_sensitive_project_root: false,
+            project_network_config_allowed: false,
+            stdio_cache_root: Some(cache.path().join("stdio-cache")),
+            sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
+                cache.path().join("sidecar-cache"),
+                codestory_retrieval::SidecarRuntimeDefaults::default(),
+            ),
+            source_index_policy: codestory_contracts::workspace::SourceIndexPolicy::default(),
+        };
+        session.select_project(project.path().to_str()).unwrap();
+        let active = session.active_project.as_ref().unwrap();
+        active.runtime.ensure_open(args::RefreshMode::Full).unwrap();
+        codestory_retrieval::test_support::publish_zero_dense_pinned_query_fixture(
+            &active.runtime.project_root,
+            &active.runtime.storage_path,
+            active.runtime.sidecar.as_raw_config_for_test(),
+        )
+        .unwrap();
+        active
+            .runtime
+            .activation
+            .use_published_retrieval_fixture_for_test();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let initialized = handle_stdio_message(
+            &mut session,
+            &json!({
+                "jsonrpc":"2.0", "id":"page-init", "method":"initialize", "params":{}
+            })
+            .to_string(),
+            &cancelled,
+        )
+        .unwrap();
+        assert!(initialized.get("result").is_some());
+        let mut arguments = json!({
+            "project":project.path(), "question":"Read the complete metadata source.",
+            "probes":[{"kind":"qualified_symbol", "symbol":"metadata"}]
+        });
+        // The ordinary public dispatcher includes admission, preparation, runtime
+        // compilation, measured projection and the final MCP formatter. The
+        // test-support dependencies use their isolated CPU embedding fixture.
+        let mut dispatch = |arguments: serde_json::Value, id: &str| {
+            for attempt in 0..20 {
+                let response = handle_stdio_message(
+                    &mut session,
+                    &json!({
+                        "jsonrpc":"2.0", "id":format!("{id}-{attempt}"), "method":"tools/call",
+                        "params":{"name":"packet", "arguments":arguments}
+                    })
+                    .to_string(),
+                    &cancelled,
+                )
+                .unwrap();
+                if response.pointer("/result/structuredContent/kind") == Some(&json!("preparing")) {
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+                assert_ne!(
+                    response.pointer("/result/isError"),
+                    Some(&json!(true)),
+                    "{response}"
+                );
+                assert_eq!(
+                    response["result"]["structuredContent"]["kind"], "complete",
+                    "{response}"
+                );
+                assert!(serde_json::to_vec(&response["result"]).unwrap().len() <= 16_384);
+                return response;
+            }
+            panic!("isolated packet fixture did not finish preparation");
+        };
+        let first = dispatch(arguments.clone(), "page-first");
+        let rows = first["result"]["structuredContent"]["evidence"]
+            .as_array()
+            .unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row.get("packet_request_patch").is_some())
+            .unwrap_or_else(|| panic!("long module must offer an executable next page: {first}"));
+        let next = row["source_delivery"]["next_start_line"].as_u64().unwrap();
+        let patch = &row["packet_request_patch"];
+        serde_json::from_value::<codestory_contracts::packet_projection_v3::PacketRequestPatchV3Dto>(patch.clone())
+            .expect("the public action satisfies the typed contract");
+        for (field, value) in patch.as_object().unwrap() {
+            // Apply replacement semantics: explicit null/empty fields clear the
+            // previous selection rather than becoming invalid input flags.
+            if value.is_null() || value.as_array().is_some_and(Vec::is_empty) {
+                arguments.as_object_mut().unwrap().remove(field);
+            } else {
+                arguments[field] = value.clone();
+            }
+        }
+        let second = dispatch(arguments, "page-next");
+        let pages = second["result"]["structuredContent"]["evidence"]
+            .as_array()
+            .unwrap();
+        let next_page = pages
+            .iter()
+            .find(|page| page["start_line"].as_u64() == Some(next))
+            .unwrap_or_else(|| panic!("offered cursor must select the next source page: {second}"));
+        assert!(
+            next_page["summary"]
+                .as_str()
+                .unwrap()
+                .contains("PAGE_DISPATCH_ANCHOR")
+        );
+        assert_eq!(
+            next_page["source_delivery"]["source_sha256"],
+            row["source_delivery"]["source_sha256"]
+        );
+    }
+
+    #[test]
     fn ready_lease_reuses_one_runtime_across_packet_then_search_without_preparation() {
         fn call_until_ready(
             session: &mut StdioServerSession,
@@ -15376,6 +16017,14 @@ version = "0.11.20"
         .expect("status response");
 
         assert_eq!(response.pointer("/result/isError"), Some(&json!(false)));
+        let cold = response
+            .pointer("/result/structuredContent")
+            .expect("compact status");
+        assert_eq!(
+            cold.pointer("/capabilities/local_navigation"),
+            Some(&json!("unavailable"))
+        );
+        assert_eq!(cold["next_action"], json!("use_source_inspection"));
         assert!(
             !cold_cache_root.exists(),
             "cold status must not create project cache storage"
@@ -15760,6 +16409,268 @@ version = "0.11.20"
         assert!(
             !runtime.storage_path.exists(),
             "status cannot create a legacy database"
+        );
+    }
+
+    #[test]
+    fn status_local_readiness_requires_a_complete_publication() {
+        let project = tempfile::tempdir().expect("project");
+        let parent = tempfile::tempdir().expect("cache parent");
+        let cache = parent.path().join("not-created");
+        let runtime = RuntimeContext::new_inspect_only(&args::ProjectArgs {
+            project: project.path().to_path_buf(),
+            cache_dir: Some(cache.clone()),
+        })
+        .expect("runtime");
+        let publication = IndexPublicationDto {
+            generation: 1,
+            generation_id: "complete-core".into(),
+            run_id: "complete-run".into(),
+            mode: codestory_contracts::api::IndexPublicationModeDto::Full,
+            published_at_epoch_ms: 1,
+        };
+        for (index_publication, activation_required, expected) in [
+            (json!(null), true, "unavailable"),
+            (json!(null), false, "unavailable"),
+            (json!(publication), true, "unavailable"),
+            (json!(publication), false, "ready"),
+        ] {
+            let status = stdio_status_with_activation(
+                &runtime,
+                json!({
+                    "stats": {"node_count": 42},
+                    "index_publication": index_publication,
+                    "allowed_surfaces": {
+                        "ground": {"allowed": true, "activation_required": activation_required},
+                        "packet": {"allowed": false}
+                    }
+                }),
+            );
+            assert_eq!(
+                status.pointer("/capabilities/local_navigation"),
+                Some(&json!(expected))
+            );
+            assert_eq!(
+                status.pointer("/allowed_surfaces/ground/allowed"),
+                Some(&json!(true)),
+                "status must preserve permission for ordinary Core preparation"
+            );
+            assert_eq!(
+                status["next_action"],
+                json!(if expected == "ready" {
+                    "continue_with_local_navigation"
+                } else {
+                    "use_source_inspection"
+                })
+            );
+        }
+        assert!(
+            !cache.exists(),
+            "readiness projection remains observational"
+        );
+    }
+
+    #[test]
+    fn status_cold_retrieval_keeps_fresh_complete_core_usable() {
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("isolated cache");
+        std::fs::write(
+            project.path().join("fixture.rs"),
+            "pub fn local_fixture() {}\n",
+        )
+        .expect("source fixture");
+        let args = args::ProjectArgs {
+            project: project.path().to_path_buf(),
+            cache_dir: Some(cache.path().to_path_buf()),
+        };
+        let startup = stdio_multi_project_startup(cache.path());
+        let writer =
+            RuntimeContext::new_inspect_only_with_startup(&args, &startup).expect("Core writer");
+        writer
+            .ensure_core_open(args::RefreshMode::Full)
+            .expect("publish isolated Core without retrieval activation");
+        let storage_path = codestory_runtime::resolve_core_database_path(&writer.storage_path)
+            .expect("resolve published physical Core generation");
+        drop(writer);
+        let reader = RuntimeContext::new_inspect_only_with_startup(&args, &startup)
+            .expect("fresh cold reader");
+        assert!(reader.activation.snapshot().is_none());
+        let durable_before = std::fs::read(&storage_path).expect("published Core bytes");
+        let mut session = StdioServerSession::new(Some(reader));
+        session.startup = startup;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let compact_response = handle_stdio_message(
+            &mut session,
+            &json!({"jsonrpc":"2.0", "id":1, "method":"tools/call",
+                "params":{"name":"status", "arguments":{"project":project.path()}}})
+            .to_string(),
+            &cancelled,
+        )
+        .expect("first cold status tool response");
+        assert_eq!(
+            compact_response.pointer("/result/isError"),
+            Some(&json!(false))
+        );
+        let compact = compact_response
+            .pointer("/result/structuredContent")
+            .expect("compact status");
+        assert_eq!(compact["state"], json!("working_locally"));
+        assert_eq!(compact["capabilities"]["local_navigation"], json!("ready"));
+        assert_eq!(
+            compact["capabilities"]["broad_search"],
+            json!("unavailable")
+        );
+        assert_eq!(compact["live_ready"], json!(false));
+        assert_eq!(
+            compact["next_action"],
+            json!("continue_with_local_navigation")
+        );
+        assert_eq!(compact["current_operation"], json!(null));
+        let uri = stdio_resource_uri_for_project(&StdioResource::Status, project.path());
+        let resource_response = handle_stdio_message(
+            &mut session,
+            &json!({"jsonrpc":"2.0", "id":2, "method":"resources/read",
+                "params":{"uri":uri}})
+            .to_string(),
+            &cancelled,
+        )
+        .expect("same cold status resource response");
+        let resource: serde_json::Value = serde_json::from_str(
+            resource_response
+                .pointer("/result/contents/0/text")
+                .and_then(serde_json::Value::as_str)
+                .expect("status resource text"),
+        )
+        .expect("status resource JSON");
+        assert!(!resource["index_publication"].is_null());
+        for field in [
+            "state",
+            "capabilities",
+            "next_action",
+            "current_operation",
+            "live_ready",
+        ] {
+            assert_eq!(
+                compact[field], resource[field],
+                "same cold publication: {field}"
+            );
+        }
+        assert!(
+            session
+                .active_project
+                .as_ref()
+                .expect("active reader")
+                .runtime
+                .activation
+                .snapshot()
+                .is_none(),
+            "status must not start activation"
+        );
+        assert_eq!(
+            std::fs::read(&storage_path).expect("Core after reads"),
+            durable_before,
+            "neither status surface may mutate the complete Core"
+        );
+    }
+
+    #[test]
+    fn status_cold_retrieval_respects_core_readiness_failures() {
+        let (_project, _cache, runtime) = stdio_inspect_only_runtime();
+        let publication = json!({"generation":1, "generation_id":"complete-core",
+            "run_id":"complete-run", "mode":"full", "published_at_epoch_ms":1});
+        for (mode, reason) in [
+            ("unavailable", "retrieval_manifest_missing"),
+            ("full", "retrieval_manifest_stale: input_changed"),
+            ("full", "embedding_runtime_unavailable: runtime_cold"),
+        ] {
+            for failure in [
+                "none",
+                "missing_publication",
+                "stale_source",
+                "fatal_core",
+                "unknown_source",
+            ] {
+                let stats = StorageStatsDto {
+                    node_count: 42,
+                    edge_count: 1,
+                    file_count: 1,
+                    error_count: 0,
+                    fatal_error_count: u32::from(failure == "fatal_core"),
+                };
+                let freshness = IndexFreshnessDto {
+                    status: match failure {
+                        "stale_source" => IndexFreshnessStatusDto::Stale,
+                        "unknown_source" => IndexFreshnessStatusDto::NotChecked,
+                        _ => IndexFreshnessStatusDto::Fresh,
+                    },
+                    changed_file_count:u32::from(failure == "stale_source"),
+                    new_file_count:0, removed_file_count:0, checked_file_count:1,
+                    indexed_file_count:1, duration_ms:1,
+                    reason:None,
+                    not_checked_cause: (failure == "unknown_source").then_some(
+                        codestory_contracts::api::IndexFreshnessNotCheckedCauseDto::InventoryUnavailable),
+                    samples:Vec::new(),
+                };
+                let readiness =
+                    crate::readiness::build_readiness_verdicts(crate::readiness::ReadinessInputs {
+                        project: "/generic/project",
+                        stats: &stats,
+                        freshness: Some(&freshness),
+                        sidecar: Some(crate::readiness::ReadinessSidecarInput {
+                            profile: Some("agent"),
+                            run_id: None,
+                            retrieval_mode: mode,
+                            degraded_reason: Some(reason),
+                            embedding_device_policy: Some("accelerator_required"),
+                            embedding_device_state: Some("unknown"),
+                            embedding_device_observation_source: Some("retrieval_unobserved"),
+                            embedding_detected_provider: None,
+                            embedding_detected_gpu: None,
+                            embedding_accelerator_requested: false,
+                            embedding_accelerator_request_provider: None,
+                            embedding_accelerator_request_device: None,
+                            embedding_cpu_allowed: false,
+                            manifest_generation: None,
+                            manifest_input_hash: None,
+                        }),
+                    });
+                let status = stdio_status_with_activation(
+                    &runtime,
+                    json!({
+                        "project_root":"/generic/project",
+                        "index_publication":if failure == "missing_publication" {json!(null)} else {publication.clone()},
+                        "readiness":stdio_public_readiness(&readiness),
+                        "allowed_surfaces":stdio_public_allowed_surfaces(&stdio_allowed_surfaces(&readiness)),
+                        "retrieval_mode":mode, "degraded_reason":reason, "live_ready":false,
+                    }),
+                );
+                let compact = compact_stdio_status(&runtime, &status);
+                let usable = failure == "none";
+                assert_eq!(
+                    compact["capabilities"]["local_navigation"],
+                    json!(if usable { "ready" } else { "unavailable" }),
+                    "{mode}/{reason}/{failure}"
+                );
+                assert_eq!(
+                    compact["state"],
+                    json!(if usable {
+                        "working_locally"
+                    } else {
+                        "unavailable"
+                    })
+                );
+                assert_eq!(
+                    compact["capabilities"]["broad_search"],
+                    json!("unavailable")
+                );
+                assert_eq!(compact["live_ready"], json!(false));
+                assert_eq!(compact["current_operation"], json!(null));
+                assert_eq!(compact["capabilities"], status["capabilities"]);
+            }
+        }
+        assert!(
+            runtime.activation.snapshot().is_none(),
+            "projection cannot activate neural readiness"
         );
     }
 
@@ -16763,6 +17674,720 @@ mod representation_budget_tests {
     use codestory_contracts::compilation::*;
     use codestory_runtime::representation_budget_test_support as fixture;
 
+    #[test]
+    #[ignore = "retrospective pre-repair source only; use authenticated archived CPU4 executable"]
+    fn captured_packet_faithful_replay() {
+        let runtime_path =
+            std::env::var_os("CODESTORY_CPU_REPLAY_RUNTIME").expect("runtime replay path");
+        let stdio_path = std::env::var_os("CODESTORY_CPU_REPLAY_STDIO").expect("stdio replay path");
+        let runtime_bytes = std::fs::read(runtime_path).unwrap();
+        let runtime: serde_json::Value = serde_json::from_slice(&runtime_bytes).unwrap();
+        let stdio: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(stdio_path).unwrap()).unwrap();
+        use sha2::{Digest, Sha256};
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&runtime_bytes)),
+            stdio["runtime_sha256"].as_str().unwrap()
+        );
+        assert_eq!(runtime["complete"], serde_json::json!(true));
+        assert_eq!(stdio["complete"], serde_json::json!(true));
+        let payload = &stdio["payload"];
+        let plan = StdioPacketRepresentationPlanV3 {
+            revision: crate::stdio_v3::McpRevisionV3::parse(payload["revision"].as_str().unwrap())
+                .unwrap(),
+            publication_meta: payload["publication_meta"].clone(),
+            wall_expiry_epoch_ms: payload["wall_expiry_epoch_ms"].as_u64().unwrap(),
+        };
+        let public_id = payload["projection"]["identity"]["packet_id"]
+            .as_str()
+            .unwrap();
+        let (selected, rows) =
+            fixture::replay_captured(&runtime, public_id, |p| plan.measure(p)).unwrap();
+        assert_eq!(
+            rows,
+            runtime["measurements"].as_array().unwrap().clone(),
+            "all actual proposal fingerprints and outcomes must reproduce"
+        );
+        assert_eq!(
+            serde_json::to_value(&selected.packet).unwrap(),
+            runtime["selected_packet"]
+        );
+        let digest = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&selected.packet).unwrap())
+        );
+        let winner = rows
+            .iter()
+            .rposition(|row| row["after_internal_budget_sha256"].as_str() == Some(digest.as_str()))
+            .unwrap();
+        assert_eq!(
+            winner,
+            runtime["selected_measurement_ordinal"].as_u64().unwrap() as usize
+        );
+        // The adapter reserves expiry and capability bytes after pure projection.
+        let mut root = serde_json::to_value(&selected.product.projection).unwrap();
+        reserve_packet_diagnostics_capability_v3(&mut root, plan.wall_expiry_epoch_ms).unwrap();
+        let mut typed_root = root.clone();
+        typed_root
+            .pointer_mut("/diagnostics/reference")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("uri");
+        let adapter_projection = serde_json::from_value(typed_root).unwrap();
+        assert_eq!(
+            serde_json::to_value(&adapter_projection).unwrap(),
+            payload["projection"]
+        );
+        assert_eq!(
+            plan.measure(&adapter_projection).unwrap(),
+            payload["measured_bytes"].as_u64().unwrap() as usize
+        );
+        let replay = plan.replay_payload(&adapter_projection).unwrap();
+        assert_eq!(replay["measured_result"], payload["measured_result"]);
+        root["diagnostics"]["reference"]["uri"] =
+            payload["served_result"]["structuredContent"]["diagnostics"]["reference"]["uri"]
+                .clone();
+        let served = build_served_tool_result_v3(
+            plan.revision,
+            "packet",
+            &root,
+            Some(&plan.publication_meta),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&served).unwrap(),
+            payload["served_result"]
+        );
+        assert_eq!(
+            v3_serialize_call_tool_result(&served).unwrap().len(),
+            payload["served_bytes"].as_u64().unwrap() as usize
+        );
+        println!(
+            "faithful captured replay: measurements={} winner={} bytes={} support={}",
+            rows.len(),
+            runtime["selected_measurement_ordinal"],
+            payload["measured_bytes"],
+            selected.packet.support.len()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires authenticated captured query; CPU-only candidate evaluation"]
+    fn captured_packet_complete_first_candidate() {
+        use sha2::{Digest, Sha256};
+        let runtime_bytes = std::fs::read(
+            std::env::var_os("CODESTORY_CPU_REPLAY_RUNTIME").expect("runtime replay"),
+        )
+        .unwrap();
+        let runtime: serde_json::Value = serde_json::from_slice(&runtime_bytes).unwrap();
+        let stdio: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(std::env::var_os("CODESTORY_CPU_REPLAY_STDIO").expect("stdio replay"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&runtime_bytes)),
+            stdio["runtime_sha256"].as_str().unwrap()
+        );
+        assert_eq!(runtime["complete"], serde_json::json!(true));
+        assert_eq!(stdio["complete"], serde_json::json!(true));
+        let payload = &stdio["payload"];
+        let plan = StdioPacketRepresentationPlanV3 {
+            revision: crate::stdio_v3::McpRevisionV3::parse(payload["revision"].as_str().unwrap())
+                .unwrap(),
+            publication_meta: payload["publication_meta"].clone(),
+            wall_expiry_epoch_ms: payload["wall_expiry_epoch_ms"].as_u64().unwrap(),
+        };
+        let public_id = payload["projection"]["identity"]["packet_id"]
+            .as_str()
+            .unwrap();
+        let (selected, rows) =
+            fixture::replay_captured(&runtime, public_id, |p| plan.measure(p)).unwrap();
+        assert!(rows.len() <= fixture::MAX_MEASURED_CANDIDATES);
+        assert!(
+            rows.iter()
+                .all(|r| r["internal_support_unchanged"] == serde_json::json!(true))
+        );
+        assert!(selected.packet.support.len() <= 16);
+        let mut root = serde_json::to_value(&selected.product.projection).unwrap();
+        reserve_packet_diagnostics_capability_v3(&mut root, plan.wall_expiry_epoch_ms).unwrap();
+        let mut typed = root.clone();
+        typed
+            .pointer_mut("/diagnostics/reference")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("uri");
+        let projection = serde_json::from_value(typed).unwrap();
+        let measured = plan.measure(&projection).unwrap();
+        assert!(measured <= 16_384);
+        root["diagnostics"]["reference"]["uri"] =
+            payload["served_result"]["structuredContent"]["diagnostics"]["reference"]["uri"]
+                .clone();
+        let served = build_served_tool_result_v3(
+            plan.revision,
+            "packet",
+            &root,
+            Some(&plan.publication_meta),
+        )
+        .unwrap();
+        assert_eq!(
+            v3_serialize_call_tool_result(&served).unwrap().len(),
+            measured
+        );
+        let options = &selected
+            .packet
+            .disposition
+            .drill
+            .as_ref()
+            .expect("offered continuations")
+            .options;
+        assert!(
+            options.iter().any(|option| option.source_label.is_some()),
+            "continuation labels are prepared from pinned hydrated metadata"
+        );
+        let mut all_labels = root.clone();
+        for option in options {
+            let Some(label) = &option.source_label else {
+                continue;
+            };
+            let mut expected = label.path.clone().unwrap_or_default();
+            if let Some(range) = option.source_range {
+                if expected.is_empty() {
+                    expected = format!("lines:{}-{}", range.start_line, range.end_line);
+                } else {
+                    expected.push_str(&format!(":{}-{}", range.start_line, range.end_line));
+                }
+            }
+            if let Some(symbol) = &label.symbol {
+                if !expected.is_empty() {
+                    expected.push(' ');
+                }
+                expected.push_str(symbol);
+            }
+            let labeled_gap = all_labels["gaps"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|gap| gap["identity"]["gap_id"] == option.id)
+                .unwrap();
+            labeled_gap["message"] = serde_json::json!(expected);
+            let gap = root["gaps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|gap| gap["identity"]["gap_id"] == option.id)
+                .expect("same executable identity");
+            // Optional gap prose can be removed by the existing public finalizer.
+            // A surviving label must stay exact; an omission cannot become source proof.
+            if let Some(message) = gap["message"].as_str() {
+                assert_eq!(message, expected);
+            }
+        }
+        let visible_labels =
+            options
+                .iter()
+                .filter(|option| option.source_label.is_some())
+                .filter(|option| {
+                    root["gaps"].as_array().unwrap().iter().any(|gap| {
+                        gap["identity"]["gap_id"] == option.id && gap["message"].is_string()
+                    })
+                })
+                .count();
+        let all_labels_result = build_served_tool_result_v3(
+            plan.revision,
+            "packet",
+            &all_labels,
+            Some(&plan.publication_meta),
+        )
+        .unwrap();
+        let all_labels_bytes = v3_serialize_call_tool_result(&all_labels_result)
+            .unwrap()
+            .len();
+        if visible_labels == 0 {
+            assert!(
+                all_labels_bytes > 16_384,
+                "omit labels only when unchanged source frame cannot fit them"
+            );
+        }
+        println!(
+            "same-frame all-label bytes={} final_bytes={} evidence_unchanged={}",
+            all_labels_bytes,
+            measured,
+            all_labels["evidence"] == root["evidence"]
+        );
+        println!(
+            "source-derived labels: offered={} retained_after_normal_compaction={}",
+            options
+                .iter()
+                .filter(|option| option.source_label.is_some())
+                .count(),
+            visible_labels
+        );
+        let complete = selected
+            .packet
+            .support
+            .iter()
+            .filter(|s| {
+                s.source_delivery
+                    .as_ref()
+                    .is_some_and(|d| d.remaining_source_bytes == 0)
+            })
+            .count();
+        let baseline_complete = runtime["selected_packet"]["support"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|s| s["source_delivery"]["remaining_source_bytes"].as_u64() == Some(0))
+            .count();
+        assert!(
+            complete >= baseline_complete,
+            "the measured objective must not regress completion on this captured input"
+        );
+        println!(
+            "candidate captured query: measurements={} bytes={} complete_pages={} baseline_complete_pages={} support={}",
+            rows.len(),
+            measured,
+            complete,
+            baseline_complete,
+            serde_json::to_string(&selected.packet.support).unwrap()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires retained source-bound public projection; representation only"]
+    fn frozen_packet_continuation_labels_survive_actual_stdio_projection() {
+        let fixture: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                std::env::var_os("CODESTORY_CPU_LABEL_REPRESENTATION")
+                    .expect("retained representation fixture"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let baseline = &fixture["baseline_projection"];
+        let labeled = &fixture["labeled_projection"];
+        let revision =
+            crate::stdio_v3::McpRevisionV3::parse(fixture["revision"].as_str().unwrap()).unwrap();
+        let publication = &fixture["publication_meta"];
+        let labels = labeled["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|gap| gap["kind"] == "continuation_required")
+            .map(|gap| (gap["identity"].clone(), gap["message"].clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(labels.len(), 8);
+        let mut unlabeled = labeled.clone();
+        unlabeled["gaps"] = baseline["gaps"].clone();
+        assert_eq!(unlabeled, *baseline, "only existing gap text was replaced");
+        for force_compaction in [false, true] {
+            let mut root = labeled.clone();
+            if force_compaction {
+                root["gaps"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!({
+                        "identity": {"gap_id": "optional-display-fixture"},
+                        "kind": "evidence_missing",
+                        "message": "optional display context ".repeat(150)
+                    }));
+                let before =
+                    build_served_tool_result_v3(revision, "packet", &root, Some(publication))
+                        .unwrap();
+                assert!(v3_serialize_call_tool_result(&before).unwrap().len() > 16_384);
+            }
+            let measured =
+                finalize_packet_projection_for_stdio_v3(&mut root, revision, Some(publication))
+                    .unwrap();
+            let served =
+                build_served_tool_result_v3(revision, "packet", &root, Some(publication)).unwrap();
+            let bytes = v3_serialize_call_tool_result(&served).unwrap();
+            assert_eq!(bytes.len(), measured);
+            assert!(measured <= 16_384);
+            assert_eq!(root["kind"], "complete");
+            for field in [
+                "evidence",
+                "continuation",
+                "identity",
+                "publication",
+                "retrieval",
+                "diagnostics",
+                "answer_sufficiency",
+            ] {
+                assert_eq!(root[field], baseline[field], "unchanged {field}");
+            }
+            for original in baseline["gaps"].as_array().unwrap() {
+                let retained = root["gaps"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|gap| gap["identity"] == original["identity"])
+                    .unwrap();
+                assert_eq!(retained["kind"], original["kind"]);
+                if original["kind"] == "source_unavailable" {
+                    assert_eq!(retained["message"], original["message"]);
+                }
+            }
+            for (identity, message) in &labels {
+                let gap = root["gaps"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|gap| gap["identity"] == *identity)
+                    .unwrap();
+                assert_eq!(gap["message"], *message);
+            }
+            assert_eq!(served["structuredContent"], root);
+            let text: serde_json::Value =
+                serde_json::from_str(served["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(text, root);
+            println!(
+                "frozen public labels: force_compaction={} retained={} served_bytes={}",
+                force_compaction,
+                labels.len(),
+                measured
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "CPU-only normal producer/reader/fusion/admission/hydration comparison on authenticated captured query"]
+    fn captured_published_call_admission_objectives() {
+        use codestory_contracts::api::{AgentPacketDto, SupportUnitKindDto};
+        use sha2::{Digest, Sha256};
+        use std::collections::{BTreeMap, BTreeSet};
+        let runtime_bytes = std::fs::read(
+            std::env::var_os("CODESTORY_CPU_REPLAY_RUNTIME").expect("runtime capsule"),
+        )
+        .unwrap();
+        let runtime: serde_json::Value = serde_json::from_slice(&runtime_bytes).unwrap();
+        let stdio: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(std::env::var_os("CODESTORY_CPU_REPLAY_STDIO").expect("stdio capsule"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&runtime_bytes)),
+            stdio["runtime_sha256"].as_str().unwrap()
+        );
+        assert_eq!(runtime["complete"], serde_json::json!(true));
+        assert_eq!(stdio["complete"], serde_json::json!(true));
+        let core = std::path::PathBuf::from(
+            std::env::var_os("CODESTORY_CPU_REPLAY_CORE").expect("existing immutable Core"),
+        );
+        assert_eq!(
+            format!("{:x}", Sha256::digest(std::fs::read(&core).unwrap())),
+            "5ee4894051af6c44774f86286a4dae2457fb364a63ef7e630ccac3accc2eb8fc"
+        );
+        let owned = tempfile::tempdir().unwrap();
+        let changed =
+            fixture::replay_with_published_call_metadata(&runtime, &core, owned.path()).unwrap();
+        let admissions = changed["input"]["prepared"]["input"]["admissions"]
+            .as_array()
+            .unwrap();
+        assert_eq!(admissions.len(), 16);
+        assert!(
+            admissions
+                .iter()
+                .map(|a| a["reserved_source_bytes"].as_u64().unwrap())
+                .sum::<u64>()
+                <= 16_384
+        );
+        assert!(
+            changed["input"]["prepared"]["input"]["sources"]
+                .as_array()
+                .unwrap()
+                .len()
+                <= 16
+        );
+        println!("prepared navigation input {}", changed["input"]["prepared"]);
+        let payload = &stdio["payload"];
+        let plan = StdioPacketRepresentationPlanV3 {
+            revision: crate::stdio_v3::McpRevisionV3::parse(payload["revision"].as_str().unwrap())
+                .unwrap(),
+            publication_meta: payload["publication_meta"].clone(),
+            wall_expiry_epoch_ms: payload["wall_expiry_epoch_ms"].as_u64().unwrap(),
+        };
+        let id = payload["projection"]["identity"]["packet_id"]
+            .as_str()
+            .unwrap();
+        let mut fitting = Vec::new();
+        let transport_measurements = std::cell::Cell::new(0usize);
+        let (selected, rows) = fixture::replay_captured_observed(
+            &changed,
+            id,
+            |p| {
+                transport_measurements.set(transport_measurements.get() + 1);
+                plan.measure(p)
+            },
+            |p, n| fitting.push((p.packet.clone(), n)),
+        )
+        .unwrap();
+        println!(
+            "candidate public navigation replay {}",
+            plan.replay_payload(&selected.product.projection)
+                .expect("selected public projection")
+        );
+        let baseline: codestory_contracts::packet_projection_v3::PacketProjectionV3Dto =
+            serde_json::from_value(
+                rows.iter()
+                    .find(|row| !row["same_request_baseline_projection"].is_null())
+                    .expect("current request baseline measured")["same_request_baseline_projection"]
+                    .clone(),
+            )
+            .unwrap();
+        println!(
+            "same request accepted baseline {}",
+            plan.replay_payload(&baseline)
+                .expect("baseline full transport frame")
+        );
+        let codestory_contracts::packet_projection_v3::PacketProjectionV3Dto::Complete {
+            evidence,
+            ..
+        } = &selected.product.projection
+        else {
+            panic!("selected complete")
+        };
+        // Reference coverage below uses support. Prove those exact pages are
+        // actually delivered before crediting any source lines in that oracle.
+        for source in selected
+            .packet
+            .support
+            .iter()
+            .filter(|row| row.kind == SupportUnitKindDto::SourceRange)
+        {
+            assert!(
+                evidence
+                    .as_slice()
+                    .iter()
+                    .any(
+                        |row| row.path.as_ref().map(|p| p.as_str()) == source.path.as_deref()
+                            && row.start_line == source.start_line
+                            && row.end_line == source.end_line
+                            && row.summary.as_ref().map(|s| s.as_str())
+                                == source.snippet.as_deref()
+                            && row.source_delivery == source.source_delivery
+                    ),
+                "credited page must survive final projection"
+            );
+        }
+        assert!(rows.len() <= fixture::MAX_MEASURED_CANDIDATES);
+        assert!(transport_measurements.get() <= fixture::MAX_TRANSPORT_MEASUREMENTS);
+        println!(
+            "actual transport probe accounting {}",
+            serde_json::json!({"calls":transport_measurements.get(),"maximum":fixture::MAX_TRANSPORT_MEASUREMENTS,"proposal_callbacks":rows.len(),"proposal_maximum":fixture::MAX_MEASURED_CANDIDATES,"scope":"CPU transport only; no research counter reset"})
+        );
+        assert!(
+            rows.iter()
+                .all(|r| r["internal_support_unchanged"] == serde_json::json!(true))
+        );
+        assert!(!fitting.is_empty());
+        // Retain exact typed input above and every candidate's witnesses,
+        // rank and measured outcome; redundant packet hashes stay in the
+        // in-memory fixture rows and the original sealed frontier receipt.
+        let frontier=rows.iter().map(|row|serde_json::json!({
+            "ordinal":row["ordinal"],"extent_sha256":row["extent_sha256"],
+            "selection_phase":row["selection_phase"],"served_baseline_preserved":row["served_baseline_preserved"],
+            "support_rows":row["support_rows"],"support_frontier":row["support_frontier"],
+            "selection_rank":row["selection_rank"],"internal_support_unchanged":row["internal_support_unchanged"],
+            "outcome":row["outcome"]})).collect::<Vec<_>>();
+        println!("candidate frontier {}", serde_json::json!(frontier));
+        let original = runtime["input"]["descriptor_queries"]["ranked_eligible_descriptors"]
+            .as_array()
+            .unwrap();
+        let ranks = original
+            .iter()
+            .enumerate()
+            .map(|(i, d)| (d["stable_identity"].as_str().unwrap().to_owned(), i + 1))
+            .collect::<BTreeMap<_, _>>();
+        let rank_list = admissions
+            .iter()
+            .map(|a| ranks[a["stable_identity"].as_str().unwrap()])
+            .collect::<Vec<_>>();
+        let root =
+            std::path::Path::new(runtime["input"]["scope"]["project_root"].as_str().unwrap());
+        // Independently read pinned reference spans, used only for offline
+        // comparison; none of these paths/names enter product selection.
+        let spans = [
+            ("policy_delay", "chain.go", 61, 74),
+            ("policy_skip", "chain.go", 78, 92),
+            ("wrapping_then", "chain.go", 30, 35),
+            ("wrapping_configuration", "option.go", 34, 38),
+            ("registration_schedule", "cron.go", 158, 174),
+            ("registration_entry", "cron.go", 148, 154),
+            ("dispatch_due", "cron.go", 242, 277),
+            ("dispatch_worker", "cron.go", 308, 314),
+            ("shutdown_stop", "cron.go", 323, 336),
+            ("shutdown_branch", "cron.go", 290, 293),
+            ("delay_idle_test", "chain_test.go", 103, 111),
+            ("delay_overlap_test", "chain_test.go", 127, 151),
+            ("skip_overlap_test", "chain_test.go", 181, 205),
+            ("skip_rapid_test", "chain_test.go", 207, 219),
+            ("separate_wrappers_test", "chain_test.go", 221, 240),
+            ("post_stop_registration_test", "cron_test.go", 98, 113),
+            ("shutdown_slow_work_test", "cron_test.go", 599, 624),
+            ("shutdown_contexts_test", "cron_test.go", 626, 671),
+            ("repeated_firing_test", "cron_test.go", 255, 272),
+            ("multiple_schedules_test", "cron_test.go", 274, 294),
+        ];
+        let files = spans
+            .iter()
+            .map(|(_, path, _, _)| *path)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|path| {
+                let bytes = std::fs::read(root.join(path)).unwrap();
+                let hash = format!("{:x}", Sha256::digest(&bytes));
+                assert!(
+                    runtime["input"]["scope"]["source_sha256"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|v| v.as_str() == Some(hash.as_str()))
+                );
+                (path, (hash, String::from_utf8(bytes).unwrap()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let delivered = |packet: &AgentPacketDto| {
+            let mut lines = BTreeSet::new();
+            for row in &packet.support {
+                if row.kind != SupportUnitKindDto::SourceRange {
+                    continue;
+                }
+                let Some(path) = row.path.as_deref() else {
+                    continue;
+                };
+                let Some((hash, text)) = files.get(path) else {
+                    continue;
+                };
+                let Some(delivery) = row.source_delivery.as_ref() else {
+                    continue;
+                };
+                assert_eq!(&delivery.source_sha256, hash);
+                if let (Some(start), Some(end)) = (row.start_line, row.end_line) {
+                    let snippet = row
+                        .snippet
+                        .as_deref()
+                        .expect("credited source has numbered bytes");
+                    let mut observed = BTreeMap::new();
+                    for rendered in snippet.lines() {
+                        let Some((prefix, body)) = rendered.split_once(" | ") else {
+                            continue;
+                        };
+                        let Some(number) =
+                            prefix.trim_start_matches('>').trim().parse::<u32>().ok()
+                        else {
+                            continue;
+                        };
+                        assert!(
+                            observed.insert(number, body).is_none(),
+                            "duplicate numbered source line"
+                        );
+                    }
+                    for line in start..=end {
+                        let raw = text
+                            .lines()
+                            .nth(line as usize - 1)
+                            .expect("credited line exists");
+                        assert_eq!(
+                            observed.get(&line).copied(),
+                            Some(raw),
+                            "credited source bytes differ from pinned text"
+                        );
+                        lines.insert((path.to_owned(), line));
+                    }
+                }
+            }
+            lines
+        };
+        let coverage = |packet: &AgentPacketDto| {
+            let lines = delivered(packet);
+            spans.iter().map(|(name,path,start,end)| {
+                let count=(*start..=*end).filter(|line|lines.contains(&(path.to_string(),*line))).count();
+                serde_json::json!({"reference":name,"path":path,"start":start,"end":end,"delivered_lines":count,
+                    "coverage":if count==(*end-*start+1) as usize {"complete"} else if count>0 {"partial"} else {"absent"}})
+            }).collect::<Vec<_>>()
+        };
+        let objective = |packet: &AgentPacketDto| {
+            let mut credited = BTreeMap::<String, f64>::new();
+            for row in &packet.support {
+                if let (Some(id), Some(d), Some(start), Some(end)) = (
+                    &row.symbol_id,
+                    &row.source_delivery,
+                    row.start_line,
+                    row.end_line,
+                ) {
+                    let identity = format!("node:{id}");
+                    let Some(rank) = ranks.get(&identity) else {
+                        continue;
+                    };
+                    let fraction = (end - start + 1) as f64
+                        / (d.requested_range.end_line - d.requested_range.start_line + 1) as f64;
+                    let credit = fraction / (*rank as f64);
+                    credited
+                        .entry(identity)
+                        .and_modify(|v| *v = (*v).max(credit))
+                        .or_insert(credit);
+                }
+            }
+            let lines = delivered(packet);
+            let paths = lines.iter().map(|(p, _)| p).collect::<BTreeSet<_>>().len();
+            let source_bytes = files
+                .iter()
+                .map(|(path, (_, text))| {
+                    text.split_inclusive('\n')
+                        .enumerate()
+                        .filter(|(i, _)| lines.contains(&(path.to_string(), (*i + 1) as u32)))
+                        .map(|(_, s)| s.len())
+                        .sum::<usize>()
+                })
+                .sum::<usize>();
+            let complete_reference = coverage(packet)
+                .iter()
+                .filter(|s| s["coverage"] == "complete")
+                .count();
+            (
+                credited.values().sum::<f64>(),
+                source_bytes,
+                paths,
+                complete_reference,
+            )
+        };
+        let mut comparisons = Vec::new();
+        let baseline: AgentPacketDto =
+            serde_json::from_value(runtime["selected_packet"].clone()).unwrap();
+        comparisons.push(serde_json::json!({"objective":"original_served_baseline","bytes":payload["served_bytes"],"coverage":coverage(&baseline)}));
+        comparisons.push(serde_json::json!({"objective":"production_completion","coverage":coverage(&selected.packet),"support":selected.packet.support.iter().map(|s|serde_json::json!({"summary":s.summary,"path":s.path,"start":s.start_line,"end":s.end_line})).collect::<Vec<_>>()}));
+        for objective_index in 0..4 {
+            let winner = fitting
+                .iter()
+                .max_by(|(a, _), (b, _)| {
+                    let x = objective(a);
+                    let y = objective(b);
+                    match objective_index {
+                        0 => x.0.total_cmp(&y.0),
+                        1 => x.1.cmp(&y.1),
+                        2 => x.2.cmp(&y.2),
+                        _ => x.3.cmp(&y.3),
+                    }
+                })
+                .unwrap();
+            let names = [
+                "reciprocal_original_rank_extent",
+                "distinct_source_bytes",
+                "distinct_source_paths",
+                "TEST_ONLY_reference_coverage_oracle",
+            ];
+            comparisons.push(serde_json::json!({"objective":names[objective_index],"bytes":winner.1,"coverage":coverage(&winner.0),"support":winner.0.support.iter().map(|s|serde_json::json!({"summary":s.summary,"path":s.path,"start":s.start_line,"end":s.end_line})).collect::<Vec<_>>()}));
+        }
+        println!(
+            "metadata admission comparison {}",
+            serde_json::json!({"scope":"CPU_only_counterfactual_no_live_Full_publication_no_neural_grade_claim","admission_original_ranks":rank_list,"measurements":rows.len(),"fitting_proposals":fitting.len(),"comparisons":comparisons})
+        );
+    }
+
     fn hydrated_pages() -> PacketCompilationInputV1 {
         let admissions = (0..16)
             .map(|ordinal| PacketAdmissionReceiptV1 {
@@ -16779,6 +18404,7 @@ mod representation_budget_tests {
             .collect();
         let sources = (0..16)
             .map(|ordinal| PacketHydratedSourceRangeV1 {
+                callable_body: None,
                 stable_identity: format!("node:{ordinal}"),
                 path: format!("src/{}/page_{ordinal:02}.rs", "directory".repeat(7)),
                 symbol: Some(format!("page_{ordinal:02}")),
@@ -16950,6 +18576,8 @@ mod representation_budget_tests {
                     packet_diagnostics: Some(selected.product.diagnostics),
                     publication_meta: Some(plan.publication_meta.clone()),
                     packet_wall_expiry_epoch_ms: Some(plan.wall_expiry_epoch_ms),
+                    source_ranges_budget: None,
+                    packet_replay: None,
                 },
                 &registry,
             );
@@ -16974,6 +18602,100 @@ mod representation_budget_tests {
                 assert_eq!(
                     served["_meta"]["codestory_publication"],
                     plan.publication_meta
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn private_replay_join_is_excluded_from_served_tool_result() {
+        let request = request();
+        let revision = crate::stdio_v3::McpRevisionV3::preferred();
+        let plan = plan(revision);
+        let selected = fixture::select_prepared(hydrated_pages(), &request, |candidate| {
+            plan.measure(candidate)
+        })
+        .unwrap();
+        let registry = Arc::new(std::sync::Mutex::new(
+            crate::stdio_v3::DiagnosticsRegistryV3::new(),
+        ));
+        let output = stdio_jsonrpc_tool_execution_v3(
+            serde_json::json!("request"),
+            "packet",
+            revision,
+            StdioToolExecutionV3 {
+                response: serde_json::json!({"result":selected.product.projection}),
+                packet_diagnostics: Some(selected.product.diagnostics),
+                publication_meta: Some(plan.publication_meta),
+                packet_wall_expiry_epoch_ms: Some(plan.wall_expiry_epoch_ms),
+                source_ranges_budget: None,
+                packet_replay: Some(StdioPacketReplayJoinV3 {
+                    question: "PRIVATE_TRACE_QUESTION_SENTINEL".into(),
+                    core_generation: "private-core".into(),
+                    core_run: "private-run".into(),
+                    retrieval_generation: "private-retrieval".into(),
+                    internal_packet_id: "PRIVATE_TRACE_PACKET_SENTINEL".into(),
+                    wall_expiry_epoch_ms: plan.wall_expiry_epoch_ms,
+                }),
+            },
+            &registry,
+        );
+        assert!(output.get("error").is_none(), "{output}");
+        let wire = serde_json::to_string(&output).unwrap();
+        assert!(!wire.contains("PRIVATE_TRACE_QUESTION_SENTINEL"));
+        assert!(!wire.contains("PRIVATE_TRACE_PACKET_SENTINEL"));
+        assert!(!wire.contains("packet_replay"));
+        assert!(
+            output["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("codestory://packet-diagnostics/")
+        );
+    }
+
+    #[test]
+    fn replay_cost_plan_survives_json_and_rebuilds_exact_server_frame() {
+        let request = request();
+        let (packet, _) = fixture::default_packet(hydrated_pages(), &request);
+        let product = fixture::project_packet(&request, &packet, |_| Ok(0)).unwrap();
+        for revision in crate::stdio_v3::McpRevisionV3::all() {
+            let mut original = plan(*revision);
+            original.publication_meta["refresh"]["phase"] =
+                serde_json::json!("quotes\\\"\n café 🦀");
+            original.wall_expiry_epoch_ms = u64::MAX;
+            let capsule = original.replay_payload(&product.projection).unwrap();
+            let saved: serde_json::Value =
+                serde_json::from_slice(&serde_json::to_vec(&capsule).unwrap()).unwrap();
+            let restored = StdioPacketRepresentationPlanV3 {
+                revision: crate::stdio_v3::McpRevisionV3::parse(
+                    saved["revision"].as_str().unwrap(),
+                )
+                .unwrap(),
+                publication_meta: saved["publication_meta"].clone(),
+                wall_expiry_epoch_ms: saved["wall_expiry_epoch_ms"].as_u64().unwrap(),
+            };
+            let projection = serde_json::from_value(saved["projection"].clone()).unwrap();
+            assert_eq!(
+                restored.measure(&projection).unwrap(),
+                saved["measured_bytes"].as_u64().unwrap() as usize
+            );
+            assert_eq!(restored.replay_payload(&projection).unwrap(), capsule);
+            let retained = v3_serialize_call_tool_result(&saved["measured_result"]).unwrap();
+            assert_eq!(
+                retained.len(),
+                original.measure(&product.projection).unwrap()
+            );
+            let mirrored: serde_json::Value = serde_json::from_str(
+                saved["measured_result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            if revision.profile().structured_content {
+                assert_eq!(mirrored, saved["measured_result"]["structuredContent"]);
+                assert_eq!(
+                    saved["measured_result"]["_meta"]["codestory_publication"],
+                    original.publication_meta
                 );
             }
         }
@@ -17062,7 +18784,7 @@ mod representation_budget_tests {
     }
 
     #[test]
-    fn real_record_refuses_invalid_receipt_and_measurement_errors_propagate() {
+    fn invalid_delivery_refuses_before_measurement_and_measurement_errors_propagate() {
         let input = hydrated_pages();
         let request = request();
         let (mut packet, _) = fixture::default_packet(input.clone(), &request);
@@ -17071,8 +18793,21 @@ mod representation_budget_tests {
             .as_mut()
             .unwrap()
             .next_start_line = Some(1);
-        let error = fixture::project_packet(&request, &packet, |_| Ok(0)).unwrap_err();
-        assert!(error.message.contains("packet record"));
+        let measured = std::cell::Cell::new(false);
+        let error = fixture::project_packet(&request, &packet, |_| {
+            measured.set(true);
+            Ok(0)
+        })
+        .unwrap_err();
+        assert_eq!(error.code, "internal");
+        assert_eq!(
+            error.message,
+            "Packet source page and delivery receipt cannot be represented without loss."
+        );
+        assert!(
+            !measured.get(),
+            "invalid receipt must fail before any measurement"
+        );
         assert!(fixture::select_prepared(input, &request, |_| Err(())).is_err());
     }
 

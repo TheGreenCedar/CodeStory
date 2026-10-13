@@ -2554,6 +2554,17 @@ pub enum OperationReadClass {
     Retrieval,
 }
 
+impl OperationReadClass {
+    /// Request only the publication capability this class can read.
+    /// Core-only operations may still refresh Core, but cannot start retrieval.
+    pub fn activation_goal(self) -> ActivationGoal {
+        match self {
+            Self::Retrieval => ActivationGoal::Full,
+            Self::GraphOnly | Self::SourceBacked | Self::PinnedObserver => ActivationGoal::CoreOnly,
+        }
+    }
+}
+
 /// The read class of one public operation name.
 ///
 /// Operation names here are the runtime-visible names: `stdio` maps tool
@@ -3012,6 +3023,16 @@ pub struct PublicOperationService {
 }
 
 impl PublicOperationService {
+    /// Commit the source inventory of the adapter's finalized Complete product.
+    /// Preview projection APIs never issue a historical-source record.
+    pub fn commit_packet_served_sources_v3(
+        &self,
+        caller: &str,
+        product: &crate::PacketEvidenceProductV3,
+    ) -> Result<(), ApiError> {
+        crate::agent::packet_served_sources::commit(&self.controller, caller, product)
+    }
+
     pub(crate) fn new(controller: AppController) -> Self {
         Self {
             controller,
@@ -3105,11 +3126,7 @@ impl PublicOperationService {
         let activation = self.activation.as_ref().ok_or_else(|| {
             ApiError::internal("managed source repair requires an activation owner")
         })?;
-        let goal = if operation_requires_retrieval(operation) {
-            ActivationGoal::Full
-        } else {
-            ActivationGoal::CoreOnly
-        };
+        let goal = operation_read_class(operation).activation_goal();
         activation
             .activate_with_goal_until(
                 &self.controller.require_project_root()?,
@@ -4611,6 +4628,39 @@ mod freshness_gate_tests {
     }
 
     #[test]
+    fn graph_and_source_reads_activate_only_core() {
+        for operation in [
+            "symbols",
+            "files",
+            "graph",
+            "exact_search",
+            "source_snippet",
+            "affected",
+            crate::call_path_kernel::PROOF_DOMAIN,
+        ] {
+            assert_eq!(
+                operation_read_class(operation).activation_goal(),
+                ActivationGoal::CoreOnly,
+                "{operation}"
+            );
+        }
+        for operation in [
+            "packet",
+            "search",
+            "context",
+            "drill",
+            "resolution",
+            "graph_assisted",
+        ] {
+            assert_eq!(
+                operation_read_class(operation).activation_goal(),
+                ActivationGoal::Full,
+                "{operation}"
+            );
+        }
+    }
+
+    #[test]
     fn dark_indexed_call_path_builder_remains_core_only() {
         assert!(!operation_requires_retrieval(
             crate::call_path_kernel::PROOF_DOMAIN
@@ -5573,6 +5623,84 @@ pub(crate) mod activation_tests {
             core_generation_id: None,
             retrieval_generation: None,
         }
+    }
+
+    #[test]
+    fn packet_public_admission_refuses_missing_retrieval_before_response_building() {
+        let (project, _cache, storage_path, _) = complete_core_without_retrieval_pointer_fixture();
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
+        runtime
+            .project_service()
+            .open_core_read_only_with_storage_path(project.path().to_path_buf(), storage_path)
+            .expect("attach complete Core without retrieval");
+        let service = runtime.public_operation_service();
+        let request = warm_packet_request();
+        let _latency_scope = crate::enter_packet_latency_scope(request.latency_budget_ms);
+
+        for observational in [false, true] {
+            let mut body_calls = 0;
+            let mut build = || {
+                body_calls += 1;
+                Ok(())
+            };
+            let error = if observational {
+                service.run_observational_with_cancel(
+                    "packet",
+                    Arc::new(AtomicBool::new(false)),
+                    &mut build,
+                )
+            } else {
+                service.run_with_cancel("packet", Arc::new(AtomicBool::new(false)), &mut build)
+            }
+            .expect_err("missing retrieval must refuse before the response builder");
+            assert_eq!(error.code, "retrieval_unavailable", "{error:?}");
+            assert!(
+                error.message.contains("expected profile=agent mode=full"),
+                "{error:?}"
+            );
+            assert_eq!(
+                body_calls, 0,
+                "unavailable retrieval must not invoke the body"
+            );
+            assert!(service.active_packet_representation_context_v3().is_none());
+            assert!(active_public_operation_cancellation().is_none());
+        }
+        let graph = service
+            .run_with_cancel("symbols", Arc::new(AtomicBool::new(false)), || Ok(()))
+            .expect("complete Core remains available for graph-only reads");
+        assert!(graph.core_publication.is_some());
+        assert!(graph.retrieval_publication.is_none());
+    }
+
+    #[test]
+    fn packet_public_admission_preserves_ready_representation_owner() {
+        let fixture = ready_activation_fixture();
+        let service = fixture.runtime.public_operation_service();
+        let browser = fixture.runtime.browser_service();
+        let request = warm_packet_request();
+        let _latency_scope = crate::enter_packet_latency_scope(request.latency_budget_ms);
+        let operation = service
+            .run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
+                let context = service
+                    .active_packet_representation_context_v3()
+                    .expect("fresh representation context");
+                assert!(context.publication.retrieval_publication.is_some());
+                let represented = browser.packet_for_representation_v3(
+                    request.clone(),
+                    "test",
+                    &mut |candidate| {
+                        serde_json::to_vec(candidate)
+                            .map(|bytes| bytes.len())
+                            .map_err(|_| ())
+                    },
+                )?;
+                assert_eq!(service.active_publication(), Some(context.publication));
+                Ok(represented.product)
+            })
+            .expect("ready packet representation retains the actual owner");
+        assert!(operation.retrieval_publication.is_some());
+        assert!(service.active_packet_representation_context_v3().is_none());
     }
 
     #[test]

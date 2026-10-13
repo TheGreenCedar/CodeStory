@@ -39,7 +39,8 @@ impl RetrievalCacheKey {
             sidecar_schema_version: manifest.sidecar_schema_version,
             projection_count: manifest.projection_count,
             query_fingerprint: format!(
-                "{}:{}",
+                "published-call-descriptors/v2:{}:{}:{}",
+                crate::ranker::RANKING_POLICY_VERSION,
                 crate::query_windows::QUERY_WINDOW_POLICY,
                 query_fingerprint.into()
             ),
@@ -326,6 +327,7 @@ mod tests {
     #[test]
     fn cache_key_tracks_core_and_sidecar_publications() {
         let base = RetrievalIndexManifest {
+            artifact_scope: None,
             project_id: "abc".into(),
             lexical_version: "v1".into(),
             semantic_generation: "codestory_abc_hash_a".into(),
@@ -360,6 +362,7 @@ mod tests {
         );
 
         let first = crate::executor::RetrievalPublicationIdentity {
+            artifact_scope: None,
             core_generation_id: "core-a".into(),
             core_run_id: "run-a".into(),
             sidecar_generation: "abc-hash-a".into(),
@@ -367,6 +370,7 @@ mod tests {
             semantic_generation: base.semantic_generation.clone(),
         };
         let second = crate::executor::RetrievalPublicationIdentity {
+            artifact_scope: None,
             core_generation_id: "core-b".into(),
             core_run_id: "run-b".into(),
             ..first.clone()

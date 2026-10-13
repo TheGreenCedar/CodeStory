@@ -348,13 +348,17 @@ pub(crate) fn agent_packet(
 pub(crate) fn agent_packet_for_representation(
     controller: &AppController,
     req: AgentPacketRequestDto,
-    measure: &mut dyn FnMut(&AgentPacketDto) -> Result<Option<usize>, ApiError>,
+    caller: &str,
+    measure: &mut dyn FnMut(
+        &AgentPacketDto,
+        Option<&crate::evidence_projection_v3::PacketRepresentationBaselineV1>,
+    ) -> Result<Option<usize>, ApiError>,
 ) -> Result<AgentPacketDto, ApiError> {
     agent_packet_with_session(
         controller,
         req,
         std::rc::Rc::new(PacketProofSession::new()),
-        Some(measure),
+        Some((caller, measure)),
     )
 }
 
@@ -387,10 +391,24 @@ fn agent_packet_with_session(
     controller: &AppController,
     req: AgentPacketRequestDto,
     proof_session: std::rc::Rc<PacketProofSession>,
-    representation_measure: Option<
-        &mut dyn FnMut(&AgentPacketDto) -> Result<Option<usize>, ApiError>,
-    >,
+    representation_measure: Option<(
+        &str,
+        &mut dyn FnMut(
+            &AgentPacketDto,
+            Option<&crate::evidence_projection_v3::PacketRepresentationBaselineV1>,
+        ) -> Result<Option<usize>, ApiError>,
+    )>,
 ) -> Result<AgentPacketDto, ApiError> {
+    if representation_measure.is_none()
+        && req
+            .parent_packet_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("psr1:"))
+    {
+        return Err(ApiError::invalid_argument(
+            "Issued packet continuation requires its current public representation owner.",
+        ));
+    }
     let question = req.question.trim().to_string();
     if question.is_empty() {
         return Err(ApiError::invalid_argument("Question cannot be empty."));
@@ -399,6 +417,11 @@ fn agent_packet_with_session(
         .map_err(ApiError::invalid_argument)?;
     let project_root = controller.require_project_root()?;
     let project_id = codestory_workspace::project_identity_v3(&project_root).project_id;
+    let replay_enrollment =
+        super::packet_replay::PacketReplayEnrollment::for_request(&project_root, &req);
+    if replay_enrollment.is_some() {
+        proof_session.enable_replay_metadata();
+    }
     controller.begin_packet_retrieval();
     let _proof_session_guard = install_packet_proof_session(std::rc::Rc::clone(&proof_session));
     let packet_latency = PacketLatencyBudget::inherited_or_new(req.latency_budget_ms);
@@ -419,6 +442,11 @@ fn agent_packet_with_session(
         &req,
         crate::agent::retrieval_primary::active_pinned_retrieval_publication(controller).as_ref(),
     )?;
+    if let Some((caller, _)) = representation_measure.as_ref() {
+        if let Some(record) = super::packet_served_sources::load(controller, caller, &req)? {
+            proof_session.protect_served_sources(record)?;
+        }
+    }
     let mut probes = normalize_packet_probe_request(&req.probes);
     probes.extend(
         crate::agent::packet_compiler::continuation_probes_from_options(&req, &project_id)?,
@@ -593,7 +621,11 @@ fn agent_packet_with_session(
 
     let phase_started = Instant::now();
     let mut packet = AgentPacketDto {
-        packet_id: answer.answer_id.clone(),
+        packet_id: super::packet_served_sources::packet_request_id(
+            representation_measure.as_ref().map(|(caller, _)| *caller),
+            prepared_compilation.supports_served_source_record(),
+            &answer.answer_id,
+        ),
         question,
         plan,
         answer,
@@ -604,10 +636,19 @@ fn agent_packet_with_session(
         answer_sufficiency: Default::default(),
     };
     append_packet_non_trace_phase(&mut packet.answer, "packet_dto", phase_started);
-    if let Some(measure) = representation_measure {
+    if let Some((_caller, measure)) = representation_measure {
+        let mut replay = replay_enrollment.and_then(|enrollment| {
+            super::packet_replay::PacketReplayTrace::begin(
+                enrollment,
+                &req,
+                &prepared_compilation,
+                &packet,
+                proof_session.replay_descriptor_metadata(),
+            )
+        });
         let mut full_proposal = None;
         let mut accepted_proposal = None;
-        let frozen = prepared_compilation.select_for_representation(|prepared, product| {
+        let frozen = prepared_compilation.select_for_representation_with_baseline(|prepared, product, baseline_product| {
             packet_remaining_for_handoff(
                 controller,
                 packet_latency,
@@ -616,13 +657,34 @@ fn agent_packet_with_session(
             let mut candidate = packet.clone();
             prepared.apply_proposal(&mut candidate, Some(&req), product);
             append_compiled_source_evidence(&mut candidate.answer, &product.support);
+            let before_budget = replay.as_ref().map(|_| candidate.clone());
             enforce_packet_output_budget(&project_root, &mut candidate);
             if candidate.support != product.support {
                 return Err(ApiError::internal(
                     "Presentation budget changed compiled source delivery.",
                 ));
             }
-            let result = measure(&candidate)?;
+            let baseline = baseline_product.map(|product| {
+                let mut base = packet.clone();
+                prepared.apply_proposal(&mut base, Some(&req), product);
+                append_compiled_source_evidence(&mut base.answer, &product.support);
+                enforce_packet_output_budget(&project_root, &mut base);
+                if base.support != product.support {
+                    return Err(ApiError::internal("Baseline presentation changed compiled source delivery."));
+                }
+                Ok(crate::evidence_projection_v3::PacketRepresentationBaselineV1 {
+                    resolved_gap_witnesses: prepared.resolved_baseline_option_witnesses(&base, &candidate),
+                    added_source_units: candidate.support.iter().filter(|row| row.kind == codestory_contracts::api::SupportUnitKindDto::SourceRange && !base.support.contains(row)).cloned().collect(), packet: base,
+                })
+            }).transpose()?;
+            if baseline.as_ref().is_some_and(|binding| !prepared.retain_baseline_continuation_actions(&binding.packet, &mut candidate)) {
+                return Ok(None);
+            }
+            let measured = measure(&candidate, baseline.as_ref());
+            if let (Some(replay), Some(before)) = (replay.as_mut(), before_budget.as_ref()) {
+                replay.record(prepared, before, &candidate, &measured);
+            }
+            let result = measured?;
             if full_proposal.is_none() {
                 full_proposal = Some(candidate.clone());
             }
@@ -632,11 +694,23 @@ fn agent_packet_with_session(
                 accepted_proposal = Some(candidate);
             }
             Ok(result)
-        })?;
+        });
+        let frozen = match frozen {
+            Ok(frozen) => frozen,
+            Err(error) => {
+                if let Some(replay) = replay {
+                    replay.finish(None, Some(format!("{error:?}")));
+                }
+                return Err(error);
+            }
+        };
         packet = accepted_proposal
             .or(full_proposal)
             .ok_or_else(|| ApiError::internal("No representation proposal was measured."))?;
         commit_measured_packet_compilation(&packet, frozen)?;
+        if let Some(replay) = replay {
+            replay.finish(Some(&packet), None);
+        }
         // The selected immutable projection already includes diagnostics. A
         // developer trace export must not mutate that measured public record.
         if let Some(diagnostic) = trace_export::write_packet_step_trace_from_env(&packet.answer) {
@@ -868,7 +942,10 @@ fn order_packet_sections(sections: &mut [AgentResponseSectionDto]) {
 /// bytes are bounded by the descriptor reservation contract.
 const PACKET_SOURCE_MAX_TOTAL_BYTES: usize = 14_336;
 
-fn append_compiled_source_evidence(answer: &mut AgentAnswerDto, support: &[SupportUnitDto]) {
+pub(crate) fn append_compiled_source_evidence(
+    answer: &mut AgentAnswerDto,
+    support: &[SupportUnitDto],
+) {
     let mut rendered = String::new();
     for source in support
         .iter()

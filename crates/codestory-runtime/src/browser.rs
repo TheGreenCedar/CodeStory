@@ -126,6 +126,88 @@ pub const SOURCE_RANGES_MAX_ENTRIES: usize = 12;
 pub const SOURCE_RANGES_MAX_LINE: u32 = 1_000_000;
 pub const SOURCE_RANGES_MAX_RESPONSE_BYTES: usize = 128 * 1024;
 
+/// A bounded physical-line read owned by runtime. The transport supplies only
+/// a representation measurement; runtime owns source cuts and truthful receipts.
+pub struct PreparedSourceRanges {
+    windows: Vec<(String, u32, u32, crate::snippets::PathSourceWindow)>,
+    source_budget: usize,
+}
+
+impl PreparedSourceRanges {
+    fn render(&self, budget: usize) -> codestory_contracts::api::SourceRangesDto {
+        let ranges = crate::snippets::render_path_source_windows(self.windows.clone(), budget);
+        codestory_contracts::api::SourceRangesDto {
+            requested_count: self.windows.len() as u32,
+            omitted_count: ranges.iter().filter(|range| !range.complete).count() as u32,
+            complete: ranges.iter().all(|range| range.complete),
+            ranges,
+            max_total_bytes: budget as u32,
+            max_response_bytes: SOURCE_RANGES_MAX_RESPONSE_BYTES as u32,
+        }
+    }
+
+    fn structured_size(
+        result: &codestory_contracts::api::SourceRangesDto,
+    ) -> Result<usize, ApiError> {
+        serde_json::to_vec(result)
+            .map(|bytes| bytes.len())
+            .map_err(|error| ApiError::internal(error.to_string()))
+    }
+
+    pub fn render_default(&self) -> Result<codestory_contracts::api::SourceRangesDto, ApiError> {
+        let result = self.render(self.source_budget);
+        if Self::structured_size(&result)? > SOURCE_RANGES_MAX_RESPONSE_BYTES {
+            return Err(ApiError::new(
+                "source_response_too_large",
+                "Range metadata and escaped source exceed the response bound; narrow the request",
+            ));
+        }
+        Ok(result)
+    }
+
+    /// Keep all receipts and whole lines, using only the prepared read. Search
+    /// bounded source budgets and retain a measured fitting page. Receipt metadata
+    /// can change non-monotonically, so this is not a maximum-packing claim.
+    /// The zero-source page must fit or delivery refuses.
+    pub fn render_for_representation(
+        &self,
+        maximum_bytes: usize,
+        mut measure: impl FnMut(&codestory_contracts::api::SourceRangesDto) -> Result<usize, ApiError>,
+    ) -> Result<codestory_contracts::api::SourceRangesDto, ApiError> {
+        let mut fits =
+            |result: &codestory_contracts::api::SourceRangesDto| -> Result<bool, ApiError> {
+                Ok(
+                    Self::structured_size(result)? <= SOURCE_RANGES_MAX_RESPONSE_BYTES
+                        && measure(result)? <= maximum_bytes,
+                )
+            };
+        let full = self.render(self.source_budget);
+        if fits(&full)? {
+            return Ok(full);
+        }
+        let mut selected = self.render(0);
+        if !fits(&selected)? {
+            return Err(ApiError::new(
+                "source_response_budget_too_small",
+                "Allowance cannot fit source range receipts; narrow the request or increase it",
+            ));
+        }
+        let mut lower = 1;
+        let mut upper = self.source_budget.saturating_sub(1);
+        while lower <= upper {
+            let budget = lower + (upper - lower) / 2;
+            let result = self.render(budget);
+            if fits(&result)? {
+                selected = result;
+                lower = budget + 1;
+            } else {
+                upper = budget - 1;
+            }
+        }
+        Ok(selected)
+    }
+}
+
 impl ReadOnlyBrowserService {
     pub(crate) fn new(controller: AppController, public_operation: PublicOperationService) -> Self {
         Self {
@@ -184,10 +266,20 @@ impl ReadOnlyBrowserService {
             .ok_or_else(|| {
                 ApiError::internal("Representation requires the actual fresh packet owner.")
             })?;
+        let mut bounded_measure =
+            crate::evidence_projection_v3::bounded_packet_transport_measure_v3(measure);
+        let measure = &mut bounded_measure;
         let reserved = crate::PacketProjectionIdentityV3::new();
         let mut full_product = None;
         let mut accepted_product = None;
-        let mut measure_packet = |packet: &AgentPacketDto| {
+        let mut baseline_product: Option<(AgentPacketDto, crate::PacketEvidenceProductV3)> = None;
+        let mut issued_record: Option<
+            Option<crate::agent::packet_served_sources::ServedSourceRecord>,
+        > = None;
+        let mut measure_packet = |packet: &AgentPacketDto,
+                                  baseline: Option<
+            &crate::evidence_projection_v3::PacketRepresentationBaselineV1,
+        >| {
             let product = crate::project_packet_v3_with_identity(
                 &self.public_operation,
                 caller_id,
@@ -196,6 +288,61 @@ impl ReadOnlyBrowserService {
                 &reserved,
                 &mut *measure,
             )?;
+            if issued_record.is_none() {
+                issued_record = Some(crate::agent::packet_served_sources::load(
+                    &self.controller,
+                    caller_id,
+                    &req,
+                )?);
+            }
+            if issued_record
+                .as_ref()
+                .and_then(|r| r.as_ref())
+                .is_some_and(|record| {
+                    !crate::agent::packet_served_sources::projection_preserves(
+                        record,
+                        &product.projection,
+                    )
+                })
+            {
+                return Ok(None);
+            }
+            if let Some(binding) = baseline {
+                if baseline_product.is_none() {
+                    let projected = if packet.support == binding.packet.support
+                        && packet.disposition == binding.packet.disposition
+                    {
+                        product.clone()
+                    } else {
+                        crate::project_packet_v3_with_identity(
+                            &self.public_operation,
+                            caller_id,
+                            &req,
+                            &binding.packet,
+                            &reserved,
+                            &mut *measure,
+                        )?
+                    };
+                    baseline_product = Some((binding.packet.clone(), projected));
+                }
+                let (base_packet, base_product) = baseline_product.as_ref().unwrap();
+                if base_packet.packet_id != binding.packet.packet_id
+                    || base_packet.support != binding.packet.support
+                    || base_packet.disposition != binding.packet.disposition
+                {
+                    return Err(ApiError::internal(
+                        "Same-request baseline changed during joint selection.",
+                    ));
+                }
+                if !crate::evidence_projection_v3::packet_projection_preserves_baseline_v3(
+                    &base_product.projection,
+                    &product.projection,
+                    &binding.resolved_gap_witnesses,
+                    &binding.added_source_units,
+                ) {
+                    return Ok(None);
+                }
+            }
             let complete_bytes = if matches!(
                 &product.projection,
                 codestory_contracts::packet_projection_v3::PacketProjectionV3Dto::Complete { .. }
@@ -219,8 +366,11 @@ impl ReadOnlyBrowserService {
             Ok(complete_bytes)
         };
         let packet = match self.public_operation.with_active_packet_owner(&req, || {
-            self.controller
-                .agent_packet_for_representation(req.clone(), &mut measure_packet)
+            self.controller.agent_packet_for_representation(
+                req.clone(),
+                caller_id,
+                &mut measure_packet,
+            )
         }) {
             Some(result) => result?,
             None => {
@@ -229,9 +379,12 @@ impl ReadOnlyBrowserService {
                 ));
             }
         };
-        let product = accepted_product
+        let mut product = accepted_product
             .or(full_product)
             .ok_or_else(|| ApiError::internal("No validated packet proposal was projected."))?;
+        if let Some(Some(record)) = issued_record {
+            product.protected_source_witnesses = record.witnesses;
+        }
         Ok(crate::RepresentedPacketProductV3 { packet, product })
     }
 
@@ -321,10 +474,7 @@ impl ReadOnlyBrowserService {
         target: TargetSelection,
         file_filter: Option<&str>,
     ) -> Result<TargetResolution, ApiError> {
-        let operation = match &target {
-            TargetSelection::Id(_) => "graph",
-            TargetSelection::Query { .. } => "resolution",
-        };
+        let operation = "source_snippet";
         self.run_public(operation, || {
             self.controller
                 .resolve_source_target(target.clone(), file_filter)
@@ -406,49 +556,75 @@ impl ReadOnlyBrowserService {
         max_total_bytes: usize,
     ) -> Result<codestory_contracts::api::SourceRangesDto, ApiError> {
         self.run_public("files", || {
-            if requests.is_empty() || requests.len() > SOURCE_RANGES_MAX_ENTRIES {
-                return Err(ApiError::invalid_argument("Expected 1..=12 source ranges"));
+            self.build_source_ranges(requests, max_total_bytes)?
+                .render_default()
+        })
+    }
+
+    /// Retain one validated source read for revision-specific delivery sizing.
+    /// Rendering never reads the workspace again or changes readiness.
+    pub fn prepare_source_ranges(
+        &self,
+        requests: &[SourceRangeRequest],
+        max_total_bytes: usize,
+    ) -> Result<PreparedSourceRanges, ApiError> {
+        self.run_public("files", || {
+            self.build_source_ranges(requests, max_total_bytes)
+        })
+    }
+
+    fn build_source_ranges(
+        &self,
+        requests: &[SourceRangeRequest],
+        max_total_bytes: usize,
+    ) -> Result<PreparedSourceRanges, ApiError> {
+        if requests.is_empty() || requests.len() > SOURCE_RANGES_MAX_ENTRIES {
+            return Err(ApiError::invalid_argument("Expected 1..=12 source ranges"));
+        }
+        let source_budget = max_total_bytes.min(crate::DIRECT_SNIPPET_MAX_BYTES);
+        let mut grouped = std::collections::BTreeMap::new();
+        for (index, request) in requests.iter().enumerate() {
+            if request.start_line == 0
+                || request.end_line < request.start_line
+                || request.end_line > SOURCE_RANGES_MAX_LINE
+            {
+                return Err(ApiError::invalid_argument(
+                    "Source range must satisfy 1 <= start <= end <= 1000000",
+                ));
             }
-            let source_budget = max_total_bytes.min(crate::DIRECT_SNIPPET_MAX_BYTES);
-            let mut grouped = std::collections::BTreeMap::new();
-            for (index, request) in requests.iter().enumerate() {
-                if request.start_line == 0 || request.end_line < request.start_line
-                    || request.end_line > SOURCE_RANGES_MAX_LINE {
-                    return Err(ApiError::invalid_argument("Source range must satisfy 1 <= start <= end <= 1000000"));
-                }
-                let path = self.controller.resolve_project_file_path(&request.path, false)?;
-                grouped.entry(path).or_insert_with(Vec::new).push(index);
+            let path = self
+                .controller
+                .resolve_project_file_path(&request.path, false)?;
+            grouped.entry(path).or_insert_with(Vec::new).push(index);
+        }
+        let mut prepared = (0..requests.len()).map(|_| None).collect::<Vec<_>>();
+        for (path, indices) in grouped {
+            let ranges = indices
+                .iter()
+                .map(|index| (requests[*index].start_line, requests[*index].end_line))
+                .collect::<Vec<_>>();
+            let path = path
+                .to_str()
+                .ok_or_else(|| ApiError::invalid_argument("Source path is not UTF-8"))?;
+            let (relative, windows) =
+                self.controller
+                    .path_source_windows(path, &ranges, source_budget)?;
+            for (index, window) in indices.into_iter().zip(windows) {
+                prepared[index] = Some((relative.clone(), window));
             }
-            let mut prepared = (0..requests.len()).map(|_| None).collect::<Vec<_>>();
-            for (path, indices) in grouped {
-                let ranges = indices.iter().map(|index| {
-                    (requests[*index].start_line, requests[*index].end_line)
-                }).collect::<Vec<_>>();
-                let path = path.to_str().ok_or_else(|| ApiError::invalid_argument("Source path is not UTF-8"))?;
-                let (relative, windows) = self.controller.path_source_windows(path, &ranges, source_budget)?;
-                for (index, window) in indices.into_iter().zip(windows) {
-                    prepared[index] = Some((relative.clone(), window));
-                }
-            }
-            let windows = requests.iter().zip(prepared).map(|(request, prepared)| {
-                let (path, window) = prepared.ok_or_else(|| ApiError::internal("Missing source window"))?;
+        }
+        let windows = requests
+            .iter()
+            .zip(prepared)
+            .map(|(request, prepared)| {
+                let (path, window) =
+                    prepared.ok_or_else(|| ApiError::internal("Missing source window"))?;
                 Ok((path, request.start_line, request.end_line, window))
-            }).collect::<Result<Vec<_>, ApiError>>()?;
-            let ranges = crate::snippets::render_path_source_windows(windows, source_budget);
-            let result = codestory_contracts::api::SourceRangesDto {
-                requested_count: requests.len() as u32,
-                omitted_count: ranges.iter().filter(|range| !range.complete).count() as u32,
-                complete: ranges.iter().all(|range| range.complete),
-                ranges, max_total_bytes: source_budget as u32,
-                max_response_bytes: SOURCE_RANGES_MAX_RESPONSE_BYTES as u32,
-            };
-            let encoded = serde_json::to_vec(&result)
-                .map_err(|error| ApiError::internal(error.to_string()))?;
-            if encoded.len() > SOURCE_RANGES_MAX_RESPONSE_BYTES {
-                return Err(ApiError::new("source_response_too_large",
-                    "Range metadata and escaped source exceed the response bound; narrow the request"));
-            }
-            Ok(result)
+            })
+            .collect::<Result<Vec<_>, ApiError>>()?;
+        Ok(PreparedSourceRanges {
+            windows,
+            source_budget,
         })
     }
 
@@ -503,6 +679,16 @@ impl ReadOnlyBrowserService {
         req: ListRootSymbolsRequest,
     ) -> Result<Vec<SymbolSummaryDto>, ApiError> {
         self.run_public("graph", || self.controller.list_root_symbols(req.clone()))
+    }
+
+    pub fn list_root_symbols_page(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<SymbolSummaryDto>, usize, String), ApiError> {
+        self.run_public("graph", || {
+            self.controller.list_root_symbols_page(offset, limit)
+        })
     }
 
     pub fn list_children_symbols(
@@ -648,5 +834,222 @@ impl ReadOnlyBrowserService {
                 "No symbol matched query `{query}`. Run `codestory-cli search --query \"{query}\" --limit 10` to inspect candidates."
             ))
         })
+    }
+}
+
+#[cfg(test)]
+mod source_response_budget_tests {
+    use super::*;
+    fn prepared(source: &str, count: usize) -> PreparedSourceRanges {
+        let windows = crate::snippets::read_path_source_windows(
+            std::io::Cursor::new(source.as_bytes()),
+            &vec![(1, 100); count],
+            65536,
+        )
+        .unwrap();
+        PreparedSourceRanges {
+            windows: windows
+                .into_iter()
+                .map(|w| ("source.rs".into(), 1, 100, w))
+                .collect(),
+            source_budget: 65536,
+        }
+    }
+    #[test]
+    fn source_response_budget_reads_the_documented_batch_allowance() {
+        use sha2::Digest;
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let source = (1..=160)
+            .map(|line| format!("entry {line}: {}\r\n", "é🦀 \\\"".repeat(12)))
+            .collect::<String>();
+        assert!(source.len() > 8192); // Exceeds the observed old halving cut.
+        std::fs::write(root.path().join("source.txt"), &source).unwrap();
+        std::fs::write(root.path().join("second.txt"), "last\n").unwrap();
+        let controller = AppController::new_with_owned_cache_root(cache.path());
+        controller.state.lock().project_root = Some(root.path().to_path_buf());
+        let operation = PublicOperationService::new(controller.clone());
+        let browser = ReadOnlyBrowserService::new(controller, operation);
+        let requests = [
+            SourceRangeRequest {
+                path: "source.txt".into(),
+                start_line: 1,
+                end_line: 160,
+            },
+            SourceRangeRequest {
+                path: "second.txt".into(),
+                start_line: 1,
+                end_line: 1,
+            },
+        ];
+        let page = browser.build_source_ranges(&requests, usize::MAX).unwrap();
+        assert_eq!(page.source_budget, crate::DIRECT_SNIPPET_MAX_BYTES);
+        let complete = page.render_default().unwrap();
+        assert!(complete.complete);
+        assert_eq!(complete.ranges.len(), 2);
+        assert_eq!(complete.ranges[0].delivered_end_line, Some(160));
+        assert_eq!(
+            complete.ranges[0].source_range_sha256,
+            Some(format!("{:x}", sha2::Sha256::digest(source.as_bytes())))
+        );
+        assert_eq!(complete.ranges[1].delivered_end_line, Some(1));
+        // The smaller explicit source allowance still cuts whole physical lines.
+        let small = browser
+            .build_source_ranges(&requests, 4096)
+            .unwrap()
+            .render_default()
+            .unwrap();
+        assert!(!small.complete);
+        assert!(small.ranges.iter().map(|r| r.snippet.len()).sum::<usize>() <= 4096);
+        assert!(small.ranges[0].next_start_line.is_some());
+        // Sizing a prepared page never reopens changed workspace files.
+        std::fs::write(root.path().join("source.txt"), "replacement\n").unwrap();
+        let mirrored_size = |dto: &codestory_contracts::api::SourceRangesDto| {
+            serde_json::to_vec(&serde_json::json!({
+                "content": [{"type": "text", "text": serde_json::to_string(dto).unwrap()}],
+                "structuredContent": dto,
+            }))
+            .map(|bytes| bytes.len())
+            .map_err(|e| ApiError::internal(e.to_string()))
+        };
+        let allowance = mirrored_size(&complete).unwrap();
+        let delivered = page
+            .render_for_representation(allowance, mirrored_size)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(delivered).unwrap(),
+            serde_json::to_value(complete).unwrap()
+        );
+    }
+
+    #[test]
+    fn source_response_budget_retains_a_fitting_page_between_halving_steps() {
+        let source = (1..=700)
+            .map(|line| format!("entry {line}: {}\n", "é🦀 \\\"".repeat(4)))
+            .collect::<String>();
+        let windows = crate::snippets::read_path_source_windows(
+            std::io::Cursor::new(source.as_bytes()),
+            &[(1, 700); 2],
+            crate::DIRECT_SNIPPET_MAX_BYTES,
+        )
+        .unwrap();
+        let page = PreparedSourceRanges {
+            windows: windows
+                .into_iter()
+                .map(|window| ("source.txt".into(), 1, 700, window))
+                .collect(),
+            source_budget: crate::DIRECT_SNIPPET_MAX_BYTES,
+        };
+        let measure = |dto: &codestory_contracts::api::SourceRangesDto| {
+            serde_json::to_vec(&serde_json::json!({
+                "content": [{"type": "text", "text": serde_json::to_string(dto).unwrap()}],
+                "structuredContent": dto,
+            }))
+            .map(|bytes| bytes.len())
+            .map_err(|e| ApiError::internal(e.to_string()))
+        };
+        let known_fitting = page.render(24_000);
+        let allowance = measure(&known_fitting).unwrap();
+        assert!(measure(&page.render(32_768)).unwrap() > allowance);
+        let expected_source = known_fitting
+            .ranges
+            .iter()
+            .map(|r| r.snippet.len())
+            .sum::<usize>();
+        let mut calls = 0;
+        let fitted = page
+            .render_for_representation(allowance, |dto| {
+                calls += 1;
+                measure(dto)
+            })
+            .unwrap();
+        assert!(calls <= 18, "bounded source-budget search: {calls}");
+        assert!(measure(&fitted).unwrap() <= allowance);
+        assert!(
+            PreparedSourceRanges::structured_size(&fitted).unwrap()
+                <= SOURCE_RANGES_MAX_RESPONSE_BYTES
+        );
+        assert!(fitted.ranges.iter().map(|r| r.snippet.len()).sum::<usize>() >= expected_source);
+        assert_eq!(fitted.ranges.len(), 2);
+        assert!(
+            fitted
+                .ranges
+                .iter()
+                .all(|r| r.snippet.is_empty() || r.snippet.ends_with("```"))
+        );
+        for range in fitted.ranges.iter().filter(|r| !r.complete) {
+            assert_eq!(
+                range.next_start_line,
+                Some(range.delivered_end_line.unwrap_or(0) + 1)
+            );
+        }
+    }
+
+    #[test]
+    fn source_response_budget_propagates_measurement_failure() {
+        let page = prepared("line\n", 1);
+        let error = page
+            .render_for_representation(4096, |_| {
+                Err(ApiError::new(
+                    "measurement_failed",
+                    "cannot measure caller result",
+                ))
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "measurement_failed");
+    }
+
+    #[test]
+    fn source_response_budget_defaults_exact_tiny_and_receipts() {
+        let source = "alpha\r\nβ🦀 \\\"\nlast";
+        let page = prepared(source, 2);
+        let original = page.render_default().unwrap();
+        let measure = |dto: &codestory_contracts::api::SourceRangesDto| {
+            PreparedSourceRanges::structured_size(dto)
+        };
+        let exact = measure(&original).unwrap();
+        let full = page.render_for_representation(exact, measure).unwrap();
+        assert_eq!(
+            serde_json::to_value(full).unwrap(),
+            serde_json::to_value(original).unwrap()
+        );
+        let cut = page.render_for_representation(exact - 1, measure).unwrap();
+        assert!(measure(&cut).unwrap() <= exact - 1);
+        assert_eq!(cut.ranges.len(), 2);
+        // A smaller max_total_bytes numeral can save bytes without dropping
+        // source. Exact-minus-one need not imply an incomplete source window.
+        let partial_limit = measure(&page.render(0)).unwrap() + 1;
+        let partial = page
+            .render_for_representation(partial_limit, measure)
+            .unwrap();
+        assert!(measure(&partial).unwrap() <= partial_limit);
+        assert!(!partial.complete);
+        for range in cut.ranges.iter().filter(|r| !r.complete) {
+            assert!(range.next_start_line.is_some());
+            assert!(range.snippet.is_empty() || range.snippet.ends_with("```"));
+        }
+        assert_eq!(
+            page.render_for_representation(1, measure).unwrap_err().code,
+            "source_response_budget_too_small"
+        );
+    }
+    #[test]
+    fn source_response_budget_keeps_zero_source_receipts_and_structured_escape_cap() {
+        let page = prepared(&format!("{}\n", "\0".repeat(30000)), 3);
+        assert_eq!(
+            page.render_default().unwrap_err().code,
+            "source_response_too_large"
+        );
+        let bounded = page.render_for_representation(524288, |_| Ok(1)).unwrap();
+        assert!(
+            PreparedSourceRanges::structured_size(&bounded).unwrap()
+                <= SOURCE_RANGES_MAX_RESPONSE_BYTES
+        );
+        assert_eq!(bounded.ranges.len(), 3);
+        assert!(!bounded.complete);
+        assert!(bounded.ranges.iter().all(|r| r.snippet.is_empty()
+            && r.next_start_line == Some(1)
+            && r.delivered_start_line.is_none()
+            && r.source_range_sha256.is_none()));
     }
 }

@@ -15,7 +15,7 @@ struct RrfLaneWeights {
 }
 
 const RRF_K: f32 = 20.0;
-pub const RANKING_POLICY_VERSION: &str = "weighted_rrf_v2";
+pub const RANKING_POLICY_VERSION: &str = "weighted_rrf_v3_present_lanes_scaled";
 const FUSED_RRF_WEIGHT: f32 = 0.70;
 const GRAPH_SUPPORT_WEIGHT: f32 = 0.15;
 const TEXT_QUALITY_WEIGHT: f32 = 0.05;
@@ -198,7 +198,12 @@ fn weighted_rrf(candidate: &CandidateHit, weights: RrfLaneWeights) -> f32 {
     let graph = candidate_has_typed_graph_support(candidate)
         .then_some(candidate.lane_scores.graph.as_ref())
         .flatten();
-    let weighted = [
+    // Dense anchors selectively cover the graph. Absence from that lane is
+    // unknown evidence, rather than a negative vote against lexical source.
+    // Normalize by positive-weight lanes present for this identity. This
+    // deliberately removes a cardinality bonus for cross-lane agreement;
+    // typed graph support remains an independent term in the final score.
+    let (weighted, present_weight) = [
         (candidate.lane_scores.lexical.as_ref(), weights.lexical),
         (candidate.lane_scores.semantic.as_ref(), weights.semantic),
         (graph, weights.graph),
@@ -209,14 +214,26 @@ fn weighted_rrf(candidate: &CandidateHit, weights: RrfLaneWeights) -> f32 {
             return None;
         }
         let evidence = evidence?;
-        Some(weight / (RRF_K + evidence.rank.max(1) as f32))
+        Some((weight / (RRF_K + evidence.rank.max(1) as f32), weight))
     })
-    .sum::<f32>();
-    let maximum = (weights.lexical + weights.semantic + weights.graph) / (RRF_K + 1.0);
-    if maximum <= 0.0 {
+    .fold((0.0, 0.0), |(sum, total), (score, weight)| {
+        (sum + score, total + weight)
+    });
+    let maximum = present_weight / (RRF_K + 1.0);
+    let configured_total =
+        weights.lexical.max(0.0) + weights.semantic.max(0.0) + weights.graph.max(0.0);
+    let strongest_lane = weights
+        .lexical
+        .max(weights.semantic)
+        .max(weights.graph)
+        .max(0.0);
+    if maximum <= 0.0 || configured_total <= 0.0 {
         0.0
     } else {
-        (weighted / maximum).clamp(0.0, 1.0)
+        // Keep the configured strongest-lane amplitude relative to the
+        // unchanged auxiliary features. Pure present-lane normalization
+        // otherwise amplifies adjacent sparse ranks and overwhelms overlap.
+        ((weighted / maximum) * (strongest_lane / configured_total)).clamp(0.0, 1.0)
     }
 }
 
@@ -535,6 +552,91 @@ mod tests {
     use codestory_store::FileRole;
 
     #[test]
+    fn common_calibration_preserves_strongest_lane_amplitude_across_shapes() {
+        for shape in [
+            QueryShape::NaturalLanguage,
+            QueryShape::Mixed,
+            QueryShape::PathLike,
+            QueryShape::SymbolLike,
+        ] {
+            let weights = rrf_weights_for_shape(shape);
+            let (lane, weight) = if weights.graph > weights.lexical {
+                (CandidateLane::Graph, weights.graph)
+            } else {
+                (CandidateLane::Lexical, weights.lexical)
+            };
+            let mut hit =
+                CandidateHit::with_source("src/service.rs", None, 0.8, CandidateSource::Lexical);
+            hit.lane_scores = Default::default();
+            hit.record_lane(lane, 0.8, 1, "measured");
+            if lane == CandidateLane::Graph {
+                hit.scip_hop_distance = Some(1);
+            }
+            let expected = weight / (weights.lexical + weights.semantic + weights.graph);
+            assert!((weighted_rrf(&hit, weights) - expected).abs() < f32::EPSILON * 4.0);
+        }
+    }
+
+    #[test]
+    fn sparse_membership_is_not_a_negative_vote_and_consensus_tradeoff_is_explicit() {
+        let weights = rrf_weights_for_shape(QueryShape::NaturalLanguage);
+        let mut sparse = CandidateHit::lexical_stub("src/sparse.rs", 0.8);
+        sparse.record_lane(CandidateLane::Lexical, 0.8, 1, "symbol_doc");
+        let mut consensus = CandidateHit::lexical_stub("src/consensus.rs", 0.8);
+        consensus.record_lane(CandidateLane::Lexical, 0.8, 16, "symbol_doc");
+        consensus.record_lane(CandidateLane::Semantic, 0.9, 16, "dense_anchor");
+        assert!(weighted_rrf(&sparse, weights) > weighted_rrf(&consensus, weights));
+        consensus.lane_scores.lexical.as_mut().unwrap().rank = 1;
+        consensus.lane_scores.semantic.as_mut().unwrap().rank = 1;
+        assert_eq!(
+            weighted_rrf(&sparse, weights),
+            weighted_rrf(&consensus, weights),
+            "present-lane mean intentionally has no lane-cardinality bonus"
+        );
+        let mut weak_singleton =
+            CandidateHit::with_source("src/weak.rs", None, 0.02, CandidateSource::Semantic);
+        weak_singleton.record_lane(CandidateLane::Semantic, 0.02, 1, "dense_anchor");
+        assert_eq!(
+            weighted_rrf(&weak_singleton, weights),
+            weighted_rrf(&consensus, weights),
+            "rank normalization cannot infer absolute reliability of a singleton lane"
+        );
+    }
+
+    #[test]
+    fn normalization_ignores_disabled_untyped_and_empty_lanes() {
+        let mut hit =
+            CandidateHit::with_source("src/service.rs", None, 0.9, CandidateSource::Semantic);
+        hit.record_lane(CandidateLane::Semantic, 0.9, 1, "dense_anchor");
+        assert_eq!(
+            weighted_rrf(&hit, rrf_weights_for_shape(QueryShape::PathLike)),
+            0.0
+        );
+        hit.record_lane(CandidateLane::Graph, 0.9, 1, "same_file_name_affinity");
+        assert_eq!(
+            weighted_rrf(&hit, rrf_weights_for_shape(QueryShape::PathLike)),
+            0.0
+        );
+        assert_eq!(
+            weighted_rrf(
+                &hit,
+                RrfLaneWeights {
+                    lexical: 0.0,
+                    semantic: 0.0,
+                    graph: 0.0
+                }
+            ),
+            0.0
+        );
+        let mut empty = CandidateHit::lexical_stub("src/empty.rs", 0.0);
+        empty.lane_scores = Default::default();
+        assert_eq!(
+            weighted_rrf(&empty, rrf_weights_for_shape(QueryShape::NaturalLanguage)),
+            0.0
+        );
+    }
+
+    #[test]
     fn ranker_prefers_higher_lexical_for_path_query() {
         let features = classify_query("src/lib.rs");
         let candidates = vec![
@@ -773,6 +875,41 @@ mod tests {
                 .iter()
                 .all(|hit| hit.file_role != Some(FileRole::Test))
         );
+    }
+
+    #[test]
+    fn ranker_go_test_suffix_fallback_respects_requested_role() {
+        for (query, include_test) in [
+            ("explain event processor output", false),
+            ("event processor tests output", true),
+        ] {
+            let features = classify_query(query);
+            let test = CandidateHit::with_source(
+                "pkg/event_processor_test.go",
+                Some("event processor output".into()),
+                0.99,
+                CandidateSource::Semantic,
+            );
+            assert_eq!(test.file_role, None);
+            let production = CandidateHit::with_source(
+                "pkg/event_processor.go",
+                Some("event processor output".into()),
+                0.72,
+                CandidateSource::Lexical,
+            );
+            let ranked = rank_candidates(&features, vec![test, production]);
+            assert!(ranked.iter().any(|hit| {
+                hit.file_path == "pkg/event_processor.go" && hit.file_role == Some(FileRole::Source)
+            }));
+            assert_eq!(
+                ranked.iter().any(|hit| {
+                    hit.file_path == "pkg/event_processor_test.go"
+                        && hit.file_role == Some(FileRole::Test)
+                }),
+                include_test,
+                "{query}"
+            );
+        }
     }
 
     #[test]
@@ -1133,7 +1270,9 @@ mod tests {
         let ranked = rank_candidates(&features, vec![candidate]);
         let candidate = &ranked[0];
         let rank_features = candidate.rank_features.as_ref().expect("rank features");
-        let expected = 0.70
+        // All three rank-one lanes share a present-lane mean of one.
+        // NaturalLanguage's strongest configured lane contributes 1/2.75.
+        let expected = 0.70 * (1.0 / 2.75)
             + 0.15 * rank_features.scip_distance
             + 0.05 * rank_features.text_quality
             + 0.05 * rank_features.requested_role_agreement

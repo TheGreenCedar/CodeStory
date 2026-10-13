@@ -2389,7 +2389,7 @@ mod platform {
             if !create && error.kind() == ErrorKind::NotFound {
                 return Ok(None);
             }
-            return Err(error).context("open handle-relative embedding authority");
+            return Err(authority_open_error(error));
         }
         let file = unsafe { File::from_raw_fd(fd) };
         let metadata = file.metadata()?;
@@ -2422,6 +2422,15 @@ mod platform {
         }
         ensure_runtime_directory_matches(runtime)?;
         Ok(Some(file))
+    }
+
+    fn authority_open_error(error: std::io::Error) -> anyhow::Error {
+        let context = if error.kind() == ErrorKind::PermissionDenied {
+            "embedding_runtime_authority_access_denied: OS denied open handle-relative embedding authority"
+        } else {
+            "open handle-relative embedding authority"
+        };
+        anyhow::Error::new(error).context(context)
     }
 
     fn try_lock(fd: RawFd) -> Result<bool> {
@@ -2840,6 +2849,43 @@ mod platform {
             fs::create_dir(path).expect("create private test directory");
             fs::set_permissions(path, fs::Permissions::from_mode(PRIVATE_DIR_MODE))
                 .expect("secure private test directory");
+        }
+
+        #[test]
+        fn authority_open_permission_denial_retains_os_cause() {
+            for code in [libc::EPERM, libc::EACCES] {
+                let error = authority_open_error(std::io::Error::from_raw_os_error(code));
+                assert!(
+                    error
+                        .to_string()
+                        .starts_with("embedding_runtime_authority_access_denied:")
+                );
+                assert_eq!(
+                    error
+                        .downcast_ref::<std::io::Error>()
+                        .expect("retain the original OS error")
+                        .raw_os_error(),
+                    Some(code)
+                );
+            }
+        }
+
+        #[test]
+        fn authority_open_other_failures_keep_existing_context() {
+            for code in [libc::ENOENT, libc::EIO, libc::ELOOP] {
+                let error = authority_open_error(std::io::Error::from_raw_os_error(code));
+                assert_eq!(
+                    error.to_string(),
+                    "open handle-relative embedding authority"
+                );
+                assert_eq!(
+                    error
+                        .downcast_ref::<std::io::Error>()
+                        .expect("retain the original OS error")
+                        .raw_os_error(),
+                    Some(code)
+                );
+            }
         }
 
         #[test]

@@ -648,6 +648,7 @@ struct PreparedFullRefreshSnapshots {
 
 fn prepare_full_refresh_snapshots(
     staged: &mut StagedSnapshot,
+    root: &Path,
     source_identity: &str,
     cancel_token: Option<&CancellationToken>,
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
@@ -656,6 +657,7 @@ fn prepare_full_refresh_snapshots(
     let semantic_started = Instant::now();
     let semantic_stats = finalize_staged_semantic_docs_for_runtime(
         staged.store_mut(),
+        Some(root),
         None,
         None,
         source_identity,
@@ -913,6 +915,7 @@ fn prepare_full_refresh(
     )?;
     let snapshots = prepare_full_refresh_snapshots(
         preparation.staged_mut(),
+        root,
         &live_state.dense_anchor_source_identity,
         cancel_token,
         runtime,

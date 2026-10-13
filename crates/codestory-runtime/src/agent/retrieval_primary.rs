@@ -475,8 +475,11 @@ pub(crate) fn with_pinned_retrieval_publication_value<T>(
         let value = build()?;
         return Ok((value, Some(publication)));
     }
-    if !sidecar_retrieval_primary_enabled(controller) {
-        return build().map(|value| (value, None));
+    // This helper owns Retrieval-class public admission. An unavailable
+    // generation cannot lend a pin to its response builder, even when Core is
+    // fresh. Preserve the readiness reason instead of running an unpinned body.
+    if let Some(reason) = sidecar_retrieval_unavailable_reason(controller) {
+        return Err(sidecar_retrieval_unavailable_error(controller, reason));
     }
 
     let pinned = Rc::new(PinnedRetrievalRead::begin(controller)?);
@@ -1113,10 +1116,41 @@ pub(crate) fn preadmit_packet_descriptor_queries_with_policy(
                     ))
                 })?;
         }
+        // Observe the returned eligible view order before max-score pooling.
+        // Bounded metadata only; this cannot rerank, read or admit a candidate.
+        let mut view_rows = Vec::new();
+        let mut view_eligible_counts = Vec::new();
+        for result in query_results.iter().take(4) {
+            let mut rows = Vec::new();
+            let mut eligible = 0;
+            for (rank, hit) in result.hits.iter().enumerate() {
+                if is_phantom_sidecar_hit(hit) {
+                    continue;
+                }
+                if let Some(descriptor) = hit.packet_descriptor() {
+                    eligible += 1;
+                    if rows.len() < 16 {
+                        rows.push((
+                            descriptor.stable_identity,
+                            rank,
+                            descriptor.retrieval_score.value.to_bits(),
+                        ));
+                    }
+                }
+            }
+            view_rows.push(rows);
+            view_eligible_counts.push(eligible);
+        }
+        super::packet_batch::observe_packet_raf_query_views(
+            &view_rows,
+            &view_eligible_counts,
+            query_results.len(),
+        );
         let seal_started = Instant::now();
-        admit_packet_candidate_descriptors(
+        admit_packet_candidate_descriptors_bound(
             &session,
             query_results.iter().flat_map(|result| result.hits.iter()),
+            Some(&pinned.session.publication_identity().sidecar_input_hash),
         );
         let admission_seal_wall_ms = packet_descriptor_phase_wall_ms(seal_started);
         // The repository-wide freshness and core/vector attestation checks are
@@ -1157,9 +1191,18 @@ fn packet_descriptor_phase_wall_ms(started_at: Instant) -> u64 {
     millis.saturating_add(u64::from(!elapsed.subsec_nanos().is_multiple_of(1_000_000)))
 }
 
+#[cfg(test)]
 fn admit_packet_candidate_descriptors<'a>(
     session: &crate::agent::packet_candidate::PacketProofSession,
     candidates: impl IntoIterator<Item = &'a CandidateHit>,
+) {
+    admit_packet_candidate_descriptors_bound(session, candidates, None);
+}
+
+fn admit_packet_candidate_descriptors_bound<'a>(
+    session: &crate::agent::packet_candidate::PacketProofSession,
+    candidates: impl IntoIterator<Item = &'a CandidateHit>,
+    input_hash: Option<&str>,
 ) {
     let mut descriptors = Vec::new();
     for candidate in candidates
@@ -1185,6 +1228,7 @@ fn admit_packet_candidate_descriptors<'a>(
             .total_cmp(&left.retrieval_score.value)
             .then_with(|| left.stable_identity.cmp(&right.stable_identity))
     });
+    session.retain_replay_ranked_descriptors(&descriptors);
     let mut ranked_identities = Vec::new();
     let mut ranked_seen = HashSet::new();
     for descriptor in &descriptors {
@@ -1192,22 +1236,16 @@ fn admit_packet_candidate_descriptors<'a>(
             ranked_identities.push(descriptor.stable_identity.clone());
         }
     }
-    let mut seen = HashSet::new();
-    for descriptor in descriptors {
-        if !seen.insert(descriptor.stable_identity.clone()) {
-            continue;
-        }
-        match session.admit_descriptor(&descriptor) {
-            PacketAdmissionDecision::Admitted | PacketAdmissionDecision::AlreadyAdmitted => {}
-            PacketAdmissionDecision::CountBudgetExceeded
-                if session.remaining_hydration_slots() == 0 =>
-            {
-                break;
-            }
-            PacketAdmissionDecision::CountBudgetExceeded
-            | PacketAdmissionDecision::SourceBudgetExceeded => {}
-        }
-    }
+    let descriptors = published_call_admission_order(
+        &descriptors,
+        &session
+            .receipts()
+            .into_iter()
+            .map(|r| r.stable_identity)
+            .collect(),
+        input_hash,
+    );
+    admit_published_call_descriptors(session, &descriptors);
     session.seal_retrieval_admission();
     let admitted_identities = session
         .receipts()
@@ -1218,6 +1256,96 @@ fn admit_packet_candidate_descriptors<'a>(
         &ranked_identities,
         &admitted_identities,
     );
+}
+
+/// Admission remains count/source bounded. Retaining metadata is a separate
+/// pass over the same validated pool, so a late exact owner cannot lose its
+/// navigation annotation when a new identity first exceeds the count cap.
+fn admit_published_call_descriptors(
+    session: &crate::agent::packet_candidate::PacketProofSession,
+    descriptors: &[codestory_contracts::compilation::PacketCandidateDescriptorV1],
+) {
+    for descriptor in descriptors {
+        match session.admit_descriptor(descriptor) {
+            PacketAdmissionDecision::CountBudgetExceeded
+                if session.remaining_hydration_slots() == 0 =>
+            {
+                break;
+            }
+            _ => {}
+        }
+    }
+    for descriptor in descriptors {
+        session.retain_admitted_call_annotation(descriptor);
+    }
+}
+
+/// Validate and deduplicate one published eligible pool without changing new
+/// identity retrieval rank. Optional call hints remain annotations only. This
+/// reserves no extra source, performs no read, and cannot introduce a new target.
+fn published_call_admission_order(
+    ranked: &[codestory_contracts::compilation::PacketCandidateDescriptorV1],
+    already_admitted: &HashSet<String>,
+    input_hash: Option<&str>,
+) -> Vec<codestory_contracts::compilation::PacketCandidateDescriptorV1> {
+    use codestory_contracts::compilation::*;
+    let mut unique = Vec::<PacketCandidateDescriptorV1>::new();
+    let mut indices = HashMap::<String, usize>::new();
+    let mut conflicts = HashSet::new();
+    for row in ranked {
+        let mut row = row.clone();
+        if row.published_calls_conflicted {
+            conflicts.insert(row.stable_identity.clone());
+            row.published_calls = None;
+        }
+        row.published_calls = row.published_calls.filter(|m| {
+            Some(m.sidecar_input_hash.as_str()) == input_hash
+                && input_hash.is_some()
+                && m.neighborhood.is_valid_for(&row.stable_identity)
+        });
+        if let Some(&index) = indices.get(&row.stable_identity) {
+            let previous = &mut unique[index];
+            if conflicts.contains(&row.stable_identity) {
+                previous.published_calls = None;
+                previous.published_calls_conflicted = true;
+            }
+            match (&previous.published_calls, &row.published_calls) {
+                (None, Some(_)) if !conflicts.contains(&row.stable_identity) => {
+                    previous.published_calls = row.published_calls
+                }
+                (Some(a), Some(b)) if a != b => {
+                    previous.published_calls = None;
+                    previous.published_calls_conflicted = true;
+                    conflicts.insert(row.stable_identity);
+                }
+                _ => {}
+            }
+        } else {
+            indices.insert(row.stable_identity.clone(), unique.len());
+            unique.push(row);
+        }
+    }
+    // Already-issued owners retain their existing session receipts and are
+    // annotated in the separate full-pool pass. All new identities retain the
+    // unique versioned retrieval order; optional topology cannot evict them.
+    unique.sort_by_key(|row| already_admitted.contains(&row.stable_identity));
+    unique
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn replay_published_call_admissions(
+    ranked: &[codestory_contracts::compilation::PacketCandidateDescriptorV1],
+    input_hash: &str,
+) -> (
+    Vec<codestory_contracts::compilation::PacketAdmissionReceiptV1>,
+    Vec<codestory_contracts::compilation::PacketDirectedRelationV1>,
+) {
+    let session = crate::agent::packet_candidate::PacketProofSession::new();
+    let ordered = published_call_admission_order(ranked, &HashSet::new(), Some(input_hash));
+    admit_published_call_descriptors(&session, &ordered);
+    session.seal_retrieval_admission();
+    session.reserve_source_pages(&std::collections::HashSet::new());
+    (session.receipts(), session.admitted_call_navigation())
 }
 
 pub(crate) fn run_and_resolve_sidecar_query(
@@ -3130,25 +3258,17 @@ fn resolve_sidecar_candidates_in_storage(
             false
         };
         let node_id = if let Some(descriptor) = descriptor.as_ref() {
-            descriptor
-                .stable_identity
-                .strip_prefix("node:")
-                .and_then(|raw| raw.parse::<i64>().ok())
-                .map(CoreNodeId)
-                .or_else(|| {
-                    descriptor
-                        .stable_identity
-                        .strip_prefix("path:")
-                        .and_then(|_| {
-                            resolve_candidate_node_id(
-                                storage,
-                                node_names,
-                                project_root,
-                                &rel_path,
-                                candidate,
-                            )
-                        })
-                })
+            if let Some(raw_id) = descriptor.stable_identity.strip_prefix("node:") {
+                raw_id.parse::<i64>().ok().map(CoreNodeId)
+            } else if let Some(path) = descriptor.stable_identity.strip_prefix("path:") {
+                // A sealed path admits this file, not an inferred callable or
+                // a source-root alias. Use the same exact file lookup as
+                // subsequent packet source hydration.
+                super::packet_compiler::find_admitted_file(storage, project_root, path)?
+                    .map(|file| CoreNodeId(file.id))
+            } else {
+                None
+            }
         } else {
             resolve_candidate_node_id(storage, node_names, project_root, &rel_path, candidate)
         };
@@ -3745,6 +3865,7 @@ mod tests {
             node_names: Arc::new(HashMap::new()),
         };
         let publication = codestory_retrieval::RetrievalPublicationIdentity {
+            artifact_scope: None,
             core_generation_id: cached.core_generation_id.clone(),
             core_run_id: cached.core_run_id.clone(),
             sidecar_generation: "sidecar-one".into(),
@@ -4595,6 +4716,134 @@ mod tests {
     }
 
     #[test]
+    fn sealed_path_descriptors_keep_file_identity_and_exact_path_lookup() {
+        use crate::agent::packet_candidate::{PacketProofSession, install_packet_proof_session};
+        use codestory_store::{FileInfo, FileRole};
+
+        let project = tempfile::tempdir().expect("isolated project");
+        let mut storage = Store::new_in_memory().expect("storage");
+        for (id, path) in [
+            (1, project.path().join("src/first.rs")),
+            (4, PathBuf::from("src/second.rs")),
+            (7, PathBuf::from("src/main/java/Entry.java")),
+        ] {
+            storage
+                .insert_file(&FileInfo {
+                    id,
+                    path: path.clone(),
+                    language: "rust".into(),
+                    modification_time: 1,
+                    indexed: true,
+                    complete: true,
+                    line_count: 20,
+                    file_role: FileRole::Source,
+                })
+                .unwrap();
+            storage
+                .insert_nodes_batch(&[
+                    codestory_contracts::graph::Node {
+                        id: CoreNodeId(id),
+                        kind: NodeKind::FILE,
+                        serialized_name: path.to_string_lossy().into_owned(),
+                        file_node_id: Some(CoreNodeId(id)),
+                        start_line: Some(1),
+                        ..Default::default()
+                    },
+                    codestory_contracts::graph::Node {
+                        id: CoreNodeId(id + 1),
+                        kind: NodeKind::FUNCTION,
+                        serialized_name: "first_callable".into(),
+                        file_node_id: Some(CoreNodeId(id)),
+                        start_line: Some(2),
+                        end_line: Some(3),
+                        ..Default::default()
+                    },
+                    codestory_contracts::graph::Node {
+                        id: CoreNodeId(id + 2),
+                        kind: NodeKind::FUNCTION,
+                        serialized_name: "later_callable".into(),
+                        file_node_id: Some(CoreNodeId(id)),
+                        start_line: Some(10),
+                        end_line: Some(12),
+                        ..Default::default()
+                    },
+                ])
+                .unwrap();
+        }
+        for (path, file_id) in [("./src//first.rs", 1), ("src/second.rs", 4)] {
+            for symbol in [None, Some("later_callable")] {
+                let mut file_candidate = CandidateHit::with_source(
+                    path,
+                    symbol.map(str::to_owned),
+                    1.0,
+                    CandidateSource::Lexical,
+                );
+                file_candidate.source_bytes_upper_bound = Some(64);
+                let mut canonical = CandidateHit::with_source(
+                    path,
+                    Some("later_callable".into()),
+                    0.8,
+                    CandidateSource::Lexical,
+                );
+                canonical.node_id = Some((file_id + 2).to_string());
+                canonical.source_bytes_upper_bound = Some(64);
+                let candidates = [file_candidate, canonical];
+                let session = Rc::new(PacketProofSession::new());
+                admit_packet_candidate_descriptors(&session, candidates.iter());
+                assert!(session.retrieval_admission_is_sealed());
+                let receipts = session.receipts();
+                assert_eq!(receipts.len(), 2);
+                assert_eq!(
+                    receipts[0].stable_identity,
+                    format!("path:{}", path.trim_start_matches("./").replace("//", "/"))
+                );
+                assert_eq!(receipts[1].stable_identity, format!("node:{}", file_id + 2));
+                let _guard = install_packet_proof_session(Rc::clone(&session));
+                let outcome = resolve_sidecar_candidates_in_storage(
+                    &storage,
+                    &HashMap::new(),
+                    project.path(),
+                    &candidates,
+                    2,
+                )
+                .expect("resolve sealed file and canonical node descriptors");
+                assert_eq!(outcome.resolved_hits.len(), 2);
+                assert_eq!(outcome.resolved_hits[0].node_id.0, file_id.to_string());
+                assert_eq!(outcome.resolved_hits[0].kind, ApiNodeKind::FILE);
+                assert_eq!(
+                    outcome.resolved_hits[1].node_id.0,
+                    (file_id + 2).to_string()
+                );
+                assert_eq!(outcome.resolved_hits[1].kind, ApiNodeKind::FUNCTION);
+                assert!(outcome.packet_hits[0].graph.is_none());
+                assert!(outcome.packet_hits[0].graph_provenance.is_empty());
+                assert_eq!(session.receipts(), receipts);
+            }
+        }
+        // A metadata path cannot select a similarly spelled source-root alias.
+        let mut alias =
+            CandidateHit::with_source("main/java/Entry.java", None, 1.0, CandidateSource::Lexical);
+        alias.source_bytes_upper_bound = Some(64);
+        let session = Rc::new(PacketProofSession::new());
+        admit_packet_candidate_descriptors(&session, [&alias]);
+        let _guard = install_packet_proof_session(Rc::clone(&session));
+        let outcome = resolve_sidecar_candidates_in_storage(
+            &storage,
+            &HashMap::new(),
+            project.path(),
+            &[alias],
+            1,
+        )
+        .expect("unresolved exact path remains a diagnostic");
+        assert!(outcome.resolved_hits.is_empty());
+        assert_eq!(outcome.unresolved_candidate_count, 1);
+        assert_eq!(
+            session.receipts()[0].stable_identity,
+            "path:main/java/Entry.java"
+        );
+    }
+
+    #[test]
     fn seventeenth_packet_identity_is_rejected_before_core_hydration() {
         use crate::agent::packet_candidate::{
             PacketAdmissionDecision, PacketProofSession, install_packet_proof_session,
@@ -4650,6 +4899,386 @@ mod tests {
     }
 
     #[test]
+    fn published_call_admission_skips_unaffordable_rank_without_refunds() {
+        let mut rows = (1..=24)
+            .map(|id| {
+                let mut hit = CandidateHit::lexical_stub("src/opaque", 1.0);
+                hit.node_id = Some(id.to_string());
+                hit.source_bytes_upper_bound = Some(512);
+                hit.packet_descriptor().unwrap()
+            })
+            .collect::<Vec<_>>();
+        let session = crate::agent::packet_candidate::PacketProofSession::new();
+        let initial = session.remaining_source_bytes();
+        rows[0].source_bytes_upper_bound = Some((initial + 1) as u32);
+        let ordered = published_call_admission_order(&rows, &HashSet::new(), Some("h"));
+        admit_published_call_descriptors(&session, &ordered);
+        assert_eq!(
+            session
+                .receipts()
+                .iter()
+                .map(|r| r.stable_identity.clone())
+                .collect::<Vec<_>>(),
+            (2..=17).map(|id| format!("node:{id}")).collect::<Vec<_>>()
+        );
+        assert_eq!(session.remaining_source_bytes(), initial - 16 * 512);
+        assert_eq!(session.remaining_hydration_slots(), 0);
+        assert!(session.gaps().iter().any(|g| g.kind
+            == codestory_contracts::compilation::PacketAdmissionGapKindV1::SourceBudgetExceeded));
+    }
+
+    #[test]
+    fn published_call_hints_cannot_evict_feasible_retrieval_prefix() {
+        use codestory_contracts::compilation::*;
+        let mut rows = (1..=24)
+            .map(|id| {
+                let mut hit = CandidateHit::lexical_stub("src/opaque", 1.0);
+                hit.node_id = Some(id.to_string());
+                hit.source_bytes_upper_bound = Some(512);
+                hit.packet_descriptor().unwrap()
+            })
+            .collect::<Vec<_>>();
+        for (seed, target) in [(0, 20), (1, 23), (2, 24)] {
+            rows[seed].published_calls = Some(PacketPublishedCallsV1 {
+                sidecar_input_hash: "sealed".into(),
+                neighborhood: PacketCallNeighborhoodV1 {
+                    schema_version: 1,
+                    source_identity: rows[seed].stable_identity.clone(),
+                    truncated: true,
+                    targets: vec![PacketCallTargetV1 {
+                        stable_identity: format!("node:{target}"),
+                        representative_edge_id: target.to_string(),
+                        callsite_count: 32,
+                        certainty: PacketRelationCertaintyV1::Uncertain,
+                        minimum_confidence: Some(0.2),
+                    }],
+                },
+            });
+        }
+        let session = crate::agent::packet_candidate::PacketProofSession::new();
+        let ordered = published_call_admission_order(&rows, &HashSet::new(), Some("sealed"));
+        admit_published_call_descriptors(&session, &ordered);
+        assert_eq!(
+            session
+                .receipts()
+                .iter()
+                .map(|r| r.stable_identity.clone())
+                .collect::<Vec<_>>(),
+            (1..=16).map(|id| format!("node:{id}")).collect::<Vec<_>>()
+        );
+        assert!(
+            ordered[0]
+                .published_calls
+                .as_ref()
+                .unwrap()
+                .neighborhood
+                .truncated
+        );
+    }
+
+    #[test]
+    fn published_call_partial_positive_hints_and_zero_gain_rank_fallback() {
+        use codestory_contracts::compilation::*;
+        let make = |id: u32| {
+            let mut h = CandidateHit::lexical_stub("src/opaque", 1.0);
+            h.node_id = Some(id.to_string());
+            h.source_bytes_upper_bound = Some(512);
+            h.packet_descriptor().unwrap()
+        };
+        let mut rows = (1..=24).map(make).collect::<Vec<_>>();
+        let target = |id: u32| PacketCallTargetV1 {
+            stable_identity: format!("node:{id}"),
+            representative_edge_id: id.to_string(),
+            callsite_count: 1,
+            certainty: PacketRelationCertaintyV1::Uncertain,
+            minimum_confidence: Some(0.2),
+        };
+        rows[0].published_calls = Some(PacketPublishedCallsV1 {
+            sidecar_input_hash: "h".into(),
+            neighborhood: PacketCallNeighborhoodV1 {
+                schema_version: 1,
+                source_identity: "node:1".into(),
+                truncated: true,
+                targets: vec![target(20)],
+            },
+        });
+        let positive = published_call_admission_order(&rows, &HashSet::new(), Some("h"));
+        assert_eq!(positive[8].stable_identity, "node:9");
+        assert!(
+            positive[0]
+                .published_calls
+                .as_ref()
+                .unwrap()
+                .neighborhood
+                .truncated,
+            "incomplete coverage remains explicit"
+        );
+        rows[0]
+            .published_calls
+            .as_mut()
+            .unwrap()
+            .neighborhood
+            .targets = vec![target(2), target(20)];
+        // Lexicographic target identities, including a prefix-contained target.
+        assert_eq!(
+            published_call_admission_order(&rows, &HashSet::new(), Some("h"))[8].stable_identity,
+            "node:9",
+            "already covered seed cannot displace higher-ranked nonneighbors"
+        );
+        rows[0]
+            .published_calls
+            .as_mut()
+            .unwrap()
+            .neighborhood
+            .targets
+            .clear();
+        assert_eq!(
+            published_call_admission_order(&rows, &HashSet::new(), Some("h")),
+            rows,
+            "empty partial hints preserve original rank"
+        );
+    }
+
+    #[test]
+    fn published_call_seed_coverage_resists_hubs_and_symbol_spelling() {
+        use codestory_contracts::compilation::*;
+        let make = |id: u32| {
+            let mut hit = CandidateHit::lexical_stub("src/anonymous.rs", 1.0);
+            hit.node_id = Some(id.to_string());
+            hit.source_bytes_upper_bound = Some(512);
+            hit.packet_descriptor().unwrap()
+        };
+        let mut rows = (1..=24).map(make).collect::<Vec<_>>();
+        let targets = |ids: Vec<u32>| {
+            let mut t = ids
+                .into_iter()
+                .map(|id| PacketCallTargetV1 {
+                    stable_identity: format!("node:{id}"),
+                    representative_edge_id: id.to_string(),
+                    callsite_count: 1,
+                    certainty: PacketRelationCertaintyV1::Probable,
+                    minimum_confidence: Some(0.5),
+                })
+                .collect::<Vec<_>>();
+            t.sort_by(|a, b| a.stable_identity.cmp(&b.stable_identity));
+            t
+        };
+        for (i, ids) in [(0, (9..=24).collect()), (1, vec![23]), (2, vec![24])] {
+            rows[i].published_calls = Some(PacketPublishedCallsV1 {
+                sidecar_input_hash: "sealed".into(),
+                neighborhood: PacketCallNeighborhoodV1 {
+                    schema_version: 1,
+                    source_identity: rows[i].stable_identity.clone(),
+                    truncated: false,
+                    targets: targets(ids),
+                },
+            });
+        }
+        let ordered = published_call_admission_order(&rows, &HashSet::new(), Some("sealed"));
+        assert_eq!(ordered[8].stable_identity, "node:9");
+        assert_eq!(ordered[9].stable_identity, "node:10");
+        let identities = ordered
+            .iter()
+            .map(|d| d.stable_identity.clone())
+            .collect::<Vec<_>>();
+        for row in &mut rows {
+            row.symbol = Some("unrelated opaque spelling".into());
+            row.path = "other/language/fixture.xyz".into();
+            if let Some(m) = row.published_calls.as_mut() {
+                for t in &mut m.neighborhood.targets {
+                    t.callsite_count = 32;
+                }
+            }
+        }
+        assert_eq!(
+            published_call_admission_order(&rows, &HashSet::new(), Some("sealed"))
+                .iter()
+                .map(|d| d.stable_identity.clone())
+                .collect::<Vec<_>>(),
+            identities,
+            "selection must not inspect names, paths, language, or repeated callsite counts"
+        );
+    }
+
+    #[test]
+    fn published_call_late_exact_owner_retains_annotation_after_count_break() {
+        use codestory_contracts::compilation::*;
+        let rows = (1..=24)
+            .map(|id| {
+                let mut hit = CandidateHit::lexical_stub("src/opaque", 1.0);
+                hit.node_id = Some(id.to_string());
+                hit.source_bytes_upper_bound = Some(512);
+                hit.packet_descriptor().unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut rows = rows;
+        rows[23].published_calls = Some(PacketPublishedCallsV1 {
+            sidecar_input_hash: "h".into(),
+            neighborhood: PacketCallNeighborhoodV1 {
+                schema_version: 1,
+                source_identity: "node:24".into(),
+                truncated: true,
+                targets: vec![PacketCallTargetV1 {
+                    stable_identity: "node:15".into(),
+                    representative_edge_id: "1".into(),
+                    callsite_count: 1,
+                    certainty: PacketRelationCertaintyV1::Probable,
+                    minimum_confidence: None,
+                }],
+            },
+        });
+        let session = crate::agent::packet_candidate::PacketProofSession::new();
+        assert_eq!(
+            session.admit_exact_selector("node:24", 1, 0),
+            PacketAdmissionDecision::Admitted
+        );
+        let ordered =
+            published_call_admission_order(&rows, &HashSet::from(["node:24".into()]), Some("h"));
+        let mut probe_count = 1;
+        let mut rejection = None;
+        for (i, row) in ordered.iter().enumerate() {
+            if row.stable_identity == "node:24" {
+                continue;
+            }
+            if probe_count == 16 {
+                rejection = Some(i);
+                break;
+            }
+            probe_count += 1;
+        }
+        assert!(
+            rejection.unwrap()
+                < ordered
+                    .iter()
+                    .position(|r| r.stable_identity == "node:24")
+                    .unwrap(),
+            "negative control must put exact metadata behind the first rejected new ID"
+        );
+        admit_published_call_descriptors(&session, &ordered);
+        assert_eq!(session.receipts().len(), 16);
+        assert!(
+            session
+                .receipts()
+                .iter()
+                .any(|r| r.stable_identity == "node:24"
+                    && r.origin == PacketAdmissionOriginV1::ExactTypedSelector)
+        );
+        let links = session.admitted_call_navigation();
+        assert!(links.iter().any(|l| l.from_identity == "node:24"
+            && l.to_identity == "node:15"
+            && l.certainty == PacketRelationCertaintyV1::Probable));
+    }
+
+    #[test]
+    fn published_call_admission_falls_back_and_preserves_conflicts_and_exact_slots() {
+        use codestory_contracts::compilation::*;
+        let make = |id: u32| {
+            let mut hit = CandidateHit::lexical_stub("src/worker.rs", 1.0);
+            hit.node_id = Some(id.to_string());
+            hit.source_bytes_upper_bound = Some(512);
+            hit.packet_descriptor().unwrap()
+        };
+        let mut rows = (1..=24).map(make).collect::<Vec<_>>();
+        let metadata = |target: u32| PacketPublishedCallsV1 {
+            sidecar_input_hash: "bound".into(),
+            neighborhood: PacketCallNeighborhoodV1 {
+                schema_version: PACKET_CALL_DESCRIPTOR_SCHEMA_V1,
+                source_identity: "node:1".into(),
+                truncated: false,
+                targets: vec![PacketCallTargetV1 {
+                    stable_identity: format!("node:{target}"),
+                    representative_edge_id: "1".into(),
+                    callsite_count: 1,
+                    certainty: PacketRelationCertaintyV1::Unknown,
+                    minimum_confidence: None,
+                }],
+            },
+        };
+        let none = HashSet::new();
+        assert_eq!(
+            published_call_admission_order(&rows, &none, Some("bound")),
+            rows
+        );
+        rows[0].published_calls = Some(metadata(20));
+        let ordered = published_call_admission_order(&rows, &none, Some("bound"));
+        assert_eq!(ordered[8].stable_identity, "node:9");
+        assert_eq!(
+            published_call_admission_order(&rows, &none, Some("wrong"))[8].stable_identity,
+            "node:9"
+        );
+        assert!(
+            published_call_admission_order(&rows, &none, Some("wrong"))[0]
+                .published_calls
+                .is_none()
+        );
+        for invalid in 0..2 {
+            let mut skew = rows.clone();
+            let m = skew[0].published_calls.as_mut().unwrap();
+            match invalid {
+                0 => m.neighborhood.source_identity = "node:2".into(),
+                _ => m.neighborhood.targets[0].stable_identity = "node:999".into(),
+            }
+            if invalid == 0 {
+                assert!(
+                    published_call_admission_order(&skew, &none, Some("bound"))[0]
+                        .published_calls
+                        .is_none()
+                );
+            }
+            assert_eq!(
+                published_call_admission_order(&skew, &none, Some("bound"))[8].stable_identity,
+                "node:9"
+            );
+        }
+        let mut duplicate = rows[0].clone();
+        duplicate.published_calls = Some(metadata(21));
+        let conflicted =
+            published_call_admission_order(&[rows[0].clone(), duplicate], &none, Some("bound"));
+        assert!(conflicted[0].published_calls_conflicted);
+        assert!(conflicted[0].published_calls.is_none());
+        let twice = published_call_admission_order(
+            &[conflicted[0].clone(), rows[0].clone()],
+            &none,
+            Some("bound"),
+        );
+        assert!(twice[0].published_calls_conflicted);
+        assert!(twice[0].published_calls.is_none());
+        let exact = (1..=8)
+            .map(|id| format!("node:{id}"))
+            .collect::<HashSet<_>>();
+        let after_exact = published_call_admission_order(&rows, &exact, Some("bound"));
+        assert_eq!(
+            after_exact[..4]
+                .iter()
+                .map(|d| d.stable_identity.as_str())
+                .collect::<Vec<_>>(),
+            vec!["node:9", "node:10", "node:11", "node:12"]
+        );
+        assert_eq!(after_exact[4].stable_identity, "node:13");
+        let session = crate::agent::packet_candidate::PacketProofSession::new();
+        for id in 1..=8 {
+            assert_eq!(
+                session.admit_exact_selector(&format!("node:{id}"), 1, id),
+                PacketAdmissionDecision::Admitted
+            );
+        }
+        for descriptor in after_exact {
+            if matches!(
+                session.admit_descriptor(&descriptor),
+                PacketAdmissionDecision::CountBudgetExceeded
+            ) {
+                break;
+            }
+        }
+        assert_eq!(session.receipts().len(), 16);
+        assert!(
+            session.receipts()[..8]
+                .iter()
+                .all(|r| r.origin == PacketAdmissionOriginV1::ExactTypedSelector)
+        );
+    }
+
+    #[test]
     fn packet_admission_consumes_versioned_retrieval_score_order() {
         use crate::agent::packet_candidate::{PacketProofSession, install_packet_proof_session};
 
@@ -4673,6 +5302,8 @@ mod tests {
         high.node_id = Some("2".to_string());
         high.source_bytes_upper_bound = Some(64);
 
+        let expected_score_version = high.packet_descriptor().unwrap().retrieval_score.version;
+
         let _ = resolve_sidecar_candidates_in_storage(
             &storage,
             &HashMap::new(),
@@ -4684,10 +5315,7 @@ mod tests {
 
         assert_eq!(session.receipts().len(), 1);
         assert_eq!(session.receipts()[0].stable_identity, "node:2");
-        assert_eq!(
-            session.receipts()[0].score_version,
-            codestory_contracts::compilation::PACKET_RETRIEVAL_SCORE_VERSION_V1
-        );
+        assert_eq!(session.receipts()[0].score_version, expected_score_version);
     }
 
     #[test]
@@ -6939,6 +7567,7 @@ mod tests {
         let mut storage = Store::open(&storage_path).expect("open storage");
         let mut manifest = retrieval_manifest_fixture(&project_id, hash);
         manifest.embedding_backend = Some("stale-backend".into());
+        manifest.artifact_scope = Some(codestory_store::RetrievalArtifactScope::Local);
         storage
             .upsert_retrieval_index_manifest(&manifest)
             .expect("manifest");
@@ -6964,6 +7593,7 @@ mod tests {
         let mut storage = Store::open(storage_path).expect("open storage");
         storage
             .upsert_retrieval_index_manifest(&codestory_store::RetrievalIndexManifest {
+                artifact_scope: None,
                 project_id: project_id.into(),
                 lexical_version: codestory_retrieval::LEXICAL_INDEX_VERSION.into(),
                 semantic_generation,

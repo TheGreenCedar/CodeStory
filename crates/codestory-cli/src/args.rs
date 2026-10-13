@@ -1642,6 +1642,7 @@ pub(crate) struct ServeCommand {
     #[arg(
         long,
         requires = "stdio",
+        conflicts_with = "cache_dir",
         help = "Route each stdio tool request by its required project argument instead of binding the server to one repository."
     )]
     pub(crate) multi_project: bool,
@@ -2703,6 +2704,59 @@ mod tests {
             .find_subcommand_mut(name)
             .expect("subcommand should exist");
         subcommand.render_long_help().to_string()
+    }
+
+    #[test]
+    fn serve_multi_project_rejects_exact_cache_override() {
+        let error = Cli::try_parse_from([
+            "codestory-cli",
+            "serve",
+            "--stdio",
+            "--multi-project",
+            "--cache-dir",
+            "retained-cache",
+        ])
+        .expect_err("multi-project routing cannot use one exact cache directory");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        let message = error.to_string();
+        assert!(message.contains("--multi-project"), "{message}");
+        assert!(message.contains("--cache-dir"), "{message}");
+    }
+
+    #[test]
+    fn serve_multi_project_keeps_per_request_project_routing() {
+        let parsed = Cli::try_parse_from(["codestory-cli", "serve", "--stdio", "--multi-project"])
+            .expect("ordinary multi-project stdio should parse");
+        let Command::Serve(parsed) = parsed.command else {
+            panic!("expected serve command");
+        };
+        assert!(parsed.stdio);
+        assert!(parsed.multi_project);
+        assert!(parsed.project.cache_dir.is_none());
+    }
+
+    #[test]
+    fn serve_single_project_preserves_exact_cache_override() {
+        let parsed = Cli::try_parse_from([
+            "codestory-cli",
+            "serve",
+            "--stdio",
+            "--project",
+            "selected-project",
+            "--cache-dir",
+            "retained-cache",
+        ])
+        .expect("single-project stdio should retain its exact cache directory");
+        let Command::Serve(parsed) = parsed.command else {
+            panic!("expected serve command");
+        };
+        assert!(parsed.stdio);
+        assert!(!parsed.multi_project);
+        assert_eq!(parsed.project.project, PathBuf::from("selected-project"));
+        assert_eq!(
+            parsed.project.cache_dir,
+            Some(PathBuf::from("retained-cache"))
+        );
     }
 
     /// Reclaiming cache state is opt-in. A `cache clean` invocation that

@@ -276,3 +276,18 @@ helpers, not an operator workflow.
 - a structural cache row is copied through the generic parser cache or is
   published without matching source and projection identities;
 - a partial promotion can be reported as successful.
+
+## Bounded graph navigation
+
+Trail expansion prioritizes certain edges to known effective neighbors before
+the streamed edge and BFS node caps. Explicit certainty wins over confidence;
+legacy confidence uses the shared certain threshold only when certainty is absent.
+All other edges retain deterministic edge-ID order. This ordering does not change
+edge certainty, perform resolution, or establish runtime call behavior.
+Unknown or speculative targets remain visible when capacity permits.
+
+When an edge cap truncates a fetch, BFS still drains its existing bounded queue
+up to the node cap. It skips further expansion once the global edge budget is
+exhausted. Truncation and omitted-edge receipts remain explicit; the result cannot
+establish graph completeness. Caller scope, utility and edge filters still run
+before accepted edges consume the fetch budget.

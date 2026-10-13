@@ -284,6 +284,8 @@ pub struct InfrastructureHealth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_execution_node_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_completed_operator_counts: Option<std::collections::BTreeMap<String, u64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_resident_accelerator_tensor_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_resident_accelerator_tensor_bytes: Option<u64>,
@@ -417,6 +419,9 @@ pub fn probe_infrastructure_health(runtime: &SidecarRuntimeConfig) -> Infrastruc
             .as_ref()
             .map(|identity| identity.execution_observation_source.to_string()),
         embedding_encode_count: identity.as_ref().map(|identity| identity.encode_count),
+        embedding_completed_operator_counts: identity
+            .as_ref()
+            .map(|identity| identity.completed_operator_counts.clone()),
         embedding_execution_node_count: identity
             .as_ref()
             .map(|identity| identity.execution_node_count),
@@ -894,6 +899,7 @@ mod tests {
     fn status_reports_unavailable_for_legacy_manifest_without_generation_contract() {
         let layout = SidecarLayout::from_env();
         let manifest = codestory_store::RetrievalIndexManifest {
+            artifact_scope: None,
             project_id: "testproject".into(),
             lexical_version: crate::lexical_index::LEXICAL_INDEX_VERSION.into(),
             semantic_generation: "codestory_testproject".into(),
@@ -1110,6 +1116,7 @@ mod tests {
     #[test]
     fn manifest_contract_reports_core_fields_and_lane_provenance() {
         let manifest = codestory_store::RetrievalIndexManifest {
+            artifact_scope: None,
             project_id: "testproject".into(),
             lexical_version: crate::lexical_index::LEXICAL_INDEX_VERSION.into(),
             semantic_generation: "codestory_testproject_hash".into(),

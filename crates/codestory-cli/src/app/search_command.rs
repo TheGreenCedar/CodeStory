@@ -58,7 +58,11 @@ fn render_search_projection_markdown(
     if !search.gaps.as_slice().is_empty() {
         let _ = writeln!(markdown, "\n## Gaps");
         for gap in search.gaps.as_slice() {
-            let _ = writeln!(markdown, "- {:?}", gap.kind);
+            if let Some(message) = &gap.message {
+                let _ = writeln!(markdown, "- {:?}: {}", gap.kind, message.as_str());
+            } else {
+                let _ = writeln!(markdown, "- {:?}", gap.kind);
+            }
         }
     }
     markdown
@@ -72,5 +76,56 @@ fn search_request_from_command(cmd: &SearchCommand) -> SearchRequest {
         expand_search_plan: false,
         hybrid_weights: None,
         hybrid_limits: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_search_projection_markdown;
+    use codestory_contracts::packet_projection_v3::SearchProjectionV3Dto;
+    use serde_json::json;
+
+    fn projection_with_gap_message(message: Option<&str>) -> SearchProjectionV3Dto {
+        serde_json::from_value(json!({
+            "kind": "complete",
+            "schema_version": 3,
+            "identity": {
+                "packet_id": "search-projection-test",
+                "request_id": "search-request-test",
+                "question_sha256": "0".repeat(64)
+            },
+            "publication": {
+                "core": {"project_id": "project-test", "generation_id": "core-test", "run_id": "run-test"},
+                "retrieval": null
+            },
+            "status": "no_useful_evidence",
+            "evidence": [],
+            "gaps": [{
+                "identity": {"gap_id": "scope-test"},
+                "kind": "evidence_missing",
+                "message": message
+            }],
+            "continuation": null,
+            "retrieval": {"state": "symbolic", "generation_id": null},
+            "diagnostics": {"availability": "unavailable"}
+        }))
+        .expect("bounded public search projection")
+    }
+
+    #[test]
+    fn search_markdown_preserves_gap_messages_and_kind_only_rows() {
+        let message = "Semantic and repository-text retrieval were not requested.";
+        let with_message = projection_with_gap_message(Some(message));
+        let rendered = render_search_projection_markdown(&with_message);
+        assert_eq!(
+            rendered.lines().last(),
+            Some("- EvidenceMissing: Semantic and repository-text retrieval were not requested.")
+        );
+        assert!(rendered.contains("status: `NoUsefulEvidence`"));
+        assert!(rendered.contains("packet_id: `search-projection-test`"));
+
+        let without_message = projection_with_gap_message(None);
+        let rendered = render_search_projection_markdown(&without_message);
+        assert_eq!(rendered.lines().last(), Some("- EvidenceMissing"));
     }
 }

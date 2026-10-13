@@ -2483,6 +2483,7 @@ mod tests {
             .expect("legacy artifact");
         storage
             .upsert_retrieval_index_manifest(&codestory_store::RetrievalIndexManifest {
+                artifact_scope: None,
                 project_id: codestory_retrieval::project_id_for_root(project),
                 lexical_version: codestory_retrieval::LEXICAL_INDEX_VERSION.into(),
                 semantic_generation: "codestory_old".into(),

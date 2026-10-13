@@ -17,6 +17,66 @@ const GENERIC_RETRIEVAL_PURPOSE: &str =
     "unchanged question for generic lexical and semantic retrieval";
 const TYPED_FREE_QUERY_PURPOSE: &str = "typed free-query retrieval seed";
 
+/// Keep the unchanged query and bounded literal paragraph views. Blank lines
+/// are syntax only: no words, task classes, selectors or evidence roles are
+/// inferred. Every view receives ordinary generic retrieval authority.
+pub fn generic_retrieval_queries(question: &str) -> Vec<&str> {
+    const MAX_PARAGRAPH_QUERIES: usize = 7;
+    let whole = question.trim();
+    if whole.is_empty() {
+        return Vec::new();
+    }
+    let paragraph_count = literal_paragraphs(question).count();
+    let count = paragraph_count.min(MAX_PARAGRAPH_QUERIES);
+    let positions = (0..count)
+        .map(|position| {
+            if paragraph_count <= MAX_PARAGRAPH_QUERIES {
+                position
+            } else {
+                position * (paragraph_count - 1) / (MAX_PARAGRAPH_QUERIES - 1)
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut wanted = positions.into_iter().peekable();
+    let mut queries = vec![whole];
+    for (index, paragraph) in literal_paragraphs(question).enumerate() {
+        if wanted.peek() != Some(&index) {
+            continue;
+        }
+        wanted.next();
+        if !queries
+            .iter()
+            .any(|query| query.eq_ignore_ascii_case(paragraph))
+        {
+            queries.push(paragraph);
+        }
+        if wanted.peek().is_none() {
+            break;
+        }
+    }
+    queries
+}
+
+fn literal_paragraphs(question: &str) -> impl Iterator<Item = &str> {
+    let mut lines = question.split_inclusive('\n');
+    let mut offset = 0;
+    std::iter::from_fn(move || {
+        let mut start = None;
+        for line in lines.by_ref() {
+            let end = offset;
+            offset += line.len();
+            if line.trim().is_empty() {
+                if let Some(begin) = start.take() {
+                    return Some(question[begin..end].trim());
+                }
+            } else {
+                start.get_or_insert(end);
+            }
+        }
+        start.map(|begin| question[begin..offset].trim())
+    })
+}
+
 pub fn build_packet_plan(question: &str, budget: PacketBudgetModeDto) -> PacketPlanDto {
     build_packet_plan_with_extra(question, budget, &[])
 }
@@ -40,11 +100,9 @@ pub fn build_packet_plan_from_seed_plan(
     budget: PacketBudgetModeDto,
 ) -> PacketPlanDto {
     let mut queries = Vec::new();
-    push_packet_query(
-        &mut queries,
-        &seed_plan.generic_query,
-        GENERIC_RETRIEVAL_PURPOSE,
-    );
+    for query in generic_retrieval_queries(&seed_plan.generic_query) {
+        push_packet_query(&mut queries, query, GENERIC_RETRIEVAL_PURPOSE);
+    }
 
     for query in &seed_plan.free_queries {
         push_packet_query(&mut queries, query, TYPED_FREE_QUERY_PURPOSE);
@@ -206,6 +264,68 @@ fn push_packet_query(queries: &mut Vec<PacketPlanQueryDto>, query: &str, purpose
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generic_paragraph_views_keep_original_and_literal_unicode_text() {
+        let question = "背景 café\n\n1. 質問 alpha?\n\n2. вопрос beta?\n";
+        let queries = generic_retrieval_queries(question);
+        assert_eq!(
+            queries,
+            [
+                question.trim(),
+                "背景 café",
+                "1. 質問 alpha?",
+                "2. вопрос beta?"
+            ]
+        );
+        assert!(queries.iter().all(|query| question.contains(query)));
+        let plan = build_packet_plan(question, PacketBudgetModeDto::Standard);
+        assert_eq!(
+            plan.queries
+                .iter()
+                .map(|query| query.query.as_str())
+                .collect::<Vec<_>>(),
+            queries
+        );
+        assert!(
+            plan.queries
+                .iter()
+                .all(|query| !packet_plan_query_is_typed_free_query(query))
+        );
+        assert!(
+            build_retrieval_seed_plan(question, &[])
+                .exact_selectors
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn generic_paragraph_views_handle_crlf_blank_space_and_duplicates() {
+        assert!(generic_retrieval_queries(" \r\n\r\n").is_empty());
+        assert_eq!(
+            generic_retrieval_queries("alpha\r\nbeta\r\n"),
+            ["alpha\r\nbeta"]
+        );
+        let question = "alpha\r\n \r\nALPHA\r\n\r\nbeta";
+        assert_eq!(
+            generic_retrieval_queries(question),
+            [question, "alpha", "beta"]
+        );
+    }
+
+    #[test]
+    fn generic_paragraph_views_are_bounded_and_include_the_final_position() {
+        let question = (0..30)
+            .map(|index| format!("paragraph_{index:02}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let queries = generic_retrieval_queries(&question);
+        assert_eq!(queries.len(), 8);
+        assert_eq!(queries[0], question);
+        assert_eq!(queries[1], "paragraph_00");
+        assert_eq!(queries[7], "paragraph_29");
+        assert!(queries.iter().all(|query| question.contains(query)));
+    }
 
     #[test]
     fn planning_keeps_generic_retrieval_and_only_typed_exact_identities() {

@@ -101,6 +101,7 @@ pub fn retrieval_manifest_fixture(
     sidecar_input_hash: &str,
 ) -> RetrievalIndexManifest {
     RetrievalIndexManifest {
+        artifact_scope: None,
         project_id: project_id.into(),
         lexical_version: crate::lexical_index::LEXICAL_INDEX_VERSION.into(),
         semantic_generation: crate::generation::sidecar_vector_generation(

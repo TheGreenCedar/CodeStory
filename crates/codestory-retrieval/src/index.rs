@@ -872,7 +872,6 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
 ) -> Result<FinalizeIndexOutcome> {
     begin_finalize_phase_timings();
     ensure_retrieval_index_not_cancelled(cancelled, "preflight")?;
-    let layout = runtime.layout.clone();
     let project_identity = runtime.validated_project_identity(project_root)?;
     let project_id = project_identity.artifact_scope_id;
     let workspace_id = project_identity.workspace_id;
@@ -890,11 +889,19 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
     // serving the old coherent publication while the new components build.
     let writer_scope = format!("writer-{project_id}");
     let _writer_lock = GenerationRetentionLock::acquire_with_cancel(
-        &layout.state_file,
+        &global_gc_state_file,
         &writer_scope,
         Some(cancelled),
     )
     .context("lock sidecar generation construction")?;
+    let (producer_runtime, publication_scope) =
+        crate::publication_scope::runtime_for_publication_writer(
+            project_root,
+            storage_path,
+            runtime,
+        )?;
+    let runtime = &producer_runtime;
+    let layout = runtime.layout.clone();
     layout.ensure_data_dirs()?;
     let embedding_residency =
         crate::embeddings::acquire_product_embedding_residency_for_runtime(runtime)
@@ -1267,6 +1274,7 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
         embedding_dim,
         &sidecar_input,
     );
+    manifest.artifact_scope = Some(publication_scope);
     manifest.scip_revision = read_scip_revision(&scip_dir);
 
     let existing_status = probe_sidecar_health_for_runtime(
@@ -1428,7 +1436,9 @@ fn physical_predecessor_manifest(
 ///
 /// Production callers hold the project finalization lock. Embedded legacy storage deliberately
 /// returns false so its existing manifest-row semantics remain authoritative.
-fn external_retrieval_publication_is_physically_absent(storage_path: &Path) -> Result<bool> {
+pub(crate) fn external_retrieval_publication_is_physically_absent(
+    storage_path: &Path,
+) -> Result<bool> {
     let layout = codestory_store::CorePublicationLayout::from_storage_path(storage_path)
         .context("resolve core publication layout for retrieval finalization")?;
     if layout
@@ -2814,6 +2824,7 @@ fn retrieval_manifest_for_sidecar(
     sidecar_input: &SidecarInputFingerprint,
 ) -> RetrievalIndexManifest {
     RetrievalIndexManifest {
+        artifact_scope: None,
         project_id: project_id.to_string(),
         lexical_version: LEXICAL_INDEX_VERSION.to_string(),
         semantic_generation: collection.to_string(),
@@ -2981,6 +2992,7 @@ fn persist_finalized_manifest_with_hooks(
                 storage_path,
             )?;
             let prepared_retention = prepare_generation_retention(
+                project_root,
                 retention_context,
                 &project_id,
                 &manifest,
@@ -3478,6 +3490,7 @@ fn validate_candidate_generation(
 }
 
 fn prepare_generation_retention(
+    project_root: &Path,
     context: &GenerationRetentionContext<'_>,
     project_id: &str,
     active: &RetrievalIndexManifest,
@@ -3537,23 +3550,33 @@ fn prepare_generation_retention(
             {
                 bail!("rollback retrieval generation does not match its immutable core");
             }
+            let candidate_runtime = crate::publication_scope::resolve_publication_runtime(
+                project_root,
+                &candidate_storage,
+                &candidate,
+                context.runtime,
+            )?;
+            let _candidate_guard = crate::publication_scope::observe_publication_origin(
+                &candidate_runtime,
+                project_id,
+            )?;
             crate::embedded_vector::validate_sealed_generation_evidence_for_publication(
-                context.layout,
+                &candidate_runtime.layout,
                 &candidate_storage,
                 &core_path,
                 &candidate,
                 &publication,
-                context.runtime,
+                &candidate_runtime,
                 context.embedding_device,
                 context.embedding_residency.identity(),
             )
             .context("validate rollback vector bytes, producer evidence, and anchor coverage")?;
             let status = probe_sidecar_health_for_runtime(
-                context.layout,
+                &candidate_runtime.layout,
                 project_id,
                 Some(candidate.clone()),
                 context.embedding_device,
-                context.runtime,
+                &candidate_runtime,
             );
             // Same manifest override as the reuse branch: a rollback pointer
             // must name a generation whose artifacts are live healthy right
@@ -5376,6 +5399,7 @@ mod tests {
             execution_observation_source: "ggml_eval_callback",
             encode_count: 1,
             execution_node_count: u64::from(accelerated),
+            completed_operator_counts: std::collections::BTreeMap::from([("MUL_MAT".into(), 1)]),
             resident_accelerator_tensor_count: u64::from(accelerated),
             resident_accelerator_tensor_bytes: u64::from(accelerated),
             model_layer_count: 13,
@@ -5992,6 +6016,7 @@ mod tests {
         };
 
         let prepared = prepare_generation_retention(
+            fixture.project.path(),
             &context,
             &project_id,
             &active,
@@ -8121,6 +8146,7 @@ mod tests {
                 graph_equivalent_predecessor: None,
             };
             prepare_generation_retention(
+                project.path(),
                 &context,
                 &previous.project_id,
                 &active,
@@ -8780,6 +8806,7 @@ mod tests {
                 graph_equivalent_predecessor: None,
             };
             prepare_generation_retention(
+                fixture.project.path(),
                 &context,
                 &fixture.manifest.project_id,
                 &active,
