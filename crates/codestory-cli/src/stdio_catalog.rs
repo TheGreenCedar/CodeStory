@@ -2483,7 +2483,7 @@ static PACKET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
             "Optional tagged exact-path, symbol-id, qualified-symbol, file-symbol, free-query, or generation-bound continuation probes.",
             PACKET_PROBE_SCHEMAS,
         )
-        .with_item_bounds(1, PACKET_PROBE_MAX_COUNT as u64),
+        .with_item_bounds(0, PACKET_PROBE_MAX_COUNT as u64),
         SchemaProperty::integer(
             "latency_budget_ms",
             "Optional packet retrieval latency budget in milliseconds; defaults to 18000 when omitted.",
@@ -2493,12 +2493,13 @@ static PACKET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::string(
             "parent_packet_id",
             "Parent packet id for a generation-bound continuation; repeat the original question unchanged.",
-        ),
+        )
+        .nullable(),
         SchemaProperty::string_array(
             "option_ids",
             "Continuation option ids returned by the parent packet. Execute them once; do not invent a second search.",
         )
-        .with_item_bounds(1, 8)
+        .with_item_bounds(0, 8)
         .with_item_min_length(1),
         SchemaProperty::string(
             "core_generation_id",
@@ -2507,7 +2508,8 @@ static PACKET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::string(
             "retrieval_generation",
             "Pinned retrieval generation for a continuation.",
-        ),
+        )
+        .nullable(),
     ],
     &["question"],
 );

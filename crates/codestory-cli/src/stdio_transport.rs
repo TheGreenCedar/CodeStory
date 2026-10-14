@@ -13692,6 +13692,136 @@ version = "0.11.20"
         assert!(codestory_contracts::api::validate_packet_probe_request(&probes).is_err());
     }
 
+    fn assert_literal_packet_patch_parses(patch: serde_json::Value) {
+        let patch = serde_json::from_value::<
+            codestory_contracts::packet_projection_v3::PacketRequestPatchV3Dto,
+        >(patch)
+        .expect("public packet patch");
+        let mut request = json!({
+            "params": {"arguments": {
+                "project": "/repo",
+                "question": "Inspect received repository evidence.",
+                "budget": "standard",
+                "latency_budget_ms": 18000,
+                "probes": [{"kind": "qualified_symbol", "symbol": "old_selector"}],
+                "parent_packet_id": "old-parent",
+                "option_ids": ["bounded_source_read:src%2Fold.rs"],
+                "core_generation_id": "old-core",
+                "retrieval_generation": "old-retrieval"
+            }}
+        });
+        let original = stdio_packet_request_v3(&request).expect("original request");
+        let expected = patch.apply_to(&original).expect("typed replacement");
+        request["params"]["arguments"]
+            .as_object_mut()
+            .unwrap()
+            .extend(
+                serde_json::to_value(&patch)
+                    .unwrap()
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            );
+        assert_eq!(
+            crate::stdio_arguments::validate_tool_arguments(
+                "packet",
+                request.pointer("/params/arguments"),
+            ),
+            Ok(()),
+            "the literal public patch must pass the dispatcher without deleting clearing fields"
+        );
+        let parsed = stdio_packet_request_v3(&request).expect("literal patched request");
+        assert_eq!(
+            serde_json::to_value(parsed).unwrap(),
+            serde_json::to_value(expected).unwrap(),
+            "literal replacement must match the typed action, including unchanged question and budgets"
+        );
+    }
+
+    #[test]
+    fn literal_packet_patch_broad_continuation_clears_previous_probes() {
+        for retrieval in [json!("retrieval-new"), json!(null)] {
+            assert_literal_packet_patch_parses(json!({
+                "probes": [],
+                "parent_packet_id": "parent-new",
+                "option_ids": ["ms1:12:30:7"],
+                "core_generation_id": "core-new",
+                "retrieval_generation": retrieval
+            }));
+        }
+    }
+
+    #[test]
+    fn literal_packet_patch_exact_page_clears_previous_parent_and_options() {
+        for retrieval in [json!("retrieval-new"), json!(null)] {
+            assert_literal_packet_patch_parses(json!({
+                "probes": [{
+                    "kind": "continuation", "contract_version": 1,
+                    "project_id": "project", "core_generation_id": "core-new",
+                    "retrieval_generation": retrieval,
+                    "selector": {
+                        "stable_identity": "node:7", "symbol_id": "7",
+                        "reason": "source_budget_exceeded",
+                        "source_range": {"start_line": 12, "end_line": 30}
+                    }
+                }],
+                "parent_packet_id": null,
+                "option_ids": [],
+                "core_generation_id": "core-new",
+                "retrieval_generation": retrieval
+            }));
+        }
+    }
+
+    #[test]
+    fn literal_packet_patch_keeps_input_bounds_and_types() {
+        let ordinary = json!({"project": "/repo", "question": "Inspect repository evidence."});
+        let validate = |arguments: &serde_json::Value| {
+            crate::stdio_arguments::validate_tool_arguments("packet", Some(arguments))
+        };
+        for (field, item, maximum) in [
+            (
+                "probes",
+                json!({"kind": "symbol_id", "id": "7"}),
+                codestory_contracts::api::PACKET_PROBE_MAX_COUNT,
+            ),
+            ("option_ids", json!("ms1:12:30:7"), 8),
+        ] {
+            for count in [0, maximum] {
+                let mut arguments = ordinary.clone();
+                arguments[field] = json!(vec![item.clone(); count]);
+                assert_eq!(validate(&arguments), Ok(()), "{field}: {count}");
+            }
+            let mut arguments = ordinary.clone();
+            arguments[field] = json!(vec![item; maximum + 1]);
+            assert!(validate(&arguments).is_err(), "{field} upper bound");
+            for invalid in [json!(null), json!("not an array"), json!({})] {
+                arguments[field] = invalid;
+                assert!(validate(&arguments).is_err(), "{field} array type");
+            }
+        }
+        for field in ["parent_packet_id", "retrieval_generation"] {
+            for invalid in [json!(false), json!(7), json!([]), json!({})] {
+                let mut arguments = ordinary.clone();
+                arguments[field] = invalid;
+                assert!(validate(&arguments).is_err(), "{field} string/null type");
+            }
+        }
+        let mut empty = ordinary.clone();
+        empty["probes"] = json!([]);
+        assert_eq!(
+            serde_json::to_value(
+                stdio_packet_request_v3(&json!({"params": {"arguments": empty}})).unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(
+                stdio_packet_request_v3(&json!({"params": {"arguments": ordinary}})).unwrap()
+            )
+            .unwrap(),
+            "empty probes retain the existing ordinary request meaning"
+        );
+    }
+
     #[test]
     fn stdio_product_cache_keys_use_exact_pinned_publications() {
         let packet_first = packet_key("Explain packet caching.", 1);
@@ -15458,15 +15588,10 @@ version = "0.11.20"
         let patch = &row["packet_request_patch"];
         serde_json::from_value::<codestory_contracts::packet_projection_v3::PacketRequestPatchV3Dto>(patch.clone())
             .expect("the public action satisfies the typed contract");
-        for (field, value) in patch.as_object().unwrap() {
-            // Apply replacement semantics: explicit null/empty fields clear the
-            // previous selection rather than becoming invalid input flags.
-            if value.is_null() || value.as_array().is_some_and(Vec::is_empty) {
-                arguments.as_object_mut().unwrap().remove(field);
-            } else {
-                arguments[field] = value.clone();
-            }
-        }
+        arguments
+            .as_object_mut()
+            .unwrap()
+            .extend(patch.as_object().unwrap().clone());
         let second = dispatch(arguments, "page-next");
         let pages = second["result"]["structuredContent"]["evidence"]
             .as_array()

@@ -26,6 +26,12 @@ CLI flags. Every call requires `project` (absolute repository root).
 - When the user supplies an exact packet question, copy it verbatim into
   `question`, including its punctuation. Do not paraphrase or trim it, and use
   the same bytes for an offered continuation.
+- Apply an offered `packet_request_patch` by replacing each named field in the
+  original request, including empty arrays and null values. Those values clear
+  previous probes, options or optional generation fields; do not append them to
+  the previous selection. Keep the question, project, budget and latency budget
+  unchanged. Both the broad continuation and an evidence row's source-page
+  action use the same public `packet` operation.
 - Use the standard budget unless the task benefits from a smaller `compact`
   selection. The packet does not replace source inspection or decide when the
   investigation is complete.

@@ -10,15 +10,15 @@
     ],
     "preferredMcpProtocolVersion": "2025-11-25",
     "discoveryContracts": {
-      "2024-11-05": "1a1b0643c3ddd5804ab2da4bc0ec260952f0e6bb613762d08cd4a3a9ae6d7e23",
-      "2025-03-26": "6071bd24115e10394bc977ae011168ed40a261f0fe2f5d97c3971760746608f2",
-      "2025-06-18": "1a3fb4e97eaa6378806577a817cd68a6c1e23d243b139ad21bde7c01be74bb4c",
-      "2025-11-25": "d5ad31ed3089ddd26916a41d6b6701285cbbc6bf5f05e0453633e1b9585e5fed"
+      "2024-11-05": "f66f5345582da21a98b297b98d9f2e2dab054899746c1aa47a72c786bf1f9e69",
+      "2025-03-26": "dc0d3ed5d1ac887cb36dd65a2fbb5b4e9ae5eb32664522bed42b02830f375299",
+      "2025-06-18": "12356e0402463316db6ec3dc1b012816057f03d1744264ce9a3977a075220d76",
+      "2025-11-25": "bc3b3a3319a1a1027547a0d5d7f9a3cab1d6df237de5bba1137ac89811cd4ca7"
     }
   },
   "revisionProfiles": {
     "2024-11-05": {
-      "discoveryContractSha256": "1a1b0643c3ddd5804ab2da4bc0ec260952f0e6bb613762d08cd4a3a9ae6d7e23",
+      "discoveryContractSha256": "f66f5345582da21a98b297b98d9f2e2dab054899746c1aa47a72c786bf1f9e69",
       "tools": [
         {
           "description": "Inspect CodeStory readiness for the requested repository when diagnostics are needed. CodeStory effect: observational and does not activate managed state.",
@@ -76,12 +76,15 @@
                   "type": "string"
                 },
                 "maxItems": 8,
-                "minItems": 1,
+                "minItems": 0,
                 "type": "array"
               },
               "parent_packet_id": {
                 "description": "Parent packet id for a generation-bound continuation; repeat the original question unchanged.",
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "probes": {
                 "description": "Optional tagged exact-path, symbol-id, qualified-symbol, file-symbol, free-query, or generation-bound continuation probes.",
@@ -328,7 +331,7 @@
                   ]
                 },
                 "maxItems": 16,
-                "minItems": 1,
+                "minItems": 0,
                 "type": "array"
               },
               "project": {
@@ -352,7 +355,10 @@
               },
               "retrieval_generation": {
                 "description": "Pinned retrieval generation for a continuation.",
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               }
             },
             "required": [
@@ -1913,7 +1919,7 @@
       ]
     },
     "2025-03-26": {
-      "discoveryContractSha256": "6071bd24115e10394bc977ae011168ed40a261f0fe2f5d97c3971760746608f2",
+      "discoveryContractSha256": "dc0d3ed5d1ac887cb36dd65a2fbb5b4e9ae5eb32664522bed42b02830f375299",
       "tools": [
         {
           "annotations": {
@@ -1983,12 +1989,15 @@
                   "type": "string"
                 },
                 "maxItems": 8,
-                "minItems": 1,
+                "minItems": 0,
                 "type": "array"
               },
               "parent_packet_id": {
                 "description": "Parent packet id for a generation-bound continuation; repeat the original question unchanged.",
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "probes": {
                 "description": "Optional tagged exact-path, symbol-id, qualified-symbol, file-symbol, free-query, or generation-bound continuation probes.",
@@ -2235,7 +2244,7 @@
                   ]
                 },
                 "maxItems": 16,
-                "minItems": 1,
+                "minItems": 0,
                 "type": "array"
               },
               "project": {
@@ -2259,7 +2268,10 @@
               },
               "retrieval_generation": {
                 "description": "Pinned retrieval generation for a continuation.",
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               }
             },
             "required": [
@@ -3928,7 +3940,7 @@
       ]
     },
     "2025-06-18": {
-      "discoveryContractSha256": "1a3fb4e97eaa6378806577a817cd68a6c1e23d243b139ad21bde7c01be74bb4c",
+      "discoveryContractSha256": "12356e0402463316db6ec3dc1b012816057f03d1744264ce9a3977a075220d76",
       "tools": [
         {
           "_meta": {
@@ -4206,12 +4218,15 @@
                   "type": "string"
                 },
                 "maxItems": 8,
-                "minItems": 1,
+                "minItems": 0,
                 "type": "array"
               },
               "parent_packet_id": {
                 "description": "Parent packet id for a generation-bound continuation; repeat the original question unchanged.",
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "probes": {
                 "description": "Optional tagged exact-path, symbol-id, qualified-symbol, file-symbol, free-query, or generation-bound continuation probes.",
@@ -4458,7 +4473,7 @@
                   ]
                 },
                 "maxItems": 16,
-                "minItems": 1,
+                "minItems": 0,
                 "type": "array"
               },
               "project": {
@@ -4482,7 +4497,10 @@
               },
               "retrieval_generation": {
                 "description": "Pinned retrieval generation for a continuation.",
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               }
             },
             "required": [
@@ -14720,7 +14738,7 @@
       ]
     },
     "2025-11-25": {
-      "discoveryContractSha256": "d5ad31ed3089ddd26916a41d6b6701285cbbc6bf5f05e0453633e1b9585e5fed",
+      "discoveryContractSha256": "bc3b3a3319a1a1027547a0d5d7f9a3cab1d6df237de5bba1137ac89811cd4ca7",
       "tools": [
         {
           "_meta": {
@@ -14998,12 +15016,15 @@
                   "type": "string"
                 },
                 "maxItems": 8,
-                "minItems": 1,
+                "minItems": 0,
                 "type": "array"
               },
               "parent_packet_id": {
                 "description": "Parent packet id for a generation-bound continuation; repeat the original question unchanged.",
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "probes": {
                 "description": "Optional tagged exact-path, symbol-id, qualified-symbol, file-symbol, free-query, or generation-bound continuation probes.",
@@ -15250,7 +15271,7 @@
                   ]
                 },
                 "maxItems": 16,
-                "minItems": 1,
+                "minItems": 0,
                 "type": "array"
               },
               "project": {
@@ -15274,7 +15295,10 @@
               },
               "retrieval_generation": {
                 "description": "Pinned retrieval generation for a continuation.",
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               }
             },
             "required": [
@@ -25789,12 +25813,15 @@
               "type": "string"
             },
             "maxItems": 8,
-            "minItems": 1,
+            "minItems": 0,
             "type": "array"
           },
           "parent_packet_id": {
             "description": "Parent packet id for a generation-bound continuation; repeat the original question unchanged.",
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "probes": {
             "description": "Optional tagged exact-path, symbol-id, qualified-symbol, file-symbol, free-query, or generation-bound continuation probes.",
@@ -26041,7 +26068,7 @@
               ]
             },
             "maxItems": 16,
-            "minItems": 1,
+            "minItems": 0,
             "type": "array"
           },
           "project": {
@@ -26065,7 +26092,10 @@
           },
           "retrieval_generation": {
             "description": "Pinned retrieval generation for a continuation.",
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
