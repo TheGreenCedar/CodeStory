@@ -16,6 +16,8 @@
 
 - Packet continuations accept the returned request patch directly, including fields that clear the previous selection.
 
+- Fresh sessions retain the existing index when source symlinks have unchanged verified content, keeping continuations tied to that index.
+
 - Managed tools can refresh once after a content check catches a delayed filesystem notification, within the original call deadline. Source-backed reads still refuse stale bytes; retained graph results remain labelled historical.
 
 - Packet retrieval considers matching source when an ordinary question includes example values absent from the code. Explicit search queries retain their quoted-term requirements.
