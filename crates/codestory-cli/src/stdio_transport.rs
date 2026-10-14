@@ -16079,10 +16079,24 @@ version = "0.11.20"
             "mod exact_context_target {}\nmod context_decoy {}\n",
         )
         .expect("write context target fixture");
-        let runtime = RuntimeContext::new_inspect_only(&args::ProjectArgs {
-            project: project.path().to_path_buf(),
-            cache_dir: Some(cache.path().to_path_buf()),
-        })
+        let startup = crate::config::CliStartupConfig {
+            user_home: None,
+            allow_sensitive_project_root: false,
+            project_network_config_allowed: false,
+            stdio_cache_root: Some(cache.path().join("stdio-cache")),
+            sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
+                cache.path().join("sidecar-cache"),
+                codestory_retrieval::SidecarRuntimeDefaults::default(),
+            ),
+            source_index_policy: codestory_contracts::workspace::SourceIndexPolicy::default(),
+        };
+        let runtime = RuntimeContext::new_agent_sidecar_with_startup(
+            &args::ProjectArgs {
+                project: project.path().to_path_buf(),
+                cache_dir: Some(cache.path().to_path_buf()),
+            },
+            &startup,
+        )
         .expect("runtime context");
         runtime
             .ensure_open(args::RefreshMode::Full)
