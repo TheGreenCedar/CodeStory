@@ -1991,6 +1991,12 @@ fn handle_request(
         }));
 }
 
+type EmbeddedInputs = (
+    Vec<Vec<f32>>,
+    EmbeddingRequestTimings,
+    Vec<(usize, usize, EncodeObservation)>,
+);
+
 #[allow(clippy::too_many_arguments)]
 fn embed_inputs(
     model: &LlamaModel,
@@ -2003,14 +2009,7 @@ fn embed_inputs(
     admission: &EmbeddingAdmissionTracker,
     request_context: &EmbeddingRequestContext,
     resident_snapshot: Option<&EngineLifecycleSnapshot>,
-) -> Result<
-    (
-        Vec<Vec<f32>>,
-        EmbeddingRequestTimings,
-        Vec<(usize, usize, EncodeObservation)>,
-    ),
-    EngineError,
-> {
+) -> Result<EmbeddedInputs, EngineError> {
     if inputs.is_empty() {
         return Ok((Vec::new(), EmbeddingRequestTimings::default(), Vec::new()));
     }
