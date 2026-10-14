@@ -221,6 +221,7 @@ jobs:
           # which only exists under test-support (EV-9, #1652). Without this
           # invocation the whole module is compiled out of the PR lane.
           cargo test --locked -p codestory-retrieval --features test-support --lib rollback::
+          cargo test --locked -p codestory-retrieval --features test-support --lib publication_scope::
 
       - name: Architecture ownership contract tests
         run: cargo test --locked -p codestory-cli --test architecture_contracts

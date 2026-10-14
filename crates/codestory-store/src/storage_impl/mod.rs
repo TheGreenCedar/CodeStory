@@ -89,6 +89,9 @@ const ATTACHED_COMMENT_SCHEMA_VERSION: u32 = 35;
 const PROOF_RESOLUTION_FK_INDEX_SCHEMA_VERSION: u32 = 36;
 const FILE_EXTRACTION_IDENTITY_SCHEMA_VERSION: u32 = 37;
 const SCHEMA_VERSION: u32 = FILE_EXTRACTION_IDENTITY_SCHEMA_VERSION;
+// v37 only adds file extraction identity; retention's manifest/pointer
+// projection is unchanged. Keep this ceiling explicit across future bumps.
+const RETENTION_PUBLICATION_MAX_CORE_SCHEMA_VERSION: u32 = FILE_EXTRACTION_IDENTITY_SCHEMA_VERSION;
 // Reserved outside the sequential migration range so a future real schema version cannot
 // accidentally be treated as an interrupted run from this release.
 /// The `user_version` sentinel stamped while an incremental index run is
@@ -5228,6 +5231,20 @@ impl Storage {
         Self::open_nonmutating(path.as_ref(), NonmutatingOpenPolicy::StrictCurrentSchema)
     }
 
+    /// Observe only a complete publication identity from known historical Core schemas.
+    ///
+    /// This shares the closed retention-publication compatibility set and
+    /// nonmutating schema/row snapshot. It does not admit graph or source reads,
+    /// migrate the image, or expose a historical Store to the caller.
+    pub fn observe_complete_index_publication<P: AsRef<Path>>(
+        path: P,
+    ) -> Result<Option<IndexPublicationRecord>, StorageError> {
+        let path = path.as_ref();
+        let _exact_lease = pin_exact_core(path)?;
+        let storage = Self::open_nonmutating(path, NonmutatingOpenPolicy::RetentionPublications)?;
+        storage.get_complete_index_publication()
+    }
+
     /// Observe only retrieval protection pointers without migrating the owning Core.
     ///
     /// The enumerated legacy schemas share this projection, not the general Store
@@ -5497,9 +5514,11 @@ impl Storage {
         match policy {
             // Closed schema set: a future Core schema bump must prove this
             // projection's compatibility before it can enter a retention scan.
-            NonmutatingOpenPolicy::RetentionPublications if !matches!(version, 32..=36) => {
+            NonmutatingOpenPolicy::RetentionPublications
+                if !matches!(version, 32..=RETENTION_PUBLICATION_MAX_CORE_SCHEMA_VERSION) =>
+            {
                 return Err(StorageError::Other(format!(
-                    "Retention publication observation supports Core schemas 32–36, found {version}"
+                    "Retention publication observation supports Core schemas 32–{RETENTION_PUBLICATION_MAX_CORE_SCHEMA_VERSION}, found {version}"
                 )));
             }
             NonmutatingOpenPolicy::RetentionPointer if version != 1 => {

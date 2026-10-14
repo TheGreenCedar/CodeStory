@@ -8,7 +8,9 @@ use crate::retention::{
     global_generation_gc_state_file, read_retention_marker,
 };
 use anyhow::{Context, Result, bail};
-use codestory_store::{RetrievalArtifactScope, RetrievalIndexManifest, Store};
+use codestory_store::{
+    IndexPublicationRecord, RetrievalArtifactScope, RetrievalIndexManifest, Store,
+};
 use std::path::Path;
 
 pub(crate) fn resolve_publication_runtime(
@@ -20,12 +22,15 @@ pub(crate) fn resolve_publication_runtime(
     if let Some(scope) = manifest.artifact_scope.as_ref() {
         return consumer.with_publication_artifact_scope(scope);
     }
-    resolve_legacy_runtime(project_root, storage, manifest, consumer, false)
+    let publication = storage
+        .get_complete_index_publication()?
+        .context("publication locator requires complete Core")?;
+    resolve_legacy_runtime(project_root, &publication, manifest, consumer, false)
 }
 
 fn resolve_legacy_runtime(
     project_root: &Path,
-    storage: &Store,
+    publication: &IndexPublicationRecord,
     manifest: &RetrievalIndexManifest,
     consumer: &SidecarRuntimeConfig,
     writer: bool,
@@ -37,9 +42,9 @@ fn resolve_legacy_runtime(
     let mut errors = Vec::new();
     let selected = if writer {
         authenticate_registered_owner(project_root, manifest, consumer)
-            .or_else(|_| authenticate_locator(storage, manifest, consumer))
+            .or_else(|_| authenticate_locator(publication, manifest, consumer))
     } else {
-        authenticate_locator(storage, manifest, consumer)
+        authenticate_locator(publication, manifest, consumer)
     };
     match selected {
         Ok(()) => candidates.push(consumer.clone()),
@@ -52,7 +57,7 @@ fn resolve_legacy_runtime(
                 if writer {
                     Ok(())
                 } else {
-                    authenticate_locator(storage, manifest, &local)
+                    authenticate_locator(publication, manifest, &local)
                 }
             });
         match validation {
@@ -108,7 +113,7 @@ fn authenticate_registered_owner(
 }
 
 fn authenticate_locator(
-    storage: &Store,
+    publication: &IndexPublicationRecord,
     manifest: &RetrievalIndexManifest,
     runtime: &SidecarRuntimeConfig,
 ) -> Result<()> {
@@ -158,17 +163,14 @@ fn authenticate_locator(
         &runtime.layout,
         &manifest.semantic_generation,
     )?;
-    let core = storage
-        .get_complete_index_publication()?
-        .context("publication locator requires complete Core")?;
     let evidence = &vector.evidence.publication;
     let count = manifest
         .dense_projection_count
         .or(manifest.projection_count)
         .and_then(|n| u64::try_from(n).ok())
         .context("publication dense count is invalid")?;
-    if evidence.core_generation_id != core.generation_id
-        || evidence.core_run_id != core.run_id
+    if evidence.core_generation_id != publication.generation_id
+        || evidence.core_run_id != publication.run_id
         || evidence.retrieval_generation != generation
         || evidence.retrieval_input_hash != input
         || evidence.semantic_generation != manifest.semantic_generation
@@ -250,16 +252,14 @@ pub(crate) fn runtime_for_publication_writer(
         storage_path,
         &bound.core.generation_id,
     )?;
-    let core = Store::open_read_only(&core_path)?;
-    let complete = core
-        .get_complete_index_publication()?
+    let complete = Store::observe_complete_index_publication(&core_path)?
         .context("writer predecessor Core is incomplete")?;
     if complete.generation_id != bound.core.generation_id || complete.run_id != bound.core.run_id {
         bail!("writer predecessor Core binding does not match complete publication");
     }
     let resolved = match bound.manifest.artifact_scope.as_ref() {
         Some(scope) => consumer.with_publication_artifact_scope(scope)?,
-        None => resolve_legacy_runtime(project_root, &core, &bound.manifest, consumer, true)?,
+        None => resolve_legacy_runtime(project_root, &complete, &bound.manifest, consumer, true)?,
     };
     let scope = match bound.manifest.artifact_scope {
         Some(scope) => scope,
@@ -429,7 +429,11 @@ mod tests {
         forged.sidecar_input_hash = Some("wrong".into());
         assert!(
             authenticate_locator(
-                &Store::open_read_only(&f.path).unwrap(),
+                &Store::open_read_only(&f.path)
+                    .unwrap()
+                    .get_complete_index_publication()
+                    .unwrap()
+                    .unwrap(),
                 &forged,
                 &f.producer
             )
@@ -570,6 +574,183 @@ mod tests {
         std::fs::remove_file(vector).unwrap();
         assert!(runtime_for_publication_writer(f.project.path(), &f.path, &f.consumer).is_ok());
     }
+    #[test]
+    fn writer_preserves_prior_schema_origin_after_current_core_upgrade() {
+        use crate::test_support::{
+            publish_complete_core_fixture, publish_empty_complete_generation_only_core_fixture,
+        };
+        use codestory_contracts::core_publication::CoreGenerationIdentityV1;
+        use codestory_store::{
+            CorePublicationLayout, CorePublishTransaction, IndexPublicationMode,
+            IndexPublicationRecord, SnapshotStore,
+        };
+
+        let _env = env_lock();
+        let project = TempDir::new().unwrap();
+        let cache = TempDir::new().unwrap();
+        let core = TempDir::new().unwrap();
+        std::fs::write(project.path().join("lib.rs"), "pub fn hello() {}\n").unwrap();
+        let path = core.path().join("codestory.db");
+        publish_empty_complete_generation_only_core_fixture(project.path(), &path).unwrap();
+        let producer = crate::config::with_test_cache_root(cache.path(), || {
+            SidecarRuntimeConfig::for_project_profile_with_run_id(
+                Some(project.path()),
+                SidecarProfile::Agent,
+                Some("producer-run"),
+            )
+        });
+        let consumer = producer.with_profile_and_run_id(
+            Some(project.path()),
+            SidecarProfile::Agent,
+            Some("consumer-run"),
+        );
+        let mut manifest =
+            publish_zero_dense_pinned_query_fixture(project.path(), &path, &producer).unwrap();
+        manifest.artifact_scope = Some(producer.publication_artifact_scope().unwrap());
+        Store::open(&path)
+            .unwrap()
+            .upsert_retrieval_index_manifest(&manifest)
+            .unwrap();
+        let layout = CorePublicationLayout::from_storage_path(&path).unwrap();
+        let previous = layout.read_pointer().unwrap().unwrap().active;
+        let previous_path = layout
+            .resolve_generation_database(&previous.generation_id)
+            .unwrap();
+        let mutate_predecessor = |sql: &str| {
+            let permissions = std::fs::metadata(&previous_path).unwrap().permissions();
+            // Apply hostile writes to a private writable image, then replace
+            // and reseal only this test-owned generation database.
+            let mutable = core.path().join("predecessor-mutation.sqlite3");
+            std::fs::copy(&previous_path, &mutable).unwrap();
+            codestory_store::make_file_owner_writable(&mutable).unwrap();
+            {
+                let old = rusqlite::Connection::open(&mutable).unwrap();
+                old.execute_batch(sql).unwrap();
+                old.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                    .unwrap();
+            }
+            codestory_store::make_file_owner_writable(&previous_path).unwrap();
+            std::fs::rename(&mutable, &previous_path).unwrap();
+            std::fs::set_permissions(&previous_path, permissions).unwrap();
+        };
+        mutate_predecessor("DROP TABLE file_extraction_identity; PRAGMA user_version = 36;");
+        assert_eq!(
+            Store::database_schema_version_observational(&previous_path).unwrap(),
+            36
+        );
+        let old_bytes = std::fs::read(&previous_path).unwrap();
+        let pointer_bytes = std::fs::read(layout.retrieval_publication_path()).unwrap();
+
+        let current = IndexPublicationRecord {
+            generation: 2,
+            generation_id: "22222222-2222-4222-8222-222222222222".into(),
+            run_id: "current-core-run".into(),
+            mode: IndexPublicationMode::Full,
+            published_at_epoch_ms: 2,
+        };
+        let stage = SnapshotStore::staged_path(&path).unwrap();
+        {
+            let mut store = Store::open(&stage).unwrap();
+            publish_complete_core_fixture(&mut store, project.path(), &current).unwrap();
+        }
+        let identity = CoreGenerationIdentityV1 {
+            generation_id: current.generation_id.clone(),
+            run_id: current.run_id.clone(),
+            logical_bytes: std::fs::metadata(&stage).unwrap().len(),
+            published_at_epoch_ms: 2,
+        };
+        CorePublishTransaction::begin_from_stage(&path, stage)
+            .unwrap()
+            .commit_pointer(identity, Some(previous.clone()))
+            .unwrap();
+        let store = Store::open_read_only(&path).unwrap();
+        assert_eq!(
+            store.get_complete_index_publication().unwrap(),
+            Some(current)
+        );
+        let bound = store
+            .get_bound_retrieval_index_manifest(&manifest.project_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bound.core.generation_id, previous.generation_id);
+        assert_eq!(bound.core.run_id, previous.run_id);
+        assert_eq!(bound.manifest, manifest);
+        drop(store);
+        assert!(
+            Store::open_read_only(&previous_path).is_err(),
+            "source reads remain strict"
+        );
+
+        let selected = runtime_for_publication_writer(project.path(), &path, &consumer);
+        assert_eq!(std::fs::read(&previous_path).unwrap(), old_bytes);
+        assert_eq!(
+            std::fs::read(layout.retrieval_publication_path()).unwrap(),
+            pointer_bytes
+        );
+        let (writer, scope) =
+            selected.expect("writer can authenticate the preserved prior-schema origin");
+        assert_eq!(
+            writer.layout.semantic_data_dir,
+            producer.layout.semantic_data_dir
+        );
+        assert_eq!(Some(scope), manifest.artifact_scope);
+        assert_eq!(writer.run_id, consumer.run_id);
+        assert!(
+            PinnedQuerySession::begin(project.path(), &path, &consumer).is_err(),
+            "old-schema retrieval cannot be admitted for current source reads"
+        );
+        let restore = format!(
+            "DELETE FROM incomplete_index_run; UPDATE index_publication SET generation_id = '{}', run_id = '{}' WHERE id = 1;",
+            previous.generation_id, previous.run_id,
+        );
+        for scope in [manifest.artifact_scope.as_ref(), None] {
+            {
+                let pointer =
+                    rusqlite::Connection::open(layout.retrieval_publication_path()).unwrap();
+                pointer
+                    .execute(
+                        "UPDATE retrieval_index_manifest SET artifact_scope_json = ?1",
+                        [scope.map(|scope| serde_json::to_string(scope).unwrap())],
+                    )
+                    .unwrap();
+                pointer
+                    .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                    .unwrap();
+            }
+            for (mutation, cause) in [
+                (
+                    "INSERT INTO incomplete_index_run (id, started_at_epoch_ms) VALUES (1, 1)",
+                    "predecessor Core is incomplete",
+                ),
+                (
+                    "UPDATE index_publication SET run_id = 'different-run' WHERE id = 1",
+                    "binding does not match",
+                ),
+                (
+                    "UPDATE index_publication SET generation_id = '33333333-3333-4333-8333-333333333333' WHERE id = 1",
+                    "binding does not match",
+                ),
+            ] {
+                mutate_predecessor(mutation);
+                assert_eq!(
+                    Store::database_schema_version_observational(&previous_path).unwrap(),
+                    36
+                );
+                let old_before = std::fs::read(&previous_path).unwrap();
+                let pointer_before = std::fs::read(layout.retrieval_publication_path()).unwrap();
+                let error = runtime_for_publication_writer(project.path(), &path, &consumer)
+                    .expect_err("invalid predecessor identity must stop before origin fallback");
+                assert!(format!("{error:#}").contains(cause), "{error:#}");
+                assert_eq!(std::fs::read(&previous_path).unwrap(), old_before);
+                assert_eq!(
+                    std::fs::read(layout.retrieval_publication_path()).unwrap(),
+                    pointer_before
+                );
+                mutate_predecessor(&restore);
+            }
+        }
+    }
+
     #[test]
     fn writer_and_gc_resolve_same_agent_producer_across_request_runs() {
         let _env = env_lock();

@@ -1411,8 +1411,114 @@ fn create_legacy_retention_fixture(path: &Path, version: u32) {
 }
 
 #[test]
+fn historical_complete_publication_observation_is_bounded_and_nonmutating() {
+    let publication = IndexPublicationRecord {
+        generation: 1,
+        generation_id: "11111111-1111-4111-8111-111111111111".into(),
+        run_id: "historical-publication-run".into(),
+        mode: IndexPublicationMode::Full,
+        published_at_epoch_ms: 1,
+    };
+    for version in [
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        SCHEMA_VERSION,
+        SCHEMA_VERSION + 1,
+        INCOMPLETE_INCREMENTAL_SCHEMA_VERSION,
+    ] {
+        let path = unique_temp_db_path("historical-publication-observation");
+        create_versioned_observation_fixture(&path, version);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE index_publication (id INTEGER PRIMARY KEY, generation INTEGER,
+                 generation_id TEXT, run_id TEXT, mode TEXT, published_at_epoch_ms INTEGER);
+                 CREATE TABLE incomplete_index_run (id INTEGER PRIMARY KEY, started_at_epoch_ms INTEGER);
+                 INSERT INTO index_publication VALUES (1, 1,
+                 '11111111-1111-4111-8111-111111111111', 'historical-publication-run', 'full', 1);",
+            ).unwrap();
+        }
+        let before = durable_sqlite_state(&path);
+        let observed = Storage::observe_complete_index_publication(&path);
+        if (32..=FILE_EXTRACTION_IDENTITY_SCHEMA_VERSION).contains(&version) {
+            assert_eq!(observed.unwrap(), Some(publication.clone()));
+        } else {
+            assert!(
+                observed
+                    .unwrap_err()
+                    .to_string()
+                    .contains("supports Core schemas")
+            );
+        }
+        assert_eq!(durable_sqlite_state(&path), before);
+        assert_no_sqlite_sidecars(&path);
+        if version != SCHEMA_VERSION {
+            assert!(Storage::open_observational(&path).is_err());
+            assert!(Storage::open_read_only(&path).is_err());
+        }
+        fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
+fn historical_complete_publication_observation_refuses_incomplete_or_invalid_rows() {
+    for (mutation, absent) in [
+        ("INSERT INTO incomplete_index_run VALUES (1, 1)", true),
+        ("DELETE FROM index_publication", true),
+        ("UPDATE index_publication SET run_id = ''", false),
+        ("UPDATE index_publication SET mode = 'unknown'", false),
+        (
+            "ALTER TABLE index_publication RENAME COLUMN run_id TO unknown_run",
+            false,
+        ),
+    ] {
+        let path = unique_temp_db_path("historical-publication-row-fence");
+        {
+            let storage = Storage::open(&path).unwrap();
+            storage
+                .put_index_publication(&IndexPublicationRecord {
+                    generation: 1,
+                    generation_id: "11111111-1111-4111-8111-111111111111".into(),
+                    run_id: "historical-publication-run".into(),
+                    mode: IndexPublicationMode::Full,
+                    published_at_epoch_ms: 1,
+                })
+                .unwrap();
+        }
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("DROP TABLE file_extraction_identity; PRAGMA user_version = 36;")
+                .unwrap();
+            // Bypass row constraints only to exercise corrupt persisted
+            // metadata that the observer must independently reject.
+            conn.execute_batch("PRAGMA ignore_check_constraints = ON;")
+                .unwrap();
+            conn.execute_batch(mutation).unwrap();
+        }
+        let before = durable_sqlite_state(&path);
+        let result = Storage::observe_complete_index_publication(&path);
+        if absent {
+            assert_eq!(result.unwrap(), None, "{mutation}");
+        } else {
+            assert!(result.is_err(), "{mutation}");
+        }
+        assert_eq!(
+            Storage::database_schema_version_observational(&path).unwrap(),
+            36
+        );
+        assert_eq!(durable_sqlite_state(&path), before);
+        assert_no_sqlite_sidecars(&path);
+        fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
 fn retention_publication_observation_reads_known_legacy_projection_without_migration() {
-    for version in [32, 33, 34, 35, 36] {
+    for version in [32, 33, 34, 35, 36, FILE_EXTRACTION_IDENTITY_SCHEMA_VERSION] {
         let path = unique_temp_db_path("retention-legacy-projection");
         create_legacy_retention_fixture(&path, version);
         let before = durable_sqlite_state(&path);
@@ -1450,11 +1556,20 @@ fn retention_publication_observation_reads_known_legacy_projection_without_migra
 
 #[test]
 fn retention_publication_observation_rejects_unknown_schema_and_incomplete_rows() {
-    for version in [31, 37, INCOMPLETE_INCREMENTAL_SCHEMA_VERSION] {
+    for version in [
+        31,
+        SCHEMA_VERSION + 1,
+        INCOMPLETE_INCREMENTAL_SCHEMA_VERSION,
+    ] {
         let path = unique_temp_db_path("retention-unknown-schema");
         create_legacy_retention_fixture(&path, version);
         let before = durable_sqlite_state(&path);
-        assert!(Storage::observe_retrieval_index_publications(&path).is_err());
+        let error = Storage::observe_retrieval_index_publications(&path)
+            .expect_err("unknown Core schemas cannot establish retention protection");
+        assert!(
+            error.to_string().contains("supports Core schemas"),
+            "{error}"
+        );
         assert_eq!(durable_sqlite_state(&path), before);
         assert_no_sqlite_sidecars(&path);
         fs::remove_file(path).unwrap();
