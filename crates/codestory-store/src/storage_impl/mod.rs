@@ -8581,6 +8581,9 @@ impl Storage {
         Ok(edges)
     }
 
+    /// Returns normalized incident edges for each requested node in edge-ID order.
+    /// Resolution filtering matches [`Self::get_edges_for_node_id`], whose trail
+    /// resolution priority can produce a different order.
     pub fn get_edges_for_node_ids(
         &self,
         node_ids: &[NodeId],
@@ -14818,7 +14821,8 @@ impl Storage {
         )
     }
 
-    /// Get all edges connected to a node (both directions)
+    /// Get all edges connected to a node (both directions).
+    /// Uses trail resolution priority, with edge-ID order within each priority.
     pub fn get_edges_for_node_id(&self, node_id: NodeId) -> Result<Vec<Edge>, StorageError> {
         trail::get_edges_for_node_id(self, node_id)
     }

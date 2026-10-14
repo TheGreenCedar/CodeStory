@@ -11191,27 +11191,75 @@ fn batched_edges_for_node_ids_matches_single_node_lookup() -> Result<(), Storage
             confidence: Some(1.0),
             ..Default::default()
         },
+        Edge {
+            id: EdgeId(-9),
+            source: NodeId(1),
+            target: NodeId(2),
+            kind: EdgeKind::CALL,
+            resolved_target: Some(NodeId(3)),
+            certainty: Some(ResolutionCertainty::Uncertain),
+            confidence: Some(1.0),
+            ..Default::default()
+        },
     ])?;
 
-    let node_ids = [NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
-    let batched = storage.get_edges_for_node_ids(&node_ids)?;
-    for node_id in node_ids {
-        let single_edge_ids = storage
-            .get_edges_for_node_id(node_id)?
-            .into_iter()
-            .map(|edge| edge.id)
-            .collect::<Vec<_>>();
-        let batched_edge_ids = batched
-            .get(&node_id)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|edge| edge.id)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            batched_edge_ids, single_edge_ids,
-            "batched lookup should match single-node lookup for {node_id:?}"
-        );
+    let expectations = [
+        (
+            NodeId(1),
+            vec![EdgeId(-9), EdgeId(1), EdgeId(3)],
+            vec![EdgeId(3), EdgeId(-9), EdgeId(1)],
+        ),
+        (
+            NodeId(2),
+            vec![EdgeId(-9), EdgeId(1)],
+            vec![EdgeId(-9), EdgeId(1)],
+        ),
+        (
+            NodeId(3),
+            vec![EdgeId(2), EdgeId(3)],
+            vec![EdgeId(3), EdgeId(2)],
+        ),
+        (NodeId(4), vec![EdgeId(2)], vec![EdgeId(2)]),
+        (NodeId(999), vec![], vec![]),
+    ];
+    let node_ids = expectations
+        .iter()
+        .map(|(node_id, _, _)| *node_id)
+        .collect::<Vec<_>>();
+    let mut reversed_node_ids = node_ids.clone();
+    reversed_node_ids.reverse();
+    reversed_node_ids.push(NodeId(1));
+    for seed_ids in [&node_ids, &reversed_node_ids] {
+        let batched = storage.get_edges_for_node_ids(seed_ids)?;
+        for (node_id, expected_batched_ids, expected_single_ids) in &expectations {
+            let mut single_edges = storage.get_edges_for_node_id(*node_id)?;
+            let batched_edges = batched
+                .get(node_id)
+                .expect("requested node has a batch entry");
+            assert_eq!(
+                batched_edges
+                    .iter()
+                    .map(|edge| edge.id)
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                expected_batched_ids.as_slice(),
+                "batched lookup must keep edge-ID order for {node_id:?}"
+            );
+            assert_eq!(
+                single_edges
+                    .iter()
+                    .map(|edge| edge.id)
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                expected_single_ids.as_slice(),
+                "single-node lookup must keep trail priority for {node_id:?}"
+            );
+            single_edges.sort_by_key(|edge| edge.id);
+            assert_eq!(
+                batched_edges, &single_edges,
+                "lookups must return the same normalized edges for {node_id:?}"
+            );
+        }
     }
 
     Ok(())
