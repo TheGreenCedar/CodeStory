@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Packets can include complete small configuration and text files found by lexical search even when the symbol index has no file entry. Delivered text is checked against the published and current file, stays within the existing source limit, and remains protected during CLI source continuation.
+
 - Python function and method source includes directly attached decorators, so test parameterization and other declaration settings stay with the inspected callable. Calls in decorator arguments are attributed to their enclosing function. Existing indexes rebuild once on their next refresh.
 
 - CLI query-based symbol, call-graph, exploration and bookmark commands initialize the required retrieval runtime, avoiding failures caused by the default local profile. ID-based navigation remains available from the Core index.

@@ -92,6 +92,37 @@ fn active_pinned_retrieval_read(controller: &AppController) -> Option<Rc<PinnedR
     })
 }
 
+pub(super) fn read_admitted_published_file(
+    controller: &AppController,
+    receipt: &codestory_contracts::compilation::PacketAdmissionReceiptV1,
+) -> Result<Option<codestory_retrieval::PublishedFileSourceWitness>, ApiError> {
+    let pinned = active_pinned_retrieval_read(controller)
+        .ok_or_else(|| ApiError::internal("Published file source is missing its operation pin."))?;
+    let session = active_packet_proof_session().ok_or_else(|| {
+        ApiError::invalid_argument("Published file source lacks an active packet admission.")
+    })?;
+    if !session.authorizes_published_file(receipt, pinned.session.publication_identity()) {
+        return Err(ApiError::invalid_argument(
+            "Published file source lacks sealed lexical admission.",
+        ));
+    }
+    let path = receipt
+        .stable_identity
+        .strip_prefix("path:")
+        .ok_or_else(|| {
+            ApiError::invalid_argument("Published file source requires a file identity.")
+        })?;
+    pinned
+        .session
+        .read_published_file_source(
+            path,
+            crate::services::active_public_operation_cancellation(),
+        )
+        .map_err(|error| {
+            ApiError::internal(format!("Published file source unavailable: {error:#}"))
+        })
+}
+
 struct ActivePinnedRetrievalReadGuard {
     previous: Option<(usize, Rc<PinnedRetrievalRead>)>,
 }
@@ -353,6 +384,31 @@ impl PinnedRetrievalRead {
         }
         result
     }
+
+    fn revalidate_after_response(&self) -> Result<(), ApiError> {
+        let mut span = super::packet_batch::observe_packet_operation_span(
+            super::packet_batch::PacketOperationObservationSpan::PinRevalidation,
+        );
+        let result = self.session.revalidate_after_response().map_err(|error| {
+            if let Some(fence) =
+                error.downcast_ref::<codestory_retrieval::PublishedFileSourceFenceError>()
+            {
+                let code = match fence {
+                    codestory_retrieval::PublishedFileSourceFenceError::Cancelled => "cancelled",
+                    codestory_retrieval::PublishedFileSourceFenceError::Changed { .. } => {
+                        "source_stale"
+                    }
+                };
+                ApiError::new(code, error.to_string())
+            } else {
+                map_pinned_query_error(error)
+            }
+        });
+        if result.is_ok() {
+            span.finish_success();
+        }
+        result
+    }
 }
 
 fn map_pinned_query_error(error: AnyhowError) -> ApiError {
@@ -487,7 +543,7 @@ pub(crate) fn with_pinned_retrieval_publication_value<T>(
     let publication = publication_dto(&pinned);
     with_active_pinned_retrieval_read(controller, Rc::clone(&pinned), || {
         build().and_then(|value| {
-            pinned.revalidate()?;
+            pinned.revalidate_after_response()?;
             Ok((value, Some(publication)))
         })
     })
@@ -511,7 +567,7 @@ fn with_stable_retrieval_publication_inner<T: RetrievalPublicationResponse>(
         let result = with_active_pinned_retrieval_read(controller, Rc::clone(&pinned), || {
             build().and_then(|mut response| {
                 response.attach_retrieval_publication(publication.clone());
-                pinned.revalidate()?;
+                pinned.revalidate_after_response()?;
                 Ok(response)
             })
         });
@@ -3538,6 +3594,13 @@ mod tests {
     }
 
     fn public_packet_fixture_with_unindexed_lexical_artifact() -> PinnedOperationFixture {
+        public_packet_fixture_with_lexical_files(&[(
+            "LICENSE",
+            "The control plane assumes the control plane role, and worker nodes use the worker node role.\n",
+        )])
+    }
+
+    fn public_packet_fixture_with_lexical_files(files: &[(&str, &str)]) -> PinnedOperationFixture {
         let project = tempfile::tempdir().expect("project");
         let storage = tempfile::tempdir().expect("storage");
         let retrieval_cache = tempfile::tempdir().expect("retrieval cache");
@@ -3547,17 +3610,25 @@ mod tests {
             "// public packet freshness anchor\n",
         )
         .expect("write indexed freshness anchor");
-        std::fs::write(
-            project.path().join("LICENSE"),
-            "The control plane assumes the control plane role, and worker nodes use the worker node role.\n",
-        )
-        .expect("write unindexed lexical artifact");
+        for (path, content) in files {
+            let path = project.path().join(path);
+            std::fs::create_dir_all(path.parent().expect("artifact parent"))
+                .expect("create artifact parent");
+            std::fs::write(path, content).expect("write unindexed lexical artifact");
+        }
         let mut runtime = codestory_retrieval::with_test_cache_root(retrieval_cache.path(), || {
             SidecarRuntimeConfig::for_project_profile(
                 Some(project.path()),
                 codestory_retrieval::SidecarProfile::Agent,
             )
         });
+        assert_eq!(
+            crate::semantic_projection::semantic_doc_scope_from_value(
+                &runtime.retrieval.semantic_doc_scope
+            ),
+            crate::semantic_projection::SemanticDocScope::DurableSymbols,
+            "zero-dense public fixture requires the unchanged durable semantic scope",
+        );
         runtime.embedding.allow_cpu = true;
         let controller = AppController::new_with_config(runtime.clone());
         controller
@@ -7815,8 +7886,790 @@ mod tests {
         );
     }
 
+    fn assert_published_file_packet_available(
+        fixture: &PinnedOperationFixture,
+        request: &AgentPacketRequestDto,
+        packet: &AgentPacketDto,
+    ) {
+        use codestory_contracts::packet_projection_v3::{GapKindV3Dto, PacketProjectionV3Dto};
+        use std::sync::atomic::AtomicBool;
+        assert_ne!(
+            packet.disposition.kind,
+            PacketDispositionKindDto::Unavailable,
+            "authenticated whole-file evidence must not imply unavailable retrieval: {:?}",
+            packet.disposition
+        );
+        let service = crate::PublicOperationService::new(fixture.controller.clone());
+        let _latency = crate::enter_packet_latency_scope(request.latency_budget_ms);
+        let projected = service
+            .run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
+                crate::project_packet_v3(&service, "codestory-cli", request, packet, |p| {
+                    serde_json::to_vec(p).map(|v| v.len()).map_err(|_| ())
+                })
+            })
+            .unwrap()
+            .value;
+        let gaps = match &projected.projection {
+            PacketProjectionV3Dto::Complete { gaps, .. }
+            | PacketProjectionV3Dto::BudgetExceeded { gaps, .. } => gaps,
+        };
+        assert!(
+            !gaps
+                .as_slice()
+                .iter()
+                .any(|g| g.kind == GapKindV3Dto::RetrievalUnavailable),
+            "authenticated lexical evidence must not emit packet-evidence-unavailable: {:?}",
+            projected.projection
+        );
+    }
+
     #[test]
-    fn browser_packet_serves_unindexed_lexical_artifact_without_evidence() {
+    fn browser_packet_delivers_small_published_lexical_file_without_core_symbols() {
+        assert_browser_packet_delivers_small_published_lexical_files(Vec::new());
+    }
+
+    #[test]
+    fn browser_packet_delivers_small_published_lexical_file_with_exact_probe_and_matching_query() {
+        assert_browser_packet_delivers_small_published_lexical_files(vec![
+            codestory_contracts::api::PacketProbeDto::ExactPath {
+                path: "settings.ini".into(),
+            },
+        ]);
+    }
+
+    fn assert_browser_packet_delivers_small_published_lexical_files(
+        probes: Vec<codestory_contracts::api::PacketProbeDto>,
+    ) {
+        use crate::agent::packet_candidate::{PacketProofSession, install_packet_proof_session};
+        use codestory_contracts::api::SupportUnitKindDto;
+        use sha2::{Digest, Sha256};
+
+        let files = [
+            (
+                "settings.ini",
+                "[settings]\nretry_limit = 3\nstop_on_error = true\n",
+            ),
+            (
+                "meson.build",
+                "project('configuration', 'c')\nadd_project_arguments('-DSTOP_ON_ERROR=1', language: 'c')\n",
+            ),
+        ];
+        let expected_sources = [
+            "```text\n>    1 | [settings]\n     2 | retry_limit = 3\n     3 | stop_on_error = true\n```",
+            "```text\n>    1 | project('configuration', 'c')\n     2 | add_project_arguments('-DSTOP_ON_ERROR=1', language: 'c')\n```",
+        ];
+        let question = "Where are retry_limit and stop_on_error configured and how does the build define STOP_ON_ERROR?";
+        let fixture = public_packet_fixture_with_lexical_files(&files);
+        let project_root = fixture._project.path();
+        let core = Store::open_read_only(&fixture.storage_path).expect("open pinned core");
+        for (path, _) in files {
+            assert!(!codestory_workspace::has_supported_source_route(Path::new(
+                path
+            )));
+            assert!(
+                super::super::packet_compiler::find_admitted_file(&core, project_root, path)
+                    .expect("look up exact Core file identity")
+                    .is_none(),
+                "lexical-only fixture must not seed a Core file row: {path}"
+            );
+        }
+        drop(core);
+
+        let pinned = Rc::new(
+            PinnedRetrievalRead::begin_packet_descriptor(&fixture.controller)
+                .expect("begin descriptor publication pin"),
+        );
+        let session = Rc::new(PacketProofSession::new());
+        with_active_pinned_retrieval_read(&fixture.controller, Rc::clone(&pinned), || {
+            let _guard = install_packet_proof_session(Rc::clone(&session));
+            preadmit_packet_descriptor_queries_with_policy(
+                &fixture.controller,
+                &[PacketRetrievalQuery {
+                    query: question.to_string(),
+                    lexical_policy: LexicalAdmissionPolicy::BroadQuestionV1,
+                }],
+                None,
+            )
+            .expect("retrieve and seal ordinary file descriptors");
+            let retained = session
+                .descriptor_result_with_policy(
+                    question,
+                    LexicalAdmissionPolicy::BroadQuestionV1,
+                    true,
+                    pinned.session.publication_identity(),
+                )
+                .expect("retain the same-publication descriptor result");
+            assert!(session.retrieval_admission_is_sealed());
+            let bare_path = PacketProofSession::new();
+            assert_eq!(
+                bare_path.admit_exact_selector("path:settings.ini", 512, 0),
+                PacketAdmissionDecision::Admitted
+            );
+            bare_path.seal_retrieval_admission();
+            assert!(
+                !bare_path.authorizes_published_file(
+                    &bare_path.receipts()[0],
+                    pinned.session.publication_identity()
+                ),
+                "a caller path alone cannot authorize published source bytes"
+            );
+            for (path, _) in files {
+                let identity = format!("path:{path}");
+                assert!(
+                    retained.hits.iter().any(|candidate| {
+                        candidate.file_path == path
+                            && candidate.source == CandidateSource::Lexical
+                            && candidate.node_id.is_none()
+                            && candidate
+                                .packet_descriptor()
+                                .is_some_and(|descriptor| descriptor.stable_identity == identity)
+                    }),
+                    "normal retrieval must retain an eligible file descriptor: {path}"
+                );
+                assert!(
+                    session.is_admitted_identity(&identity),
+                    "the file must cross sealed admission before source delivery: {path}"
+                );
+                let receipt = session
+                    .receipts()
+                    .into_iter()
+                    .find(|receipt| receipt.stable_identity == identity)
+                    .unwrap();
+                assert!(
+                    session
+                        .authorizes_published_file(&receipt, pinned.session.publication_identity())
+                );
+                let mut forged = receipt.clone();
+                forged.reserved_source_bytes += 1;
+                assert!(
+                    !session
+                        .authorizes_published_file(&forged, pinned.session.publication_identity())
+                );
+                forged = receipt.clone();
+                forged.packet_ordinal += 1;
+                assert!(
+                    !session
+                        .authorizes_published_file(&forged, pinned.session.publication_identity())
+                );
+                assert!(
+                    !PacketProofSession::new()
+                        .authorizes_published_file(&receipt, pinned.session.publication_identity())
+                );
+                let mut foreign = pinned.session.publication_identity().clone();
+                foreign.core_generation_id.push_str("-foreign");
+                assert!(!session.authorizes_published_file(&receipt, &foreign));
+            }
+        });
+        drop(pinned);
+
+        let request = AgentPacketRequestDto {
+            question: question.into(),
+            budget: PacketBudgetModeDto::Standard,
+            probes,
+            latency_budget_ms: Some(30_000),
+            parent_packet_id: None,
+            option_ids: Vec::new(),
+            core_generation_id: None,
+            retrieval_generation: None,
+        };
+        let packet = fixture
+            .controller
+            .browser_service()
+            .packet(request.clone())
+            .expect("ordinary packet over the real Core and lexical publication");
+
+        for ((path, content), expected) in files.into_iter().zip(expected_sources) {
+            let source = packet
+                .support
+                .iter()
+                .find(|row| {
+                    row.kind == SupportUnitKindDto::SourceRange
+                        && row.path.as_deref() == Some(path)
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "small admitted published file must reach physical source support: {path}; disposition={:?}",
+                        packet.disposition
+                    )
+                });
+            assert!(
+                source.symbol_id.is_none(),
+                "a file must not invent a graph ID"
+            );
+            let line_count = content.lines().count() as u32;
+            assert_eq!(
+                (source.start_line, source.end_line),
+                (Some(1), Some(line_count))
+            );
+            let snippet = source.snippet.as_deref().expect("physical source bytes");
+            assert_eq!(
+                snippet, expected,
+                "every original physical line must be delivered"
+            );
+            let delivery = source
+                .source_delivery
+                .as_ref()
+                .expect("published file must carry an authenticated source receipt");
+            assert_eq!(
+                delivery.source_sha256,
+                format!("{:x}", Sha256::digest(content))
+            );
+            assert_eq!(delivery.requested_range.start_line, 1);
+            assert_eq!(delivery.requested_range.end_line, line_count);
+            assert_eq!(delivery.remaining_source_bytes, 0);
+            assert!(delivery.next_start_line.is_none());
+            assert!(
+                packet
+                    .answer
+                    .source_coverage
+                    .iter()
+                    .any(|coverage| coverage.path == path
+                        && coverage.status
+                            == codestory_contracts::api::SourceCoverageStatusDto::NotEstablished
+                        && coverage.not_established_cause
+                            == Some(
+                                codestory_contracts::api::SourceCoverageNotEstablishedCauseDto::LookupUnavailable
+                            )),
+                "published source must preserve honest missing Core coverage: {path}"
+            );
+        }
+        assert_published_file_packet_available(&fixture, &request, &packet);
+    }
+
+    #[test]
+    fn mixed_published_file_packet_issuance_preserves_loaded_source_floor() {
+        use crate::agent::packet_candidate::{PacketProofSession, install_packet_proof_session};
+        use crate::agent::packet_served_sources;
+        use codestory_contracts::api::{PacketProbeDto, SupportUnitKindDto};
+        use codestory_contracts::packet_projection_v3::{EvidenceKindV3Dto, PacketProjectionV3Dto};
+        use std::sync::atomic::AtomicBool;
+        let content = "ini_flag = true\n";
+        assert_eq!(
+            crate::retrieval_file_role_from_path("tests/support.rs"),
+            crate::RetrievalFileRole::Test
+        );
+        let fixture = public_packet_fixture_with_lexical_files(&[
+            ("settings.ini", content),
+            ("tests/support.rs", "mod protected_context {}\n"),
+        ]);
+        let core = Store::open_read_only(&fixture.storage_path).unwrap();
+        let node = core
+            .get_nodes()
+            .unwrap()
+            .into_iter()
+            .find(|n| n.kind == NodeKind::MODULE && n.serialized_name.contains("protected_context"))
+            .expect("real parsed module must provide a numeric source identity");
+        let indexed_file = core
+            .get_file_by_id(node.file_node_id.expect("parsed symbol file").0)
+            .unwrap()
+            .unwrap();
+        assert!(indexed_file.path.ends_with("tests/support.rs"));
+        assert!(indexed_file.indexed && indexed_file.complete);
+        assert_eq!((node.start_line, node.end_line), (Some(1), Some(1)));
+        drop(core);
+        let service = crate::PublicOperationService::new(fixture.controller.clone());
+        let browser =
+            crate::ReadOnlyBrowserService::new(fixture.controller.clone(), service.clone());
+        let mut retained_request = None;
+        let mut completed_branches = Vec::new();
+        let mut executed_returned_patches = 0;
+        for retain_file in [false, true] {
+            let request = AgentPacketRequestDto {
+                question: "ini_flag".into(),
+                budget: PacketBudgetModeDto::Standard,
+                probes: vec![PacketProbeDto::SymbolId {
+                    id: node.id.0.to_string(),
+                }],
+                latency_budget_ms: Some(30_000),
+                parent_packet_id: None,
+                option_ids: Vec::new(),
+                core_generation_id: None,
+                retrieval_generation: None,
+            };
+            let _latency = crate::enter_packet_latency_scope(request.latency_budget_ms);
+            let follow_up = service.run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
+                let represented = browser.packet_for_representation_v3(request.clone(), "codestory-cli", &mut |projection| {
+                    let has_file = match projection {
+                        PacketProjectionV3Dto::Complete { evidence, .. } => evidence.as_slice().iter().any(|r| r.kind == EvidenceKindV3Dto::ExactSource && r.path.as_ref().is_some_and(|p| p.as_str() == "settings.ini")),
+                        _ => false,
+                    };
+                    if !retain_file && has_file { Ok(16_385) } else { serde_json::to_vec(projection).map(|v| v.len()).map_err(|_| ()) }
+                })?;
+                assert_ne!(represented.packet.disposition.kind, PacketDispositionKindDto::Unavailable, "mixed retained/omitted lexical file cannot mark numeric evidence unavailable: {:?}", represented.packet.disposition);
+                let gaps = match &represented.product.projection {
+                    PacketProjectionV3Dto::Complete { gaps, .. } | PacketProjectionV3Dto::BudgetExceeded { gaps, .. } => gaps,
+                };
+                assert!(!gaps.as_slice().iter().any(|g| g.kind == codestory_contracts::packet_projection_v3::GapKindV3Dto::RetrievalUnavailable), "mixed representation cannot emit packet-evidence-unavailable: {:?}", represented.product.projection);
+                assert!(represented.packet.packet_id.starts_with("psr1:"), "mixed prepared input must retain issued source identity even when a file is omitted");
+                if let Some(drill) = &represented.packet.disposition.drill {
+                    for option in &drill.options {
+                        if option.symbol_id.is_none() {
+                            assert!(option.source_range.is_none(), "whole-file paths must never advertise a numeric source cursor");
+                            assert!(!option.id.starts_with("range:path:"));
+                        }
+                    }
+                }
+                let path_option_offered = represented.packet.disposition.drill.as_ref().is_some_and(|drill| drill.options.iter().any(|o| o.path.as_deref() == Some("settings.ini") && o.symbol_id.is_none()));
+                if !retain_file {
+                    assert!(path_option_offered, "the selected omitted small file must expose the existing whole-file action for execution proof");
+                }
+                let offered_patch = if !retain_file {
+                    match &represented.product.projection {
+                        PacketProjectionV3Dto::Complete { continuation: Some(continuation), .. } => Some(continuation.packet_request_patch.clone().expect("public whole-file option must carry its executable request patch")),
+                        _ => panic!("offered whole-file action requires complete public continuation"),
+                    }
+                } else { None };
+                let originals = represented.packet.support.iter().filter(|r| r.kind == SupportUnitKindDto::SourceRange).cloned().collect::<Vec<_>>();
+                assert!(originals.iter().any(|r| r.symbol_id.as_deref() == Some(node.id.0.to_string().as_str())));
+                assert_eq!(originals.iter().any(|r| r.path.as_deref() == Some("settings.ini")), retain_file);
+                packet_served_sources::commit(&fixture.controller, "codestory-cli", &represented.product)?;
+                let mut continuation = request.clone();
+                continuation.parent_packet_id = Some(represented.packet.packet_id.clone());
+                let record = packet_served_sources::load(&fixture.controller, "codestory-cli", &continuation)?.expect("actual issued record must reload");
+                assert_eq!(record.witnesses.iter().any(|w| w.node_id.is_none()), retain_file);
+                let session = Rc::new(PacketProofSession::new());
+                session.protect_served_sources(record.clone())?;
+                session.seal_retrieval_admission();
+                let _guard = install_packet_proof_session(Rc::clone(&session));
+                let pinned = active_pinned_retrieval_read(&fixture.controller).expect("current public packet pin");
+                let prepare = || super::super::packet_compiler::prepare_packet_compilation(
+                    &fixture.controller, pinned.session.project_id(), &[], None, &session, None,
+                );
+                let prepared = prepare()?;
+                assert_eq!(session.benchmark_retrieval_proof().descriptor_query_count, 0, "issued path authority must not depend on new ranked hits");
+                let frozen = prepared.select_for_representation(|_, product| Ok(Some(serde_json::to_vec(&product.support).unwrap().len())))?;
+                for old in &originals {
+                    assert!(frozen.product.support.iter().any(|r| r.kind == SupportUnitKindDto::SourceRange && r.symbol_id == old.symbol_id && r.path == old.path && r.start_line == old.start_line && r.end_line == old.end_line && r.snippet == old.snippet && r.source_delivery == old.source_delivery), "loaded issued sources must remain exact protected context");
+                }
+                if retain_file {
+                    retained_request = Some(continuation.clone());
+                }
+                Ok(offered_patch.map(|patch| {
+                    let mut next = request.clone();
+                    next.probes = patch.probes.as_slice().to_vec();
+                    next.parent_packet_id = patch.parent_packet_id.as_ref().map(|v| v.as_str().to_owned());
+                    next.option_ids = patch.option_ids.as_slice().iter().map(|v| v.as_str().to_owned()).collect();
+                    next.core_generation_id = Some(patch.core_generation_id.as_str().to_owned());
+                    next.retrieval_generation = patch.retrieval_generation.as_ref().map(|v| v.as_str().to_owned());
+                    (next, originals)
+                }))
+            }).unwrap_or_else(|error| panic!("mixed retain_file={retain_file} stage=successful-issuance-reload-floor: {error:?}")).value;
+            completed_branches.push(retain_file);
+            assert_eq!(
+                follow_up.is_some(),
+                !retain_file,
+                "mixed retain_file={retain_file} stage=returned-whole-file-patch"
+            );
+            if let Some((next, originals)) = follow_up {
+                service.run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
+                    let represented = browser.packet_for_representation_v3(next.clone(), "codestory-cli", &mut |p| serde_json::to_vec(p).map(|v| v.len()).map_err(|_| ()))?;
+                    assert_ne!(represented.packet.disposition.kind, PacketDispositionKindDto::Unavailable);
+                    assert!(represented.packet.support.iter().any(|r| r.kind == SupportUnitKindDto::SourceRange && r.path.as_deref() == Some("settings.ini")), "ordinary whole-file follow-up must execute without the ranged-node refusal");
+                    for old in &originals {
+                        assert!(represented.packet.support.iter().any(|r| r.kind == SupportUnitKindDto::SourceRange && r.symbol_id == old.symbol_id && r.path == old.path && r.snippet == old.snippet && r.source_delivery == old.source_delivery), "executed returned patch preserves the issued numeric context");
+                    }
+                    Ok(())
+                }).unwrap_or_else(|error| panic!("mixed retain_file={retain_file} stage=execute-returned-whole-file-patch: {error:?}"));
+                executed_returned_patches += 1;
+            }
+        }
+        assert_eq!(completed_branches, vec![false, true]);
+        assert_eq!(executed_returned_patches, 1);
+
+        // Authenticate issued history under the actual owner, then mutate.
+        // Public retrieval freshness rejects the changed input before source
+        // measurement; this does not assert the later history-digest boundary.
+        // Restore only after the operation has returned.
+        let retained_request = retained_request.expect("retained branch issued path history");
+        let _hostile_latency =
+            crate::enter_packet_latency_scope(retained_request.latency_budget_ms);
+        let path = fixture._project.path().join("settings.ini");
+        let mut public_refusal = None;
+        let mut represented_product_returned = false;
+        let mut measurements = 0;
+        let hostile = service.run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
+            let record = packet_served_sources::load(
+                &fixture.controller,
+                "codestory-cli",
+                &retained_request,
+            )?
+            .expect("hostile operation loads authentic path history");
+            assert!(
+                record
+                    .witnesses
+                    .iter()
+                    .any(|w| w.node_id.is_none() && w.path == "settings.ini")
+            );
+            std::fs::write(&path, content.replace("true", "fake")).unwrap();
+            match browser.packet_for_representation_v3(
+                retained_request.clone(),
+                "codestory-cli",
+                &mut |projection| {
+                    measurements += 1;
+                    serde_json::to_vec(projection)
+                        .map(|bytes| bytes.len())
+                        .map_err(|_| ())
+                },
+            ) {
+                Err(error) => {
+                    public_refusal = Some((error.code.clone(), error.message.clone()));
+                    Err(error)
+                }
+                Ok(_) => {
+                    represented_product_returned = true;
+                    Ok(())
+                }
+            }
+        });
+        std::fs::write(&path, content).expect("restore hostile fixture outside the operation");
+        assert!(
+            !represented_product_returned,
+            "stage=hostile-public-representation must not return evidence for changed signed source"
+        );
+        assert_eq!(
+            measurements, 0,
+            "stage=hostile-public-representation must refuse before source projection measurement"
+        );
+        let (code, message) = public_refusal
+            .expect("stage=hostile-public-representation must refuse changed signed path bytes");
+        assert_eq!(
+            code, "retrieval_unavailable",
+            "stage=hostile-public-representation actual code={code}, message={message}"
+        );
+        assert!(
+            message.contains("retrieval_manifest_stale")
+                && message.contains("sidecar_input_hash_changed"),
+            "stage=hostile-public-representation: {message}"
+        );
+        let propagated = match hostile {
+            Err(error) => error,
+            Ok(_) => panic!(
+                "stage=hostile-public-operation must propagate the public representation refusal"
+            ),
+        };
+        assert_eq!((propagated.code, propagated.message), (code, message));
+    }
+
+    #[test]
+    fn browser_packet_refuses_published_file_changed_after_selection() {
+        use codestory_contracts::packet_projection_v3::{
+            EvidenceKindV3Dto, GapKindV3Dto, PacketProjectionV3Dto,
+        };
+        use std::sync::atomic::AtomicBool;
+        let original = "stop_on_error = true\n";
+        let changed = "stop_on_error = fake\n";
+        assert_eq!(original.len(), changed.len());
+        let fixture = public_packet_fixture_with_lexical_files(&[("settings.ini", original)]);
+        let service = crate::PublicOperationService::new(fixture.controller.clone());
+        let browser =
+            crate::ReadOnlyBrowserService::new(fixture.controller.clone(), service.clone());
+        let request = AgentPacketRequestDto {
+            question: "stop_on_error".into(),
+            budget: PacketBudgetModeDto::Standard,
+            probes: Vec::new(),
+            latency_budget_ms: Some(30_000),
+            parent_packet_id: None,
+            option_ids: Vec::new(),
+            core_generation_id: None,
+            retrieval_generation: None,
+        };
+        let _latency = crate::enter_packet_latency_scope(request.latency_budget_ms);
+        let baseline = service
+            .run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
+                browser.packet_for_representation_v3(
+                    request.clone(),
+                    "codestory-cli",
+                    &mut |projection| {
+                        serde_json::to_vec(projection)
+                            .map(|bytes| bytes.len())
+                            .map_err(|_| ())
+                    },
+                )
+            })
+            .expect("unchanged positive public representation control")
+            .value;
+        let expected_body = "```text\n>1 | stop_on_error = true\n```";
+        match &baseline.product.projection {
+            PacketProjectionV3Dto::Complete { evidence, .. } => {
+                assert!(evidence.as_slice().iter().any(|row| {
+                    row.kind == EvidenceKindV3Dto::ExactSource
+                        && row
+                            .path
+                            .as_ref()
+                            .is_some_and(|p| p.as_str() == "settings.ini")
+                        && row
+                            .summary
+                            .as_ref()
+                            .is_some_and(|s| s.as_str() == expected_body)
+                }))
+            }
+            other => panic!("positive whole-file control must be complete: {other:?}"),
+        }
+
+        let path = fixture._project.path().join("settings.ini");
+        let mut cutpoint_hits = 0;
+        let outcome = service.run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
+            browser.packet_for_representation_v3(request.clone(), "codestory-cli", &mut |projection| {
+                if cutpoint_hits == 0 && matches!(projection, PacketProjectionV3Dto::Complete { evidence, .. }
+                    if evidence.as_slice().iter().any(|row| row.kind == EvidenceKindV3Dto::ExactSource
+                        && row.path.as_ref().is_some_and(|p| p.as_str() == "settings.ini")
+                        && row.summary.as_ref().is_some_and(|s| s.as_str() == expected_body))) {
+                    std::fs::write(&path, changed).unwrap();
+                    cutpoint_hits += 1;
+                }
+                serde_json::to_vec(projection).map(|bytes| bytes.len()).map_err(|_| ())
+            })
+        });
+        std::fs::write(&path, original)
+            .expect("restore selected source after the operation returns");
+        assert_eq!(
+            cutpoint_hits, 1,
+            "hostile cutpoint must see the actual complete exact file body before mutation"
+        );
+        match outcome {
+            Err(error) => assert!(
+                matches!(
+                    error.code.as_str(),
+                    "publication_changed" | "source_stale" | "source_unavailable"
+                ),
+                "expected a typed source/publication refusal after selection, got {error:?}"
+            ),
+            Ok(operation) => {
+                let projection = &operation.value.product.projection;
+                let gaps = match projection {
+                    PacketProjectionV3Dto::Complete { evidence, gaps, .. } => {
+                        assert!(
+                            !evidence.as_slice().iter().any(|row| row.kind
+                                == EvidenceKindV3Dto::ExactSource
+                                && row
+                                    .path
+                                    .as_ref()
+                                    .is_some_and(|p| p.as_str() == "settings.ini")),
+                            "a completed packet served stale exact source after the selected file changed: {projection:?}"
+                        );
+                        gaps
+                    }
+                    PacketProjectionV3Dto::BudgetExceeded { gaps, .. } => gaps,
+                };
+                assert!(
+                    gaps.as_slice()
+                        .iter()
+                        .any(|gap| gap.kind == GapKindV3Dto::SourceUnavailable
+                            && gap.message.as_ref().is_some_and(|message| {
+                                let text = message.as_str();
+                                text.contains("settings.ini")
+                                    && [
+                                        "changed",
+                                        "stale",
+                                        "omitted",
+                                        "unavailable",
+                                        "not delivered",
+                                    ]
+                                    .iter()
+                                    .any(|reason| text.contains(reason))
+                            })),
+                    "a non-source result must explicitly retain the stale/omitted-file gap: {projection:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn published_file_hydration_checks_freshness_before_budget_and_preserves_admission() {
+        use crate::agent::packet_candidate::{PacketProofSession, install_packet_proof_session};
+        use codestory_contracts::compilation::{
+            PacketAdmissionGapKindV1, PacketParserCompletenessV1,
+        };
+        let files = [
+            ("short.ini", "short_setting = 1\n".to_string()),
+            ("raw.ini", format!("raw_setting = {}\n", "x".repeat(512))),
+            (
+                "lines.ini",
+                format!("line_setting = 1\n{}", "\n".repeat(80)),
+            ),
+            (
+                "stale.ini",
+                format!("stale_setting = {}\n", "s".repeat(512)),
+            ),
+        ];
+        let inputs = files
+            .iter()
+            .map(|(path, content)| (*path, content.as_str()))
+            .collect::<Vec<_>>();
+        let fixture = public_packet_fixture_with_lexical_files(&inputs);
+        let pinned =
+            Rc::new(PinnedRetrievalRead::begin_packet_descriptor(&fixture.controller).unwrap());
+        let session = Rc::new(PacketProofSession::new());
+        with_active_pinned_retrieval_read(&fixture.controller, Rc::clone(&pinned), || {
+            let _guard = install_packet_proof_session(Rc::clone(&session));
+            preadmit_packet_descriptor_queries_with_policy(
+                &fixture.controller,
+                &[PacketRetrievalQuery {
+                    query: "Explain short_setting raw_setting line_setting stale_setting".into(),
+                    lexical_policy: LexicalAdmissionPolicy::BroadQuestionV1,
+                }],
+                None,
+            )
+            .unwrap();
+            for (path, _) in &files {
+                assert!(session.is_admitted_identity(&format!("path:{path}")));
+            }
+            pinned.session.validate_full_readiness().unwrap();
+            let receipts = session.receipts();
+            let queries = session.benchmark_retrieval_proof().descriptor_query_count;
+            let mut forged = receipts
+                .iter()
+                .find(|r| r.stable_identity == "path:short.ini")
+                .unwrap()
+                .clone();
+            forged.reserved_source_bytes += 1;
+            assert!(read_admitted_published_file(&fixture.controller, &forged).is_err());
+            let stale = fixture._project.path().join("stale.ini");
+            let modified = std::fs::metadata(&stale).unwrap().modified().unwrap();
+            std::fs::write(&stale, files[3].1.replace('s', "t")).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&stale)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(modified))
+                .unwrap();
+            let prepared = super::super::packet_compiler::prepare_packet_compilation(
+                &fixture.controller,
+                pinned.session.project_id(),
+                &[],
+                None,
+                &session,
+                None,
+            )
+            .unwrap();
+            let input = prepared.replay_input();
+            let short = input
+                .sources
+                .iter()
+                .find(|source| source.stable_identity == "path:short.ini")
+                .expect("short whole file");
+            assert!(short.callable_body.is_none());
+            assert_eq!(
+                short.parser_completeness,
+                PacketParserCompletenessV1::Unknown
+            );
+            assert!(
+                input.relations.is_empty(),
+                "published paths must not become Core graph endpoints"
+            );
+            for path in ["raw.ini", "lines.ini"] {
+                let identity = format!("path:{path}");
+                assert!(
+                    input
+                        .admissions
+                        .iter()
+                        .any(|r| r.stable_identity == identity)
+                );
+                assert!(
+                    !input
+                        .sources
+                        .iter()
+                        .any(|source| source.stable_identity == identity)
+                );
+                assert!(
+                    input
+                        .admission_gaps
+                        .iter()
+                        .any(
+                            |gap| gap.stable_identity.as_deref() == Some(identity.as_str())
+                                && gap.kind == PacketAdmissionGapKindV1::SourceBudgetExceeded
+                        )
+                );
+            }
+            assert!(
+                !input
+                    .admissions
+                    .iter()
+                    .any(|r| r.stable_identity == "path:stale.ini")
+            );
+            assert!(
+                input
+                    .admission_gaps
+                    .iter()
+                    .any(
+                        |gap| gap.stable_identity.as_deref() == Some("path:stale.ini")
+                            && gap.kind == PacketAdmissionGapKindV1::SourceUnavailable
+                    )
+            );
+            assert!(
+                !input
+                    .admission_gaps
+                    .iter()
+                    .any(
+                        |gap| gap.stable_identity.as_deref() == Some("path:stale.ini")
+                            && gap.kind == PacketAdmissionGapKindV1::SourceBudgetExceeded
+                    )
+            );
+            assert_eq!(
+                session.receipts(),
+                receipts,
+                "failed source must not refund or grow sealed reservations"
+            );
+            assert_eq!(
+                session.benchmark_retrieval_proof().descriptor_query_count,
+                queries,
+                "source hydration must not issue another query"
+            );
+        });
+    }
+
+    #[test]
+    fn published_lexical_file_packet_refuses_changed_discovery_exclusion() {
+        let fixture = public_packet_fixture_with_lexical_files(&[
+            (".ignore", "/.ignore\n"),
+            ("settings.ini", "policy_setting = true\n"),
+        ]);
+        let request = AgentPacketRequestDto {
+            question: "policy_setting".into(),
+            budget: PacketBudgetModeDto::Standard,
+            probes: Vec::new(),
+            latency_budget_ms: Some(30_000),
+            parent_packet_id: None,
+            option_ids: Vec::new(),
+            core_generation_id: None,
+            retrieval_generation: None,
+        };
+        let before = fixture
+            .controller
+            .browser_service()
+            .packet(request.clone())
+            .unwrap();
+        assert!(
+            before
+                .support
+                .iter()
+                .any(|r| r.path.as_deref() == Some("settings.ini") && r.snippet.is_some())
+        );
+        std::fs::write(
+            fixture._project.path().join(".ignore"),
+            "/.ignore\n/settings.ini\n",
+        )
+        .unwrap();
+        let discovered =
+            codestory_workspace::WorkspaceManifest::open(fixture._project.path().to_path_buf())
+                .unwrap()
+                .source_files()
+                .unwrap();
+        assert!(
+            !discovered
+                .iter()
+                .any(|p| p.file_name().is_some_and(|n| n == "settings.ini"))
+        );
+        assert!(
+            discovered
+                .iter()
+                .any(|p| p.file_name().is_some_and(|n| n == "metadata.rs"))
+        );
+        fixture.controller.browser_service().packet(request).expect_err("changed discovery policy must refuse the fresh packet before serving the old published file");
+    }
+
+    #[test]
+    fn browser_packet_serves_published_lexical_artifact_without_core_symbols() {
         let question =
             "Which role is assumed by the control plane, and which is used by worker nodes?";
         let fixture = public_packet_fixture_with_unindexed_lexical_artifact();
@@ -7835,25 +8688,39 @@ mod tests {
         drop(core);
         let browser = fixture.controller.browser_service();
 
-        let packet = browser
-            .packet(AgentPacketRequestDto {
-                question: question.into(),
-                budget: PacketBudgetModeDto::Compact,
-                probes: Vec::new(),
-                latency_budget_ms: Some(30_000),
-                parent_packet_id: None,
-                option_ids: Vec::new(),
-                core_generation_id: None,
-                retrieval_generation: None,
-            })
+        let request = AgentPacketRequestDto {
+            question: question.into(),
+            budget: PacketBudgetModeDto::Compact,
+            probes: Vec::new(),
+            latency_budget_ms: Some(30_000),
+            parent_packet_id: None,
+            option_ids: Vec::new(),
+            core_generation_id: None,
+            retrieval_generation: None,
+        };
+        let packet = browser.packet(request.clone())
             .unwrap_or_else(|error| {
                 panic!(
-                    "public packet must classify a real unindexed lexical artifact as an empty diagnostic result, got {}: {}",
+                    "public packet must deliver a real published lexical file while retaining diagnostic authority limits, got {}: {}",
                     error.code, error.message
                 )
             });
 
-        assert!(packet.support.is_empty());
+        assert_published_file_packet_available(&fixture, &request, &packet);
+        let source = packet
+            .support
+            .iter()
+            .find(|row| row.path.as_deref() == Some("LICENSE") && row.snippet.is_some())
+            .expect("small published LICENSE remains ordinary lexical file evidence");
+        assert!(source.symbol_id.is_none());
+        assert_eq!((source.start_line, source.end_line), (Some(1), Some(1)));
+        assert!(source.snippet.as_deref().unwrap().contains("The control plane assumes the control plane role, and worker nodes use the worker node role."));
+        assert!(
+            source
+                .source_delivery
+                .as_ref()
+                .is_some_and(|delivery| delivery.remaining_source_bytes == 0)
+        );
         assert!(packet.answer.citations.is_empty());
         assert!(
             packet
@@ -7862,16 +8729,23 @@ mod tests {
                 .retrieval_publication
                 .is_some()
         );
-        assert_eq!(
+        assert_ne!(
             packet.disposition.kind,
             PacketDispositionKindDto::NotEstablished
         );
-        assert_eq!(
+        assert_ne!(
             packet.disposition.reason.as_deref(),
             Some("no bounded repository evidence was retained")
         );
         assert!(packet.disposition.drill.is_none());
-        assert!(packet.disposition.omission_receipts.is_empty());
+        assert!(packet.answer.source_coverage.iter().any(|coverage| coverage.path == "LICENSE"
+            && coverage.status == codestory_contracts::api::SourceCoverageStatusDto::NotEstablished
+            && coverage.not_established_cause == Some(codestory_contracts::api::SourceCoverageNotEstablishedCauseDto::LookupUnavailable)));
+        assert_eq!(
+            packet.disposition.omission_receipts,
+            vec!["source coverage (lookup_unavailable) is unproven for LICENSE."],
+            "published source does not claim parser/Core coverage"
+        );
         let shadow = packet
             .answer
             .retrieval_trace

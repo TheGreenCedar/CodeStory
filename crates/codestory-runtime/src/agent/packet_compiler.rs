@@ -57,6 +57,10 @@ pub(crate) struct PreparedPacketCompilationV1 {
     pub(crate) source_coverage: Vec<SourceCoverageObservationDto>,
     publication: PacketCompilationPublicationV1,
     source_refusals: Vec<String>,
+    // Live proof minted only by successful pinned PublishedFile hydration.
+    // Replay source DTOs cannot certify deliberate absence from Core.
+    #[serde(skip)]
+    published_file_sources: Vec<PacketHydratedSourceRangeV1>,
     file_navigation_paths: HashMap<String, String>,
     // Complete-line alternatives are made during the same authenticated read.
     // They remain private runtime witnesses, never compiler question inputs.
@@ -85,6 +89,7 @@ impl PreparedPacketCompilationV1 {
             input,
             source_coverage: Vec::new(),
             source_refusals: Vec::new(),
+            published_file_sources: Vec::new(),
             file_navigation_paths: HashMap::new(),
             source_page_alternatives: BTreeMap::new(),
             requested_source_identities: BTreeSet::new(),
@@ -95,10 +100,20 @@ impl PreparedPacketCompilationV1 {
 
     pub(crate) fn supports_served_source_record(&self) -> bool {
         self.input.sources.iter().all(|s| {
-            s.delivery.is_some()
-                && s.stable_identity
-                    .strip_prefix("node:")
-                    .is_some_and(|id| id.parse::<i64>().is_ok())
+            s.delivery.as_ref().is_some_and(|d| {
+                d.matches_delivery(s.start_line, s.end_line)
+                    && (s
+                        .stable_identity
+                        .strip_prefix("node:")
+                        .is_some_and(|id| id.parse::<i64>().is_ok())
+                        || (s.stable_identity == format!("path:{}", s.path)
+                            && s.symbol.is_none()
+                            && s.start_line == 1
+                            && d.requested_range.end_line == s.end_line
+                            && d.remaining_source_bytes == 0
+                            && d.next_start_line.is_none()
+                            && d.blocked_line_rendered_bytes.is_none()))
+            })
         })
     }
     pub(crate) fn default_product(&self) -> RepositoryDerivedCompilationV1 {
@@ -118,6 +133,7 @@ impl PreparedPacketCompilationV1 {
             publication: self.publication,
             source_refusals: self.source_refusals,
             hydrated_sources: self.input.sources,
+            published_file_sources: self.published_file_sources,
             context_floor: Vec::new(),
         }
     }
@@ -135,6 +151,7 @@ impl PreparedPacketCompilationV1 {
             &self.publication,
             &self.source_refusals,
             &self.input.sources,
+            &self.published_file_sources,
         );
     }
 
@@ -781,13 +798,20 @@ pub(crate) struct FrozenPacketCompilationV1 {
     publication: PacketCompilationPublicationV1,
     source_refusals: Vec<String>,
     hydrated_sources: Vec<PacketHydratedSourceRangeV1>,
+    published_file_sources: Vec<PacketHydratedSourceRangeV1>,
     context_floor: Vec<SupportUnitDto>,
 }
 
 #[derive(Debug, Clone)]
 struct AuthenticatedPacketAdmissionV1 {
     receipt: PacketAdmissionReceiptV1,
-    core_node_id: CoreNodeId,
+    origin: AuthenticatedPacketOriginV1,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AuthenticatedPacketOriginV1 {
+    CoreNode(CoreNodeId),
+    PublishedFile,
 }
 
 /// Hydrate exactly the packet-wide admitted identities and compile their
@@ -843,7 +867,7 @@ pub(crate) fn prepare_packet_compilation(
         let mut old_admissions = Vec::new();
         let mut old_ranges = HashMap::new();
         for witness in &record.witnesses {
-            let identity = format!("node:{}", witness.node_id);
+            let identity = witness.stable_identity();
             let mut admission = session
                 .receipts()
                 .into_iter()
@@ -947,6 +971,16 @@ pub(crate) fn prepare_packet_compilation(
         .filter(|source| requested_identities.contains(&source.stable_identity))
         .map(|source| source.stable_identity.clone())
         .collect();
+    let published_file_sources = authenticated_admissions
+        .iter()
+        .filter(|admission| matches!(admission.origin, AuthenticatedPacketOriginV1::PublishedFile))
+        .filter_map(|admission| {
+            sources
+                .iter()
+                .find(|source| source.stable_identity == admission.receipt.stable_identity)
+        })
+        .cloned()
+        .collect();
     let relations = hydrate_induced_relations(&storage, &authenticated_admissions)?;
     let admissions = authenticated_admissions
         .into_iter()
@@ -980,6 +1014,7 @@ pub(crate) fn prepare_packet_compilation(
         source_coverage,
         publication,
         source_refusals,
+        published_file_sources,
         file_navigation_paths,
         source_page_alternatives,
         requested_source_identities,
@@ -1041,6 +1076,7 @@ pub(crate) fn replay_prepare_from_sealed_admissions(
         publication,
         source_coverage: coverage,
         source_refusals: refusals,
+        published_file_sources: Vec::new(),
         file_navigation_paths: navigation,
         source_page_alternatives: alternatives,
         requested_source_identities: std::collections::BTreeSet::new(),
@@ -1150,6 +1186,7 @@ pub(crate) fn apply_frozen_packet_compilation(
         &frozen.publication,
         &frozen.source_refusals,
         &frozen.hydrated_sources,
+        &frozen.published_file_sources,
     );
     // Rejected previews never enter final-support telemetry.
     crate::agent::packet_batch::observe_packet_raf_final_support(
@@ -1189,6 +1226,7 @@ fn apply_compilation_state(
     publication: &PacketCompilationPublicationV1,
     source_refusals: &[String],
     hydrated_sources: &[PacketHydratedSourceRangeV1],
+    published_file_sources: &[PacketHydratedSourceRangeV1],
 ) {
     packet.support = product.support.clone();
     packet.disposition = classify_packet_disposition(
@@ -1199,6 +1237,7 @@ fn apply_compilation_state(
         &publication.project_id,
         publication.core_generation_id.clone(),
         publication.retrieval_generation.clone(),
+        published_file_sources,
     );
     if !source_refusals.is_empty()
         && packet.disposition.kind == codestory_contracts::api::PacketDispositionKindDto::Supported
@@ -1345,7 +1384,7 @@ fn hydrate_admitted_sources_with_ranges(
     let mut callable_body_cache = HashMap::new();
     for admission in admissions {
         let previous_refusal_count = source_refusals.len();
-        let (core_node_id, is_file_source, result) =
+        let (origin, is_file_source, result) =
             if let Some(raw_id) = admission.stable_identity.strip_prefix("node:") {
                 let Some(node) = authenticated_node(storage, raw_id)? else {
                     push_admission_gap(
@@ -1369,7 +1408,7 @@ fn hydrate_admitted_sources_with_ranges(
                     file_navigation_paths.insert(admission.stable_identity.clone(), path);
                 }
                 (
-                    node.id,
+                    AuthenticatedPacketOriginV1::CoreNode(node.id),
                     node.kind == CoreNodeKind::FILE,
                     hydrate_admitted_node_source_with_range_cached(
                         controller,
@@ -1383,23 +1422,38 @@ fn hydrate_admitted_sources_with_ranges(
                     ),
                 )
             } else if let Some(path) = admission.stable_identity.strip_prefix("path:") {
-                let Some(file) = find_admitted_file(storage, &project_root, path)? else {
-                    push_admission_gap(
-                        admission_gaps,
-                        admission,
-                        PacketAdmissionGapKindV1::StableIdentityMissing,
-                        false,
-                    );
-                    continue;
-                };
-                if let Some(path) = authenticated_file_navigation_path(controller, &file) {
-                    file_navigation_paths.insert(admission.stable_identity.clone(), path);
+                if let Some(file) = find_admitted_file(storage, &project_root, path)? {
+                    if let Some(path) = authenticated_file_navigation_path(controller, &file) {
+                        file_navigation_paths.insert(admission.stable_identity.clone(), path);
+                    }
+                    (
+                        AuthenticatedPacketOriginV1::CoreNode(CoreNodeId(file.id)),
+                        true,
+                        hydrate_admitted_file_source(controller, storage, admission, &file),
+                    )
+                } else {
+                    let witness = match super::retrieval_primary::read_admitted_published_file(
+                        controller, admission,
+                    ) {
+                        Ok(Some(witness)) => witness,
+                        _ => {
+                            push_admission_gap(
+                                admission_gaps,
+                                admission,
+                                PacketAdmissionGapKindV1::SourceUnavailable,
+                                true,
+                            );
+                            continue;
+                        }
+                    };
+                    file_navigation_paths
+                        .insert(admission.stable_identity.clone(), witness.path().to_owned());
+                    (
+                        AuthenticatedPacketOriginV1::PublishedFile,
+                        true,
+                        hydrate_published_file_source(admission, &witness),
+                    )
                 }
-                (
-                    CoreNodeId(file.id),
-                    true,
-                    hydrate_admitted_file_source(controller, storage, admission, &file),
-                )
             } else {
                 push_admission_gap(
                     admission_gaps,
@@ -1413,7 +1467,7 @@ fn hydrate_admitted_sources_with_ranges(
             Ok(source) => {
                 authenticated.push(AuthenticatedPacketAdmissionV1 {
                     receipt: admission.clone(),
-                    core_node_id,
+                    origin,
                 });
                 sources.push(source);
             }
@@ -1437,7 +1491,7 @@ fn hydrate_admitted_sources_with_ranges(
                 }
                 authenticated.push(AuthenticatedPacketAdmissionV1 {
                     receipt: admission.clone(),
-                    core_node_id,
+                    origin,
                 });
                 push_admission_gap(
                     admission_gaps,
@@ -1845,6 +1899,35 @@ fn hydrate_admitted_file_source(
         .to_string_lossy()
         .replace('\\', "/");
     hydrated_source(admission, &canonical_path, None, &markdown)
+}
+
+fn hydrate_published_file_source(
+    admission: &PacketAdmissionReceiptV1,
+    witness: &codestory_retrieval::PublishedFileSourceWitness,
+) -> Result<PacketHydratedSourceRangeV1, PacketAdmissionGapKindV1> {
+    let text = witness.content();
+    let line_count = u32::try_from(text.lines().count())
+        .map_err(|_| PacketAdmissionGapKindV1::SourceUnavailable)?;
+    if line_count == 0 {
+        return Err(PacketAdmissionGapKindV1::SourceUnavailable);
+    }
+    let cap = source_byte_cap(admission);
+    if text.len() > cap {
+        return Err(PacketAdmissionGapKindV1::SourceBudgetExceeded);
+    }
+    let markdown = complete_file_markdown(text, line_count, cap)?;
+    let mut source = hydrated_source(admission, witness.path(), None, &markdown)?;
+    source.delivery = Some(PacketSourceDeliveryV1 {
+        requested_range: PacketSourceRangeV1 {
+            start_line: 1,
+            end_line: line_count,
+        },
+        source_sha256: witness.source_sha256().to_owned(),
+        remaining_source_bytes: 0,
+        next_start_line: None,
+        blocked_line_rendered_bytes: None,
+    });
+    Ok(source)
 }
 
 fn complete_file_markdown(
@@ -2277,13 +2360,18 @@ fn hydrate_induced_relations(
 ) -> Result<Vec<PacketDirectedRelationV1>, codestory_contracts::api::ApiError> {
     let mut stable_identity_by_node = HashMap::new();
     for admission in admissions {
-        stable_identity_by_node
-            .entry(admission.core_node_id)
-            .or_insert_with(|| admission.receipt.stable_identity.clone());
+        if let AuthenticatedPacketOriginV1::CoreNode(node_id) = admission.origin {
+            stable_identity_by_node
+                .entry(node_id)
+                .or_insert_with(|| admission.receipt.stable_identity.clone());
+        }
     }
     let node_ids = admissions
         .iter()
-        .map(|admission| admission.core_node_id)
+        .filter_map(|admission| match admission.origin {
+            AuthenticatedPacketOriginV1::CoreNode(node_id) => Some(node_id),
+            AuthenticatedPacketOriginV1::PublishedFile => None,
+        })
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
@@ -2359,6 +2447,7 @@ fn probe_ambiguities(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn classify_packet_disposition(
     packet: &AgentPacketDto,
     request: Option<&AgentPacketRequestDto>,
@@ -2367,6 +2456,7 @@ fn classify_packet_disposition(
     project_id: &str,
     core_generation_id: String,
     retrieval_generation: Option<String>,
+    published_file_sources: &[PacketHydratedSourceRangeV1],
 ) -> PacketDispositionDto {
     if let Some(request) = request {
         if let Some(expected) = request.core_generation_id.as_deref()
@@ -2409,7 +2499,11 @@ fn classify_packet_disposition(
             })
     });
 
-    let coverage = packet_coverage_for_disposition(&packet.answer.source_coverage, &packet.support);
+    let coverage = packet_coverage_for_disposition(
+        &packet.answer.source_coverage,
+        &packet.support,
+        published_file_sources,
+    );
     let coverage_blocks = coverage.blocks_packet_availability();
     if coverage_blocks {
         let blocked_paths = coverage.unprovable_paths();
@@ -2633,6 +2727,7 @@ fn is_retained_source_continuation(
 fn packet_coverage_for_disposition(
     observations: &[codestory_contracts::api::SourceCoverageObservationDto],
     support: &[SupportUnitDto],
+    published_file_sources: &[PacketHydratedSourceRangeV1],
 ) -> PacketCoverageInput {
     let verified_source_paths = support
         .iter()
@@ -2647,6 +2742,17 @@ fn packet_coverage_for_disposition(
     let blocking = observations
         .iter()
         .filter(|observation| {
+            // This live same-pin proof also survives output omission. It proves
+            // the missing Core row is deliberate, not that the row was served.
+            if observation.status == SourceCoverageStatusDto::NotEstablished
+                && observation.not_established_cause
+                    == Some(SourceCoverageNotEstablishedCauseDto::LookupUnavailable)
+                && published_file_sources
+                    .iter()
+                    .any(|source| source.path == observation.path)
+            {
+                return false;
+            }
             observation.status != SourceCoverageStatusDto::Incomplete
                 || observation.reason != Some(FileCoverageReason::ParserPartial)
                 || !verified_source_paths.contains(observation.path.as_str())
@@ -2956,6 +3062,7 @@ mod tests {
                 "project",
                 "core".into(),
                 Some("retrieval".into()),
+                &[],
             )
         };
         let baseline = classify(&[], None).drill.unwrap();
@@ -5204,7 +5311,8 @@ mod tests {
         assert!(
             packet_coverage_for_disposition(
                 std::slice::from_ref(&observation),
-                std::slice::from_ref(&source)
+                std::slice::from_ref(&source),
+                &[],
             )
             .blocks_packet_availability()
         );
@@ -5212,7 +5320,8 @@ mod tests {
         assert!(
             !packet_coverage_for_disposition(
                 std::slice::from_ref(&observation),
-                std::slice::from_ref(&source)
+                std::slice::from_ref(&source),
+                &[],
             )
             .blocks_packet_availability()
         );
@@ -5220,9 +5329,112 @@ mod tests {
         assert!(
             packet_coverage_for_disposition(
                 std::slice::from_ref(&observation),
-                std::slice::from_ref(&source)
+                std::slice::from_ref(&source),
+                &[],
             )
             .blocks_packet_availability()
+        );
+    }
+
+    #[test]
+    fn published_file_coverage_proof_is_live_and_never_replay_authority() {
+        let source = PacketHydratedSourceRangeV1 {
+            callable_body: None,
+            stable_identity: "path:settings.ini".into(),
+            path: "settings.ini".into(),
+            symbol: None,
+            start_line: 1,
+            end_line: 1,
+            source: "```text\n>    1 | value = 1\n```".into(),
+            parser_completeness: PacketParserCompletenessV1::Unknown,
+            delivery: Some(PacketSourceDeliveryV1 {
+                requested_range: PacketSourceRangeV1 {
+                    start_line: 1,
+                    end_line: 1,
+                },
+                source_sha256: "a".repeat(64),
+                remaining_source_bytes: 0,
+                next_start_line: None,
+                blocked_line_rendered_bytes: None,
+            }),
+        };
+        let observation = source_coverage_not_established(&source.path);
+        let input = PacketCompilationInputV1 {
+            contract_version: PACKET_COMPILATION_CONTRACT_VERSION_V1,
+            publication: PacketCompilationPublicationV1 {
+                project_id: "project".into(),
+                core_generation_id: "core".into(),
+                retrieval_generation: None,
+            },
+            admissions: Vec::new(),
+            sources: vec![source.clone()],
+            relations: Vec::new(),
+            ambiguities: Vec::new(),
+            admission_gaps: Vec::new(),
+        };
+        let mut prepared = PreparedPacketCompilationV1::from_fixture_input(input);
+        assert!(
+            packet_coverage_for_disposition(
+                std::slice::from_ref(&observation),
+                &[],
+                &prepared.published_file_sources
+            )
+            .blocks_packet_availability(),
+            "source DTO shape alone has no live publication authority"
+        );
+        prepared.published_file_sources = vec![source];
+        assert!(
+            !packet_coverage_for_disposition(
+                std::slice::from_ref(&observation),
+                &[],
+                &prepared.published_file_sources
+            )
+            .blocks_packet_availability(),
+            "successful same-pin whole file proves deliberate Core absence even after output omission"
+        );
+        let mut encoded = serde_json::to_value(&prepared).unwrap();
+        assert!(encoded.get("published_file_sources").is_none());
+        encoded["published_file_sources"] =
+            serde_json::to_value(&prepared.published_file_sources).unwrap();
+        let replayed: PreparedPacketCompilationV1 = serde_json::from_value(encoded).unwrap();
+        assert!(replayed.published_file_sources.is_empty());
+        assert!(
+            packet_coverage_for_disposition(
+                std::slice::from_ref(&observation),
+                &[],
+                &replayed.published_file_sources
+            )
+            .blocks_packet_availability()
+        );
+        for mode in 0..4 {
+            let mut blocked = observation.clone();
+            match mode {
+                0 => blocked.path = "other/settings.ini".into(),
+                1 => {
+                    blocked.not_established_cause =
+                        Some(SourceCoverageNotEstablishedCauseDto::PublicationIncomplete)
+                }
+                2 => blocked.not_established_cause = None,
+                _ => {
+                    blocked.status = SourceCoverageStatusDto::Incomplete;
+                    blocked.reason = Some(FileCoverageReason::ParserPartial);
+                    blocked.not_established_cause = None;
+                }
+            }
+            assert!(
+                packet_coverage_for_disposition(&[blocked], &[], &prepared.published_file_sources)
+                    .blocks_packet_availability(),
+                "unrelated coverage failure remains closed: {mode}"
+            );
+        }
+        assert_eq!(observation.status, SourceCoverageStatusDto::NotEstablished);
+        assert_eq!(
+            observation.not_established_cause,
+            Some(SourceCoverageNotEstablishedCauseDto::LookupUnavailable)
+        );
+        assert_eq!(
+            prepared.published_file_sources[0].parser_completeness,
+            PacketParserCompletenessV1::Unknown
         );
     }
 
@@ -6385,6 +6597,7 @@ mod tests {
             "project",
             "core".into(),
             Some("retrieval".into()),
+            &[],
         );
         assert_eq!(
             disposition.kind,
@@ -6425,6 +6638,7 @@ mod tests {
                 "project",
                 "core".into(),
                 Some("retrieval".into()),
+                &[],
             )
         };
         for status in [
@@ -6592,6 +6806,7 @@ mod tests {
                 "project",
                 "core".into(),
                 Some("retrieval".into()),
+                &[],
             )
         };
         let accepted = classify(&packet);
@@ -6763,6 +6978,7 @@ mod tests {
             input,
             source_coverage: packet.answer.source_coverage.clone(),
             source_refusals: Vec::new(),
+            published_file_sources: Vec::new(),
             file_navigation_paths: HashMap::new(),
             source_page_alternatives: BTreeMap::new(),
             requested_source_identities: BTreeSet::new(),
@@ -7362,6 +7578,7 @@ mod tests {
                 "project",
                 "core".into(),
                 Some("retrieval".into()),
+                &[],
             );
             let drill = disposition
                 .drill
@@ -7423,6 +7640,7 @@ mod tests {
                     "project",
                     "core".into(),
                     Some("retrieval".into()),
+                    &[],
                 );
                 assert!(terminal.drill.is_none());
                 if request.parent_packet_id.is_some()
@@ -7668,6 +7886,7 @@ mod tests {
             "project",
             publication.generation_id.clone(),
             None,
+            &[],
         );
         assert_eq!(
             unknown.kind,
@@ -8381,7 +8600,7 @@ mod tests {
                 reserved_source_bytes: 1,
                 origin: PacketAdmissionOriginV1::Retrieval,
             },
-            core_node_id: CoreNodeId(node_id),
+            origin: AuthenticatedPacketOriginV1::CoreNode(CoreNodeId(node_id)),
         }
     }
 
@@ -8591,7 +8810,7 @@ mod tests {
                     reserved_source_bytes: 1,
                     origin: PacketAdmissionOriginV1::Retrieval,
                 },
-                core_node_id: CoreNodeId(1),
+                origin: AuthenticatedPacketOriginV1::CoreNode(CoreNodeId(1)),
             },
             AuthenticatedPacketAdmissionV1 {
                 receipt: PacketAdmissionReceiptV1 {
@@ -8601,7 +8820,7 @@ mod tests {
                     reserved_source_bytes: 1,
                     origin: PacketAdmissionOriginV1::Retrieval,
                 },
-                core_node_id: CoreNodeId(2),
+                origin: AuthenticatedPacketOriginV1::CoreNode(CoreNodeId(2)),
             },
             AuthenticatedPacketAdmissionV1 {
                 receipt: PacketAdmissionReceiptV1 {
@@ -8611,7 +8830,7 @@ mod tests {
                     reserved_source_bytes: 1,
                     origin: PacketAdmissionOriginV1::Retrieval,
                 },
-                core_node_id: CoreNodeId(3),
+                origin: AuthenticatedPacketOriginV1::CoreNode(CoreNodeId(3)),
             },
         ];
 

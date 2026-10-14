@@ -42,6 +42,26 @@ publication checks, the single continuation round, and the complete 16-KiB
 serialized public projection remain enforced. If spare capacity is insufficient,
 the page stays bounded and reports its remaining source bytes.
 
+An admitted lexical-only file that has no Core file row can supply its original
+whole-file text through the pinned retrieval publication. Runtime authenticates
+the retained descriptor or issued source record, the newest logical document,
+and current source bytes before checking the delivery budget. Both the raw text
+and complete numbered rendering must fit the existing reservation. Larger
+verified files retain navigation with a budget gap; stale or unavailable files
+cannot acquire authenticated navigation from their old descriptor. Empty files
+do not manufacture a source line. These witnesses have no Core node, parser
+coverage, graph endpoint, partial-file page or next-page action.
+Private proof from successful hydration distinguishes intentional absence from
+Core from a failed source lookup, even if output fitting omits the file. Raw
+Core coverage stays unestablished; omitted text is never counted as delivered.
+This live proof is not restored from serialized replay input. A whole-file
+follow-up uses the existing path action without a line range.
+After response selection and measurement, the outer retrieval owner verifies
+each authenticated file again against its accepted native identity and content
+hash. It retains the original cancellation flag and refuses a changed source;
+duplicate reads cannot establish a replacement identity. This final check is
+bounded per file and does not rerun retrieval or change the source reservation.
+
 Every observed coverage gap remains explicit in the measured public response,
 whether response-size selection retains or omits its bounded source witness.
 A verified source page permits positive evidence without establishing complete
@@ -207,7 +227,18 @@ source extents, gaps, navigation and full-frame measurement remain unchanged.
 
 The normal CLI can issue an immutable served-source record after its complete public envelope is finalized and rendered. Runtime stores bounded metadata only: actual transport caller, execution request, project and Core/retrieval publication identities, question digest, exact delivered bounds/receipt, rendered reservation and source-prefix digest. An owner-private HMAC key authenticates issuance across CLI processes. The record has a one-hour lease, immutable idempotent commits, bounded inventory scanning and 128-MiB scope/512-MiB namespace limits; expiration never evicts or renews evidence automatically. Preview/projector callbacks and BudgetExceeded results never issue history. This is ordinary local-file integrity, not same-user agent or native credential isolation.
 
-A marked numeric source-page continuation must resolve its real issued record under the same transport/question/publication; missing, foreign, expired or tampered history refuses. Runtime reserves all protected identities/bytes before optional descriptor retrieval, rehydrates the original delivered prefix from sealed current source, and freezes every prior body/receipt/citation before new optional context competes. Both actual public projection and adapter-final commit verify all prior prefixes. The original cap and whole-chain latency contract remain unchanged. Legacy FILE/path sources without paging receipts and stdio retain their existing conservative path and identifiers; this CLI implementation does not claim their historical receipt qualification.
+A marked numeric source-page continuation must resolve its real issued record under the same transport/question/publication; missing, foreign, expired or tampered history refuses. Runtime reserves all protected identities/bytes before optional descriptor retrieval, rehydrates the original delivered prefix from sealed current source, and freezes every prior body/receipt/citation before new optional context competes. Both actual public projection and adapter-final commit verify all prior prefixes. The original cap and whole-chain latency contract remain unchanged.
+
+Numeric-only records retain their version-1 bytes and authentication. A
+version-2 record can additionally protect complete lexical-only file witnesses
+by path, with exact whole-file bounds, text and receipt. An authenticated issued
+record authorizes rehydration even when the new retrieval prefix omits that
+file; the pinned publication and current-source checks still apply. A file
+omitted from final delivery does not enter the record or prevent the selected
+numeric sources from receiving their normal protection. Legacy FILE/path
+sources without delivery receipts and stdio retain their existing conservative
+path and identifiers; this CLI implementation does not claim their historical
+receipt qualification.
 
 The owned packet operation's existing private diagnostic log records at most four
 query views with sixteen eligible identity digests, returned ranks and exact fused

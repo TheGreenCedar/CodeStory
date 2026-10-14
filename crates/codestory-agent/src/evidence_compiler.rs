@@ -1617,14 +1617,16 @@ fn continuation_selectors(
     let mut omitted_page_cursors = BTreeMap::<String, Vec<_>>::new();
     for selected in sources {
         let source = selected.witness;
-        if source_page_was_retained(source, retained_source_pages) {
+        if source_page_was_retained(source, retained_source_pages)
+            || !source.stable_identity.starts_with("node:")
+        {
             continue;
         }
         let Some(delivery) = &source.delivery else {
             continue;
         };
         for identity in &selected.represented_identities {
-            if source_budget_omissions.contains(identity) {
+            if identity.starts_with("node:") && source_budget_omissions.contains(identity) {
                 omitted_page_cursors
                     .entry(identity.clone())
                     .or_default()
@@ -1750,7 +1752,8 @@ fn continuation_selectors(
             .iter()
             .filter(|source| &source.stable_identity == identity)
         {
-            if let Some(delivery) = &source.delivery
+            if identity.starts_with("node:")
+                && let Some(delivery) = &source.delivery
                 && delivery.matches_delivery(source.start_line, source.end_line)
                 && let Some(next) = delivery.next_start_line
                 && source_page_was_retained(source, retained_source_pages)
@@ -3515,6 +3518,171 @@ mod tests {
                 .iter()
                 .any(|selector| selector.stable_identity == "node:exact")
         );
+    }
+
+    #[test]
+    fn omitted_whole_file_uses_path_action_while_numeric_pages_keep_ranges() {
+        let mut value = measured_page_input();
+        let mut source = value.sources[0].clone();
+        source.stable_identity = "path:settings.ini".into();
+        source.path = "settings.ini".into();
+        source.symbol = None;
+        source.callable_body = None;
+        source.parser_completeness = PacketParserCompletenessV1::Unknown;
+        let delivery = source.delivery.as_mut().unwrap();
+        delivery.requested_range.end_line = source.end_line;
+        delivery.remaining_source_bytes = 0;
+        delivery.next_start_line = None;
+        value.sources = vec![source.clone()];
+        value.admissions.truncate(1);
+        value.admissions[0].stable_identity = source.stable_identity.clone();
+        value.relations.clear();
+        let selected = compile_repository_evidence_for_representation(&value, |product| {
+            Ok::<_, ()>(Some(
+                if product
+                    .support
+                    .iter()
+                    .any(|r| r.kind == SupportUnitKindDto::SourceRange)
+                {
+                    16_385
+                } else {
+                    4096
+                },
+            ))
+        })
+        .unwrap();
+        let RepresentationBudgetSelectionV1::Complete { product, .. } = selected else {
+            panic!("whole-file navigation must fit");
+        };
+        let selector = product
+            .continuation
+            .iter()
+            .find(|s| s.stable_identity == "path:settings.ini")
+            .expect("omitted file keeps its existing whole-file action");
+        assert_eq!(selector.path.as_deref(), Some("settings.ini"));
+        assert!(
+            selector.symbol_id.is_none() && selector.source_range.is_none(),
+            "a file action cannot acquire an unexecutable numeric page cursor"
+        );
+
+        let mut numeric = measured_page_input();
+        numeric.relations.clear();
+        let retained = compile_repository_evidence(&numeric);
+        assert!(
+            retained
+                .continuation
+                .iter()
+                .any(|s| s.stable_identity.starts_with("node:")
+                    && s.source_range
+                        .is_some_and(|r| r.start_line == 2 && r.end_line == 3)),
+            "retained numeric pages keep their unread-tail cursor"
+        );
+        let omitted = compile_repository_evidence_for_representation(&numeric, |product| {
+            Ok::<_, ()>(Some(
+                if product
+                    .support
+                    .iter()
+                    .any(|r| r.kind == SupportUnitKindDto::SourceRange)
+                {
+                    16_385
+                } else {
+                    4096
+                },
+            ))
+        })
+        .unwrap();
+        let RepresentationBudgetSelectionV1::Complete { product, .. } = omitted else {
+            panic!("numeric navigation fits");
+        };
+        assert!(
+            product
+                .continuation
+                .iter()
+                .any(|s| s.stable_identity.starts_with("node:")
+                    && s.source_range
+                        .is_some_and(|r| r.start_line == 1 && r.end_line == 3)),
+            "omitted numeric pages retry their actual requested range"
+        );
+    }
+
+    #[test]
+    fn coalesced_path_alias_never_inherits_numeric_omission_cursor() {
+        let mut value = measured_page_input();
+        let mut owner = value.sources[0].clone();
+        owner.path = "settings.ini".into();
+        let delivery = owner.delivery.as_mut().unwrap();
+        delivery.requested_range.end_line = owner.end_line;
+        delivery.remaining_source_bytes = 0;
+        delivery.next_start_line = None;
+        let mut numeric_alias = owner.clone();
+        numeric_alias.stable_identity = "node:99".into();
+        let mut path_alias = owner.clone();
+        path_alias.stable_identity = "path:settings.ini".into();
+        path_alias.symbol = None;
+        path_alias.callable_body = None;
+        path_alias.parser_completeness = PacketParserCompletenessV1::Unknown;
+        value.sources = vec![owner.clone(), numeric_alias.clone(), path_alias.clone()];
+        let receipt = value.admissions[0].clone();
+        value.admissions = [&owner, &numeric_alias, &path_alias]
+            .into_iter()
+            .enumerate()
+            .map(|(index, source)| {
+                let mut admission = receipt.clone();
+                admission.packet_ordinal = index as u32;
+                admission.stable_identity = source.stable_identity.clone();
+                admission.origin = if index == 0 {
+                    PacketAdmissionOriginV1::ExactTypedSelector
+                } else {
+                    PacketAdmissionOriginV1::Retrieval
+                };
+                admission
+            })
+            .collect();
+        value.relations.clear();
+        let all = compile_repository_evidence(&value);
+        assert_eq!(
+            all.support
+                .iter()
+                .filter(|r| r.kind == SupportUnitKindDto::SourceRange)
+                .count(),
+            1,
+            "equal whole-file extents must actually coalesce under the numeric owner"
+        );
+        let selected = compile_repository_evidence_for_representation(&value, |product| {
+            Ok::<_, ()>(Some(
+                if product
+                    .support
+                    .iter()
+                    .any(|r| r.kind == SupportUnitKindDto::SourceRange)
+                {
+                    16_385
+                } else {
+                    4096
+                },
+            ))
+        })
+        .unwrap();
+        let RepresentationBudgetSelectionV1::Complete { product, .. } = selected else {
+            panic!("omitted aliases fit as navigation");
+        };
+        for source in [&owner, &numeric_alias] {
+            assert!(
+                product
+                    .continuation
+                    .iter()
+                    .any(|s| s.stable_identity == source.stable_identity
+                        && s.source_range
+                            == Some(source.delivery.as_ref().unwrap().requested_range)),
+                "each numeric alias retains its omission range"
+            );
+        }
+        let path = product
+            .continuation
+            .iter()
+            .find(|s| s.stable_identity == path_alias.stable_identity)
+            .expect("coalesced path still has whole-file navigation");
+        assert!(path.source_range.is_none() && path.symbol_id.is_none());
+        assert_eq!(path.path.as_deref(), Some("settings.ini"));
     }
 
     #[test]

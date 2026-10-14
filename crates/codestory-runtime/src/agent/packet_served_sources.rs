@@ -25,7 +25,8 @@ const LEASE_SECONDS: u64 = 3600;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ServedSourceWitness {
-    pub(crate) node_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) node_id: Option<String>,
     pub(crate) path: String,
     pub(crate) start_line: u32,
     pub(crate) end_line: u32,
@@ -44,6 +45,25 @@ pub(crate) struct ServedSourceRecord {
     issued_at: u64,
     expires_at: u64,
     pub(crate) witnesses: Vec<ServedSourceWitness>,
+}
+impl ServedSourceRecord {
+    pub(crate) fn authorizes_published_file(
+        &self,
+        identity: &str,
+        publication: &codestory_retrieval::RetrievalPublicationIdentity,
+    ) -> bool {
+        self.version == 2
+            && self.publication.retrieval.as_ref().is_some_and(|p| {
+                p.core_generation_id.as_str() == publication.core_generation_id
+                    && p.core_run_id.as_str() == publication.core_run_id
+                    && p.retrieval_generation.as_str() == publication.sidecar_generation
+                    && p.retrieval_input_sha256.as_str() == publication.sidecar_input_hash
+                    && p.semantic_generation.as_str() == publication.semantic_generation
+            })
+            && self.witnesses.iter().any(|w| {
+                w.node_id.is_none() && w.stable_identity() == identity && w.valid_for_version(2)
+            })
+    }
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -265,8 +285,8 @@ fn validate_record(
     question: &str,
     at: u64,
 ) -> Result<(), ApiError> {
-    if record.version != 1
-        || record.caller != caller
+    validate_record_without_question(record)?;
+    if record.caller != caller
         || record.request_id != parent
         || record.publication != *publication
         || record.question_sha256 != digest(question.as_bytes())
@@ -279,24 +299,6 @@ fn validate_record(
                 .ok_or_else(refused)?
         || record.witnesses.len() > INTERIM_MAX_ADMITTED_CANDIDATES
     {
-        return Err(refused());
-    }
-    let mut identities = std::collections::BTreeSet::new();
-    let mut bytes = 0usize;
-    for w in &record.witnesses {
-        if w.node_id.parse::<i64>().is_err()
-            || !identities.insert(w.node_id.clone())
-            || !w.delivery.matches_delivery(w.start_line, w.end_line)
-            || w.rendered_bytes == 0
-            || w.rendered_bytes > 4096
-            || w.public_source_sha256.len() != 64
-            || w.path.is_empty()
-        {
-            return Err(refused());
-        }
-        bytes = bytes.checked_add(w.rendered_bytes).ok_or_else(refused)?;
-    }
-    if bytes > INTERIM_MAX_ADMITTED_SOURCE_BYTES {
         return Err(refused());
     }
     Ok(())
@@ -411,21 +413,30 @@ fn projection_preserves_witness(
     };
     evidence.as_slice().iter().any(|row| {
         if row.kind != EvidenceKindV3Dto::ExactSource
-            || row.symbol_id.as_ref().map(|id| id.as_str()) != Some(old.node_id.as_str())
+            || row.symbol_id.as_ref().map(|id| id.as_str()) != old.node_id.as_deref()
             || row.path.as_ref().map(|p| p.as_str()) != Some(old.path.as_str())
             || row.start_line != Some(old.start_line)
-            || row.end_line.is_none_or(|end| end < old.end_line)
+            || row.end_line.is_none_or(|end| {
+                end < old.end_line || (old.node_id.is_none() && end != old.end_line)
+            })
         {
             return false;
         }
         let Some(delivery) = row.source_delivery.as_ref() else {
             return false;
         };
-        if delivery.source_sha256 != old.delivery.source_sha256
+        if (old.node_id.is_none() && *delivery != old.delivery)
+            || delivery.source_sha256 != old.delivery.source_sha256
             || delivery.requested_range != old.delivery.requested_range
             || !delivery.matches_delivery(old.start_line, row.end_line.unwrap())
         {
             return false;
+        }
+        if old.node_id.is_none() {
+            return row
+                .summary
+                .as_ref()
+                .is_some_and(|text| digest(text.as_str().as_bytes()) == old.public_source_sha256);
         }
         let Some(body) = row
             .summary
@@ -444,13 +455,54 @@ fn projection_preserves_witness(
     })
 }
 impl ServedSourceWitness {
+    pub(crate) fn stable_identity(&self) -> String {
+        self.node_id
+            .as_ref()
+            .map_or_else(|| format!("path:{}", self.path), |id| format!("node:{id}"))
+    }
+
+    fn valid_for_version(&self, version: u32) -> bool {
+        let identity_valid = match &self.node_id {
+            Some(id) => id.parse::<i64>().is_ok(),
+            None => {
+                version == 2
+                    && !self.path.is_empty()
+                    && !self.path.contains('\\')
+                    && self
+                        .path
+                        .split('/')
+                        .all(|p| !p.is_empty() && !matches!(p, "." | ".."))
+                    && Path::new(&self.path)
+                        .components()
+                        .all(|p| matches!(p, std::path::Component::Normal(_)))
+                    && self.start_line == 1
+                    && self.delivery.requested_range.end_line == self.end_line
+                    && self.delivery.remaining_source_bytes == 0
+                    && self.delivery.next_start_line.is_none()
+                    && self.delivery.blocked_line_rendered_bytes.is_none()
+            }
+        };
+        identity_valid
+            && !self.path.is_empty()
+            && self
+                .delivery
+                .matches_delivery(self.start_line, self.end_line)
+            && self.rendered_bytes > 0
+            && self.rendered_bytes <= 4096
+            && self.public_source_sha256.len() == 64
+            && self
+                .public_source_sha256
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit())
+    }
+
     pub(crate) fn matches(&self, source: &PacketHydratedSourceRangeV1) -> bool {
         let compact = crate::evidence_projection_v3::compact_numbered_source_page(
             &source.source,
             source.start_line,
             source.end_line,
         );
-        source.stable_identity == format!("node:{}", self.node_id)
+        source.stable_identity == self.stable_identity()
             && source.path == self.path
             && source.start_line == self.start_line
             && source.end_line == self.end_line
@@ -483,12 +535,7 @@ fn witnesses(projection: &PacketProjectionV3Dto) -> Result<Vec<ServedSourceWitne
         let start = row.start_line.ok_or_else(refused)?;
         let end = row.end_line.ok_or_else(refused)?;
         result.push(ServedSourceWitness {
-            node_id: row
-                .symbol_id
-                .as_ref()
-                .ok_or_else(refused)?
-                .as_str()
-                .to_owned(),
+            node_id: row.symbol_id.as_ref().map(|id| id.as_str().to_owned()),
             path: row.path.as_ref().ok_or_else(refused)?.as_str().to_owned(),
             start_line: start,
             end_line: end,
@@ -571,7 +618,11 @@ pub(crate) fn commit(
                 }
                 let at = now()?;
                 let record = ServedSourceRecord {
-                    version: 1,
+                    version: if final_witnesses.iter().any(|w| w.node_id.is_none()) {
+                        2
+                    } else {
+                        1
+                    },
                     caller: caller.to_owned(),
                     request_id: identity.request_id.as_str().to_owned(),
                     question_sha256: identity.question_sha256.as_str().to_owned(),
@@ -590,7 +641,9 @@ pub(crate) fn commit(
 fn validate_record_without_question(record: &ServedSourceRecord) -> Result<(), ApiError> {
     // The projection builder already bound the question digest; the loader
     // compares it to the actual continuation question. Validate remaining shape.
-    if record.question_sha256.len() != 64
+    if !matches!(record.version, 1 | 2)
+        || (record.version == 2 && record.witnesses.iter().all(|w| w.node_id.is_some()))
+        || record.question_sha256.len() != 64
         || record.request_id.is_empty()
         || record.caller.is_empty()
         || record.witnesses.len() > 16
@@ -600,12 +653,7 @@ fn validate_record_without_question(record: &ServedSourceRecord) -> Result<(), A
     let mut ids = std::collections::BTreeSet::new();
     let mut total = 0;
     for w in &record.witnesses {
-        if !ids.insert(w.node_id.clone())
-            || w.node_id.parse::<i64>().is_err()
-            || !w.delivery.matches_delivery(w.start_line, w.end_line)
-            || w.rendered_bytes == 0
-            || w.rendered_bytes > 4096
-        {
+        if !ids.insert(w.stable_identity()) || !w.valid_for_version(record.version) {
             return Err(refused());
         }
         total += w.rendered_bytes;
@@ -705,7 +753,7 @@ mod tests {
                 }),
             },
             witnesses: vec![ServedSourceWitness {
-                node_id: "17".into(),
+                node_id: Some("17".into()),
                 path: "source.rs".into(),
                 start_line: 1,
                 end_line: 1,
@@ -724,6 +772,174 @@ mod tests {
             }],
         }
     }
+    #[test]
+    fn served_source_record_preserves_legacy_literal_mac_and_closes_path_versions() {
+        // Fixed independently from the d07 v1 field declarations and stdlib
+        // HMAC; expected bytes are not produced by this serializer.
+        const LEGACY: &str = r#"{"version":1,"caller":"codestory-cli","request_id":"psr1:actual-issued-operation","question_sha256":"31cb0b231398bec14f3830a865b318504faa80fa71a65c63de10b246b11daf46","publication":{"core":{"project_id":"project","generation_id":"core","run_id":"run"},"retrieval":{"core_generation_id":"core","core_run_id":"run","retrieval_generation":"retrieval","retrieval_input_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","semantic_generation":"semantic"}},"issued_at":1700000000,"expires_at":1700003600,"witnesses":[{"node_id":"17","path":"source.rs","start_line":1,"end_line":1,"delivery":{"requested_range":{"start_line":1,"end_line":3},"source_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","remaining_source_bytes":12,"next_start_line":2,"blocked_line_rendered_bytes":null},"rendered_bytes":24,"public_source_sha256":"fea8f203cdf7dd560206d40ba8d07237a4e0ac7ac6a012fac0411d5dadc3d4ea"}]}"#;
+        const SIGNED: &str = r#"{"record":{"version":1,"caller":"codestory-cli","request_id":"psr1:actual-issued-operation","question_sha256":"31cb0b231398bec14f3830a865b318504faa80fa71a65c63de10b246b11daf46","publication":{"core":{"project_id":"project","generation_id":"core","run_id":"run"},"retrieval":{"core_generation_id":"core","core_run_id":"run","retrieval_generation":"retrieval","retrieval_input_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","semantic_generation":"semantic"}},"issued_at":1700000000,"expires_at":1700003600,"witnesses":[{"node_id":"17","path":"source.rs","start_line":1,"end_line":1,"delivery":{"requested_range":{"start_line":1,"end_line":3},"source_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","remaining_source_bytes":12,"next_start_line":2,"blocked_line_rendered_bytes":null},"rendered_bytes":24,"public_source_sha256":"fea8f203cdf7dd560206d40ba8d07237a4e0ac7ac6a012fac0411d5dadc3d4ea"}]},"mac":"21958132a8ab06aecf34e054202f61c0166d523bfea7c7f799fd28cd3158a3ed"}"#;
+        let key: [u8; 32] = std::array::from_fn(|i| i as u8);
+        let legacy: ServedSourceRecord = serde_json::from_str(LEGACY).unwrap();
+        assert_eq!(serde_json::to_vec(&legacy).unwrap(), LEGACY.as_bytes());
+        assert_eq!(
+            mac(&key, LEGACY.as_bytes()),
+            "21958132a8ab06aecf34e054202f61c0166d523bfea7c7f799fd28cd3158a3ed"
+        );
+        let root = tempfile::tempdir().unwrap();
+        let scope = root.path().join(scope_id("project", "codestory-cli"));
+        private_directory(&scope).unwrap();
+        codestory_workspace::atomic_file::publish_new_private_file_atomic(
+            &root.path().join("key"),
+            "fixture-key",
+            &key,
+        )
+        .unwrap();
+        let path = record_path(root.path(), "project", "codestory-cli", &legacy.request_id);
+        codestory_workspace::atomic_file::publish_new_private_file_atomic(
+            &path,
+            "fixture-record",
+            SIGNED.as_bytes(),
+        )
+        .unwrap();
+        let loaded = read_record(
+            root.path(),
+            &legacy.publication,
+            &legacy.caller,
+            &legacy.request_id,
+            "ordinary question",
+            1_700_000_001,
+        )
+        .unwrap();
+        assert_eq!(loaded.witnesses, legacy.witnesses);
+        for version in [0, 2, 3, u32::MAX] {
+            let mut invalid = legacy.clone();
+            invalid.version = version;
+            assert!(validate_record_without_question(&invalid).is_err());
+        }
+        let mut path_record = legacy.clone();
+        path_record.version = 2;
+        let w = &mut path_record.witnesses[0];
+        w.node_id = None;
+        w.path = "settings.ini".into();
+        w.delivery.requested_range.end_line = w.end_line;
+        w.delivery.remaining_source_bytes = 0;
+        w.delivery.next_start_line = None;
+        assert!(validate_record_without_question(&path_record).is_ok());
+        assert!(
+            !serde_json::to_string(&path_record)
+                .unwrap()
+                .contains("node_id")
+        );
+        for mode in 0..9 {
+            let mut invalid = path_record.clone();
+            match mode {
+                0 => invalid.version = 1,
+                1 => invalid.witnesses[0].path = "../settings.ini".into(),
+                2 => invalid.witnesses[0].path = "/settings.ini".into(),
+                3 => {
+                    invalid.witnesses[0].delivery.requested_range.end_line = 2;
+                    invalid.witnesses[0].delivery.next_start_line = Some(2);
+                    invalid.witnesses[0].delivery.remaining_source_bytes = 1;
+                }
+                4 => invalid.witnesses[0].start_line = 2,
+                5 => invalid.witnesses[0].delivery.blocked_line_rendered_bytes = Some(513),
+                6 => invalid.witnesses[0].delivery.next_start_line = Some(2),
+                7 => invalid.witnesses[0].path = "a\\b.ini".into(),
+                _ => invalid.witnesses[0].public_source_sha256 = "z".repeat(64),
+            }
+            assert!(
+                validate_record_without_question(&invalid).is_err(),
+                "path/version mode {mode}"
+            );
+        }
+        let null_node = LEGACY.replace("\"node_id\":\"17\"", "\"node_id\":null");
+        let null_node: ServedSourceRecord = serde_json::from_str(&null_node).unwrap();
+        assert!(
+            validate_record_without_question(&null_node).is_err(),
+            "v1 cannot acquire unsigned path semantics"
+        );
+    }
+
+    #[test]
+    fn served_whole_file_projection_rejects_appended_payload_at_same_bounds() {
+        use crate::evidence_projection_v3::representation_budget_test_support as fixture;
+        use codestory_contracts::compilation::*;
+        let source = "```text\n>    1 | value = 1\n```";
+        let input = PacketCompilationInputV1 {
+            contract_version: 1,
+            publication: PacketCompilationPublicationV1 {
+                project_id: "project-1".into(),
+                core_generation_id: "core-generation-1".into(),
+                retrieval_generation: Some("retrieval-generation-1".into()),
+            },
+            admissions: vec![PacketAdmissionReceiptV1 {
+                packet_ordinal: 0,
+                stable_identity: "path:settings.ini".into(),
+                origin: PacketAdmissionOriginV1::Retrieval,
+                score_version: "ordinary".into(),
+                reserved_source_bytes: 512,
+            }],
+            sources: vec![PacketHydratedSourceRangeV1 {
+                stable_identity: "path:settings.ini".into(),
+                path: "settings.ini".into(),
+                symbol: None,
+                start_line: 1,
+                end_line: 1,
+                source: source.into(),
+                callable_body: None,
+                parser_completeness: PacketParserCompletenessV1::Unknown,
+                delivery: Some(PacketSourceDeliveryV1 {
+                    requested_range: PacketSourceRangeV1 {
+                        start_line: 1,
+                        end_line: 1,
+                    },
+                    source_sha256: "a".repeat(64),
+                    remaining_source_bytes: 0,
+                    next_start_line: None,
+                    blocked_line_rendered_bytes: None,
+                }),
+            }],
+            relations: Vec::new(),
+            ambiguities: Vec::new(),
+            admission_gaps: Vec::new(),
+        };
+        let request: AgentPacketRequestDto =
+            serde_json::from_value(serde_json::json!({"question":"ordinary question"})).unwrap();
+        let (packet, _) = fixture::default_packet(input, &request);
+        let product = fixture::project_packet(&request, &packet, |p| {
+            Ok(serde_json::to_vec(p).unwrap().len())
+        })
+        .unwrap();
+        let old = witnesses(&product.projection).unwrap().remove(0);
+        assert!(old.node_id.is_none());
+        assert!(projection_preserves_witness(&old, &product.projection));
+        let mut changed = product.projection.clone();
+        if let PacketProjectionV3Dto::Complete { evidence, .. } = &mut changed {
+            let mut rows = evidence.as_slice().to_vec();
+            let row = rows
+                .iter_mut()
+                .find(|r| r.kind == EvidenceKindV3Dto::ExactSource)
+                .unwrap();
+            row.summary = Some(
+                codestory_contracts::packet_projection_v3::SummaryTextV3::new(
+                    row.summary
+                        .as_ref()
+                        .unwrap()
+                        .as_str()
+                        .replace("\n```", "\n 2 | appended\n```"),
+                )
+                .unwrap(),
+            );
+            *evidence = codestory_contracts::packet_projection_v3::BoundedVecV3::new(rows).unwrap();
+        } else {
+            panic!("fixture requires a complete projection");
+        }
+        assert!(
+            !projection_preserves_witness(&old, &changed),
+            "whole-file bounds cannot authenticate an unmeasured trailing payload"
+        );
+    }
+
     #[test]
     fn served_source_record_immutable_cross_process_and_hostile_bindings() {
         let dir = tempfile::tempdir().unwrap();

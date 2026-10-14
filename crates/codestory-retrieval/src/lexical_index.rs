@@ -4697,6 +4697,213 @@ fn decoded_call_neighborhood(
     Ok(Some(value))
 }
 
+pub(crate) struct PublishedFileContent {
+    pub path: String,
+    pub content: String,
+    pub source_sha256: String,
+    pub read_fence: PublishedFileReadFence,
+}
+
+/// The successful read epoch belongs to the pin, even when fitting later omits
+/// the source. Final verification must not establish a replacement epoch.
+pub(crate) struct PublishedFileReadFence {
+    source: LexicalSourceSeal,
+    source_sha256: String,
+    read_limit: u64,
+    artifacts: Vec<ArtifactSeal>,
+}
+
+impl PublishedFileReadFence {
+    pub(crate) fn revalidate(&self, project_root: &Path) -> Result<()> {
+        let verify_seals = || -> Result<()> {
+            for artifact in &self.artifacts {
+                if ArtifactSeal::observe(artifact.path())? != *artifact {
+                    bail!("published file source publication artifacts changed after hydration");
+                }
+            }
+            if LexicalSourceSeal::observe(project_root, &self.source.selected_path)? != self.source
+            {
+                bail!("published file source identity changed after hydration");
+            }
+            Ok(())
+        };
+        verify_seals()?;
+        let current = read_lexical_source_text_limited(&self.source, self.read_limit)?
+            .context("published file source exceeds final verification limit")?;
+        verify_seals()?;
+        if format!("{:x}", Sha256::digest(current.as_bytes())) != self.source_sha256 {
+            bail!("published file source content changed after hydration");
+        }
+        Ok(())
+    }
+}
+
+/// Exact original text for an already-admitted file. This is not a search:
+/// the publication's newest logical owner is the only permitted source.
+pub(crate) fn read_published_file_content(
+    shard: &Path,
+    input_hash: &str,
+    project_root: &Path,
+    expected_path: &str,
+    read_limit: u64,
+    cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+) -> Result<Option<PublishedFileContent>> {
+    if expected_path.is_empty()
+        || expected_path.contains('\\')
+        || expected_path
+            .split('/')
+            .any(|part| part.is_empty() || matches!(part, "." | ".."))
+        || !Path::new(expected_path)
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+        || codestory_workspace::has_supported_source_route(Path::new(expected_path))
+    {
+        bail!("published file source requires an exact lexical-only relative path");
+    }
+    if cancelled() {
+        bail!("published file source cancelled");
+    }
+    let generation = shard
+        .file_name()
+        .and_then(|s| s.to_str())
+        .context("file source generation")?;
+    let components = read_lexical_component_set(shard, Some(generation), Some(input_hash))?;
+    let sealed = || {
+        if let Some(set) = &components {
+            LEXICAL_COMPONENT_SET_RECEIPTS
+                .reuse_sealed(
+                    &shard.join(LEXICAL_COMPONENT_SET_FILE),
+                    &lexical_component_set_artifacts(shard, set),
+                )
+                .is_some()
+        } else {
+            let path = shard.join(LEXICAL_INDEX_FILE);
+            LEXICAL_SHARD_RECEIPTS
+                .reuse_sealed(&path, &sqlite_file_with_sidecars(&path))
+                .is_some()
+        }
+    };
+    if !sealed() {
+        bail!("published file source requires the pinned sealed lexical publication");
+    }
+    let artifact_paths = components.as_ref().map_or_else(
+        || sqlite_file_with_sidecars(&shard.join(LEXICAL_INDEX_FILE)),
+        |set| lexical_component_set_artifacts(shard, set),
+    );
+    let artifacts = ArtifactSeal::observe_all(&artifact_paths)?;
+    let key = format!("source\0{expected_path}");
+    let descriptor = if let Some(set) = &components {
+        let mut owner = &set.base;
+        for delta in set.deltas.iter().rev() {
+            if delta.tombstone_keys.contains(&key) {
+                return Ok(None);
+            }
+            if delta.upsert_keys.contains(&key) {
+                owner = &delta.component;
+                break;
+            }
+        }
+        Some(owner)
+    } else {
+        None
+    };
+    let path = descriptor.map_or_else(
+        || shard.join(LEXICAL_INDEX_FILE),
+        |d| shard.join(&d.file_name),
+    );
+    let connection = open_read_only(&path)?;
+    let stop = Arc::clone(&cancelled);
+    connection.progress_handler(1000, Some(move || stop()))?;
+    if let Some(descriptor) = descriptor {
+        if read_open_database_metadata(&connection, cancelled.as_ref())? != descriptor.metadata {
+            bail!("published file source component changed");
+        }
+    } else {
+        validate_open_database_metadata(
+            &connection,
+            shard,
+            generation,
+            input_hash,
+            None,
+            cancelled.as_ref(),
+        )?;
+    }
+    let row = connection.query_row(
+        "SELECT id,document_hash,path,source,node_id,symbol_name,start_line FROM lexical_documents WHERE document_key=?1",
+        [&key],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?, row.get::<_, Option<String>>(4)?,
+            row.get::<_, Option<String>>(5)?, row.get::<_, Option<u32>>(6)?)),
+    ).optional()?;
+    let Some((id, expected_hash, actual_path, source, node, symbol, start_line)) = row else {
+        return Ok(None);
+    };
+    if actual_path != expected_path
+        || source != "lexical_source"
+        || node.is_some()
+        || symbol.is_some()
+        || start_line.is_some()
+    {
+        bail!("published file source identity is invalid");
+    }
+    let mut representation = lexical_database_representation(&connection)?;
+    representation.decoded_byte_limit = representation.decoded_byte_limit.min(read_limit);
+    let encoded_bytes: i64 = connection.query_row(
+        "SELECT length(CAST(content AS BLOB)) FROM lexical_documents WHERE id=?1",
+        [id],
+        |row| row.get(0),
+    )?;
+    if u64::try_from(encoded_bytes).map_or(true, |bytes| bytes > read_limit) {
+        bail!("published file source exceeds encoded read limit");
+    }
+    let content =
+        read_admitted_source_content(&connection, id, representation, cancelled.as_ref())?;
+    let document = LexicalDocument {
+        path: actual_path,
+        content,
+        source: LexicalDocumentSource::LexicalSource,
+        node_id: None,
+        symbol_name: None,
+        start_line: None,
+        call_neighborhood: None,
+    };
+    if lexical_document_key(&document)? != key
+        || lexical_document_hash(&document) != expected_hash
+        || stable_lexical_document_id(&key) != id
+    {
+        bail!("published file source content does not match its document identity");
+    }
+    if cancelled() {
+        bail!("published file source cancelled");
+    }
+    let before = LexicalSourceSeal::observe(project_root, &project_root.join(expected_path))?;
+    let current = read_lexical_source_text_limited(&before, read_limit)?
+        .context("published file source exceeds verification limit")?;
+    let (current, accepted_seal) =
+        revalidate_lexical_source_after_read(project_root, &before, current, read_limit)?;
+    if current != document.content {
+        bail!("published file source changed since publication");
+    }
+    if cancelled() || !sealed() {
+        bail!("published file source cancelled or publication artifacts changed");
+    }
+    if ArtifactSeal::observe_all(&artifact_paths)? != artifacts {
+        bail!("published file source publication artifacts changed while reading");
+    }
+    let source_sha256 = format!("{:x}", Sha256::digest(document.content.as_bytes()));
+    Ok(Some(PublishedFileContent {
+        path: document.path,
+        read_fence: PublishedFileReadFence {
+            source: accepted_seal,
+            source_sha256: source_sha256.clone(),
+            read_limit,
+            artifacts,
+        },
+        source_sha256,
+        content: document.content,
+    }))
+}
+
 /// Read only producer-sealed metadata for already eligible symbol identities.
 /// No FTS, content decoding, source hydration, Core or graph query is permitted.
 /// Newest component ownership wins even when its annotation is absent.
@@ -7263,6 +7470,104 @@ mod tests {
     }
 
     #[test]
+    fn published_file_source_bounds_raw_bytes_and_decoded_content_before_delivery() {
+        let root = TempDir::new().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let data = root.path().join("data");
+        let raw = source_document("legacy.ini", "éé\n");
+        std::fs::write(project.join(&raw.path), &raw.content).unwrap();
+        let shard = shard_dir_for(&data, "legacy");
+        std::fs::create_dir_all(&shard).unwrap();
+        let db = shard.join(LEXICAL_INDEX_FILE);
+        write_v2_allocation_reference(&db, "legacy", "input", &raw);
+        let metadata = verify_lexical_database_contents(&db).unwrap();
+        publish_lexical_component_envelope(
+            &shard,
+            &LexicalComponentEnvelope::new("legacy", "input", &metadata),
+        )
+        .unwrap();
+        crate::copy_on_write::make_file_immutable(&db).unwrap();
+        assert!(shard_has_lexical_index(&shard, "input"));
+        assert_eq!(
+            read_published_file_content(
+                &shard,
+                "input",
+                &project,
+                &raw.path,
+                5,
+                Arc::new(|| false)
+            )
+            .unwrap()
+            .unwrap()
+            .content,
+            raw.content
+        );
+        let error = read_published_file_content(
+            &shard,
+            "input",
+            &project,
+            &raw.path,
+            4,
+            Arc::new(|| false),
+        )
+        .err()
+        .expect("UTF-8 byte length must exceed the cap even though character length fits");
+        assert!(error.to_string().contains("encoded read limit"));
+
+        let compressed = source_document("compressed.ini", &"repeat = value\n".repeat(2048));
+        std::fs::write(project.join(&compressed.path), &compressed.content).unwrap();
+        build_prepared_lexical_shard(
+            &data,
+            "compressed",
+            &prepared_documents(vec![compressed.clone()]),
+            "compressed-input",
+            None,
+            || Ok(()),
+        )
+        .unwrap();
+        let shard = shard_dir_for(&data, "compressed");
+        assert!(shard_has_lexical_index(&shard, "compressed-input"));
+        let db = shard.join(LEXICAL_INDEX_FILE);
+        let connection = open_read_only(&db).unwrap();
+        let (codec, bytes): (i64, i64) = connection
+            .query_row(
+                "SELECT content_codec,length(CAST(content AS BLOB)) FROM lexical_documents",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(codec, LEXICAL_CONTENT_CODEC_ZLIB);
+        assert!(bytes < 1024);
+        assert!(
+            read_published_file_content(
+                &shard,
+                "compressed-input",
+                &project,
+                &compressed.path,
+                1024,
+                Arc::new(|| false)
+            )
+            .is_err(),
+            "compressed expansion must remain bounded before output allocation"
+        );
+        assert_eq!(
+            read_published_file_content(
+                &shard,
+                "compressed-input",
+                &project,
+                &compressed.path,
+                1024 * 1024,
+                Arc::new(|| false)
+            )
+            .unwrap()
+            .unwrap()
+            .content,
+            compressed.content
+        );
+    }
+
+    #[test]
     fn v2_raw_content_remains_queryable_through_the_shared_component_reader() {
         let root = TempDir::new().expect("tempdir");
         let document = source_document("src/legacy.rs", "fn legacyrawneedle() {}\n");
@@ -9140,6 +9445,14 @@ mod tests {
             seal,
             LexicalSourceSeal::observe(&root, &path).expect("current")
         );
+        PublishedFileReadFence {
+            source: seal.clone(),
+            source_sha256: format!("{:x}", Sha256::digest(accepted.as_bytes())),
+            read_limit: MAX_FILE_BYTES,
+            artifacts: Vec::new(),
+        }
+        .revalidate(&root)
+        .expect("response fence must retain the accepted post-materialization epoch");
         revalidate_lexical_source_after_read_with(
             &root,
             &seal,
@@ -9746,5 +10059,240 @@ mod tests {
         lexical_shard_coverage(data.path(), "receipt-repair", "input")
             .expect("the repaired generation verifies again");
         assert!(shard_has_lexical_index(&shard, "input"));
+    }
+    #[test]
+    fn published_file_source_uses_latest_owner_and_rejects_stale_or_unsealed_bytes() {
+        let root = TempDir::new().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let data = root.path().join("lexical");
+        let original = "value = original\n";
+        let replacement = "value = héllo\r\nlast";
+        for path in ["settings.ini", "gone.ini", "quiet.ini", "other.ini"] {
+            std::fs::write(project.join(path), original).unwrap();
+        }
+        let base = prepared_documents(
+            ["settings.ini", "gone.ini", "quiet.ini", "other.ini"]
+                .into_iter()
+                .map(|path| source_document(path, original))
+                .collect(),
+        );
+        build_prepared_lexical_shard(&data, "base", &base, "input-base", None, || Ok(())).unwrap();
+        std::fs::write(project.join("settings.ini"), replacement).unwrap();
+        let updated = prepared_documents(vec![
+            source_document("settings.ini", replacement),
+            source_document("quiet.ini", original),
+            source_document("other.ini", original),
+        ]);
+        build_prepared_lexical_shard(
+            &data,
+            "updated",
+            &updated,
+            "input-updated",
+            Some("base"),
+            || Ok(()),
+        )
+        .unwrap();
+        let shard = shard_dir_for(&data, "updated");
+        assert!(shard_has_lexical_index(&shard, "input-updated"));
+        let read = |path: &str| {
+            read_published_file_content(
+                &shard,
+                "input-updated",
+                &project,
+                path,
+                1024 * 1024,
+                Arc::new(|| false),
+            )
+        };
+        let source = read("settings.ini").unwrap().unwrap();
+        assert_eq!(source.content, replacement);
+        source
+            .read_fence
+            .revalidate(&project)
+            .expect("unchanged hydrated source remains valid at response completion");
+        assert_eq!(
+            source.source_sha256,
+            format!("{:x}", Sha256::digest(replacement.as_bytes()))
+        );
+        assert!(
+            read("gone.ini").unwrap().is_none(),
+            "tombstone must not expose original base source"
+        );
+        assert!(
+            read_published_file_content(
+                &shard,
+                "foreign",
+                &project,
+                "settings.ini",
+                1024 * 1024,
+                Arc::new(|| false)
+            )
+            .is_err()
+        );
+        assert!(
+            read_published_file_content(
+                &shard,
+                "input-updated",
+                &project,
+                "settings.ini",
+                1,
+                Arc::new(|| false)
+            )
+            .is_err()
+        );
+        assert!(
+            read_published_file_content(
+                &shard,
+                "input-updated",
+                &project,
+                "settings.ini",
+                1024 * 1024,
+                Arc::new(|| true)
+            )
+            .is_err()
+        );
+        for path in [
+            "../settings.ini",
+            "/settings.ini",
+            "settings.ini/",
+            "./settings.ini",
+        ] {
+            assert!(
+                read(path).is_err(),
+                "unsafe or noncanonical identity: {path}"
+            );
+        }
+        // Reuse the existing callback to cut at the final successful read
+        // boundary, after original bytes and current source were verified.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&calls);
+        read_published_file_content(
+            &shard,
+            "input-updated",
+            &project,
+            "settings.ini",
+            1024 * 1024,
+            Arc::new(move || {
+                count.fetch_add(1, Ordering::SeqCst);
+                false
+            }),
+        )
+        .unwrap()
+        .unwrap();
+        let last = calls.load(Ordering::SeqCst) - 1;
+        assert!(last > 0);
+        let later = Arc::new(AtomicUsize::new(0));
+        let error = read_published_file_content(
+            &shard,
+            "input-updated",
+            &project,
+            "settings.ini",
+            1024 * 1024,
+            Arc::new(move || later.fetch_add(1, Ordering::SeqCst) >= last),
+        )
+        .err()
+        .expect("late cancellation must discard verified bytes");
+        assert!(
+            error
+                .to_string()
+                .contains("cancelled or publication artifacts changed"),
+            "cutpoint must reach the final post-read fence: {error}"
+        );
+        let selected = project.join("settings.ini");
+        let modified = std::fs::metadata(&selected).unwrap().modified().unwrap();
+        std::fs::write(&selected, replacement.replacen("value", "Value", 1)).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&selected)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert!(
+            read("settings.ini").is_err(),
+            "restored mtime cannot certify changed source bytes"
+        );
+        assert!(
+            source.read_fence.revalidate(&project).is_err(),
+            "response completion must not remint a changed source epoch"
+        );
+        std::fs::write(&selected, replacement).unwrap();
+        let restored = read("settings.ini").unwrap().unwrap();
+        let set = read_lexical_component_set(&shard, Some("updated"), Some("input-updated"))
+            .unwrap()
+            .unwrap();
+        let key = "source\0settings.ini".to_string();
+        let latest = set
+            .deltas
+            .iter()
+            .rev()
+            .find(|delta| delta.upsert_keys.contains(&key))
+            .expect("fixture must retain a newer owner than the base");
+        let latest_path = shard.join(&latest.component.file_name);
+        make_test_file_writable(&latest_path);
+        std::fs::remove_file(latest_path).unwrap();
+        assert!(
+            read("settings.ini").is_err(),
+            "failed newest owner must never fall back to original source"
+        );
+        let error = restored
+            .read_fence
+            .revalidate(&project)
+            .expect_err("response fence retains the original immutable artifact seals");
+        assert!(error.to_string().contains("publication artifacts changed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn published_file_response_fence_rejects_equal_byte_replacement_and_alias_retarget() {
+        use std::os::unix::fs::symlink;
+
+        for retarget in [false, true] {
+            let root = TempDir::new().unwrap();
+            let project = root.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            let content = "enabled = true\n";
+            std::fs::write(project.join("original.ini"), content).unwrap();
+            std::fs::write(project.join("other.ini"), content).unwrap();
+            let selected = if retarget {
+                symlink("original.ini", project.join("linked.ini")).unwrap();
+                "linked.ini"
+            } else {
+                "original.ini"
+            };
+            let data = root.path().join("lexical");
+            build_prepared_lexical_shard(
+                &data,
+                "generation",
+                &prepared_documents(vec![source_document(selected, content)]),
+                "input",
+                None,
+                || Ok(()),
+            )
+            .unwrap();
+            let shard = shard_dir_for(&data, "generation");
+            assert!(shard_has_lexical_index(&shard, "input"));
+            let source = read_published_file_content(
+                &shard,
+                "input",
+                &project,
+                selected,
+                1024 * 1024,
+                Arc::new(|| false),
+            )
+            .unwrap()
+            .unwrap();
+            source.read_fence.revalidate(&project).unwrap();
+            if retarget {
+                std::fs::remove_file(project.join(selected)).unwrap();
+                symlink("other.ini", project.join(selected)).unwrap();
+            } else {
+                std::fs::rename(project.join("other.ini"), project.join(selected)).unwrap();
+            }
+            assert!(
+                source.read_fence.revalidate(&project).is_err(),
+                "retarget={retarget}: equal bytes cannot replace the hydrated native epoch"
+            );
+        }
     }
 }

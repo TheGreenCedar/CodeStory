@@ -412,7 +412,7 @@ impl PacketProofSession {
     ) -> Result<(), codestory_contracts::api::ApiError> {
         for (ordinal, witness) in record.witnesses.iter().enumerate() {
             if self.admit_exact_selector(
-                &format!("node:{}", witness.node_id),
+                &witness.stable_identity(),
                 witness.rendered_bytes,
                 ordinal as u32,
             ) != PacketAdmissionDecision::Admitted
@@ -499,6 +499,47 @@ impl PacketProofSession {
 
     pub(crate) fn retrieval_admission_is_sealed(&self) -> bool {
         *self.retrieval_admission_sealed.borrow()
+    }
+
+    /// Authorize only an exact issued receipt backed by this pin's retained
+    /// lexical metadata. Query text never crosses into source compilation.
+    pub(crate) fn authorizes_published_file(
+        &self,
+        receipt: &PacketAdmissionReceiptV1,
+        publication: &RetrievalPublicationIdentity,
+    ) -> bool {
+        if !self.retrieval_admission_is_sealed()
+            || !receipt.stable_identity.starts_with("path:")
+            || !self
+                .receipts
+                .borrow()
+                .iter()
+                .any(|issued| issued == receipt)
+        {
+            return false;
+        }
+        (receipt.origin == PacketAdmissionOriginV1::ExactTypedSelector
+            && self
+                .issued_source_record
+                .borrow()
+                .as_ref()
+                .is_some_and(|record| {
+                    record.authorizes_published_file(&receipt.stable_identity, publication)
+                }))
+            || self.descriptor_results.borrow().iter().any(|entry| {
+                &entry.publication == publication
+                    && entry.result.publication_identity.as_ref() == Some(publication)
+                    && entry.result.hits.iter().any(|candidate| {
+                        candidate.source == codestory_retrieval::CandidateSource::Lexical
+                            && candidate.node_id.is_none()
+                            && candidate.symbol_name.is_none()
+                            && candidate.qualified_name.is_none()
+                            && candidate.target.is_none()
+                            && candidate.packet_descriptor().is_some_and(|descriptor| {
+                                descriptor.stable_identity == receipt.stable_identity
+                            })
+                    })
+            })
     }
 
     pub(crate) fn seal_retrieval_admission(&self) {

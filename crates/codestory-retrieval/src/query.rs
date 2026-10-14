@@ -32,7 +32,7 @@ use codestory_store::{
 };
 use parking_lot::{Mutex, MutexGuard};
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -172,10 +172,107 @@ pub struct PinnedQuerySession {
     _generation_lease: GenerationRetentionLease,
     _embedding_residency: ProductEmbeddingResidencyLease,
     full_readiness_validated: Cell<bool>,
+    published_file_reads: RefCell<BTreeMap<String, PinnedPublishedFileRead>>,
     transaction_active: bool,
 }
 
+struct PinnedPublishedFileRead {
+    fence: crate::lexical_index::PublishedFileReadFence,
+    cancelled: Option<Arc<AtomicBool>>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PublishedFileSourceFenceError {
+    #[error("published file source validation cancelled")]
+    Cancelled,
+    #[error("published file source {path} changed after hydration: {source}")]
+    Changed {
+        path: String,
+        #[source]
+        source: anyhow::Error,
+    },
+}
+
+/// Whole-file original text authenticated against one pinned lexical publication
+/// and the current in-project source. Construction stays inside retrieval.
+pub struct PublishedFileSourceWitness {
+    path: String,
+    content: String,
+    source_sha256: String,
+    publication: RetrievalPublicationIdentity,
+}
+
+impl PublishedFileSourceWitness {
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+    pub fn source_sha256(&self) -> &str {
+        &self.source_sha256
+    }
+    pub fn publication(&self) -> &RetrievalPublicationIdentity {
+        &self.publication
+    }
+}
+
 impl PinnedQuerySession {
+    /// Runtime must authorize the exact sealed file receipt first. This method
+    /// performs no query and cannot be used during descriptor-only readiness.
+    pub fn read_published_file_source(
+        &self,
+        path: &str,
+        cancelled: Option<Arc<AtomicBool>>,
+    ) -> Result<Option<PublishedFileSourceWitness>> {
+        if !self.full_readiness_validated.get() {
+            bail!("published file source requires full readiness after sealed admission");
+        }
+        self.revalidate()?;
+        let generation = self
+            .manifest
+            .sidecar_generation
+            .as_deref()
+            .context("published file source generation is missing")?;
+        let input_hash = self
+            .manifest
+            .sidecar_input_hash
+            .as_deref()
+            .context("published file source input identity is missing")?;
+        let read_cancelled = cancelled.clone();
+        let source = crate::lexical_index::read_published_file_content(
+            &crate::lexical_index::shard_dir_for(&self.runtime.layout.lexical_data_dir, generation),
+            input_hash,
+            &self.project_root,
+            path,
+            1024 * 1024,
+            Arc::new(move || {
+                read_cancelled
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(Ordering::Acquire))
+            }),
+        )?;
+        self.revalidate()?;
+        Ok(source.map(|source| {
+            // A repeated read may authenticate the same bytes under a newer
+            // inode or alias. It cannot replace the operation's first epoch
+            // or detach its original cancellation scope.
+            self.published_file_reads
+                .borrow_mut()
+                .entry(source.path.clone())
+                .or_insert(PinnedPublishedFileRead {
+                    fence: source.read_fence,
+                    cancelled,
+                });
+            PublishedFileSourceWitness {
+                path: source.path,
+                content: source.content,
+                source_sha256: source.source_sha256,
+                publication: self.publication_identity.clone(),
+            }
+        }))
+    }
+
     pub fn begin(
         project_root: &Path,
         storage_path: &Path,
@@ -330,6 +427,7 @@ impl PinnedQuerySession {
             _generation_lease: generation_lease,
             _embedding_residency: embedding_residency,
             full_readiness_validated: Cell::new(false),
+            published_file_reads: RefCell::new(BTreeMap::new()),
             transaction_active: true,
         };
         if validate_full_readiness {
@@ -853,6 +951,44 @@ impl PinnedQuerySession {
                 Some(current),
             )
             .into());
+        }
+        Ok(())
+    }
+
+    /// The outer response owner calls this once after selection/measurement.
+    /// Publication checks alone do not cover lexical-only files absent from
+    /// Core. Verify their original successful epochs without SQL or decoding.
+    pub fn revalidate_after_response(&self) -> Result<()> {
+        self.revalidate()?;
+        let reads = self.published_file_reads.borrow();
+        if reads.is_empty() {
+            return Ok(());
+        }
+        for (path, read) in reads.iter() {
+            let is_cancelled = || {
+                read.cancelled
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(Ordering::Acquire))
+            };
+            if is_cancelled() {
+                return Err(PublishedFileSourceFenceError::Cancelled.into());
+            }
+            let verified = read.fence.revalidate(&self.project_root);
+            if is_cancelled() {
+                return Err(PublishedFileSourceFenceError::Cancelled.into());
+            }
+            verified.map_err(|source| PublishedFileSourceFenceError::Changed {
+                path: path.clone(),
+                source,
+            })?;
+        }
+        self.revalidate()?;
+        if reads.values().any(|read| {
+            read.cancelled
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Acquire))
+        }) {
+            return Err(PublishedFileSourceFenceError::Cancelled.into());
         }
         Ok(())
     }
@@ -2088,6 +2224,110 @@ mod tests {
         assert_eq!(changed.expected(), &expected);
         assert_eq!(changed.observed(), Some(&observed));
         assert_eq!(changed.detail(), None);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn published_file_response_fence_preserves_first_epoch_and_cancellation_scope() {
+        use crate::test_support::{
+            env_lock, publish_complete_core_fixture, publish_zero_dense_pinned_query_fixture,
+        };
+        use codestory_store::{IndexPublicationMode, IndexPublicationRecord};
+
+        let _env = env_lock();
+        let project = TempDir::new().unwrap();
+        let storage_dir = TempDir::new().unwrap();
+        let cache = TempDir::new().unwrap();
+        let source_path = project.path().join("settings.ini");
+        let content = "enabled = true\n";
+        std::fs::write(&source_path, content).unwrap();
+        let storage_path = storage_dir.path().join("codestory.db");
+        let mut store = Store::open(&storage_path).unwrap();
+        publish_complete_core_fixture(
+            &mut store,
+            project.path(),
+            &IndexPublicationRecord {
+                generation: 1,
+                generation_id: "11111111-1111-4111-8111-111111111111".into(),
+                run_id: "published-file-fence".into(),
+                mode: IndexPublicationMode::Full,
+                published_at_epoch_ms: 1,
+            },
+        )
+        .unwrap();
+        drop(store);
+        let runtime = crate::config::with_test_cache_root(cache.path(), || {
+            SidecarRuntimeConfig::for_project_profile(
+                Some(project.path()),
+                crate::SidecarProfile::Local,
+            )
+        });
+        publish_zero_dense_pinned_query_fixture(project.path(), &storage_path, &runtime).unwrap();
+
+        let session = PinnedQuerySession::begin(project.path(), &storage_path, &runtime).unwrap();
+        // The source reader reuses an ordinary validated lexical publication;
+        // publishing a fixture and validating full readiness alone do not seal
+        // the lexical component contents for this process.
+        let coverage = crate::lexical_index::lexical_shard_coverage(
+            &session.runtime.layout.lexical_data_dir,
+            &session.publication_identity.sidecar_generation,
+            &session.publication_identity.sidecar_input_hash,
+        )
+        .expect("validate exact pinned lexical publication before its admitted source read");
+        assert!(coverage.complete());
+        assert_eq!(coverage.indexed_files, 1);
+        let original_flag = {
+            let flag = Arc::new(AtomicBool::new(false));
+            let source = session
+                .read_published_file_source("settings.ini", Some(Arc::clone(&flag)))
+                .unwrap()
+                .expect("published original source");
+            assert_eq!(source.path(), "settings.ini");
+            assert_eq!(source.publication(), session.publication_identity());
+            Arc::downgrade(&flag)
+        };
+        session.revalidate_after_response().unwrap();
+        session
+            .read_published_file_source("settings.ini", Some(Arc::new(AtomicBool::new(false))))
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.published_file_reads.borrow().len(), 1);
+        original_flag
+            .upgrade()
+            .expect("pin retains original cancellation after its dynamic scope ends")
+            .store(true, Ordering::Release);
+        let error = session.revalidate_after_response().unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<PublishedFileSourceFenceError>(),
+            Some(PublishedFileSourceFenceError::Cancelled)
+        ));
+        drop(session);
+
+        #[cfg(unix)]
+        {
+            let session =
+                PinnedQuerySession::begin(project.path(), &storage_path, &runtime).unwrap();
+            session
+                .read_published_file_source("settings.ini", None)
+                .unwrap()
+                .unwrap();
+            let replacement = project.path().join("replacement.ini");
+            std::fs::write(&replacement, content).unwrap();
+            std::fs::rename(replacement, &source_path).unwrap();
+            session
+                .read_published_file_source("settings.ini", None)
+                .unwrap()
+                .expect("same stored bytes may authenticate under a new native epoch");
+            assert_eq!(session.published_file_reads.borrow().len(), 1);
+            let error = session.revalidate_after_response().unwrap_err();
+            assert!(
+                matches!(
+                    error.downcast_ref::<PublishedFileSourceFenceError>(),
+                    Some(PublishedFileSourceFenceError::Changed { path, .. }) if path == "settings.ini"
+                ),
+                "a duplicate read cannot replace the first source epoch: {error:#}"
+            );
+        }
     }
 
     #[cfg(feature = "test-support")]
