@@ -162,13 +162,65 @@ impl PacketProofSession {
     }
 
     pub(crate) fn replay_descriptor_metadata(&self) -> serde_json::Value {
+        let lane = |evidence: Option<&codestory_retrieval::CandidateLaneEvidence>| {
+            evidence.map(|evidence| {
+                serde_json::json!({
+                    "rank": evidence.rank,
+                    "raw_score": evidence.raw_score,
+                    "raw_score_bits": evidence.raw_score.to_bits(),
+                })
+            })
+        };
+        let queries = self
+            .descriptor_results
+            .borrow()
+            .iter()
+            .enumerate()
+            .map(|(query_index, entry)| {
+                let eligible_descriptors = entry
+                    .result
+                    .hits
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, hit)| !codestory_retrieval::is_phantom_sidecar_hit(hit))
+                    .filter_map(|(returned_index, hit)| {
+                        let descriptor = hit.packet_descriptor()?;
+                        Some(serde_json::json!({
+                            "returned_index": returned_index,
+                            "stable_identity": descriptor.stable_identity,
+                            "retrieval_lane": descriptor.retrieval_lane,
+                            "retrieval_score": {
+                                "version": descriptor.retrieval_score.version,
+                                "value": descriptor.retrieval_score.value,
+                                "bits": descriptor.retrieval_score.value.to_bits(),
+                            },
+                            "source_bytes_upper_bound": descriptor.source_bytes_upper_bound,
+                            "lane_scores": {
+                                "lexical": lane(hit.lane_scores.lexical.as_ref()),
+                                "semantic": lane(hit.lane_scores.semantic.as_ref()),
+                                "graph": lane(hit.lane_scores.graph.as_ref()),
+                            },
+                        }))
+                    })
+                    .collect::<Vec<_>>();
+                serde_json::json!({
+                    "query_index": query_index,
+                    "query_sha256": format!("{:x}", Sha256::digest(entry.query.as_bytes())),
+                    "query": entry.query,
+                    "lexical_policy": format!("{:?}", entry.lexical_policy),
+                    "include_dense_semantic": entry.include_dense_semantic,
+                    "publication": entry.publication,
+                    "candidate_count": entry.result.hits.len(),
+                    "shape": entry.result.features.shape,
+                    "trace": entry.result.trace,
+                    "eligible_descriptors": eligible_descriptors,
+                })
+            })
+            .collect::<Vec<_>>();
         serde_json::json!({
             "ranked_eligible_descriptors":*self.replay_ranked_descriptors.borrow(),
-            "queries":self.descriptor_results.borrow().iter().map(|entry| serde_json::json!({
-                "query":entry.query, "lexical_policy":format!("{:?}",entry.lexical_policy),
-                "include_dense_semantic":entry.include_dense_semantic, "publication":entry.publication,
-                "candidate_count":entry.result.hits.len(),
-            })).collect::<Vec<_>>()
+            "queries": queries,
+            "unavailable_evidence": ["rank_features", "native_query_window_details"],
         })
     }
 
@@ -1030,6 +1082,268 @@ mod tests {
         PacketEvidenceResolutionDto, PacketEvidenceTierDto, SearchHitOrigin,
     };
     use codestory_contracts::compilation::{PacketRetrievalLaneV1, VersionedRetrievalScoreV1};
+
+    #[test]
+    fn replay_metadata_preserves_all_query_contributions_without_source_payloads() {
+        use codestory_retrieval::{
+            CandidateHit, CandidateLaneEvidence, CandidateLaneScores, CandidateSource, QueryTrace,
+            RetrievalStageKind, StageCompletionStatus, StageTrace, classify_query,
+        };
+        use serde_json::json;
+
+        let session = PacketProofSession::new();
+        session.enable_replay_metadata();
+        assert_eq!(
+            session.admit("node:9000", 1),
+            PacketAdmissionDecision::Admitted
+        );
+        let publication = RetrievalPublicationIdentity {
+            artifact_scope: None,
+            core_generation_id: "core".into(),
+            core_run_id: "run".into(),
+            sidecar_generation: "sidecar".into(),
+            sidecar_input_hash: "input".into(),
+            semantic_generation: "semantic".into(),
+        };
+        let hit = |id: usize, score| {
+            let mut hit = CandidateHit::with_source(
+                "src/public.rs",
+                Some(format!("entry_{id}")),
+                score,
+                CandidateSource::Lexical,
+            );
+            hit.node_id = Some(id.to_string());
+            hit.source_bytes_upper_bound = Some(512);
+            hit.source_excerpt = Some("EXCERPT_MUST_NOT_BE_EXPORTED".into());
+            hit.lane_scores = CandidateLaneScores {
+                lexical: Some(CandidateLaneEvidence {
+                    rank: 1,
+                    raw_score: 0.5,
+                    provenance: vec!["LANE_PROVENANCE_MUST_NOT_BE_EXPORTED".into()],
+                }),
+                ..Default::default()
+            };
+            hit
+        };
+        for query_index in 0..5 {
+            let query = format!("  literal query {query_index} é\r\n");
+            let mut features = classify_query(&query);
+            features.lexical_policy = LexicalAdmissionPolicy::BroadQuestionV1;
+            let mut phantom = hit(8000, 1.0);
+            phantom.file_path = "lexical:synthetic".into();
+            let mut unbounded = hit(8001, 1.0);
+            unbounded.source_bytes_upper_bound = None;
+            let mut hits = vec![phantom, unbounded];
+            for row in 0..18 {
+                let id = if query_index == 4 && row == 0 {
+                    0
+                } else {
+                    query_index * 100 + row
+                };
+                let score = if query_index == 4 && row == 0 {
+                    f32::from_bits(0x3f7fffff)
+                } else if query_index == 0 && row == 0 {
+                    f32::from_bits(0x3eaaaaab)
+                } else {
+                    0.5
+                };
+                let mut candidate = hit(id, score);
+                candidate.lane_scores.lexical.as_mut().unwrap().rank = row as u32 + 1;
+                if row == 0 {
+                    candidate.lane_scores.semantic = Some(CandidateLaneEvidence {
+                        rank: 19,
+                        raw_score: -0.0,
+                        provenance: Vec::new(),
+                    });
+                }
+                if row == 17 {
+                    candidate.lane_scores.graph = Some(CandidateLaneEvidence {
+                        rank: 2,
+                        raw_score: f32::from_bits(0x3eaaaaab),
+                        provenance: Vec::new(),
+                    });
+                }
+                hits.push(candidate);
+            }
+            let stage = |stage, completion_status| StageTrace {
+                stage,
+                budget_ms: 200,
+                elapsed_ms: 4,
+                admission_wait_ms: 0,
+                queue_wait_ms: Some(0),
+                execution_ms: Some(4),
+                candidates_added: 18,
+                marginal_gain: 1.0,
+                cancel_reason: None,
+                cache_hit: false,
+                degraded: false,
+                stub_reason: None,
+                completion_status,
+            };
+            let result = QueryResult {
+                publication_identity: Some(publication.clone()),
+                query,
+                features,
+                hits,
+                trace: QueryTrace {
+                    retrieval_mode: "full".into(),
+                    degraded_reason: None,
+                    total_budget_ms: 400,
+                    elapsed_ms: 8,
+                    cancel_reason: None,
+                    cache_hit: false,
+                    stages: vec![
+                        stage(
+                            RetrievalStageKind::Stage1Lexical,
+                            StageCompletionStatus::Completed,
+                        ),
+                        stage(
+                            RetrievalStageKind::Stage1bSemantic,
+                            if query_index == 4 {
+                                StageCompletionStatus::Skipped
+                            } else {
+                                StageCompletionStatus::Completed
+                            },
+                        ),
+                    ],
+                },
+            };
+            session
+                .retain_descriptor_result_with_policy(
+                    &result,
+                    LexicalAdmissionPolicy::BroadQuestionV1,
+                    true,
+                    &publication,
+                )
+                .unwrap();
+        }
+        let before = session.descriptor_results.borrow().clone();
+        let admissions = serde_json::to_value(session.receipts()).unwrap();
+        let metadata = session.replay_descriptor_metadata();
+        let queries = metadata["queries"].as_array().unwrap();
+        assert_eq!(queries.len(), 5);
+        assert_eq!(
+            queries[0]["query_sha256"],
+            "ada9b88eb22ab770078f5c3b1c97c42fe9d353eaa8f09df6958c0d8d541ae16a"
+        );
+        assert_eq!(
+            metadata["unavailable_evidence"],
+            json!(["rank_features", "native_query_window_details"])
+        );
+        for (query_index, query) in queries.iter().enumerate() {
+            assert_eq!(query["query_index"], query_index);
+            assert_eq!(query["lexical_policy"], "BroadQuestionV1");
+            assert_eq!(query["include_dense_semantic"], true);
+            assert_eq!(
+                query["query"],
+                format!("  literal query {query_index} é\r\n")
+            );
+            assert_eq!(query["candidate_count"], 20);
+            assert_eq!(
+                query["publication"],
+                serde_json::to_value(&publication).unwrap()
+            );
+            assert_eq!(
+                query["trace"],
+                serde_json::to_value(&before[query_index].result.trace).unwrap()
+            );
+            assert_eq!(
+                query["shape"],
+                serde_json::to_value(before[query_index].result.features.shape).unwrap()
+            );
+            let rows = query["eligible_descriptors"].as_array().unwrap();
+            assert_eq!(rows.len(), 18);
+            for (row, descriptor) in rows.iter().enumerate() {
+                let id = if query_index == 4 && row == 0 {
+                    0
+                } else {
+                    query_index * 100 + row
+                };
+                assert_eq!(descriptor["stable_identity"], format!("node:{id}"));
+                assert_eq!(descriptor["returned_index"], row + 2);
+                assert_eq!(descriptor["retrieval_lane"], "lexical");
+                assert_eq!(descriptor["source_bytes_upper_bound"], 512);
+                let expected_bits = if query_index == 4 && row == 0 {
+                    0x3f7fffffu32
+                } else if query_index == 0 && row == 0 {
+                    0x3eaaaaabu32
+                } else {
+                    0x3f000000u32
+                };
+                assert_eq!(descriptor["retrieval_score"]["bits"], expected_bits);
+                assert_eq!(
+                    descriptor["retrieval_score"]["value"],
+                    json!(f32::from_bits(expected_bits))
+                );
+                assert!(
+                    descriptor["retrieval_score"]["version"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with(PACKET_RETRIEVAL_SCORE_VERSION_V1)
+                );
+                assert_eq!(
+                    descriptor["lane_scores"]["lexical"],
+                    json!({"rank":row+1,"raw_score":0.5,"raw_score_bits":0x3f000000u32})
+                );
+            }
+            assert_eq!(
+                rows[0]["lane_scores"]["semantic"],
+                json!({"rank":19,"raw_score":-0.0,"raw_score_bits":0x80000000u32})
+            );
+            assert!(rows[1]["lane_scores"]["semantic"].is_null());
+            assert!(rows[1]["lane_scores"]["graph"].is_null());
+            assert_eq!(
+                rows[17]["lane_scores"]["graph"]["raw_score_bits"],
+                0x3eaaaaabu32
+            );
+            assert_eq!(rows[1]["retrieval_score"]["bits"], 0x3f000000u32);
+            assert_eq!(rows[2]["retrieval_score"]["bits"], 0x3f000000u32);
+        }
+        assert_eq!(
+            queries[0]["eligible_descriptors"][0]["retrieval_score"]["bits"],
+            0x3eaaaaabu32
+        );
+        assert_eq!(
+            queries[4]["eligible_descriptors"][0]["retrieval_score"]["bits"],
+            0x3f7fffffu32
+        );
+        assert_eq!(
+            queries[4]["trace"]["stages"][1]["completion_status"],
+            "skipped"
+        );
+        let serialized = metadata.to_string();
+        for forbidden in [
+            "EXCERPT_MUST_NOT_BE_EXPORTED",
+            "LANE_PROVENANCE_MUST_NOT_BE_EXPORTED",
+            "source_excerpt",
+            "structural_kind",
+        ] {
+            assert!(!serialized.contains(forbidden));
+        }
+        assert_eq!(session.descriptor_results.borrow().len(), before.len());
+        for (expected, actual) in before
+            .iter()
+            .zip(session.descriptor_results.borrow().iter())
+        {
+            assert_eq!(expected.query, actual.query);
+            assert_eq!(expected.result.hits, actual.result.hits);
+            assert_eq!(expected.result.features, actual.result.features);
+            assert_eq!(
+                expected.result.publication_identity,
+                actual.result.publication_identity
+            );
+            assert_eq!(
+                serde_json::to_value(&expected.result.trace).unwrap(),
+                serde_json::to_value(&actual.result.trace).unwrap()
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(session.receipts()).unwrap(),
+            admissions
+        );
+        assert_eq!(*session.hydrated_admissions.borrow(), 1);
+        assert_eq!(*session.admitted_source_bytes.borrow(), 1);
+    }
 
     #[cfg(feature = "benchmark-support")]
     #[test]
