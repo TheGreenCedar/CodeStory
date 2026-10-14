@@ -17,7 +17,8 @@ python3 scripts/bootstrap-research-native-vendor.py --verify
 Alternatively pass `--crate /path/to/llama-cpp-sys-2-0.1.151.crate`. On a new
 machine, after normal download/resource coordination, explicitly use
 `--download`. The script checks the upstream archive and patch SHA-256, extracts
-only regular files/directories, applies the source patch in a temporary sibling,
+only regular files/directories, applies the source patch with Git (checkout
+conversion disabled) in a temporary sibling,
 and verifies the complete regular-file postimage content digest before copying
 into an exclusively created destination. File creation is exclusive too, so
 concurrent user files are never overwritten. Run one bootstrap writer per
@@ -32,11 +33,23 @@ rejects symlinks and special entries; timestamps/modes/empty directories are not
 part of the content digest. The upstream
 license/attribution files are retained by source reconstruction. The patch
 retains the existing native completion/device-placement changes; bootstrap does
-not add a runtime feature. Repository CI does not currently invoke this
-handoff bootstrap, so Cargo jobs may fail until the source packaging strategy
-is integrated. That integration and all product qualification remain WIP.
+not add a runtime feature. CI source-build jobs invoke the shared
+`.github/actions/native-source` action before workspace Cargo commands. The
+action passes `--ensure --download`: it verifies an existing tree or reconstructs
+an absent tree from the checksum-pinned archive. Warm `--ensure` verifies the
+pinned patch too; `--verify` checks the source tree only. A modified or partial existing
+tree fails verification and is preserved. The native patch and manifest enter
+the existing build-cache identities. Linux package and offline-proof containers
+receive the reconstructed workspace tree; bootstrap performs no acquisition
+inside the network-denied Cargo boundary. Runtime/model acquisition and product
+qualification remain separate.
+
+Run the small reconstruction/failure matrix with
+`python3 scripts/tests/bootstrap-research-native-vendor.test.py`. It uses tiny
+isolated archives and does not invoke Cargo or the network. The CI consumer
+ordering check is `node --test scripts/tests/native-source-ci.test.mjs`.
 
 The patch is immutable data. Unified-diff blank context lines contain a required
 space; the first container whitespace check flagged those lines. The scoped
 `.gitattributes` rule preserves them without weakening source-file checks or
-changing the patch hash.
+changing the patch hash. LF checkout is required so Windows applies the same bytes.

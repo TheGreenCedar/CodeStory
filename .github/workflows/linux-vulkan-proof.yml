@@ -641,6 +641,9 @@ jobs:
         with:
           python-version: "3.13"
 
+      - name: Reconstruct pinned native source
+        uses: ./.github/actions/native-source
+
       - name: Install pinned Rust
         shell: bash
         run: |

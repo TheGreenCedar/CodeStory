@@ -71,6 +71,10 @@ jobs:
         env:
           PSExecutionPolicyPreference: Bypass
 
+      - name: Reconstruct pinned native source
+        if: ${{ !inputs.use_packaged_cli_artifact }}
+        uses: ./.github/actions/native-source
+
       - name: Capture host evidence
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |

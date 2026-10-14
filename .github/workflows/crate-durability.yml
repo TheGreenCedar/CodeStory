@@ -3,6 +3,9 @@ name: crate-durability
 on:
   pull_request:
     paths:
+      - .github/actions/native-source/**
+      - scripts/bootstrap-research-native-vendor.py
+      - vendor/llama-cpp-sys-2-patches/**
       - Cargo.toml
       - Cargo.lock
       - vendor/**
@@ -23,6 +26,9 @@ on:
       - main
       - dev/codestory-next
     paths:
+      - .github/actions/native-source/**
+      - scripts/bootstrap-research-native-vendor.py
+      - vendor/llama-cpp-sys-2-patches/**
       - Cargo.toml
       - Cargo.lock
       - vendor/**
@@ -54,6 +60,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Reconstruct pinned native source
+        uses: ./.github/actions/native-source
+
       - name: Install Rust stable
         run: |
           rustup toolchain install stable --profile minimal
@@ -75,7 +84,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-crate-durability-v1-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**/Cargo.toml') }}-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-crate-durability-v1-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**/Cargo.toml', 'vendor/llama-cpp-sys-2-patches/**') }}-${{ hashFiles('Cargo.lock') }}
 
       - name: Run durability and coverage contracts
         run: |

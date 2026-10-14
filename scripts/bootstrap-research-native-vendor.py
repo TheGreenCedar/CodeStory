@@ -35,22 +35,23 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--crate', type=pathlib.Path, help='Existing upstream 0.1.151 .crate archive')
     parser.add_argument('--download', action='store_true', help='Explicitly download the checksum-pinned upstream source')
+    parser.add_argument('--ensure', action='store_true', help='Verify an existing tree, or reconstruct it when absent')
     parser.add_argument('--verify', action='store_true', help='Only verify an existing reconstructed native tree')
     args = parser.parse_args()
     repo = pathlib.Path(__file__).resolve().parent.parent
     patch_root = repo / 'vendor/llama-cpp-sys-2-patches'
     manifest = json.loads((patch_root / 'manifest.json').read_text())
     destination = repo / 'vendor/llama-cpp-sys-2'
-    if args.verify:
+    patch_file = patch_root / '0.1.151.patch'
+    if not args.verify and (not patch_file.is_file() or sha(patch_file.read_bytes()) != manifest['patch_SHA256']):
+        raise SystemExit('Native patch checksum mismatch or missing patch')
+    if args.verify or (args.ensure and os.path.lexists(destination)):
         if destination.is_symlink() or not destination.is_dir() or tree_hash(destination) != manifest['source_tree_SHA256']:
             raise SystemExit('Native source tree does not match the handoff manifest')
         print('Verified exact handoff native source tree; no build or model activity')
         return
     if os.path.lexists(destination):
         raise SystemExit('Existing native tree preserved; use --verify or a separate clean checkout')
-    patch_file = patch_root / '0.1.151.patch'
-    if sha(patch_file.read_bytes()) != manifest['patch_SHA256']:
-        raise SystemExit('Native patch checksum mismatch')
     cargo_cache = pathlib.Path(os.environ.get('CARGO_HOME', str(pathlib.Path.home() / '.cargo'))) / 'registry/cache'
     archives = [args.crate] if args.crate else list(cargo_cache.glob('*/llama-cpp-sys-2-0.1.151.crate'))
     archive = next((p for p in archives if p.is_file() and sha(p.read_bytes()) == manifest['crate_SHA256']), None)
@@ -82,7 +83,11 @@ def main():
                     target.chmod(member.mode & 0o777)
                 else:
                     raise SystemExit('Non-regular archive entry refused')
-        subprocess.run(['patch', '--batch', '--forward', '-p1', '--input', str(patch_file)], cwd=staged, check=True)
+        # Git is already required by checkout and is available on Windows too.
+        # Disable checkout conversion so the pinned archive's bytes stay intact.
+        subprocess.run(['git', '-c', 'core.autocrlf=false', '-c', 'core.safecrlf=false',
+                        'apply', '--no-index', '--whitespace=nowarn', str(patch_file)],
+                       cwd=staged, check=True)
         if tree_hash(staged) != manifest['source_tree_SHA256']:
             raise SystemExit('Reconstructed native tree checksum mismatch')
         # mkdir and exclusive file creates preserve any concurrent user entry.

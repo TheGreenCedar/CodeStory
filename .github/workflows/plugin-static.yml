@@ -3,6 +3,11 @@ name: plugin static
 on:
   pull_request:
     paths:
+      - .github/actions/native-source/**
+      - scripts/bootstrap-research-native-vendor.py
+      - scripts/tests/bootstrap-research-native-vendor.test.py
+      - scripts/tests/native-source-ci.test.mjs
+      - vendor/llama-cpp-sys-2-patches/**
       - plugins/codestory/**
       - .github/scripts/detect-codestory-release.py
       - .github/scripts/publish-marketplace-catalog.mjs
@@ -94,6 +99,11 @@ on:
       - main
       - dev/codestory-next
     paths:
+      - .github/actions/native-source/**
+      - scripts/bootstrap-research-native-vendor.py
+      - scripts/tests/bootstrap-research-native-vendor.test.py
+      - scripts/tests/native-source-ci.test.mjs
+      - vendor/llama-cpp-sys-2-patches/**
       - plugins/codestory/**
       - .github/scripts/detect-codestory-release.py
       - .github/scripts/publish-marketplace-catalog.mjs
@@ -233,6 +243,11 @@ jobs:
           scripts/tests/codestory-release-evidence-gate.test.mjs
           scripts/tests/release-evidence-runner-contract.test.mjs
 
+      - name: Check pinned native source preparation
+        run: |
+          python scripts/tests/bootstrap-research-native-vendor.test.py
+          node --test scripts/tests/native-source-ci.test.mjs
+
       - name: Check workflow policy
         run: |
           node .github/scripts/check-workflow-policy.mjs
@@ -267,3 +282,25 @@ jobs:
           else
             python .github/scripts/check-codestory-release.py --version "$plugin_version" --lane plugin
           fi
+
+  windows-native-source:
+    name: Windows pinned native source reconstruction
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install pinned Python
+        uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Reconstruct pinned native source
+        uses: ./.github/actions/native-source
+
+      - name: Verify native source and repeat reconstruction
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/bootstrap-research-native-vendor.py --verify
+          python scripts/bootstrap-research-native-vendor.py --ensure

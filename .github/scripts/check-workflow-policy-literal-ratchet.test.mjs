@@ -315,6 +315,7 @@ const EXPECTED_LITERAL_SITES = {
   expectedQualificationDriverContract: { workflowNames: 1 },
   frozenCandidateQualityWorkflowRef: { workflowNames: 1 },
   lostRunnerRecoveryViolations: { permissionTuples: 3, stepNames: 8, workflowNames: 2 },
+  nativeSourceStep: { stepNames: 1 },
   packagedPrSigningViolations: { workflowNames: 4 },
   proofFloorPolicyViolations: { permissionTuples: 1, stepNames: 16 },
   protectedRunnerReservationViolations: { stepNames: 7, workflowNames: 1 },
