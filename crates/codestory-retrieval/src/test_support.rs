@@ -221,6 +221,42 @@ pub fn publish_zero_dense_pinned_query_fixture(
     storage_path: &Path,
     runtime: &crate::SidecarRuntimeConfig,
 ) -> Result<RetrievalIndexManifest> {
+    publish_pinned_query_fixture(
+        project_root,
+        storage_path,
+        runtime,
+        FixtureVectors::ZeroDense,
+    )
+}
+
+/// Publish a nonzero-dense fixture for admission and graph name-resolution tests.
+/// Vectors are deterministic unit vectors for the real sealed anchor identities,
+/// not model embeddings. This does not support native query embedding or semantic-quality claims.
+pub fn publish_deterministic_dense_pinned_query_fixture(
+    project_root: &Path,
+    storage_path: &Path,
+    runtime: &crate::SidecarRuntimeConfig,
+) -> Result<RetrievalIndexManifest> {
+    publish_pinned_query_fixture(
+        project_root,
+        storage_path,
+        runtime,
+        FixtureVectors::DeterministicDense,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum FixtureVectors {
+    ZeroDense,
+    DeterministicDense,
+}
+
+fn publish_pinned_query_fixture(
+    project_root: &Path,
+    storage_path: &Path,
+    runtime: &crate::SidecarRuntimeConfig,
+    vectors: FixtureVectors,
+) -> Result<RetrievalIndexManifest> {
     let project_id = crate::index::sidecar_project_id_for_runtime(project_root, runtime)?;
     let embedding_backend = crate::embeddings::embedding_runtime_id_for_runtime(runtime);
     let embedding_dim = i32::try_from(crate::embeddings::semantic_vector_dim())
@@ -240,23 +276,26 @@ pub fn publish_zero_dense_pinned_query_fixture(
     // a pointer is present.
     let layout = codestory_store::CorePublicationLayout::from_storage_path(storage_path)
         .context("resolve pinned query fixture core layout")?;
-    let (mut storage, publication) = if layout
+    let sealed = layout
         .read_pointer()
         .context("read pinned query fixture publication pointer")?
-        .is_some()
-    {
+        .is_some();
+    if matches!(vectors, FixtureVectors::DeterministicDense) && !sealed {
+        bail!("deterministic dense pinned query fixture requires a sealed core publication");
+    }
+    let (mut storage, publication, anchors) = if sealed {
         let storage =
             Store::open_read_only(storage_path).context("open sealed pinned query fixture")?;
         let publication = storage
             .get_complete_index_publication()
             .context("load sealed pinned query fixture publication")?
             .context("pinned query fixture requires a complete core publication")?;
-        storage
-            .validate_dense_anchor_publication(&publication)
+        let validation = storage
+            .validate_dense_anchor_publication_contents(&publication)
             .context(
                 "immutable core fixture requires a sealed dense-anchor publication from staging",
             )?;
-        (storage, publication)
+        (storage, publication, validation.anchors)
     } else {
         let mut storage = Store::open(storage_path).context("open pinned query fixture storage")?;
         let publication = storage
@@ -269,7 +308,7 @@ pub fn publish_zero_dense_pinned_query_fixture(
                 crate::generation::SEMANTIC_POLICY_VERSION,
             )
             .context("publish pinned query fixture dense-anchor manifest")?;
-        (storage, publication)
+        (storage, publication, Vec::new())
     };
     let input = crate::index::compute_sidecar_input_fingerprint(
         &storage,
@@ -280,8 +319,14 @@ pub fn publish_zero_dense_pinned_query_fixture(
         embedding_dim,
         &producer_compatibility_identity,
     )?;
-    if input.dense_projection_count != 0 {
-        bail!("zero-dense pinned query fixture received dense anchors");
+    match vectors {
+        FixtureVectors::ZeroDense if input.dense_projection_count != 0 => {
+            bail!("zero-dense pinned query fixture received dense anchors");
+        }
+        FixtureVectors::DeterministicDense if input.dense_projection_count == 0 => {
+            bail!("deterministic dense pinned query fixture requires dense anchors");
+        }
+        _ => {}
     }
     let mut manifest = retrieval_manifest_fixture(&project_id, &input.hash);
     manifest.built_at_epoch_ms = chrono::Utc::now().timestamp_millis();
@@ -295,17 +340,35 @@ pub fn publish_zero_dense_pinned_query_fixture(
         .sidecar_generation
         .as_deref()
         .context("fixture sidecar generation")?;
-    crate::lexical_index::build_lexical_shard(
+    let prepared = crate::lexical_index::prepare_lexical_input_for_store(
+        crate::lexical_index::lexical_source_input(project_root, storage_path)
+            .context("scan pinned query fixture lexical sources")?,
         project_root,
-        Some(storage_path),
+        &storage,
+    )
+    .context("prepare pinned query fixture lexical documents")?;
+    let expected = crate::lexical_index::LexicalInputFingerprint {
+        file_count: input.lexical_file_count,
+        hash: input.lexical_hash.clone(),
+        coverage: input.lexical_coverage.clone(),
+    };
+    if prepared.fingerprint != expected {
+        bail!(
+            "pinned query fixture lexical input changed: expected {} documents with hash {}, observed {} documents with hash {}",
+            expected.file_count,
+            expected.hash,
+            prepared.fingerprint.file_count,
+            prepared.fingerprint.hash,
+        );
+    }
+    crate::lexical_index::build_prepared_lexical_shard_with_cancel(
         &runtime.layout.lexical_data_dir,
         generation,
-        &crate::lexical_index::LexicalInputFingerprint {
-            file_count: input.lexical_file_count,
-            hash: input.lexical_hash.clone(),
-            coverage: input.lexical_coverage.clone(),
-        },
+        &prepared,
         &input.hash,
+        None,
+        &|| false,
+        || prepared.revalidate_source_seals(project_root, storage_path),
     )
     .context("publish pinned query fixture lexical shard")?;
     let revision = format!("fixture-{generation}");
@@ -351,9 +414,8 @@ pub fn publish_zero_dense_pinned_query_fixture(
     storage
         .upsert_retrieval_index_manifest(&manifest)
         .context("publish pinned query fixture manifest")?;
+    publish_fixture_vector_evidence(runtime, &manifest, &publication, &storage, &anchors)?;
     drop(storage);
-
-    publish_zero_dense_vector_evidence(runtime, &manifest, &publication)?;
     Ok(manifest)
 }
 
@@ -513,10 +575,12 @@ pub fn publish_replacement_core_and_zero_dense_fixture(
     publish_zero_dense_pinned_query_fixture(project_root, storage_path, runtime)
 }
 
-fn publish_zero_dense_vector_evidence(
+fn publish_fixture_vector_evidence(
     runtime: &crate::SidecarRuntimeConfig,
     manifest: &RetrievalIndexManifest,
     publication: &codestory_store::IndexPublicationRecord,
+    storage: &Store,
+    anchors: &[codestory_store::DenseAnchorContentIdentity],
 ) -> Result<()> {
     let retrieval_generation = manifest
         .sidecar_generation
@@ -556,14 +620,53 @@ fn publish_zero_dense_vector_evidence(
         crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
         compatibility,
     );
+    let expected_anchors = anchors
+        .iter()
+        .map(|anchor| crate::embedded_vector::ExpectedVectorAnchor {
+            node_id: anchor.node_id.0.to_string(),
+            document_hash: anchor.document_hash.clone(),
+        })
+        .collect::<Vec<_>>();
     let attestation = crate::embedded_vector::EmbeddedVectorIndex::build_attested_with_points(
         &runtime.layout,
         &manifest.semantic_generation,
         retrieval_generation,
         retrieval_input_hash,
         &contract,
-        &[],
-        |_visit| Ok(()),
+        &expected_anchors,
+        |visit| {
+            if expected_anchors.is_empty() {
+                return Ok(());
+            }
+            let mut vector = vec![0.0; embedding_dim];
+            *vector
+                .first_mut()
+                .context("fixture embedding dimension must be positive")? = 1.0;
+            let mut after_node_id = None;
+            loop {
+                let batch = storage
+                    .get_dense_anchor_inputs_batch_after(after_node_id, 256)
+                    .context("load sealed fixture dense anchors")?;
+                if batch.is_empty() {
+                    break;
+                }
+                after_node_id = batch.last().map(|anchor| anchor.node_id);
+                for anchor in batch {
+                    visit(crate::embedded_vector::AttestedSemanticPoint {
+                        point: crate::embedded_vector::SemanticPoint {
+                            display_name: anchor.qualified_name.unwrap_or(anchor.display_name),
+                            node_id: anchor.node_id.0.to_string(),
+                            file_path: anchor.file_path,
+                            file_role: Some(anchor.file_role),
+                            dense_reason: Some(anchor.selection_reason),
+                            vector: vector.clone(),
+                        },
+                        document_hash: anchor.document_hash,
+                    })?;
+                }
+            }
+            Ok(())
+        },
     )?;
     let generation = crate::embedded_vector::VectorGenerationManifest::new(evidence, attestation)?;
     crate::embedded_vector::EmbeddedVectorIndex::publish_generation_manifest(

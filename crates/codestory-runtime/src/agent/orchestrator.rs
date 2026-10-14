@@ -345,14 +345,20 @@ pub(crate) fn agent_packet(
     )
 }
 
+pub(crate) type PacketRepresentationMeasure<'a> =
+    &'a mut dyn FnMut(
+        &AgentPacketDto,
+        Option<&crate::evidence_projection_v3::PacketRepresentationBaselineV1>,
+    ) -> Result<Option<usize>, ApiError>;
+
+type CallerRepresentationMeasure<'caller, 'measure> =
+    (&'caller str, PacketRepresentationMeasure<'measure>);
+
 pub(crate) fn agent_packet_for_representation(
     controller: &AppController,
     req: AgentPacketRequestDto,
     caller: &str,
-    measure: &mut dyn FnMut(
-        &AgentPacketDto,
-        Option<&crate::evidence_projection_v3::PacketRepresentationBaselineV1>,
-    ) -> Result<Option<usize>, ApiError>,
+    measure: PacketRepresentationMeasure<'_>,
 ) -> Result<AgentPacketDto, ApiError> {
     agent_packet_with_session(
         controller,
@@ -391,13 +397,7 @@ fn agent_packet_with_session(
     controller: &AppController,
     req: AgentPacketRequestDto,
     proof_session: std::rc::Rc<PacketProofSession>,
-    representation_measure: Option<(
-        &str,
-        &mut dyn FnMut(
-            &AgentPacketDto,
-            Option<&crate::evidence_projection_v3::PacketRepresentationBaselineV1>,
-        ) -> Result<Option<usize>, ApiError>,
-    )>,
+    representation_measure: Option<CallerRepresentationMeasure<'_, '_>>,
 ) -> Result<AgentPacketDto, ApiError> {
     if representation_measure.is_none()
         && req
@@ -442,10 +442,10 @@ fn agent_packet_with_session(
         &req,
         crate::agent::retrieval_primary::active_pinned_retrieval_publication(controller).as_ref(),
     )?;
-    if let Some((caller, _)) = representation_measure.as_ref() {
-        if let Some(record) = super::packet_served_sources::load(controller, caller, &req)? {
-            proof_session.protect_served_sources(record)?;
-        }
+    if let Some((caller, _)) = representation_measure.as_ref()
+        && let Some(record) = super::packet_served_sources::load(controller, caller, &req)?
+    {
+        proof_session.protect_served_sources(record)?;
     }
     let mut probes = normalize_packet_probe_request(&req.probes);
     probes.extend(

@@ -491,8 +491,8 @@ impl PreparedPacketCompilationV1 {
             if context_floor
                 .as_ref()
                 .is_some_and(|floor| !source_floor_retained(&product.support, &floor.support))
-                || !bounded_measure(&self, &product, Some(&displayed_baseline))?
-                    .is_some_and(|bytes| bytes <= PUBLIC_PACKET_SERIALIZED_MAX_BYTES)
+                || bounded_measure(&self, &product, Some(&displayed_baseline))?
+                    .is_none_or(|bytes| bytes > PUBLIC_PACKET_SERIALIZED_MAX_BYTES)
             {
                 return Err(codestory_contracts::api::ApiError::internal(
                     "Selected joint source extent failed final served-frame validation.",
@@ -1532,6 +1532,8 @@ fn hydrate_admitted_node_source_with_range(
     )
 }
 
+// Keep admission, source bounds, and hydration caches explicit at this boundary.
+#[allow(clippy::too_many_arguments)]
 fn hydrate_admitted_node_source_with_range_cached(
     controller: &AppController,
     storage: &Store,
@@ -1924,19 +1926,18 @@ fn revalidated_minimum_page(
     Some(result)
 }
 
+type AuthenticatedSourcePageDemands = (
+    HashMap<String, usize>,
+    HashMap<String, AuthenticatedMinimumSourcePage>,
+);
+
 fn authenticated_source_page_demands(
     controller: &AppController,
     storage: &Store,
     admissions: &[PacketAdmissionReceiptV1],
     ranges: &HashMap<String, PacketSourceRangeV1>,
     minimum_ends: &BTreeMap<String, u32>,
-) -> Result<
-    (
-        HashMap<String, usize>,
-        HashMap<String, AuthenticatedMinimumSourcePage>,
-    ),
-    codestory_contracts::api::ApiError,
-> {
+) -> Result<AuthenticatedSourcePageDemands, codestory_contracts::api::ApiError> {
     let root = controller.require_project_root()?;
     let mut groups: HashMap<i64, (FileInfo, Vec<(String, PacketSourceRangeV1)>)> = HashMap::new();
     for admission in admissions {

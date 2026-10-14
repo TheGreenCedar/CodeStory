@@ -2328,6 +2328,8 @@ fn lexical_candidate_limit(limit: usize, payload: LexicalHitPayload) -> usize {
     }
 }
 
+// Keep payload and admission policy explicit at the shared connection boundary.
+#[allow(clippy::too_many_arguments)]
 fn search_lexical_index_on_connection(
     connection: &Connection,
     query: &str,
@@ -5023,30 +5025,28 @@ fn append_callable_source<'a>(
     else {
         return Ok(());
     };
-    if !verified_sources.contains_key(&file.0) {
+    if let std::collections::hash_map::Entry::Vacant(entry) = verified_sources.entry(file.0) {
         let mut verified = None;
-        if let Some(info) = storage.get_file_by_id(file.0)? {
-            if info.indexed && info.complete {
-                if let Some(path) =
-                    normalize_lexical_file_path(project_root, &info.path.to_string_lossy())
-                {
-                    if let (Some(text), Some(hash)) = (
-                        sources.get(path.as_str()),
-                        storage.get_file_content_hash(file.0)?,
-                    ) {
-                        if format!("{:x}", Sha256::digest(text.as_bytes())) != hash {
-                            bail!("lexical callable source does not match its Core parser hash");
-                        }
-                        verified = Some(VerifiedCallableSource {
-                            path,
-                            text,
-                            line_offsets: callable_line_offsets(text),
-                        });
-                    }
-                }
+        if let Some(info) = storage.get_file_by_id(file.0)?
+            && info.indexed
+            && info.complete
+            && let Some(path) =
+                normalize_lexical_file_path(project_root, &info.path.to_string_lossy())
+            && let (Some(text), Some(hash)) = (
+                sources.get(path.as_str()),
+                storage.get_file_content_hash(file.0)?,
+            )
+        {
+            if format!("{:x}", Sha256::digest(text.as_bytes())) != hash {
+                bail!("lexical callable source does not match its Core parser hash");
             }
+            verified = Some(VerifiedCallableSource {
+                path,
+                text,
+                line_offsets: callable_line_offsets(text),
+            });
         }
-        verified_sources.insert(file.0, verified);
+        entry.insert(verified);
     }
     let Some(source) = verified_sources[&file.0].as_ref() else {
         return Ok(());
@@ -5067,7 +5067,7 @@ fn append_callable_source<'a>(
     let body = bounded_callable_source(source.text, &source.line_offsets, start, end);
     if !body.is_empty() {
         document.content.push_str("\nlexical_callable_source_v1:\n");
-        document.content.push_str(&body);
+        document.content.push_str(body);
     }
     Ok(())
 }
@@ -5543,15 +5543,15 @@ fn quoted_query_tokens(query: &str) -> Vec<String> {
             }
             continue;
         }
-        if let Some((marker, count, tail)) = marker {
-            if marker != b'`' || !tail.contains('`') {
-                fence = Some((marker, count));
-                // A fence is a syntax boundary. Do not join fragments of an
-                // unfinished inline quote across the removed example.
-                delimiter = None;
-                current.clear();
-                continue;
-            }
+        if let Some((marker, count, tail)) = marker
+            && (marker != b'`' || !tail.contains('`'))
+        {
+            fence = Some((marker, count));
+            // A fence is a syntax boundary. Do not join fragments of an
+            // unfinished inline quote across the removed example.
+            delimiter = None;
+            current.clear();
+            continue;
         }
         for character in line.chars() {
             if delimiter == Some(character) {

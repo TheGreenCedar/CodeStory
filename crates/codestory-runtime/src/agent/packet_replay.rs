@@ -163,19 +163,18 @@ impl PacketReplayEnrollment {
         fn sources_allowed(value: &Value, hashes: &[String]) -> bool {
             match value {
                 Value::Object(map) => {
-                    if let Some(hash) = map.get("source_sha256") {
-                        if !hash
+                    if let Some(hash) = map.get("source_sha256")
+                        && hash
                             .as_str()
-                            .is_some_and(|h| hashes.iter().any(|allowed| allowed == h))
-                        {
-                            return false;
-                        }
+                            .is_none_or(|h| hashes.iter().all(|allowed| allowed != h))
+                    {
+                        return false;
                     }
                     if map.contains_key("source")
                         && map.contains_key("stable_identity")
-                        && !map
+                        && map
                             .get("delivery")
-                            .is_some_and(|d| d.get("source_sha256").is_some())
+                            .is_none_or(|d| d.get("source_sha256").is_none())
                     {
                         return false;
                     }
@@ -215,12 +214,12 @@ impl PacketReplayTrace {
         descriptors: Value,
     ) -> Option<Self> {
         if !enrollment.allows(prepared)
-            || !base
+            || base
                 .answer
                 .retrieval_trace
                 .retrieval_publication
                 .as_ref()
-                .is_some_and(|publication| publication.core_run_id == enrollment.scope.core_run_id)
+                .is_none_or(|publication| publication.core_run_id != enrollment.scope.core_run_id)
         {
             return None;
         }

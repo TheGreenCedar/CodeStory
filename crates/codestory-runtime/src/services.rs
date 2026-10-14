@@ -218,6 +218,8 @@ fn with_public_operation_cancellation<T>(
     codestory_contracts::bounded_locks::with_thread_cancellation(cancelled, build)
 }
 
+// Bind owner identity, publication, freshness, and cancellation in one call.
+#[allow(clippy::too_many_arguments)]
 fn with_public_operation_owner<T>(
     controller_identity: usize,
     operation: &str,
@@ -3587,7 +3589,10 @@ impl PublicOperationService {
                         publication,
                     )
                 });
-            if content_drift && managed_deadline.is_some() && !serving_running_historical {
+            if content_drift
+                && let Some(deadline) = managed_deadline
+                && !serving_running_historical
+            {
                 if let (Some(activation), Some(identity)) = (&self.activation, &drifted_admission) {
                     activation.invalidate_source_admission_if_current(identity);
                 }
@@ -3607,7 +3612,6 @@ impl PublicOperationService {
                             "request cancelled before source repair",
                         ));
                     }
-                    let deadline = managed_deadline.expect("managed source repair deadline");
                     let repair = self.redrive_source_with_deadline(
                         operation,
                         Arc::clone(&cancelled),
@@ -3630,53 +3634,49 @@ impl PublicOperationService {
                             // Graph-only reads may retain the already-built,
                             // pinned value. Never invent fresh source or re-run
                             // the body after its original deadline expired.
-                            if operation_read_class(operation) == OperationReadClass::GraphOnly {
-                                if let Ok((value, core_publication, retrieval_publication)) = result
-                                {
-                                    let reason = self
-                                        .activation
-                                        .as_ref()
-                                        .and_then(|activation| {
-                                            activation.snapshot_for_target(
-                                                &self.controller.require_project_root().ok()?,
-                                                &self.controller.require_storage_path().ok()?,
-                                            )
-                                        })
-                                        .filter(|snapshot| {
-                                            snapshot.retained_core_publication.as_ref()
-                                                == Some(&core_publication)
-                                        })
-                                        .map(|snapshot| {
-                                            if snapshot.stage
-                                                == ActivationStage::WaitingForPeerWriter
-                                            {
-                                                HistoricalServedReason::PeerWriter
-                                            } else if matches!(
-                                                snapshot.state,
-                                                ActivationState::Preparing
-                                                    | ActivationState::Updating
-                                            ) {
-                                                HistoricalServedReason::RefreshInProgress
-                                            } else if matches!(
-                                                snapshot.state,
-                                                ActivationState::Retryable
-                                                    | ActivationState::Unavailable
-                                            ) {
-                                                HistoricalServedReason::ReplacementFailed
-                                            } else {
-                                                HistoricalServedReason::StaleSource
-                                            }
-                                        })
-                                        .unwrap_or(HistoricalServedReason::StaleSource);
-                                    return Ok(PublicOperation {
-                                        value,
-                                        core_publication: Some(core_publication),
-                                        retrieval_publication,
-                                        operation_id,
-                                        attempt,
-                                        freshness: OperationFreshness::Historical(reason),
-                                    });
-                                }
+                            if operation_read_class(operation) == OperationReadClass::GraphOnly
+                                && let Ok((value, core_publication, retrieval_publication)) = result
+                            {
+                                let reason = self
+                                    .activation
+                                    .as_ref()
+                                    .and_then(|activation| {
+                                        activation.snapshot_for_target(
+                                            &self.controller.require_project_root().ok()?,
+                                            &self.controller.require_storage_path().ok()?,
+                                        )
+                                    })
+                                    .filter(|snapshot| {
+                                        snapshot.retained_core_publication.as_ref()
+                                            == Some(&core_publication)
+                                    })
+                                    .map(|snapshot| {
+                                        if snapshot.stage == ActivationStage::WaitingForPeerWriter {
+                                            HistoricalServedReason::PeerWriter
+                                        } else if matches!(
+                                            snapshot.state,
+                                            ActivationState::Preparing | ActivationState::Updating
+                                        ) {
+                                            HistoricalServedReason::RefreshInProgress
+                                        } else if matches!(
+                                            snapshot.state,
+                                            ActivationState::Retryable
+                                                | ActivationState::Unavailable
+                                        ) {
+                                            HistoricalServedReason::ReplacementFailed
+                                        } else {
+                                            HistoricalServedReason::StaleSource
+                                        }
+                                    })
+                                    .unwrap_or(HistoricalServedReason::StaleSource);
+                                return Ok(PublicOperation {
+                                    value,
+                                    core_publication: Some(core_publication),
+                                    retrieval_publication,
+                                    operation_id,
+                                    attempt,
+                                    freshness: OperationFreshness::Historical(reason),
+                                });
                             }
                             return Err(error);
                         }

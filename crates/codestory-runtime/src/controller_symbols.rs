@@ -549,10 +549,7 @@ impl AppController {
         &self,
         req: AgentPacketRequestDto,
         caller: &str,
-        measure: &mut dyn FnMut(
-            &AgentPacketDto,
-            Option<&crate::evidence_projection_v3::PacketRepresentationBaselineV1>,
-        ) -> Result<Option<usize>, ApiError>,
+        measure: agent::orchestrator::PacketRepresentationMeasure<'_>,
     ) -> Result<AgentPacketDto, ApiError> {
         self.with_complete_core_snapshot(|publication| {
             agent::retrieval_primary::with_stable_packet_retrieval_publication(

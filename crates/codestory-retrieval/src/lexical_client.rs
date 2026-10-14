@@ -147,6 +147,8 @@ impl LexicalClient {
         })
         .collect()
     }
+    // Keep publication identity, admission policy, and cancellation explicit.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn search_with_policy_cancel<F>(
         &self,
         layout: &SidecarLayout,
@@ -174,6 +176,8 @@ impl LexicalClient {
         .collect()
     }
 
+    // Keep publication identity, admission policy, and cancellation explicit.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn search_descriptors_with_policy_cancel<F>(
         &self,
         layout: &SidecarLayout,

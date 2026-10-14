@@ -4682,6 +4682,8 @@ pub(super) fn sync_full_llm_symbol_projection_streaming_for_runtime(
     Ok(stats)
 }
 
+// Keep staged storage, refresh scopes, and immutable runtime inputs explicit.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn finalize_staged_semantic_docs_for_runtime(
     storage: &mut Storage,
     project_root: Option<&Path>,

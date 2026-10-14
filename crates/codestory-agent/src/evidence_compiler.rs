@@ -782,10 +782,10 @@ pub fn repository_evidence_selection_rank(
                     continue;
                 };
                 if !delivery.matches_delivery(alias.start_line, alias.end_line)
-                    || !witness
+                    || witness
                         .delivery
                         .as_ref()
-                        .is_some_and(|d| d.source_sha256 == delivery.source_sha256)
+                        .is_none_or(|d| d.source_sha256 != delivery.source_sha256)
                 {
                     continue;
                 }

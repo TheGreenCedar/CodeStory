@@ -777,19 +777,19 @@ fn resolve_query_target_from_candidates(
     }
     alternatives.retain(|hit| is_resolvable_graph_target(&query, hit));
     if let Some(file_filter) = file_filter {
-        alternatives.retain(|hit| search_hit_matches_file_filter(&project_root, hit, file_filter));
+        alternatives.retain(|hit| search_hit_matches_file_filter(project_root, hit, file_filter));
     }
     if alternatives.is_empty() {
         return Ok(TargetResolution::Rejected(no_query_match_error(
-            &project_root,
+            project_root,
             &query,
             file_filter,
         )));
     }
     alternatives.sort_by(|left, right| {
-        compare_resolution_candidates(&project_root, &query, file_filter, left, right)
+        compare_resolution_candidates(project_root, &query, file_filter, left, right)
     });
-    let tied = tied_top_alternatives(&project_root, &query, file_filter, &alternatives);
+    let tied = tied_top_alternatives(project_root, &query, file_filter, &alternatives);
     if let Some(choice) = choose {
         if choice == 0 || choice > tied.len() {
             return Ok(TargetResolution::Rejected(format!(
@@ -810,11 +810,11 @@ fn resolve_query_target_from_candidates(
         return Ok(TargetResolution::Ambiguous(AmbiguousTarget {
             query: query.clone(),
             file_filter: file_filter.map(ToOwned::to_owned),
-            message: ambiguous_query_error(&project_root, &query, file_filter, &tied),
+            message: ambiguous_query_error(project_root, &query, file_filter, &tied),
             alternatives: tied,
         }));
     }
-    debug_assert_unique_top_candidate(&project_root, &query, file_filter, &alternatives);
+    debug_assert_unique_top_candidate(project_root, &query, file_filter, &alternatives);
     let selected = alternatives
         .first()
         .cloned()

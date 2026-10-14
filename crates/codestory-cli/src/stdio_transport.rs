@@ -2534,11 +2534,7 @@ fn handle_stdio_request(
                             .as_ref()
                             .and_then(|publication| serde_json::to_value(publication).ok());
                         let mut execution = operation.value;
-                        if execution.publication_meta.is_some() {
-                            let meta = execution
-                                .publication_meta
-                                .as_ref()
-                                .expect("checked metadata");
+                        if let Some(meta) = execution.publication_meta.as_ref() {
                             let core = operation
                                 .core_publication
                                 .as_ref()
@@ -3436,36 +3432,35 @@ fn stdio_jsonrpc_tool_execution_v3(
                         );
                     }
                 }
-                if tool_name == "packet" && expected_packet_bytes.is_some() {
-                    if let Some(join) = execution.packet_replay.as_ref() {
-                        if let Some(metadata) = execution.publication_meta.as_ref() {
-                            codestory_runtime::write_packet_stdio_replay_from_env(
-                                &join.question,
-                                &join.core_generation,
-                                &join.core_run,
-                                &join.retrieval_generation,
-                                &join.internal_packet_id,
-                                || {
-                                    let mut typed_root = root.clone();
-                                    typed_root
-                                        .pointer_mut("/diagnostics/reference")?
-                                        .as_object_mut()?
-                                        .remove("uri");
-                                    let projection = serde_json::from_value(typed_root).ok()?;
-                                    let plan = StdioPacketRepresentationPlanV3 {
-                                        revision,
-                                        publication_meta: metadata.clone(),
-                                        wall_expiry_epoch_ms: join.wall_expiry_epoch_ms,
-                                    };
-                                    let mut payload = plan.replay_payload(&projection)?;
-                                    payload["served_result"] = result.clone();
-                                    payload["served_bytes"] =
-                                        serde_json::json!(expected_packet_bytes);
-                                    Some(payload)
-                                },
-                            );
-                        }
-                    }
+                if tool_name == "packet"
+                    && expected_packet_bytes.is_some()
+                    && let Some(join) = execution.packet_replay.as_ref()
+                    && let Some(metadata) = execution.publication_meta.as_ref()
+                {
+                    codestory_runtime::write_packet_stdio_replay_from_env(
+                        &join.question,
+                        &join.core_generation,
+                        &join.core_run,
+                        &join.retrieval_generation,
+                        &join.internal_packet_id,
+                        || {
+                            let mut typed_root = root.clone();
+                            typed_root
+                                .pointer_mut("/diagnostics/reference")?
+                                .as_object_mut()?
+                                .remove("uri");
+                            let projection = serde_json::from_value(typed_root).ok()?;
+                            let plan = StdioPacketRepresentationPlanV3 {
+                                revision,
+                                publication_meta: metadata.clone(),
+                                wall_expiry_epoch_ms: join.wall_expiry_epoch_ms,
+                            };
+                            let mut payload = plan.replay_payload(&projection)?;
+                            payload["served_result"] = result.clone();
+                            payload["served_bytes"] = serde_json::json!(expected_packet_bytes);
+                            Some(payload)
+                        },
+                    );
                 }
                 stdio_jsonrpc_success(id, result)
             }

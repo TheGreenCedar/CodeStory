@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Retrieval refreshes account for incremental vector work followed by a full rebuild, avoiding a timing-report error after fallback completes.
+
 - Tiny packet plans retain the additional free-query probes you supply when a multi-sentence question adds supplemental retrieval views.
 
 - Multi-project stdio refuses an exact `--cache-dir` override. To use one retained cache, bind stdio to its `--project`; multi-project requests use separate per-project caches.

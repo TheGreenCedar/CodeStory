@@ -112,6 +112,8 @@ pub(super) fn offset(request: &PageRequest) -> Result<usize> {
         .map(|v| v.map_or(0, |(_, offset)| offset))
 }
 
+// Keep request, publication binding, and inventory page explicit during rendering.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn render(
     request: &PageRequest,
     id: &serde_json::Value,
@@ -125,13 +127,13 @@ pub(super) fn render(
     let binding = serde_json::json!([project_id, &publication, inventory_fingerprint]);
     let digest = format!("{:x}", Sha256::digest(serde_json::to_vec(&binding)?));
     let start = offset(request)?;
-    if let Some(cursor) = &request.cursor {
-        if parse_cursor(cursor)?.0 != digest {
-            return Err(map_api_error(codestory_contracts::api::ApiError::new(
-                "root_symbols_cursor_stale",
-                "project, publication or inventory changed; restart root symbols",
-            )));
-        }
+    if let Some(cursor) = &request.cursor
+        && parse_cursor(cursor)?.0 != digest
+    {
+        return Err(map_api_error(codestory_contracts::api::ApiError::new(
+            "root_symbols_cursor_stale",
+            "project, publication or inventory changed; restart root symbols",
+        )));
     }
     if start > total
         || symbols.len() > request.limit

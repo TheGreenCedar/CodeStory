@@ -1708,15 +1708,13 @@ fn brace_balanced_body_end_line_with_syntax(
                 .next()?;
             match directive_name {
                 "if" | "ifdef" | "ifndef" => conditional_depths.push(depth),
-                "else" | "elif" | "elifdef" | "elifndef" => {
-                    if conditional_depths.last().copied() != Some(depth) {
-                        return None;
-                    }
+                "else" | "elif" | "elifdef" | "elifndef"
+                    if conditional_depths.last().copied() != Some(depth) =>
+                {
+                    return None;
                 }
-                "endif" => {
-                    if conditional_depths.pop() != Some(depth) {
-                        return None;
-                    }
+                "endif" if conditional_depths.pop() != Some(depth) => {
+                    return None;
                 }
                 _ => {}
             }

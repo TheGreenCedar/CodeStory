@@ -1,78 +1,113 @@
 # CodeStory 0.18 investigation WIP handoff
 
-## Current continuation — October 13, 2026
+## Current continuation — October 14, 2026
 
 The maintainer resumed research and implementation from PR 2561 and issue 2560
-for a twelve-hour window, ending October 14 at 09:33 America/Toronto
-(13:33 UTC). The accepted outcome remains the full issue 2173 program below;
-readiness requires its product and independent acceptance evidence. Main
-promotion still requires explicit approval. Historical limits, failures and
-evidence identities remain intact; the earlier stop at handoff is superseded.
+for a twelve-hour window ending October 14 at 09:33 America/Toronto (13:33 UTC).
+The outcome remains the full issue 2173 program below. Main promotion requires
+explicit approval. Historical failures, costs and evidence identities remain
+retained; the earlier stop at handoff is superseded. This continuation has not
+established 0.18 readiness.
 
 Starting PR head: `571b3c7864660f6a2a8b740c34e6e43861ad59ed`. Integration head:
-`2c85f93fa4d9d597959b375307dc820cc6a942e6`. Root owns integration, builds and
-runtime operations. Sol 6.1 owns native-source CI and protocol-consumer repairs;
-an independent Sol 6.1 reviews the changed seams. Native-source reconstruction
-and protocol-consumer repairs are implemented. Hosted durability passed on
-`93549e98654f4b68c7fc3cdb8a5b5c46e12c0a48`: Store 373 unit and 40 integration
-tests, indexer fidelity 8 and language coverage 13, and agent 126 unit and 21
-integration tests, including all 16 planner tests. These totals also passed on
-`b4234f2c39e781b122a405ca2afc3458bb3fb616`; both PR merge checkouts had the
-same tree as their source heads. Plugin/static contracts and Windows source
-reconstruction also passed. These are source checks, not product-quality proof.
+`2c85f93fa4d9d597959b375307dc820cc6a942e6`. The continuing branch is
+`codex/wip-018-investigation-handoff-20261013`; root owns integration, Cargo and
+runtime operations in the attached `018-resume-2561/CodeStory` worktree. Sol 6.1
+agents implement bounded changes, independently review them and read development
+cases with separated references. The issue and PR carry each pushed head and its
+current checks; results below identify their actual source.
 
-The same head compiled a normal Linux debug CLI and passed generated-help/catalog
-checks, then failed library Clippy. The cleanup preserves behavior and restricts
-test-only helpers/imports to test builds. On `b4234f2c`, runtime retrieval, packet
-candidate, served-source and browser-capacity contracts passed, followed by packet
-compiler, packet batch, scoring and service tests. The CLI library reached 545
-passes, five failures and five ignored tests. The failures expose stale formatting
-and status expectations plus query-target fixtures without Full publications;
-they require contract-preserving repairs. The obsolete draft source run was
-cancelled after workspace check passed; Clippy remained unrun. Next: finish source
-controls, obtain an identified normal candidate artifact, then compare actual
-unchanged-question baseline and candidate delivery before deciding whether the
-query changes deserve retention. Source passes cannot establish improved retrieval
-or close the broader acceptance program.
+Native-source reconstruction and protocol-consumer repairs are implemented.
+The producer and consumers agree on measurement protocol and snapshot schema 2,
+while native proof and constant-set schemas remain 1. Strict schema/value checks,
+boot witnesses and executable bindings remain enforced. Hosted source checks on
+`4c830fc06ab33163a56a053149690c841bae8605` pass rustdoc, plugin/static contracts,
+Windows source reconstruction and crate durability. Durability covers Store
+373 unit/40 integration, full indexer fidelity 8/language coverage 13, and agent
+126 unit/21 integration tests, including 16 planner tests. Its PR merge checkout
+has the same tree as the source head.
 
-The isolated Linux source-test lane started with sufficient storage, but both PC
-endpoints subsequently became unreachable; its result is unknown. The maintainer
-directed continuation with available resources. Recovery of the active resource
-plan corrected this thread's mistaken assumption that a historical 50-GiB disk
-reserve was binding: retained growth limits are engineering forecasts, and the
-active plan records the maintainer's earlier clarification that the old reserve
-was not a blocker. Local execution requires a fresh bounded capacity forecast.
-An independent copy-on-write clone of the retained build cache permits reuse
-without altering the original target or archives. Hosted draft CI also remains
-available; its Linux build did not retain a comparison archive or executable
-digest. Existing unrelated workloads remain untouched. No formal study,
-installation, qualification, or release has started.
+The same head's Draft source run fails at eleven retrieval Clippy sites. Its
+Retrieval run passes the runtime/evidence suites, Linux CLI 550 tests (five
+ignored), and stdio 76 tests, then fails two HTTP query tests because their
+fixtures lack retrieval manifests; later suites are skipped. Both runs are
+terminal. The attempted cancellation after a source correction became necessary
+found the Retrieval run already complete. These failures and source-only proof
+limits remain retained. The correction preserves admission and HTTP expectations
+while preparing
+attested test-only publications for graph resolution. The first fixture revision
+exposed a legacy-path assumption that omitted Store-backed symbol documents; it
+is retained as a failed attempt. The revised fixture uses the open sealed Store
+and original fingerprint/source-seal checks. All eight HTTP tests now pass,
+including the zero-dense helper rejecting nonzero input.
 
-Independent review found two local planner defects: numeric sentence endings
-could suppress the next view, and supplemental views could displace legal typed
-free queries in Tiny plans. The candidate repairs both and uses the same capped
-plan for runtime retrieval descriptors. Extracted production-function controls
-reproduce both failures before the repair and pass afterward, including hostile
-input and query-origin checks. These are algorithm controls with inert DTO
-scaffolding, not full-crate or product execution. Architecture descriptions now
-match the source candidate; delivered retrieval gain remains unmeasured.
+A normal embedded Mac CLI built from clean pushed source `59f3a935` has SHA-256
+`e3b0ee888868608955dcf20329134b4abed567e91e7ddb9f470528199c311f98`.
+Its native marker and embedded model match the retained baseline; both artifacts
+execute on Metal with CPU fallback disabled. Source version remains 0.17.7.
+Later source commits are different identities and require a rebuilt artifact
+before product claims. The CodeStory MCP tools are not visible in this host;
+normal public CLI results do not establish packaged-host MCP behavior.
 
-Retained baseline inspection separates discovery from delivery. The second public
-question already selected `SpecSchedule.Next` and `TestNext`, but delivered only
-lines 58–76 of requested 58–175 and lines 74–91 of requested 74–200, respectively.
-Its response reports a serialized-public-budget refusal. Both whole questions
-also explicitly request tests, which the prior role filter permits. New sentence
-views may benefit from broad eligibility, but that policy is not an established
-cause of either original whole-question failure. Measure delivered implementation,
-actual assertions, losses and follow-up progress; additional hits alone do not
-establish improvement.
+The unchanged Cron questions were compared on the same pinned source and Core/
+retrieval generations. Initial candidate packets gain and lose physical source
+ranges; they do not establish net improvement. Both second-question initials
+locate `SpecSchedule.Next` and `TestNext` but deliver only their opening lines.
+A broad continuation preserves source and returns a child without adding lines;
+a separately offered single-source continuation advances `Next`. Existing
+function-body snippets deliver both complete bodies in roughly 0.10 seconds of
+additional CLI time. The baseline already found both IDs. Current Complete-child
+issuance permits this result; the earlier no-child assumption below is corrected.
 
-The final starting head's plugin-static failure was a protocol-contract mismatch:
-the Rust producer used measurement protocol and snapshot schema 2 while proof
-consumers still required 1. The continuation aligns these independently owned
-versions while rejecting stale or unknown schemas; native proof and constant-set
-schemas remain 1. The earlier downloader timeout below remains historical; its
-retry test passed on the final starting head.
+Four fresh Sol 6.1 readers used equal narrow discovery/inspection/relationship
+permissions. All 84 calls returned zero. Answers and read inventories were frozen
+before an independent grade against the original sealed reference. Candidate
+Q1/Q2 and baseline Q2 score 6/6; baseline Q1 scores 5.5/6 for an unread expected
+helper body, with no critical false claim. Root review found different follow-up
+search queries caused the helper-read difference on the unchanged StrictLiteral
+route. This does not attribute an answer gain to the planner change. Call counts
+are equal within each pair (23 Q1, 19 Q2). Candidate Q1 CLI time is 36.080 seconds
+versus baseline 10.634, including an unexplained 22.098-second initial packet;
+Q2 is 10.946 versus 14.206. No efficiency gain is established. This is an exposed
+development comparison, not formal unseen or full-host acceptance.
+
+The planner changes remain provisional. Numeric sentence endings and displaced
+Tiny-plan free queries have focused controls and actual agent-test coverage, but
+neither broad role eligibility nor extra query views is an established cause of
+the original whole-question failures. Both questions already request tests.
+Strict local library Clippy passes after the observed retrieval findings and
+29 downstream normal-library findings are repaired. Existing focused checks pass:
+10 query-window, 43 evidence-compiler, 243 runtime-agent (two ignored),
+119 service and 56 grounding tests. The complete Mac CLI library suite passes
+553 tests with five ignored. These executions use Rust 1.95.0 and retained
+working-tree patch identities; hosted Draft uses pinned 1.97.1. Independent
+source review verifies guard ordering, callback lifetimes and failure boundaries.
+No exact-head release gate is claimed.
+
+The next recovered breadth case is the original PocketBase U11-C05 public
+UI-to-backend collection-deletion question. Reuse its pinned source and SDK input
+identity while keeping retained answers and evaluator keys separated.
+
+A bounded normal PocketBase preparation exposed a product defect: incremental
+vector attempts can decline before full fallback, but the CLI rejects timing
+receipts containing both phases. The command failed after 13.128 seconds with
+no resource guard. A later observational status finds a new retrieval
+generation, while the embedding runtime is uninitialized; publication alone
+does not prove query readiness. Focused Rust tests reproduce the rejection and
+a separate fractional-millisecond IPC overcount. The repair sums serial vector attempts with checked arithmetic,
+bounds emitted IPC by emitted parent milliseconds, and retains concurrent-worker,
+wall and overflow guards. Post-change accounting tests pass (eight CLI and three
+producer tests); the normal command still needs a rebuilt candidate and replay.
+
+Both PC endpoints became unreachable during the isolated Linux source attempt;
+its result remains unknown. The maintainer directed continuation with available
+resources. The old 50-GiB free-disk reserve was not binding; current retained
+resource limits are forecasts, and each local run records fresh capacity and
+owner-scoped guards. A separate copy-on-write build-cache clone preserves the
+original target and archives. No formal study, installation, qualification or
+release has started. Continue breadth convergence, then assemble the original
+independent 12-target/72-task/3-arm acceptance; do not replace that outcome with
+these supporting source repairs or a single development comparison.
 
 ## Preserved handoff
 
@@ -464,8 +499,10 @@ python3 scripts/bootstrap-research-native-vendor.py --verify
    Preserve every failed call and inspect physical ranges rather than relying
    on `snippet_truncated=false`. Continuations must use newly returned exact
    actions/pins; the published sanitized old cursors are diagnostic fixtures,
-   not current authority. Confirm all old issued source survives a new capacity
-   refusal, no child issuance appears, and fitting continuations still work.
+   not current authority. Confirm old issued source survives a capacity
+   refusal and fitting continuations still work. A Complete child may be issued
+   without additional source; compare physical ranges rather than treating child
+   issuance alone as progress or failure.
 4. Freeze changed-reader answers/inventories before independent grading. The old
    baseline reader once saw incidental team-status metadata but no reference
    answers; disclose that limitation. Keep references withheld, forbid source,

@@ -316,9 +316,23 @@ fn assemble_finalize_phase_timings(
         .map(|timing| timing.elapsed)
         .fold(Duration::ZERO, Duration::saturating_add);
     if !vector_total.is_zero() {
+        // Parent phases are serialized separately at millisecond precision.
+        // Their sub-millisecond remainders cannot fund attributed IPC time.
+        let emitted_vector_ms = accumulated
+            .iter()
+            .filter(|timing| {
+                matches!(
+                    timing.phase.as_str(),
+                    "embedded vectors" | "incremental embedded vectors"
+                )
+            })
+            .map(|timing| u64::try_from(timing.elapsed.as_millis()).unwrap_or(u64::MAX))
+            .fold(0_u64, u64::saturating_add);
         accumulated.push(AccumulatedPhaseTiming {
             phase: "vector ipc and orchestration".to_string(),
-            elapsed: vector_total.saturating_sub(vector_subphases),
+            elapsed: vector_total
+                .saturating_sub(vector_subphases)
+                .min(Duration::from_millis(emitted_vector_ms)),
         });
     }
     let attributed = accumulated
@@ -4187,6 +4201,42 @@ mod tests {
             60,
             "nested vector subphases must not be subtracted from the top-level clock twice"
         );
+    }
+
+    #[test]
+    fn vector_fallback_ipc_fits_the_emitted_parent_milliseconds() {
+        for (complete_us, incremental_us, nested_us, expected_ipc_ms) in [
+            (600, 600, 0, 0),
+            (100_600, 600, 100, 100),
+            (60_000, 40_000, 25_000, 75),
+            (600, 0, 0, 0),
+            (600, 600, 2_000, 0),
+        ] {
+            let phase = |name: &str, micros| AccumulatedPhaseTiming {
+                phase: name.into(),
+                elapsed: Duration::from_micros(micros),
+            };
+            let timings = assemble_finalize_phase_timings(
+                Duration::from_micros(complete_us + incremental_us),
+                vec![
+                    phase("embedded vectors", complete_us),
+                    phase("incremental embedded vectors", incremental_us),
+                    phase("vector native encode", nested_us),
+                ],
+            );
+            let emitted = |name| {
+                timings
+                    .iter()
+                    .find(|timing| timing.phase == name)
+                    .expect("emitted vector phase")
+                    .elapsed_ms
+            };
+            let ipc_ms = emitted("vector ipc and orchestration");
+            assert_eq!(ipc_ms, expected_ipc_ms);
+            assert!(
+                ipc_ms <= emitted("embedded vectors") + emitted("incremental embedded vectors")
+            );
+        }
     }
 
     #[test]

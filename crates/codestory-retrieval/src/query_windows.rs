@@ -176,9 +176,9 @@ where
                 }
             }
             Err(error) => {
-                if !error
+                if error
                     .downcast_ref::<PerUserEmbeddingError>()
-                    .is_some_and(|typed| typed.code == "native_embedding_input_too_long")
+                    .is_none_or(|typed| typed.code != "native_embedding_input_too_long")
                 {
                     return Err(error);
                 }

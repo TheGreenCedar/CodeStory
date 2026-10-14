@@ -1416,11 +1416,11 @@ fn merge_query_window_hits_with_control(
             if !hit.score.is_finite() {
                 bail!("embedding_query_window_score_invalid");
             }
-            hit.add_provenance(&format!(
+            hit.add_provenance(format!(
                 "query_window_policy:{}",
                 crate::query_windows::QUERY_WINDOW_POLICY
             ));
-            hit.add_provenance(&format!(
+            hit.add_provenance(format!(
                 "query_window_bytes:{}..{}",
                 window.range.start, window.range.end
             ));
