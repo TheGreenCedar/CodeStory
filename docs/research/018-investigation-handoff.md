@@ -12,19 +12,31 @@ evidence identities remain intact; the earlier stop at handoff is superseded.
 Starting PR head: `571b3c7864660f6a2a8b740c34e6e43861ad59ed`. Integration head:
 `2c85f93fa4d9d597959b375307dc820cc6a942e6`. Root owns integration, builds and
 runtime operations. Sol 6.1 owns native-source CI and protocol-consumer repairs;
-an independent Sol 6.1 reviews the changed seams. Next: repair the
-reproducible source-build blocker, execute the unfinished controls, then compare
-actual unchanged-question baseline and candidate delivery before deciding
-whether the query changes deserve retention. Additional source-only unit passes
-cannot establish improved retrieval or close the broader acceptance program.
+an independent Sol 6.1 reviews the changed seams. Native-source reconstruction
+and protocol-consumer repairs are implemented. Hosted durability passed on
+`93549e98654f4b68c7fc3cdb8a5b5c46e12c0a48`: Store 373 unit and 40 integration
+tests, indexer fidelity 8 and language coverage 13, and agent 126 unit and 21
+integration tests, including all 16 planner tests. Its PR merge checkout had the
+same tree as that source head. Plugin/static contracts and Windows source
+reconstruction also passed. These are source checks, not product-quality proof.
+
+The same head compiled a normal Linux debug CLI and passed generated-help/catalog
+checks, then failed library Clippy. The current cleanup preserves behavior and
+restricts test-only helpers/imports to test builds. The cancelled runtime contract
+run completed no Rust tests. Next: finish hosted source controls, obtain an
+identified normal candidate artifact on an available host, then compare actual
+unchanged-question baseline and candidate delivery before deciding whether the
+query changes deserve retention. Source passes cannot establish improved retrieval
+or close the broader acceptance program.
 
 The current Mac disk sample is below the retained reserve, so local Cargo and
 native execution are deferred. The isolated Linux source-test lane started with
 sufficient storage, but both PC endpoints subsequently became unreachable; its
 test result is unknown. The maintainer directed continuation with available
-resources. Hosted draft CI is the next source-check surface. Existing unrelated
-GPU workloads remain untouched. No formal study, installation, qualification,
-or release has started.
+resources. Hosted draft CI remains the source-check surface; its Linux build did
+not retain a comparison archive or executable digest. Existing unrelated GPU
+workloads remain untouched. No formal study, installation, qualification, or
+release has started.
 
 Independent review found two local planner defects: numeric sentence endings
 could suppress the next view, and supplemental views could displace legal typed
@@ -35,12 +47,22 @@ input and query-origin checks. These are algorithm controls with inert DTO
 scaffolding, not full-crate or product execution. Architecture descriptions now
 match the source candidate; delivered retrieval gain remains unmeasured.
 
-The final starting head's plugin-static failure is a protocol-contract mismatch:
-the Rust producer uses measurement protocol and snapshot schema 2 while proof
-consumers still require 1. The native proof marker itself remains version 1.
-Repair these independently owned versions without accepting stale or unknown
-schemas. The earlier downloader timeout below remains historical; the retry
-test passes on the final starting head.
+Retained baseline inspection separates discovery from delivery. The second public
+question already selected `SpecSchedule.Next` and `TestNext`, but delivered only
+lines 58–76 of requested 58–175 and lines 74–91 of requested 74–200, respectively.
+Its response reports a serialized-public-budget refusal. Both whole questions
+also explicitly request tests, which the prior role filter permits. New sentence
+views may benefit from broad eligibility, but that policy is not an established
+cause of either original whole-question failure. Measure delivered implementation,
+actual assertions, losses and follow-up progress; additional hits alone do not
+establish improvement.
+
+The final starting head's plugin-static failure was a protocol-contract mismatch:
+the Rust producer used measurement protocol and snapshot schema 2 while proof
+consumers still required 1. The continuation aligns these independently owned
+versions while rejecting stale or unknown schemas; native proof and constant-set
+schemas remain 1. The earlier downloader timeout below remains historical; its
+retry test passed on the final starting head.
 
 ## Preserved handoff
 
