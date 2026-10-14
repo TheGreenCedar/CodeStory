@@ -10347,6 +10347,84 @@ pub(crate) mod activation_tests {
     }
 
     #[test]
+    fn outdated_python_extraction_refuses_source_reads_without_mutating_publication() {
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("owned runtime cache");
+        let storage_path = project.path().join("cache/codestory.db");
+        fs::write(
+            project.path().join("fixture.py"),
+            "@trace\ndef fixture():\n    return 1\n",
+        )
+        .expect("write Python fixture");
+        let runtime = crate::test_runtime_with_owned_cache_root(cache.path());
+        runtime
+            .project_service()
+            .open_project_summary_with_storage_path(
+                project.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+        runtime
+            .index_service()
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish current extraction");
+        let summary = runtime
+            .project_service()
+            .inspect_project_summary_with_storage_path(
+                project.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            summary.freshness.as_ref().unwrap().status,
+            IndexFreshnessStatusDto::Fresh
+        );
+        let publication = summary.publication.expect("complete publication");
+
+        for mutation in [
+            "UPDATE file_extraction_identity SET extraction_revision = 'previous-python-producer';",
+            "DELETE FROM file_extraction_identity;",
+        ] {
+            mutate_active_generation_sql(&storage_path, mutation);
+            let database = codestory_store::resolve_core_database_path(&storage_path).unwrap();
+            let before = fs::read(&database).unwrap();
+            let observed = runtime
+                .project_service()
+                .inspect_project_summary_with_storage_path(
+                    project.path().to_path_buf(),
+                    storage_path.clone(),
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(observed.publication.as_ref(), Some(&publication));
+            assert_eq!(
+                observed.freshness.as_ref().unwrap().status,
+                IndexFreshnessStatusDto::Stale
+            );
+            assert_eq!(observed.freshness.as_ref().unwrap().changed_file_count, 1);
+            for operation in ["exact_search", "source_snippet"] {
+                let mut entered = false;
+                let error = runtime
+                    .public_operation_service()
+                    .run_with_cancel(operation, Arc::new(AtomicBool::new(false)), || {
+                        entered = true;
+                        Ok(())
+                    })
+                    .expect_err("outdated extraction cannot admit current source evidence");
+                assert_eq!(error.code, "project_unavailable", "{error:?}");
+                assert!(!entered, "the source response builder must not run");
+            }
+            assert_eq!(fs::read(&database).unwrap(), before);
+            assert_eq!(
+                Store::database_schema_version(&storage_path).unwrap(),
+                codestory_store::CURRENT_SCHEMA_VERSION
+            );
+            assert!(runtime.activation_service().snapshot().is_none());
+        }
+    }
+
+    #[test]
     fn newer_core_schema_refuses_observation_and_automatic_rebuild() {
         let project = tempfile::tempdir().expect("project");
         let cache = tempfile::tempdir().expect("owned cache");

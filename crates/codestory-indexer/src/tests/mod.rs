@@ -16,6 +16,7 @@ use rusqlite::types::Value;
 use std::collections::HashSet;
 use tempfile::tempdir;
 
+mod python_declaration_envelopes;
 mod walk_tree_nodes;
 
 #[test]
@@ -2742,6 +2743,7 @@ fn incremental_policy_upgrade_removes_pre_policy_structural_publication_and_cach
         .flush_projection_batch(codestory_store::ProjectionBatch {
             files: &projected.files,
             file_content_hashes: &projected.file_content_hashes,
+            file_extraction_identities: &[],
             nodes: &projected.nodes,
             structural_text_units: &projected.structural_text_units,
             structural_text_projections: &projected.structural_text_projections,
@@ -6645,6 +6647,7 @@ fn test_template_svelte_tauri_invoke_survives_projection_flush() -> Result<()> {
         .flush_projection_batch(codestory_store::ProjectionBatch {
             files: &local.files,
             file_content_hashes: &local.file_content_hashes,
+            file_extraction_identities: &[],
             nodes: &local.nodes,
             structural_text_units: &local.structural_text_units,
             structural_text_projections: &local.structural_text_projections,

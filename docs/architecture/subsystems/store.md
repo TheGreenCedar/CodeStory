@@ -148,6 +148,16 @@ logical row attempts, prepared-statement executions, and estimated raw bind
 payload bytes by family; the byte count describes input shape, not database,
 WAL, or physical-write bytes.
 
+Schema v37 adds durable `file_extraction_identity` rows binding a file's
+language, verified source hash and extraction revision. They commit with the
+file/hash/graph projection and are removed with the file. Migration creates no
+identity for legacy projections. The existing schema compatibility fence
+requires one full rebuild for an older Core; later same-schema revision
+mismatches select only affected files through normal refresh planning. Python
+currently requires this identity, including files with no callables. Status and
+doctor only observe incompatible or outdated state, and failed or cancelled
+staged work leaves the previous published generation available.
+
 Legacy promotion journals record candidate and rollback structural identities.
 Their recovery validates the recorded manifest and current row digest before
 accepting a database. Current publication installs a sealed immutable generation

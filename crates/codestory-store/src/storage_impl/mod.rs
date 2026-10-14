@@ -87,7 +87,8 @@ const PROOF_RESOLUTION_PROVENANCE_SCHEMA_VERSION: u32 = 33;
 const CANONICAL_SUFFIX_SCHEMA_VERSION: u32 = 34;
 const ATTACHED_COMMENT_SCHEMA_VERSION: u32 = 35;
 const PROOF_RESOLUTION_FK_INDEX_SCHEMA_VERSION: u32 = 36;
-const SCHEMA_VERSION: u32 = PROOF_RESOLUTION_FK_INDEX_SCHEMA_VERSION;
+const FILE_EXTRACTION_IDENTITY_SCHEMA_VERSION: u32 = 37;
+const SCHEMA_VERSION: u32 = FILE_EXTRACTION_IDENTITY_SCHEMA_VERSION;
 // Reserved outside the sequential migration range so a future real schema version cannot
 // accidentally be treated as an interrupted run from this release.
 /// The `user_version` sentinel stamped while an incremental index run is
@@ -2911,6 +2912,7 @@ impl ProjectionPersistenceStats {
 pub struct ProjectionBatch<'a> {
     pub files: &'a [FileInfo],
     pub file_content_hashes: &'a [FileContentHash],
+    pub file_extraction_identities: &'a [FileExtractionIdentity],
     pub nodes: &'a [Node],
     pub structural_text_units: &'a [StructuralTextUnit],
     pub structural_text_projections: &'a [StructuralTextProjection],
@@ -3117,6 +3119,15 @@ pub struct FileInfo {
 pub struct FileContentHash {
     pub file_id: i64,
     pub content_hash: String,
+}
+
+/// Successful extraction identity, committed with the exact file projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileExtractionIdentity {
+    pub file_id: i64,
+    pub language: String,
+    pub source_content_hash: String,
+    pub extraction_revision: String,
 }
 
 /// Opaque parser-cache payload retained for one source path.
@@ -5825,6 +5836,42 @@ impl Storage {
         cache_key: &str,
     ) -> Result<Option<Vec<u8>>, StorageError> {
         get_index_artifact_cache_from_connection(&self.conn, path, cache_key)
+    }
+
+    pub fn file_extraction_identity_matches(
+        &self,
+        file_id: i64,
+        language: &str,
+        extraction_revision: &str,
+    ) -> Result<bool, StorageError> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM file_extraction_identity e JOIN file f ON f.id = e.file_id
+                WHERE e.file_id = ?1 AND e.language = ?2 AND e.extraction_revision = ?3
+                  AND e.language = f.language AND e.source_content_hash = f.content_hash
+                  AND f.indexed = 1 AND f.complete = 1
+             )",
+            params![file_id, language, extraction_revision],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn files_with_extraction_revision_mismatch(
+        &self,
+        language: &str,
+        extraction_revision: &str,
+    ) -> Result<Vec<i64>, StorageError> {
+        let mut statement = self.conn.prepare(
+            "SELECT f.id FROM file f LEFT JOIN file_extraction_identity e ON e.file_id = f.id
+             WHERE f.language = ?1 AND (
+                e.file_id IS NULL OR e.language != f.language
+                OR e.extraction_revision != ?2 OR e.source_content_hash != f.content_hash
+                OR f.content_hash IS NULL
+             ) ORDER BY f.id",
+        )?;
+        let rows = statement.query_map(params![language, extraction_revision], |row| row.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
     }
 
     pub fn get_index_artifact_cache_entries(
@@ -8900,6 +8947,7 @@ impl Storage {
         let mut breakdown = ProjectionFlushBreakdown::default();
         if batch.files.is_empty()
             && batch.file_content_hashes.is_empty()
+            && batch.file_extraction_identities.is_empty()
             && batch.nodes.is_empty()
             && batch.structural_text_units.is_empty()
             && batch.structural_text_projections.is_empty()
@@ -8956,6 +9004,28 @@ impl Storage {
         }
         let prepared_structural =
             prepare_structural_projection_batch(&batch, &file_content_hashes)?;
+        let mut extraction_file_ids = HashSet::new();
+        for identity in batch.file_extraction_identities {
+            let file = batch.files.iter().find(|file| file.id == identity.file_id);
+            if !extraction_file_ids.insert(identity.file_id)
+                || !file.is_some_and(|file| {
+                    file.indexed && file.complete && file.language == identity.language
+                })
+                || file_content_hashes.get(&identity.file_id).copied()
+                    != Some(identity.source_content_hash.as_str())
+                || identity.source_content_hash.len() != 64
+                || !identity
+                    .source_content_hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+                || identity.extraction_revision.trim().is_empty()
+            {
+                return Err(StorageError::Other(format!(
+                    "extraction identity {} does not describe a complete verified file projection",
+                    identity.file_id
+                )));
+            }
+        }
         let transaction_started = std::time::Instant::now();
         let transaction_setup_started = std::time::Instant::now();
         let tx = self.conn.transaction()?;
@@ -9020,6 +9090,40 @@ impl Storage {
             }
             breakdown.files_ms = clamp_i64_to_u32(started.elapsed().as_millis() as i64);
             breakdown.persistence.files.wall_ms = breakdown.files_ms;
+        }
+
+        if !batch.files.is_empty() {
+            let placeholders = question_placeholders(batch.files.len());
+            let removed = tx.execute(
+                &format!("DELETE FROM file_extraction_identity WHERE file_id IN ({placeholders})"),
+                params_from_iter(batch.files.iter().map(|file| file.id)),
+            )?;
+            record_projection_statement(
+                &mut breakdown.persistence.files,
+                removed as u64,
+                projection_scalar_binds(batch.files.len()),
+            );
+            let mut statement = tx.prepare(
+                "INSERT INTO file_extraction_identity
+                 (file_id, language, source_content_hash, extraction_revision)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for identity in batch.file_extraction_identities {
+                statement.execute(params![
+                    identity.file_id,
+                    identity.language,
+                    identity.source_content_hash,
+                    identity.extraction_revision,
+                ])?;
+                record_projection_statement(
+                    &mut breakdown.persistence.files,
+                    1,
+                    projection_scalar_binds(1)
+                        .saturating_add(projection_text_bind_bytes(&identity.language))
+                        .saturating_add(projection_text_bind_bytes(&identity.source_content_hash))
+                        .saturating_add(projection_text_bind_bytes(&identity.extraction_revision)),
+                );
+            }
         }
 
         if !prepared_nodes.is_empty() {

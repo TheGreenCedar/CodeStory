@@ -1494,16 +1494,32 @@ impl<'a> ProjectionWriter<'a> {
                 &existing_states,
                 &local_storage.callable_projection_states,
             );
+            let mut extraction_changed = false;
+            for identity in &local_storage.file_extraction_identities {
+                extraction_changed |= !self
+                    .storage
+                    .file_extraction_identity_matches(
+                        identity.file_id,
+                        &identity.language,
+                        &identity.extraction_revision,
+                    )
+                    .map_err(|error| {
+                        anyhow!("Storage extraction identity lookup error: {error}")
+                    })?;
+            }
             let access_only = component_access_changed
+                && !extraction_changed
                 && file_complete
                 && compatible_file_metadata
                 && matches!(&classified_mode, ProjectionUpdateMode::NoChanges);
-            let update_mode =
-                if replace_file_owned_projection || component_access_changed && !access_only {
-                    ProjectionUpdateMode::FullReplace
-                } else {
-                    classified_mode
-                };
+            let update_mode = if extraction_changed
+                || replace_file_owned_projection
+                || component_access_changed && !access_only
+            {
+                ProjectionUpdateMode::FullReplace
+            } else {
+                classified_mode
+            };
             source_identity_only = matches!(&update_mode, ProjectionUpdateMode::NoChanges)
                 && compatible_file_metadata
                 && !component_access_changed;
@@ -1543,6 +1559,7 @@ impl<'a> ProjectionWriter<'a> {
                 local_storage
                     .nodes
                     .retain(|node| node.id != NodeId(file_id));
+                local_storage.file_extraction_identities.clear();
                 self.stats.graph_projection_changed = true;
             } else {
                 let cleanup_started = Instant::now();
@@ -1610,6 +1627,9 @@ impl<'a> ProjectionWriter<'a> {
             // semantics while keeping the store batch contract unambiguous.
             self.batched_storage
                 .file_content_hashes
+                .retain(|identity| !incoming_file_ids.contains(&identity.file_id));
+            self.batched_storage
+                .file_extraction_identities
                 .retain(|identity| !incoming_file_ids.contains(&identity.file_id));
             self.batched_storage
                 .structural_text_units
@@ -3103,6 +3123,7 @@ impl WorkspaceIndexer {
         let projection_batch = codestory_store::ProjectionBatch {
             files: &batched_storage.files,
             file_content_hashes: &batched_storage.file_content_hashes,
+            file_extraction_identities: &batched_storage.file_extraction_identities,
             nodes: &batched_storage.nodes,
             structural_text_units: &batched_storage.structural_text_units,
             structural_text_projections: &batched_storage.structural_text_projections,
@@ -3328,6 +3349,27 @@ impl WorkspaceIndexer {
         };
         let content_hash = source_content_hash(&bytes);
         let source_utf8_exact = std::str::from_utf8(&bytes).is_ok();
+        let existing_projection_id = if language_config.language_name == "python" {
+            existing_projection_id.filter(|file_id| {
+                cache_access.storage_mut().is_some_and(|storage| {
+                    storage
+                        .file_extraction_identity_matches(
+                            *file_id,
+                            "python",
+                            languages::python::CALLABLE_DECLARATION_REVISION,
+                        )
+                        .unwrap_or(false)
+                        && storage
+                            .get_file_content_hash(*file_id)
+                            .ok()
+                            .flatten()
+                            .as_deref()
+                            == Some(content_hash.as_str())
+                })
+            })
+        } else {
+            existing_projection_id
+        };
         // Inspect the parser source before building the cache key so source-aware header
         // detection chooses the same language that will be used for indexing. The key remains
         // bound to the raw bytes even when ordinary graph indexing uses a lossy view.
@@ -3483,6 +3525,9 @@ impl WorkspaceIndexer {
                                 file_id: file_info.id,
                                 content_hash,
                             });
+                    }
+                    if source_utf8_exact {
+                        add_current_file_extraction_identities(&mut local_storage);
                     }
                     Ok(PreparedIndexWork::Immediate(local_storage))
                 }
@@ -3998,6 +4043,9 @@ impl WorkspaceIndexer {
                             content_hash: prepared_input.content_hash.clone(),
                         });
                 }
+                if prepared_input.source_utf8_exact {
+                    add_current_file_extraction_identities(&mut local_storage);
+                }
                 PreparedIndexJobResult {
                     local_storage,
                     cache_write,
@@ -4270,12 +4318,46 @@ fn source_content_hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// Current extraction revisions requiring durable per-file compatibility checks.
+pub fn current_file_extraction_revision(language: &str) -> Option<&'static str> {
+    (language == "python").then_some(languages::python::CALLABLE_DECLARATION_REVISION)
+}
+
+fn add_current_file_extraction_identities(storage: &mut IntermediateStorage) {
+    for file in &storage.files {
+        if !file.indexed || !file.complete {
+            continue;
+        }
+        let Some(revision) = current_file_extraction_revision(&file.language) else {
+            continue;
+        };
+        let Some(hash) = storage
+            .file_content_hashes
+            .iter()
+            .find(|hash| hash.file_id == file.id)
+        else {
+            continue;
+        };
+        storage
+            .file_extraction_identities
+            .push(codestory_store::FileExtractionIdentity {
+                file_id: file.id,
+                language: file.language.clone(),
+                source_content_hash: hash.content_hash.clone(),
+                extraction_revision: revision.to_string(),
+            });
+    }
+}
+
 fn resolution_parser_fingerprint(language_config: &LanguageConfig) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"codestory-proof-parser-rules-v4\0");
     hasher.update(language_config.language_name.as_bytes());
     hasher.update(language_config.language.abi_version().to_be_bytes());
     hasher.update(language_config.graph_query.as_bytes());
+    if let Some(revision) = current_file_extraction_revision(language_config.language_name) {
+        hasher.update(revision.as_bytes());
+    }
     if let Some(tags_query) = language_config.tags_query {
         hasher.update(tags_query.as_bytes());
     }
@@ -4403,6 +4485,7 @@ fn duration_ms_u64(duration: std::time::Duration) -> u64 {
 fn projection_batch_has_rows(storage: &IntermediateStorage) -> bool {
     !storage.files.is_empty()
         || !storage.file_content_hashes.is_empty()
+        || !storage.file_extraction_identities.is_empty()
         || !storage.nodes.is_empty()
         || !storage.structural_text_units.is_empty()
         || !storage.structural_text_projections.is_empty()
@@ -11928,7 +12011,39 @@ fn post_process_index_results(
     // Stage 5: rewrite override placeholders after remap so synthetic nodes are canonical.
     rewrite_override_placeholders(new_file_id, &mut final_nodes, result_edges);
     // Stage 6: attribute calls to enclosing callables after the structural rewrites settle.
-    apply_line_range_call_attribution(&final_nodes, result_edges, flags);
+    if language_name == "python" {
+        let declaration_ids = canonical_role_by_node_id
+            .iter()
+            .filter_map(|(id, role)| {
+                matches!(
+                    *role,
+                    CanonicalNodeRole::Definition
+                        | CanonicalNodeRole::Declaration
+                        | CanonicalNodeRole::ForwardDeclaration
+                )
+                .then_some(id_remap.get(id).copied().unwrap_or(*id))
+            })
+            .collect::<HashSet<_>>();
+        let reference_ids = canonical_role_by_node_id
+            .iter()
+            .filter_map(|(id, role)| {
+                let remapped = id_remap.get(id).copied().unwrap_or(*id);
+                (*role == CanonicalNodeRole::Reference && !declaration_ids.contains(&remapped))
+                    .then_some(remapped)
+            })
+            .collect::<HashSet<_>>();
+        // A decorator's FUNCTION reference is a callee, not a lexical owner.
+        // Keep public references and explicit decorator edges; only the owner
+        // candidates exclude references without a canonical declaration.
+        let lexical_nodes = final_nodes
+            .iter()
+            .filter(|node| !reference_ids.contains(&node.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        apply_line_range_call_attribution(&lexical_nodes, result_edges, flags);
+    } else {
+        apply_line_range_call_attribution(&final_nodes, result_edges, flags);
+    }
     // Stage 7: runtime module imports should not retain generic CALL placeholders.
     suppress_runtime_import_call_edges(&final_nodes, result_edges, runtime_import_specs);
 
@@ -16909,9 +17024,6 @@ fn index_file_with_resolution_inputs(
         &mut impl_anchor_node_ids,
     );
 
-    let callable_projection_states =
-        build_callable_projection_states(&final_nodes, &result_edges, &result_occurrences);
-
     if let Some(st) = &symbol_table {
         for node in &final_nodes {
             st.insert(node.id.0, node.kind);
@@ -16928,6 +17040,12 @@ fn index_file_with_resolution_inputs(
         file_id,
         &final_nodes,
     );
+
+    if language_config.language_name == "python" {
+        languages::python::apply_callable_declaration_envelopes(&tree, &mut final_nodes);
+    }
+    let callable_projection_states =
+        build_callable_projection_states(&final_nodes, &result_edges, &result_occurrences);
 
     Ok((
         IndexResult {

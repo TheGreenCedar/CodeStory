@@ -47,11 +47,13 @@ pub(super) fn ensure_indexing_active(
 }
 
 pub(super) fn workspace_refresh_inputs(store: &Store) -> Result<RefreshInputs, ApiError> {
+    let mut stored_files = store
+        .files()
+        .inventory()
+        .map_err(|e| ApiError::internal(format!("Failed to read workspace inventory: {e}")))?;
+    mark_extraction_revision_mismatches(store, &mut stored_files)?;
     Ok(RefreshInputs {
-        stored_files: store
-            .files()
-            .inventory()
-            .map_err(|e| ApiError::internal(format!("Failed to read workspace inventory: {e}")))?,
+        stored_files,
         policy_exclusions: store
             .get_source_policy_exclusions()
             .map_err(|e| {
@@ -62,6 +64,25 @@ pub(super) fn workspace_refresh_inputs(store: &Store) -> Result<RefreshInputs, A
             .collect(),
         inventory: Default::default(),
     })
+}
+
+pub(super) fn mark_extraction_revision_mismatches(
+    store: &Store,
+    stored_files: &mut [codestory_contracts::workspace::StoredFileState],
+) -> Result<(), ApiError> {
+    if let Some(revision) = codestory_indexer::current_file_extraction_revision("python") {
+        let outdated = store
+            .files_with_extraction_revision_mismatch("python", revision)
+            .map_err(|error| {
+                ApiError::internal(format!("Failed to read extraction identities: {error}"))
+            })?
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        for file in stored_files.iter_mut() {
+            file.retry_required |= outdated.contains(&file.id);
+        }
+    }
+    Ok(())
 }
 
 fn reuse_completed_search_state(
@@ -435,5 +456,127 @@ pub(super) fn publish_prepared_search_state(
         search_stats: result.search_stats,
         semantic_stats: result.semantic_stats,
         runtime_cache_publish_ms: Some(clamp_u128_to_u32(publish_started.elapsed().as_millis())),
+    }
+}
+
+#[cfg(test)]
+mod extraction_identity_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn refresh_inputs_select_only_outdated_extraction_and_observe_source_binding() {
+        use codestory_store::{
+            FileContentHash, FileExtractionIdentity, FileInfo, FileRole, ProjectionBatch,
+        };
+        let mut store = Store::new_in_memory().unwrap();
+        let files = [
+            FileInfo {
+                id: 1,
+                path: PathBuf::from("empty.py"),
+                language: "python".into(),
+                modification_time: 0,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: FileRole::Source,
+            },
+            FileInfo {
+                id: 2,
+                path: PathBuf::from("plain.rs"),
+                language: "rust".into(),
+                modification_time: 0,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: FileRole::Source,
+            },
+        ];
+        let hashes = [
+            FileContentHash {
+                file_id: 1,
+                content_hash: "a".repeat(64),
+            },
+            FileContentHash {
+                file_id: 2,
+                content_hash: "b".repeat(64),
+            },
+        ];
+        let flush = |store: &mut Store, identities: &[FileExtractionIdentity]| {
+            store
+                .projections()
+                .flush_projection_batch(ProjectionBatch {
+                    files: &files,
+                    file_content_hashes: &hashes,
+                    file_extraction_identities: identities,
+                    nodes: &[],
+                    structural_text_units: &[],
+                    structural_text_projections: &[],
+                    structural_text_cache_writes: &[],
+                    edges: &[],
+                    occurrences: &[],
+                    component_access: &[],
+                    callable_projection_states: &[],
+                    file_errors: &[],
+                })
+                .unwrap();
+        };
+        flush(&mut store, &[]);
+        let inputs = workspace_refresh_inputs(&store).unwrap();
+        assert!(
+            inputs
+                .stored_files
+                .iter()
+                .find(|file| file.id == 1)
+                .unwrap()
+                .retry_required
+        );
+        assert!(
+            !inputs
+                .stored_files
+                .iter()
+                .find(|file| file.id == 2)
+                .unwrap()
+                .retry_required
+        );
+        let revision = codestory_indexer::current_file_extraction_revision("python").unwrap();
+        let identity = FileExtractionIdentity {
+            file_id: 1,
+            language: "python".into(),
+            source_content_hash: hashes[0].content_hash.clone(),
+            extraction_revision: revision.to_string(),
+        };
+        flush(&mut store, &[identity]);
+        assert!(
+            workspace_refresh_inputs(&store)
+                .unwrap()
+                .stored_files
+                .iter()
+                .all(|file| !file.retry_required)
+        );
+        store
+            .get_connection()
+            .execute(
+                "UPDATE file SET content_hash = ?1 WHERE id = 1",
+                ["c".repeat(64)],
+            )
+            .unwrap();
+        let inputs = workspace_refresh_inputs(&store).unwrap();
+        assert!(
+            inputs
+                .stored_files
+                .iter()
+                .find(|file| file.id == 1)
+                .unwrap()
+                .retry_required
+        );
+        assert!(
+            !inputs
+                .stored_files
+                .iter()
+                .find(|file| file.id == 2)
+                .unwrap()
+                .retry_required
+        );
     }
 }

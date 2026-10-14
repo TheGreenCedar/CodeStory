@@ -600,6 +600,7 @@ fn build_search_hit_marks_generic_structural_collectors_as_non_sufficient() {
                 line_count: 2,
                 file_role: codestory_store::FileRole::Source,
             }],
+            file_extraction_identities: &[],
             file_content_hashes: &[codestory_store::FileContentHash {
                 file_id: 40,
                 content_hash: source_hash.clone(),

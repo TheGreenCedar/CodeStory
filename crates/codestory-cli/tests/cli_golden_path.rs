@@ -1503,6 +1503,80 @@ fn app_controller_opens_project() {
 }
 
 #[test]
+fn python_function_body_id_snippet_retains_attached_test_cases() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    fs::write(
+        workspace.path().join("test_cases.py"),
+        r#"import pytest
+
+def unrelated_before():
+    return "UNRELATED_BEFORE"
+
+# UNRELATED_COMMENT_BEFORE
+@pytest.mark.parametrize(
+    "mode, expected",
+    [
+        ("first", "FIRST"),
+        ("second", "SECOND"),
+    ],
+)
+def test_checked_modes(mode, expected):
+    assert mode.upper() == expected
+
+# UNRELATED_COMMENT_AFTER
+def unrelated_after():
+    return "UNRELATED_AFTER"
+"#,
+    )
+    .expect("write decorated Python test");
+    run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &["index", "--refresh", "full", "--format", "json"],
+    );
+    let node_id = ground_symbol_node_id_from_existing_cache(
+        workspace.path(),
+        cache_dir.path(),
+        "test_checked_modes",
+        Some("test_cases.py"),
+    );
+    let snippet = run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "snippet",
+            "--id",
+            &node_id,
+            "--function-body",
+            "--context",
+            "0",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(snippet["resolution"]["resolved"]["node_id"], node_id);
+    assert_eq!(snippet["snippet"]["scope"], "function_body");
+    assert_eq!(snippet["snippet"]["requested_context"], 0);
+    assert_eq!(snippet["snippet"]["snippet_truncated"], false);
+    let source = string_field(&snippet, &["snippet", "snippet"]);
+    assert!(source.contains("def test_checked_modes(mode, expected):"));
+    assert!(source.contains("assert mode.upper() == expected"));
+    assert!(
+        source.contains("@pytest.mark.parametrize("),
+        "function-body source must include its attached test cases: {snippet:#}"
+    );
+    assert!(source.contains("\"mode, expected\""));
+    assert!(source.contains("(\"first\", \"FIRST\")"));
+    assert!(source.contains("(\"second\", \"SECOND\")"));
+    assert!(!source.contains("unrelated_before"));
+    assert!(!source.contains("unrelated_after"));
+    assert!(!source.contains("UNRELATED_COMMENT"));
+}
+
+#[test]
 fn snippet_exact_id_navigates_openapi_diagnostic_evidence_but_query_stays_typed() {
     let workspace = tempdir().expect("workspace dir");
     let cache_dir = tempdir().expect("cache dir");

@@ -1,4 +1,5 @@
 use super::*;
+mod file_extraction_identity;
 use rusqlite::OptionalExtension;
 
 #[test]
@@ -2488,6 +2489,7 @@ fn projection_file_upsert_updates_language_across_structural_transitions()
             .flush_projection_batch(ProjectionBatch {
                 files: std::slice::from_ref(file),
                 file_content_hashes: &[],
+                file_extraction_identities: &[],
                 nodes: &[],
                 structural_text_units: &[],
                 structural_text_projections: &[],
@@ -2713,6 +2715,7 @@ fn projection_flush_prefers_framework_definition_over_usage() -> Result<(), Stor
     storage.flush_projection_batch(ProjectionBatch {
         files: &[],
         file_content_hashes: &[],
+        file_extraction_identities: &[],
         nodes: &[definition],
         structural_text_units: &[],
         structural_text_projections: &[],
@@ -3061,6 +3064,7 @@ fn structural_projection_cache_write_is_atomic_with_file_and_unit_rows() -> Resu
     let error = storage
         .flush_projection_batch(ProjectionBatch {
             files: std::slice::from_ref(&file),
+            file_extraction_identities: &[],
             file_content_hashes: &[FileContentHash {
                 file_id: file.id,
                 content_hash: source_hash,
@@ -3180,6 +3184,7 @@ fn structural_projection_preparation_visits_each_unit_once() -> Result<(), Stora
     let batch = ProjectionBatch {
         files: &[],
         file_content_hashes: &file_content_hashes,
+        file_extraction_identities: &[],
         nodes: &[],
         structural_text_units: &structural_units,
         structural_text_projections: &structural_projections,
@@ -3240,6 +3245,7 @@ fn structural_projection_validation_rejects_duplicates_before_transaction()
         .flush_projection_batch(ProjectionBatch {
             files: &[],
             file_content_hashes: &duplicate_hashes,
+            file_extraction_identities: &[],
             nodes: &[],
             structural_text_units: &[],
             structural_text_projections: &[],
@@ -3275,6 +3281,7 @@ fn structural_projection_validation_rejects_duplicates_before_transaction()
         .flush_projection_batch(ProjectionBatch {
             files: &[],
             file_content_hashes: &file_content_hashes,
+            file_extraction_identities: &[],
             nodes: &[],
             structural_text_units: &[],
             structural_text_projections: std::slice::from_ref(&invalid_projection),
@@ -3321,6 +3328,7 @@ fn structural_projection_preparation_rejects_duplicate_projection_and_cache_writ
     let duplicate_projection_batch = ProjectionBatch {
         files: &[],
         file_content_hashes: &[],
+        file_extraction_identities: &[],
         nodes: &[],
         structural_text_units: &[],
         structural_text_projections: &duplicate_projections,
@@ -3355,6 +3363,7 @@ fn structural_projection_preparation_rejects_duplicate_projection_and_cache_writ
     let duplicate_cache_batch = ProjectionBatch {
         files: &[],
         file_content_hashes: &[],
+        file_extraction_identities: &[],
         nodes: &[],
         structural_text_units: &[],
         structural_text_projections: std::slice::from_ref(&projection),
@@ -3426,6 +3435,7 @@ fn structural_publication_prunes_deleted_excluded_and_changed_cache_membership()
     ];
     storage.flush_projection_batch(ProjectionBatch {
         files: &files,
+        file_extraction_identities: &[],
         file_content_hashes: &[
             FileContentHash {
                 file_id: files[0].id,
@@ -3791,6 +3801,7 @@ fn projection_batch_round_trips_and_clears_file_content_hash() -> Result<(), Sto
     storage.flush_projection_batch(ProjectionBatch {
         files: &files,
         file_content_hashes: &hashes,
+        file_extraction_identities: &[],
         nodes: &[],
         structural_text_units: &[],
         structural_text_projections: &[],
@@ -3809,6 +3820,7 @@ fn projection_batch_round_trips_and_clears_file_content_hash() -> Result<(), Sto
     storage.flush_projection_batch(ProjectionBatch {
         files: &files,
         file_content_hashes: &[],
+        file_extraction_identities: &[],
         nodes: &[],
         structural_text_units: &[],
         structural_text_projections: &[],
@@ -3943,6 +3955,7 @@ fn flush_projection_persistence_fixture(
     storage.flush_projection_batch(ProjectionBatch {
         files: &files,
         file_content_hashes: &file_content_hashes,
+        file_extraction_identities: &[],
         nodes: &nodes,
         structural_text_units: &structural_units,
         structural_text_projections: &structural_projections,
@@ -3980,8 +3993,8 @@ fn projection_batch_reports_exact_shape_and_commits_once() -> Result<(), Storage
     assert_eq!(breakdown.persistence.file_errors.row_attempts, 2);
     assert_eq!(breakdown.persistence.dirty_state.row_attempts, 4);
     assert_eq!(breakdown.persistence.row_attempts(), 18);
-    assert_eq!(breakdown.persistence.statement_executions(), 18);
-    assert_eq!(breakdown.persistence.files.bound_bytes, 122);
+    assert_eq!(breakdown.persistence.statement_executions(), 19);
+    assert_eq!(breakdown.persistence.files.bound_bytes, 130);
     assert_eq!(breakdown.persistence.file_errors.bound_bytes, 52);
     assert_eq!(breakdown.persistence.dirty_state.bound_bytes, 48);
     assert!(breakdown.persistence.bound_bytes() > 1_000);
@@ -8162,6 +8175,7 @@ fn publish_bound_test_structural_cache(path: &Path) -> Result<(), StorageError> 
     };
     storage.flush_projection_batch(ProjectionBatch {
         files: std::slice::from_ref(&file),
+        file_extraction_identities: &[],
         file_content_hashes: &[FileContentHash {
             file_id: file.id,
             content_hash: source_hash,
@@ -14693,6 +14707,7 @@ fn seed_structural_promotion_corpus(path: &Path, generation: i64) -> Result<(), 
     storage.flush_projection_batch(ProjectionBatch {
         files: &files,
         file_content_hashes: &file_content_hashes,
+        file_extraction_identities: &[],
         nodes: &nodes,
         structural_text_units: &units,
         structural_text_projections: &projections,
@@ -14849,6 +14864,7 @@ fn minted_staged_candidate(
         let source_hash = format!("{:064x}", file.id);
         store.flush_projection_batch(ProjectionBatch {
             files: std::slice::from_ref(&file),
+            file_extraction_identities: &[],
             file_content_hashes: &[FileContentHash {
                 file_id: file.id,
                 content_hash: source_hash.clone(),

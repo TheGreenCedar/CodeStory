@@ -762,7 +762,12 @@ pub fn parsed_callable_body_spans(
             && !body.is_missing()
             && !body.has_error()
         {
-            let span = ts_node_graph_span(node);
+            let declaration = if language.language_name == "python" {
+                languages::python::callable_declaration_node(node)
+            } else {
+                node
+            };
+            let span = ts_node_graph_span(declaration);
             let body_span = ts_node_graph_span(body);
             bodies.push(ParsedCallableBodySpan {
                 start_line: span.start_line,
