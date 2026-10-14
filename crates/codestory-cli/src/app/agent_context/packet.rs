@@ -674,7 +674,7 @@ mod tests {
                     start_line: 1,
                     end_line: 1,
                     source: format!(
-                        "```text\n>    1 | fn page_{ordinal}() {{ /* {} */ }}\n```",
+                        "```text\n>1 | fn page_{ordinal}() {{ /* {} */ }}\n```",
                         "quoted\\\"value ".repeat(17)
                     ),
                     parser_completeness: PacketParserCompletenessV1::Complete,

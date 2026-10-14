@@ -9023,9 +9023,16 @@ mod tests {
         runtime
             .ensure_open(args::RefreshMode::Full)
             .expect("publish real nonempty core");
+        let entry = runtime
+            .browser
+            .list_root_symbols(ListRootSymbolsRequest { limit: None })
+            .expect("load real indexed fixture symbols")
+            .into_iter()
+            .find(|symbol| symbol.label == "entry" && symbol.kind == NodeKind::FUNCTION)
+            .expect("indexed entry function");
         let target =
-            stdio_context_target(&runtime, &json!({"params":{"arguments":{"query":"entry"}}}))
-                .expect("resolve indexed fixture target");
+            stdio_context_target(&runtime, &json!({"params":{"arguments":{"id":entry.id.0}}}))
+                .expect("resolve exact indexed fixture target");
         let mut state = StdioServerState::default();
         for (tool, arguments) in [
             ("affected", json!({"paths":["entry.rs"]})),
@@ -16069,7 +16076,7 @@ version = "0.11.20"
         let cache = tempfile::tempdir().expect("cache");
         std::fs::write(
             project.path().join("context_target.rs"),
-            "pub fn exact_context_target() -> usize { 7 }\npub fn context_decoy() -> usize { 9 }\n",
+            "mod exact_context_target {}\nmod context_decoy {}\n",
         )
         .expect("write context target fixture");
         let runtime = RuntimeContext::new_inspect_only(&args::ProjectArgs {
@@ -16080,6 +16087,15 @@ version = "0.11.20"
         runtime
             .ensure_open(args::RefreshMode::Full)
             .expect("publish context target fixture");
+        codestory_retrieval::test_support::publish_zero_dense_pinned_query_fixture(
+            &runtime.project_root,
+            &runtime.storage_path,
+            runtime.sidecar.as_raw_config_for_test(),
+        )
+        .expect("publish strict context retrieval fixture");
+        runtime
+            .activation
+            .use_published_retrieval_fixture_for_test();
 
         let query_target = stdio_context_target(
             &runtime,
