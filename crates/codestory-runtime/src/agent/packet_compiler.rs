@@ -287,6 +287,26 @@ impl PreparedPacketCompilationV1 {
                 }
             }
         };
+        let protected_context_sources = self.issued_context_sources.clone().unwrap_or_else(|| {
+            context_sources
+                .iter()
+                .filter(|source| {
+                    context_floor.as_ref().is_some_and(|floor| {
+                        floor.support.iter().any(|row| {
+                            row.kind == SupportUnitKindDto::SourceRange
+                                && final_support_stable_identity(row).as_deref()
+                                    == Some(source.stable_identity.as_str())
+                                && row.path.as_deref() == Some(source.path.as_str())
+                                && row.start_line == Some(source.start_line)
+                                && row.end_line == Some(source.end_line)
+                                && row.snippet.as_deref() == Some(source.source.as_str())
+                                && row.source_delivery == source.delivery
+                        })
+                    })
+                })
+                .cloned()
+                .collect()
+        });
         let mut extents = vec![original_sources.clone()];
         let mut sources = original_sources.clone();
         for (_, pages) in alternatives.into_iter().rev() {
@@ -312,23 +332,21 @@ impl PreparedPacketCompilationV1 {
                     *source = original.clone();
                 }
             }
-            // A shorter new page must compete beside the genuine issued
-            // prefixes, not only beside globally shortened context. Restoring
+            // A shorter new page must compete beside the exact selected floor,
+            // including genuine issued prefixes. Restoring
             // unrequested rows here retains the existing extent/callback bound.
             // Requested old rows keep their hydrated candidates: the floor
             // check below must still reject any candidate losing their prefix.
             let mut mixed_extent = sources.clone();
-            if let Some(issued) = &self.issued_context_sources {
-                for source in &mut mixed_extent {
-                    if !self
-                        .requested_source_identities
-                        .contains(&source.stable_identity)
-                        && let Some(original) = issued
-                            .iter()
-                            .find(|old| old.stable_identity == source.stable_identity)
-                    {
-                        *source = original.clone();
-                    }
+            for source in &mut mixed_extent {
+                if !self
+                    .requested_source_identities
+                    .contains(&source.stable_identity)
+                    && let Some(original) = protected_context_sources
+                        .iter()
+                        .find(|old| old.stable_identity == source.stable_identity)
+                {
+                    *source = original.clone();
                 }
             }
             for extent in [requested_extent, mixed_extent] {
