@@ -78,6 +78,7 @@ pub(crate) struct PacketRetrievalQuery {
 }
 
 impl PacketRetrievalQuery {
+    #[cfg(test)]
     pub(crate) fn strict(query: &str) -> Self {
         Self {
             query: query.trim().to_string(),

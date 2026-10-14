@@ -138,6 +138,7 @@ impl PreparedPacketCompilationV1 {
         );
     }
 
+    #[cfg(test)]
     pub(crate) fn select_for_representation(
         self,
         mut measure: impl FnMut(

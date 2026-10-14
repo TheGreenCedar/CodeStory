@@ -1,6 +1,6 @@
 //! Bounded, post-publication retention for one sidecar namespace.
 
-use crate::config::{SidecarLayout, SidecarProfile, SidecarRuntimeConfig};
+use crate::config::{SidecarLayout, SidecarRuntimeConfig};
 use anyhow::{Context, Result, bail};
 use codestory_contracts::bounded_locks::{
     self, FileLockError, FileLockKind, LockDeadline, PUBLICATION_LOCK_WAIT, acquire_with_deadline,
@@ -1845,6 +1845,7 @@ pub(crate) fn directory_size(path: &Path) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::SidecarProfile;
     use std::time::{Duration, Instant};
     use tempfile::tempdir;
 

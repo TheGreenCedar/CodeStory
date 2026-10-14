@@ -104,9 +104,11 @@ struct PacketEntryObservation {
     descriptor_preadmit_runtime_phases_observed_count: u64,
     raf_query_views_observed_count: u64,
     raf_query_view_attempt_ordinal: u64,
+    #[cfg(test)]
     raf_ordering_observed_count: u64,
     raf_ordering_attempt_ordinal: u64,
     raf_ranked_attempt_ordinal: u64,
+    #[cfg(test)]
     raf_promotion_recorded_count: u64,
     raf_ranked_admitted_observed_count: u64,
     raf_ranked_pool_count: u64,
@@ -283,6 +285,7 @@ pub(crate) fn observe_packet_raf_query_views(
 
 /// Freeze ordering metadata to the same first observed query attempt. Retry
 /// attempts cannot append masks against a stale retained ranked seed prefix.
+#[cfg(test)]
 pub(crate) fn begin_packet_raf_ordering_observation() -> bool {
     let mut record = false;
     update_packet_operation_observation(|observation| {
@@ -302,6 +305,7 @@ pub(crate) fn begin_packet_raf_ordering_observation() -> bool {
 /// Stage 2 records an ordering promotion, not a successful admission or new retrieval hit.
 /// Seed masks use the already recorded aggregate ranked prefix (at most16).
 /// The positive marginal gain is reproducible from the uncovered-seed mask.
+#[cfg(test)]
 pub(crate) fn observe_packet_raf_promotion(
     identity: &str,
     original_rank: usize,

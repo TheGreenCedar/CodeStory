@@ -179,6 +179,7 @@ impl<'a> QueryExecutor<'a> {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn execute_packet_descriptors(
         &mut self,
         query: &str,

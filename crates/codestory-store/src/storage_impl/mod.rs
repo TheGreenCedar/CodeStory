@@ -5484,11 +5484,9 @@ impl Storage {
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         let version = version.max(0) as u32;
         match policy {
-            // Explicitly enumerated: a future Core schema bump must prove this
+            // Closed schema set: a future Core schema bump must prove this
             // projection's compatibility before it can enter a retention scan.
-            NonmutatingOpenPolicy::RetentionPublications
-                if !matches!(version, 32 | 33 | 34 | 35 | 36) =>
-            {
+            NonmutatingOpenPolicy::RetentionPublications if !matches!(version, 32..=36) => {
                 return Err(StorageError::Other(format!(
                     "Retention publication observation supports Core schemas 32–36, found {version}"
                 )));

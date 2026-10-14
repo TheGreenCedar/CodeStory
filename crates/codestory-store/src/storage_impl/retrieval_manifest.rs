@@ -459,7 +459,7 @@ impl Storage {
             if publication.generation_id != generation_id || publication.run_id != run_id {
                 return Ok(None);
             }
-            let mut statement = connection.prepare(&manifest_select(&connection, false)?)?;
+            let mut statement = connection.prepare(&manifest_select(connection, false)?)?;
             let mut rows = statement.query([])?;
             let Some(row) = rows.next()? else {
                 return Ok(None);

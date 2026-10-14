@@ -614,7 +614,7 @@ fn authenticated_callable_progress_key(
     // Same identity and same physical page aliases require metadata consensus.
     // A missing/conflicting alias does not become executable by choosing it last.
     for other in &input.sources {
-        if other.stable_identity == source.stable_identity
+        if (other.stable_identity == source.stable_identity
             || (other.path == source.path
                 && other.start_line == source.start_line
                 && other.end_line == source.end_line)
@@ -625,16 +625,14 @@ fn authenticated_callable_progress_key(
                             || other.delivery.as_ref().is_some_and(|delivery| {
                                 delivery.source_sha256 == body.source_sha256
                             }))
-                }))
-        {
-            if other.path != source.path
+                })))
+            && (other.path != source.path
                 || other.callable_body.as_ref() != Some(body)
                 || !other.delivery.as_ref().is_some_and(|d| {
                     d.matches_delivery(other.start_line, other.end_line) && body.matches_delivery(d)
-                })
-            {
-                return None;
-            }
+                }))
+        {
+            return None;
         }
     }
     Some((
@@ -1602,6 +1600,8 @@ fn source_page_was_retained(
     })
 }
 
+// Keep source/relation omissions and identity/page retention separate at this boundary.
+#[allow(clippy::too_many_arguments)]
 fn continuation_selectors(
     input: &PacketCompilationInputV1,
     sources: &[SelectedSourceRange<'_>],

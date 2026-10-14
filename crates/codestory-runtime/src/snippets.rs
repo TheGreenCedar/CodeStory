@@ -1,4 +1,6 @@
-use super::{BufRead, Path};
+use super::BufRead;
+#[cfg(test)]
+use super::Path;
 use std::fmt::Write as _;
 use std::io;
 
