@@ -1952,7 +1952,9 @@ mod tests {
     #[test]
     fn unknown_or_malformed_cache_remains_incomplete_protection() {
         for mutation in [
-            "PRAGMA user_version = 37",
+            "PRAGMA user_version = 31",
+            // Stay outside the sequential Core migration range as it advances.
+            "PRAGMA user_version = 2147483647",
             "UPDATE retrieval_index_manifest SET sidecar_generation = 'not-canonical'",
             "UPDATE retrieval_index_manifest SET rollback_record_json = 'not-json'",
         ] {
