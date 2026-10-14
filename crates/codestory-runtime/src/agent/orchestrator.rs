@@ -455,7 +455,7 @@ fn agent_packet_with_session(
     let probe_resolutions = resolve_packet_probes(controller, probes);
     let mut plan = build_packet_plan_from_seed_plan(&seed_plan, req.budget);
     plan.probe_resolutions = probe_resolutions;
-    let descriptor_queries = packet_retrieval_queries(&seed_plan);
+    let descriptor_queries = packet_retrieval_queries(&plan);
     let descriptor_budget_ms =
         packet_remaining_for_handoff(controller, packet_latency, "descriptor admission")?;
     preadmit_packet_descriptor_queries_with_policy(

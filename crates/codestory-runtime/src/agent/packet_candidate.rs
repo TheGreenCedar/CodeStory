@@ -87,26 +87,21 @@ impl PacketRetrievalQuery {
 }
 
 pub(crate) fn packet_retrieval_queries(
-    seed: &codestory_contracts::compilation::RetrievalSeedPlanV1,
+    plan: &codestory_contracts::api::PacketPlanDto,
 ) -> Vec<PacketRetrievalQuery> {
-    let mut queries = codestory_agent::packet_plan::generic_retrieval_queries(&seed.generic_query)
-        .into_iter()
+    plan.queries
+        .iter()
         .map(|query| PacketRetrievalQuery {
-            query: query.to_string(),
-            lexical_policy: LexicalAdmissionPolicy::BroadQuestionV1,
+            query: query.query.clone(),
+            lexical_policy: if codestory_agent::packet_plan::packet_plan_query_is_typed_free_query(
+                query,
+            ) {
+                LexicalAdmissionPolicy::StrictLiteralV1
+            } else {
+                LexicalAdmissionPolicy::BroadQuestionV1
+            },
         })
-        .collect::<Vec<_>>();
-    queries.extend(
-        seed.free_queries
-            .iter()
-            .map(|query| PacketRetrievalQuery::strict(query)),
-    );
-    let mut seen = HashSet::new();
-    queries.retain(|query| {
-        !query.query.is_empty()
-            && seen.insert((query.query.to_ascii_lowercase(), query.lexical_policy))
-    });
-    queries
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -1398,7 +1393,11 @@ mod tests {
             exact_selectors: Vec::new(),
             free_queries: vec!["beta ordering".into()],
         };
-        let queries = packet_retrieval_queries(&seed);
+        let plan = codestory_agent::packet_plan::build_packet_plan_from_seed_plan(
+            &seed,
+            codestory_contracts::api::PacketBudgetModeDto::Standard,
+        );
+        let queries = packet_retrieval_queries(&plan);
         assert_eq!(queries.len(), 4);
         assert!(
             queries[..3]
@@ -1409,10 +1408,6 @@ mod tests {
         assert_eq!(
             queries[3].lexical_policy,
             LexicalAdmissionPolicy::StrictLiteralV1
-        );
-        let plan = codestory_agent::packet_plan::build_packet_plan_from_seed_plan(
-            &seed,
-            codestory_contracts::api::PacketBudgetModeDto::Standard,
         );
         assert_eq!(
             plan.queries
@@ -1431,7 +1426,11 @@ mod tests {
             exact_selectors: Vec::new(),
             free_queries: vec!["text empty `absent`".into(), "text empty `absent`".into()],
         };
-        let queries = packet_retrieval_queries(&seed);
+        let plan = codestory_agent::packet_plan::build_packet_plan_from_seed_plan(
+            &seed,
+            codestory_contracts::api::PacketBudgetModeDto::Standard,
+        );
+        let queries = packet_retrieval_queries(&plan);
         assert_eq!(queries.len(), 2);
         assert_eq!(queries[0].query, seed.generic_query);
         assert_eq!(queries[1].query, seed.generic_query);

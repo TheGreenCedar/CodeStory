@@ -23,6 +23,16 @@ pinned, through the `PinnedReader` trait implemented by runtime.
   byte-bound selection over `PacketCompilationInputV1`;
 - `PinnedReader`, the only allowed view of pinned runtime state.
 
+Generic retrieval keeps the whole question, then bounded literal paragraph and
+sentence views. At most seven supplemental views are selected without domain
+importance rules or inferred selectors. Sentence handling preserves quoted/code
+content, decimals and ordinal prefixes; it is a punctuation rule, not a language
+parser. The packet plan reserves room for legal typed free-query probes before
+supplemental views consume its query limit. Runtime descriptor admission and
+planned subqueries use that same capped plan, retaining each query's broad or
+strict origin. These bounds do not imply complete investigation or better
+retrieval.
+
 ## Entry points
 
 - `src/lib.rs`: crate contract and module map

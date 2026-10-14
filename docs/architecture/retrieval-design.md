@@ -7,7 +7,7 @@ proofs; none can substitute for another.
 
 ## Ranking and packet source eligibility
 
-`weighted_rrf_v3_present_lanes_scaled` normalizes reciprocal ranks over the
+`weighted_rrf_v4_present_lanes_scaled_broad_eligible` normalizes reciprocal ranks over the
 positive-weight lanes present for each identity. Dense membership is selective,
 so absent membership contributes no negative vote. A singleton lane winner can
 tie a winner shared by several lanes: this policy removes the lane-cardinality
@@ -19,6 +19,13 @@ this is a calibration tradeoff, not a claim of unchanged rankings. Typed graph s
 text quality, requested roles, overlap and exact selectors retain their separate
 contracts. Ranking policy participates in the in-memory cache fingerprint and
 the packet score-version receipt.
+
+Broad-question retrieval admits matching candidates across effective file roles.
+Adding a primary source candidate does not remove an already eligible test,
+benchmark, generated, or vendor candidate. Strict literal queries retain their
+role exclusions. Eligibility does not reserve packet space: the shared ranking,
+identity and byte limits can still displace useful evidence. This policy does
+not establish improved delivered coverage or answer quality.
 
 Generated component reports remain navigation evidence. They cannot claim a
 source byte reservation. Lexical symbols reserve source only with a positive

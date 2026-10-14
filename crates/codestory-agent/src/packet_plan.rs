@@ -137,9 +137,15 @@ fn literal_sentences(question: &str) -> Vec<&str> {
             }
             continue;
         }
+        let ordinal_marker = character == '.'
+            && previous.is_some_and(char::is_numeric)
+            && question[start.max(line_start)..index]
+                .trim()
+                .chars()
+                .all(char::is_numeric);
         let terminator = matches!(character, '.' | '?' | '!')
             && next.is_none_or(char::is_whitespace)
-            && !(character == '.' && previous.is_some_and(char::is_numeric));
+            && !ordinal_marker;
         if blank_line || terminator {
             let end = index + character.len_utf8();
             let slice = question[start..end].trim();
@@ -198,16 +204,23 @@ pub fn build_packet_plan_from_seed_plan(
     seed_plan: &RetrievalSeedPlanV1,
     budget: PacketBudgetModeDto,
 ) -> PacketPlanDto {
+    let mut explicit_queries = Vec::new();
+    for query in &seed_plan.free_queries {
+        push_packet_query(&mut explicit_queries, query, TYPED_FREE_QUERY_PURPOSE);
+    }
+    let cap = packet_plan_query_cap(budget);
+    // Preserve the whole question and reserve space for caller-supplied queries
+    // before spending the remaining slots on supplemental literal views.
+    let generic_cap = cap.saturating_sub(explicit_queries.len()).max(1);
     let mut queries = Vec::new();
-    for query in generic_retrieval_queries(&seed_plan.generic_query) {
+    for query in generic_retrieval_queries(&seed_plan.generic_query)
+        .into_iter()
+        .take(generic_cap)
+    {
         push_packet_query(&mut queries, query, GENERIC_RETRIEVAL_PURPOSE);
     }
-
-    for query in &seed_plan.free_queries {
-        push_packet_query(&mut queries, query, TYPED_FREE_QUERY_PURPOSE);
-    }
-
-    queries.truncate(packet_plan_query_cap(budget));
+    queries.extend(explicit_queries);
+    queries.truncate(cap);
     let mut plan = PacketPlanDto {
         queries,
         probe_resolutions: Vec::new(),
@@ -480,6 +493,13 @@ mod tests {
             literal_sentences("1. first? 2. next!"),
             ["1. first?", "2. next!"]
         );
+        for first in ["Use port 8080.", "Use threshold 3.14.", "Use version 2."] {
+            let question = format!("{first} Check capacity.");
+            assert_eq!(
+                generic_retrieval_queries(&question),
+                [question.as_str(), first, "Check capacity."]
+            );
+        }
     }
 
     #[test]
@@ -628,6 +648,19 @@ mod tests {
                 .iter()
                 .any(|selector| format!("{selector:?}").contains("poison"))
         );
+    }
+
+    #[test]
+    fn supplemental_views_preserve_all_legal_typed_queries_in_tiny_plans() {
+        let question = "First. Second. Third. Fourth. Fifth. Sixth. Seventh.";
+        let free_queries = (0..16)
+            .map(|index| format!("explicit input {index}"))
+            .collect::<Vec<_>>();
+        let plan = build_packet_plan_with_extra(question, PacketBudgetModeDto::Tiny, &free_queries);
+        assert_eq!(plan.queries[0].query, question);
+        assert_eq!(packet_explicit_request_probe_queries(&plan), free_queries);
+        assert!(plan.queries.len() <= 20);
+        assert!(plan.queries.iter().any(|query| query.query == "First."));
     }
 
     #[test]

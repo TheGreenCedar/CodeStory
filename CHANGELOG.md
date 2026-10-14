@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Tiny packet plans retain the additional free-query probes you supply when a multi-sentence question adds supplemental retrieval views.
+
 - Multi-project stdio refuses an exact `--cache-dir` override. To use one retained cache, bind stdio to its `--project`; multi-project requests use separate per-project caches.
 
 - Root-symbol MCP resources return bounded, complete JSON pages with remaining counts and continuation links. Custom resource clients must read the versioned page object’s `symbols` array instead of a bare array and follow `continuation_uri` for the remaining symbols.
