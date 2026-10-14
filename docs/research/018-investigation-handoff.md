@@ -16,27 +16,37 @@ an independent Sol 6.1 reviews the changed seams. Native-source reconstruction
 and protocol-consumer repairs are implemented. Hosted durability passed on
 `93549e98654f4b68c7fc3cdb8a5b5c46e12c0a48`: Store 373 unit and 40 integration
 tests, indexer fidelity 8 and language coverage 13, and agent 126 unit and 21
-integration tests, including all 16 planner tests. Its PR merge checkout had the
-same tree as that source head. Plugin/static contracts and Windows source
+integration tests, including all 16 planner tests. These totals also passed on
+`b4234f2c39e781b122a405ca2afc3458bb3fb616`; both PR merge checkouts had the
+same tree as their source heads. Plugin/static contracts and Windows source
 reconstruction also passed. These are source checks, not product-quality proof.
 
 The same head compiled a normal Linux debug CLI and passed generated-help/catalog
-checks, then failed library Clippy. The current cleanup preserves behavior and
-restricts test-only helpers/imports to test builds. The cancelled runtime contract
-run completed no Rust tests. Next: finish hosted source controls, obtain an
-identified normal candidate artifact on an available host, then compare actual
+checks, then failed library Clippy. The cleanup preserves behavior and restricts
+test-only helpers/imports to test builds. On `b4234f2c`, runtime retrieval, packet
+candidate, served-source and browser-capacity contracts passed, followed by packet
+compiler, packet batch, scoring and service tests. The CLI library reached 545
+passes, five failures and five ignored tests. The failures expose stale formatting
+and status expectations plus query-target fixtures without Full publications;
+they require contract-preserving repairs. The obsolete draft source run was
+cancelled after workspace check passed; Clippy remained unrun. Next: finish source
+controls, obtain an identified normal candidate artifact, then compare actual
 unchanged-question baseline and candidate delivery before deciding whether the
 query changes deserve retention. Source passes cannot establish improved retrieval
 or close the broader acceptance program.
 
-The current Mac disk sample is below the retained reserve, so local Cargo and
-native execution are deferred. The isolated Linux source-test lane started with
-sufficient storage, but both PC endpoints subsequently became unreachable; its
-test result is unknown. The maintainer directed continuation with available
-resources. Hosted draft CI remains the source-check surface; its Linux build did
-not retain a comparison archive or executable digest. Existing unrelated GPU
-workloads remain untouched. No formal study, installation, qualification, or
-release has started.
+The isolated Linux source-test lane started with sufficient storage, but both PC
+endpoints subsequently became unreachable; its result is unknown. The maintainer
+directed continuation with available resources. Recovery of the active resource
+plan corrected this thread's mistaken assumption that a historical 50-GiB disk
+reserve was binding: retained growth limits are engineering forecasts, and the
+active plan records the maintainer's earlier clarification that the old reserve
+was not a blocker. Local execution requires a fresh bounded capacity forecast.
+An independent copy-on-write clone of the retained build cache permits reuse
+without altering the original target or archives. Hosted draft CI also remains
+available; its Linux build did not retain a comparison archive or executable
+digest. Existing unrelated workloads remain untouched. No formal study,
+installation, qualification, or release has started.
 
 Independent review found two local planner defects: numeric sentence endings
 could suppress the next view, and supplemental views could displace legal typed
