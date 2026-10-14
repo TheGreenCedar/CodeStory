@@ -1,4 +1,5 @@
 use serde_json::{Map, Value, json};
+use std::sync::OnceLock;
 
 use super::{V3SurfaceSet, profile::McpRevisionV3};
 
@@ -40,6 +41,32 @@ pub(crate) fn tools_for_surface_v3(revision: McpRevisionV3, surface: V3SurfaceSe
         .into_iter()
         .map(|source| project_tool_v3(revision, &source))
         .collect()
+}
+
+pub(crate) fn modern_output_schema_v3(
+    tool_name: &str,
+    surface: V3SurfaceSet,
+) -> Option<&'static Value> {
+    static EVIDENCE_SCHEMAS: OnceLock<Vec<(String, Option<Value>)>> = OnceLock::new();
+    static PROOF_SCHEMAS: OnceLock<Vec<(String, Option<Value>)>> = OnceLock::new();
+    let schemas = match surface {
+        V3SurfaceSet::EvidenceOnly => &EVIDENCE_SCHEMAS,
+        V3SurfaceSet::WithProof => &PROOF_SCHEMAS,
+    }
+    .get_or_init(|| {
+        // Keep catalog order and missing schemas so the first tool match still owns lookup.
+        tools_for_surface_v3(McpRevisionV3::June2025, surface)
+            .into_iter()
+            .filter_map(|tool| {
+                let name = tool.get("name")?.as_str()?.to_owned();
+                Some((name, tool.get("outputSchema").cloned()))
+            })
+            .collect()
+    });
+    schemas
+        .iter()
+        .find(|(name, _)| name == tool_name)
+        .and_then(|(_, schema)| schema.as_ref())
 }
 
 pub(crate) fn proof_output_schema_v3() -> Value {
