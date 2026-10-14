@@ -11,7 +11,8 @@ from .contract_primitives import (
 from .foundation import (
     RETRY_CLASSES,
     SERVER_LIFECYCLES,
-    SERVER_PROOF_SCHEMA_VERSION,
+    SERVER_PROTOCOL_SCHEMA_VERSION,
+    SERVER_SNAPSHOT_SCHEMA_VERSION,
     require,
 )
 from .native_manifest import runtime_executable_sha256
@@ -41,7 +42,9 @@ def _snapshot_clock_and_protocol(snapshot: dict, manifest: dict) -> tuple[dict, 
         "embedding_server clock is not awake-monotonic",
     )
     require_nonempty_string(clock.get("api"), "embedding_server.clock.api")
-    require_nonempty_string(clock.get("boot_id"), "embedding_server.clock.boot_id")
+    require("boot_id" in clock, "embedding_server.clock omitted boot_id")
+    if clock["boot_id"] is not None:
+        require_nonempty_string(clock["boot_id"], "embedding_server.clock.boot_id")
     require_positive_int(
         clock.get("resolution_ns"), "embedding_server.clock.resolution_ns"
     )
@@ -51,11 +54,13 @@ def _snapshot_clock_and_protocol(snapshot: dict, manifest: dict) -> tuple[dict, 
         "embedding_server snapshot omitted protocol identity",
     )
     require(
-        protocol.get("bootstrap_version") == 1,
+        type(protocol.get("bootstrap_version")) is int
+        and protocol["bootstrap_version"] == 1,
         "embedding_server bootstrap version is unsupported",
     )
     require(
-        protocol.get("schema_version") == 1,
+        type(protocol.get("schema_version")) is int
+        and protocol["schema_version"] == SERVER_PROTOCOL_SCHEMA_VERSION,
         "embedding_server protocol version is unsupported",
     )
     for field in (
@@ -228,7 +233,8 @@ def server_snapshot(status: dict, manifest: dict, *, require_resident: bool) -> 
         isinstance(snapshot, dict), "diagnostics omitted the embedding_server snapshot"
     )
     require(
-        snapshot.get("schema_version") == SERVER_PROOF_SCHEMA_VERSION,
+        type(snapshot.get("schema_version")) is int
+        and snapshot["schema_version"] == SERVER_SNAPSHOT_SCHEMA_VERSION,
         "embedding_server snapshot schema is unsupported",
     )
     event_sequence = require_nonnegative_int(

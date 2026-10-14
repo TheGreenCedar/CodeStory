@@ -8,7 +8,12 @@ from .contract_primitives import (
     require_nonnegative_int,
     require_positive_int,
 )
-from .foundation import SERVER_LIFECYCLES, require
+from .foundation import (
+    SERVER_LIFECYCLES,
+    SERVER_PROTOCOL_SCHEMA_VERSION,
+    SERVER_SNAPSHOT_SCHEMA_VERSION,
+    require,
+)
 from .qualification_artifact_types import (
     QualificationControlEvidence,
     QualificationOrchestration,
@@ -111,7 +116,11 @@ def _validated_qualification_snapshot(
         required <= set(snapshot) and set(snapshot) <= required | {"engine", "failure"},
         f"{field} fields differ from the raw snapshot contract",
     )
-    require(snapshot["schema_version"] == 1, f"{field} schema is unsupported")
+    require(
+        type(snapshot["schema_version"]) is int
+        and snapshot["schema_version"] == SERVER_SNAPSHOT_SCHEMA_VERSION,
+        f"{field} schema is unsupported",
+    )
     require_nonnegative_int(snapshot["event_sequence"], f"{field}.event_sequence")
     require(
         snapshot["lifecycle"] in SERVER_LIFECYCLES,
@@ -120,6 +129,16 @@ def _validated_qualification_snapshot(
     _validate_qualification_clock(snapshot["clock"], f"{field}.clock", observed=False)
     protocol = snapshot["protocol"]
     require(isinstance(protocol, dict), f"{field}.protocol is malformed")
+    require(
+        type(protocol.get("bootstrap_version")) is int
+        and protocol["bootstrap_version"] == 1,
+        f"{field}.protocol bootstrap version is unsupported",
+    )
+    require(
+        type(protocol.get("schema_version")) is int
+        and protocol["schema_version"] == SERVER_PROTOCOL_SCHEMA_VERSION,
+        f"{field}.protocol schema is unsupported",
+    )
     for contract_field, expected in contracts.items():
         require(
             protocol.get(contract_field) == expected,
