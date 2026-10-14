@@ -1,5 +1,49 @@
 # CodeStory 0.18 investigation WIP handoff
 
+## Current continuation — October 13, 2026
+
+The maintainer resumed research and implementation from PR 2561 and issue 2560
+for a twelve-hour window, ending October 14 at 09:33 America/Toronto
+(13:33 UTC). The accepted outcome remains the full issue 2173 program below;
+readiness requires its product and independent acceptance evidence. Main
+promotion still requires explicit approval. Historical limits, failures and
+evidence identities remain intact; the earlier stop at handoff is superseded.
+
+Starting PR head: `571b3c7864660f6a2a8b740c34e6e43861ad59ed`. Integration head:
+`2c85f93fa4d9d597959b375307dc820cc6a942e6`. Root owns integration, builds and
+runtime operations. Sol 6.1 owns native-source CI and protocol-consumer repairs;
+an independent Sol 6.1 reviews the changed seams. Next: repair the
+reproducible source-build blocker, execute the unfinished controls, then compare
+actual unchanged-question baseline and candidate delivery before deciding
+whether the query changes deserve retention. Additional source-only unit passes
+cannot establish improved retrieval or close the broader acceptance program.
+
+The current Mac disk sample is below the retained reserve, so local Cargo and
+native execution are deferred. The isolated Linux source-test lane started with
+sufficient storage, but both PC endpoints subsequently became unreachable; its
+test result is unknown. The maintainer directed continuation with available
+resources. Hosted draft CI is the next source-check surface. Existing unrelated
+GPU workloads remain untouched. No formal study, installation, qualification,
+or release has started.
+
+Independent review found two local planner defects: numeric sentence endings
+could suppress the next view, and supplemental views could displace legal typed
+free queries in Tiny plans. The candidate repairs both and uses the same capped
+plan for runtime retrieval descriptors. Extracted production-function controls
+reproduce both failures before the repair and pass afterward, including hostile
+input and query-origin checks. These are algorithm controls with inert DTO
+scaffolding, not full-crate or product execution. Architecture descriptions now
+match the source candidate; delivered retrieval gain remains unmeasured.
+
+The final starting head's plugin-static failure is a protocol-contract mismatch:
+the Rust producer uses measurement protocol and snapshot schema 2 while proof
+consumers still require 1. The native proof marker itself remains version 1.
+Repair these independently owned versions without accepting stale or unknown
+schemas. The earlier downloader timeout below remains historical; the retry
+test passes on the final starting head.
+
+## Preserved handoff
+
 This branch preserves the complete known authored research candidate, including
 previously uncommitted Rust/plugin source, the reproducible native dependency
 patch, and the unfinished retrieval changes. It is a draft handoff,
