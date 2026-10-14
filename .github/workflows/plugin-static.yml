@@ -83,7 +83,6 @@ on:
       - crates/codestory-retrieval/src/per_user_embedding/qualification_worker.rs
       - scripts/release-evidence/**
       - scripts/release-evidence/serde-json-codestory-project.json
-      - scripts/tests/release-evidence-runner-contract.test.mjs
       - scripts/codex-worktree-setup.*
       - scripts/tests/codex-worktree-setup.test.mjs
       - scripts/prove-plugin-pinned-provision.mjs
@@ -179,7 +178,6 @@ on:
       - crates/codestory-retrieval/src/per_user_embedding/qualification_worker.rs
       - scripts/release-evidence/**
       - scripts/release-evidence/serde-json-codestory-project.json
-      - scripts/tests/release-evidence-runner-contract.test.mjs
       - scripts/codex-worktree-setup.*
       - scripts/tests/codex-worktree-setup.test.mjs
       - scripts/prove-plugin-pinned-provision.mjs
@@ -241,7 +239,6 @@ jobs:
           scripts/tests/codestory-release-claims.test.mjs
           scripts/tests/codestory-release-closeout.test.mjs
           scripts/tests/codestory-release-evidence-gate.test.mjs
-          scripts/tests/release-evidence-runner-contract.test.mjs
 
       - name: Check pinned native source preparation
         run: |

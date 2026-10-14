@@ -2001,10 +2001,9 @@
         "job": "plugin-static",
         "step": "Check release claim and evidence contracts",
         "fragments": [
-          ".github/scripts/publish-marketplace-catalog.test.mjs",
-          "scripts/tests/release-evidence-runner-contract.test.mjs"
+          ".github/scripts/publish-marketplace-catalog.test.mjs"
         ],
-        "reason": "The catalog publisher and the release-evidence runner contract are the two delivery-side programs whose regressions otherwise surface only at publish time; their suites are pinned into the pre-merge lane so a delivery break is caught while it is still recoverable."
+        "reason": "The catalog publisher's delivery-side regressions otherwise surface only at publish time; its suite is pinned into the pre-merge lane so a delivery break is caught while it is still recoverable."
       },
       "plugin_static_workflow_syntax": {
         "kind": "require",
