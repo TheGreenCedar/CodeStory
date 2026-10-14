@@ -136,9 +136,8 @@ impl PacketReplayEnrollment {
         project_root: &Path,
         request: &AgentPacketRequestDto,
     ) -> Option<Self> {
-        let destination =
-            std::env::var_os(codestory_contracts::config_registry::PACKET_STEP_TRACE_OUT_ENV)?;
-        let enrollment = Self::load(PathBuf::from(destination), &request.question)?;
+        let destination = super::trace_export::packet_step_trace_destination_from_env()?;
+        let enrollment = Self::load(destination, &request.question)?;
         if std::fs::canonicalize(project_root).ok()?
             != std::fs::canonicalize(&enrollment.scope.project_root).ok()?
         {
@@ -289,13 +288,10 @@ pub fn write_packet_stdio_replay_from_env(
     current_internal_packet_id: &str,
     payload: impl FnOnce() -> Option<Value>,
 ) {
-    let Some(destination) =
-        std::env::var_os(codestory_contracts::config_registry::PACKET_STEP_TRACE_OUT_ENV)
-    else {
+    let Some(destination) = super::trace_export::packet_step_trace_destination_from_env() else {
         return;
     };
-    let Some(enrollment) = PacketReplayEnrollment::load(PathBuf::from(destination), question)
-    else {
+    let Some(enrollment) = PacketReplayEnrollment::load(destination, question) else {
         return;
     };
     write_stdio_replay(

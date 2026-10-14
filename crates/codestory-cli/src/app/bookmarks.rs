@@ -1,4 +1,5 @@
 use super::artifacts::{ensure_dot_only_for_trail, preflight_output_file};
+use super::lifecycle::open_target_surface;
 use super::resolution::resolve_target_or_emit_ambiguity;
 use crate::args::{
     BookmarkAction, BookmarkAddCommand, BookmarkAddOutput, BookmarkCommand, BookmarkListCommand,
@@ -6,7 +7,7 @@ use crate::args::{
 };
 use crate::display;
 use crate::output::emit;
-use crate::runtime::{RuntimeContext, ensure_index_ready, map_api_error};
+use crate::runtime::{RuntimeContext, map_api_error};
 use anyhow::Context;
 use anyhow::{Result, bail};
 use codestory_contracts::api::{
@@ -25,13 +26,12 @@ pub(super) fn run_bookmark(cmd: BookmarkCommand) -> Result<()> {
 fn run_bookmark_add(cmd: BookmarkAddCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "bookmark add")?;
     preflight_output_file(cmd.output_file.as_deref())?;
-    let runtime = RuntimeContext::new(&cmd.project)?;
-    let opened = runtime.ensure_open(cmd.refresh)?;
-    ensure_index_ready(&opened, "bookmark add")?;
+    let selection = cmd.target.selection()?;
+    let (runtime, _) = open_target_surface(&cmd.project, cmd.refresh, &selection, "bookmark add")?;
     let file_filter = cmd.target.file_filter();
     let target = resolve_target_or_emit_ambiguity(
         &runtime,
-        cmd.target.selection()?,
+        selection,
         file_filter.as_deref(),
         cmd.format,
         cmd.output_file.as_deref(),

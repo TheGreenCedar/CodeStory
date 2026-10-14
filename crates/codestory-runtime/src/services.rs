@@ -9149,7 +9149,7 @@ pub(crate) mod activation_tests {
             activation.activate_project(project_root, storage_path, Arc::clone(&cancelled));
         // Parallel fixture work may outlast a foreground slice. Join the same
         // operation rather than assuming the first response is terminal.
-        let terminal = if initial
+        if initial
             .as_ref()
             .is_err_and(|error| error.code == "activation_preparing")
         {
@@ -9168,8 +9168,7 @@ pub(crate) mod activation_tests {
             terminal
         } else {
             initial
-        };
-        terminal
+        }
     }
 
     #[test]

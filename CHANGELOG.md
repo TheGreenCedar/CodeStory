@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- CLI query-based symbol, call-graph, exploration and bookmark commands initialize the required retrieval runtime, avoiding failures caused by the default local profile. ID-based navigation remains available from the Core index.
+
 - Retrieval refreshes account for incremental vector work followed by a full rebuild, avoiding a timing-report error after fallback completes.
 
 - Tiny packet plans retain the additional free-query probes you supply when a multi-sentence question adds supplemental retrieval views.

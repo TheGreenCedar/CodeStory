@@ -8,7 +8,6 @@
 #[path = "stdio_root_symbols.rs"]
 mod root_symbols;
 #[cfg(test)]
-#[path = "stdio_root_symbols_integration_tests.rs"]
 mod root_symbols_integration_tests;
 
 use anyhow::{Context, Result, bail};
@@ -3023,9 +3022,7 @@ fn project_stdio_packet_for_representation_v3(
             "codestory-stdio",
             &mut |candidate| plan.measure(candidate),
         )?;
-        if std::env::var_os(codestory_contracts::config_registry::PACKET_STEP_TRACE_OUT_ENV)
-            .is_some()
-        {
+        if codestory_runtime::packet_step_trace_destination_from_env().is_some() {
             replay_packet_id = Some(represented.packet.packet_id.clone());
         }
         state
@@ -8815,7 +8812,7 @@ mod tests {
             let read = || {
                 runtime
                     .browser
-                    .prepare_source_ranges(&[request.clone()], 65536)
+                    .prepare_source_ranges(std::slice::from_ref(&request), 65536)
                     .unwrap()
             };
             let original = read().render_default().unwrap();
@@ -18475,14 +18472,17 @@ mod representation_budget_tests {
     }
 
     fn plan(revision: crate::stdio_v3::McpRevisionV3) -> StdioPacketRepresentationPlanV3 {
-        let mut state = StdioServerState::default();
-        state.status_cache = Some(StdioStatusCacheEntry {
-            key: "fixture".into(),
-            cached_at: Instant::now(),
-            value: serde_json::json!({"local_refresh":{"state":"refreshing",
-                "phase": format!("phase {}", "arbitrary\\\"refresh ".repeat(70)),
-                "pid": u64::MAX, "started_at_epoch_ms": u64::MAX}}),
-        });
+        let default_state = StdioServerState::default();
+        let state = StdioServerState {
+            status_cache: Some(StdioStatusCacheEntry {
+                key: "fixture".into(),
+                cached_at: Instant::now(),
+                value: serde_json::json!({"local_refresh":{"state":"refreshing",
+                    "phase": format!("phase {}", "arbitrary\\\"refresh ".repeat(70)),
+                    "pid": u64::MAX, "started_at_epoch_ms": u64::MAX}}),
+            }),
+            ..default_state
+        };
         let publication = IndexPublicationDto {
             generation: 1,
             generation_id: "core-generation-1".into(),

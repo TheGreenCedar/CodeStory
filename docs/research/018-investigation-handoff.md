@@ -5,109 +5,120 @@
 The maintainer resumed research and implementation from PR 2561 and issue 2560
 for a twelve-hour window ending October 14 at 09:33 America/Toronto (13:33 UTC).
 The outcome remains the full issue 2173 program below. Main promotion requires
-explicit approval. Historical failures, costs and evidence identities remain
-retained; the earlier stop at handoff is superseded. This continuation has not
-established 0.18 readiness.
+explicit approval. Historical failures, costs and identities remain retained;
+the earlier stop at handoff is superseded. **0.18 readiness remains unproved.**
 
 Starting PR head: `571b3c7864660f6a2a8b740c34e6e43861ad59ed`. Integration head:
 `2c85f93fa4d9d597959b375307dc820cc6a942e6`. The continuing branch is
 `codex/wip-018-investigation-handoff-20261013`; root owns integration, Cargo and
 runtime operations in the attached `018-resume-2561/CodeStory` worktree. Sol 6.1
 agents implement bounded changes, independently review them and read development
-cases with separated references. The issue and PR carry each pushed head and its
-current checks; results below identify their actual source.
+cases with separated references. Issue 2560 and PR 2561 carry each pushed head,
+its checks, remaining blockers and next proof target.
 
 Native-source reconstruction and protocol-consumer repairs are implemented.
-The producer and consumers agree on measurement protocol and snapshot schema 2,
-while native proof and constant-set schemas remain 1. Strict schema/value checks,
-boot witnesses and executable bindings remain enforced. Hosted source checks on
-`4c830fc06ab33163a56a053149690c841bae8605` pass rustdoc, plugin/static contracts,
-Windows source reconstruction and crate durability. Durability covers Store
-373 unit/40 integration, full indexer fidelity 8/language coverage 13, and agent
-126 unit/21 integration tests, including 16 planner tests. Its PR merge checkout
-has the same tree as the source head.
+Measurement protocol and snapshot schema are 2; native proof and constant-set
+schemas remain 1. Strict schema/value checks, boot witnesses and executable
+bindings remain enforced. Source version is still 0.17.7. CodeStory MCP tools
+are not visible in this host; normal CLI execution does not establish installed
+plugin behavior in an agent host.
 
-The same head's Draft source run fails at eleven retrieval Clippy sites. Its
-Retrieval run passes the runtime/evidence suites, Linux CLI 550 tests (five
-ignored), and stdio 76 tests, then fails two HTTP query tests because their
-fixtures lack retrieval manifests; later suites are skipped. Both runs are
-terminal. The attempted cancellation after a source correction became necessary
-found the Retrieval run already complete. These failures and source-only proof
-limits remain retained. The correction preserves admission and HTTP expectations
-while preparing
-attested test-only publications for graph resolution. The first fixture revision
-exposed a legacy-path assumption that omitted Store-backed symbol documents; it
-is retained as a failed attempt. The revised fixture uses the open sealed Store
-and original fingerprint/source-seal checks. All eight HTTP tests now pass,
-including the zero-dense helper rejecting nonzero input.
+At `e67e8762bd541fe743d3986ddc86895cd4564f7c`, the matching PR merge tree passes
+rustdoc, plugin/static contracts, Windows source reconstruction, crate durability
+and Draft source checks, including pinned Rust 1.97.1 library Clippy. Durability
+passes Store 373 unit/40 integration, full indexer fidelity 8/language coverage
+13, and agent 126 unit/21 integration. Retrieval passes Linux CLI 551 tests
+(five ignored), stdio 76, HTTP 8, retrieval units 538 (three ignored), and runtime
+contracts, then fails architecture ownership checks: 52 pass, four fail. The
+retained failures identify test-module path detection, a stale compiler-boundary
+assertion and diagnostic settings read outside their registered owner. Whole
+retrieval is failed on that head; passing child suites retain narrower evidence.
 
-A normal embedded Mac CLI built from clean pushed source `59f3a935` has SHA-256
-`e3b0ee888868608955dcf20329134b4abed567e91e7ddb9f470528199c311f98`.
-Its native marker and embedded model match the retained baseline; both artifacts
-execute on Metal with CPU fallback disabled. Source version remains 0.17.7.
-Later source commits are different identities and require a rebuilt artifact
-before product claims. The CodeStory MCP tools are not visible in this host;
-normal public CLI results do not establish packaged-host MCP behavior.
+A normal embedded Mac CLI from clean pushed e67e8762 has SHA-256
+`2b222398fde44d25a4a32bdca3941378b007e0c75607779aa81bcdc3b1743010`.
+Its changed native completion digest is authenticated against the hashed Rust
+wrapper change; all other compiled native marker fields match. Older source and
+executable identities remain distinct. The candidate fixes a real preparation
+failure: incremental vector attempts can decline before a serial full fallback.
+The CLI now sums those phase receipts with checked arithmetic and bounds emitted
+IPC by emitted parent milliseconds. Eight CLI and three producer accounting
+checks pass. Replaying the same normal PocketBase preparation succeeds in 11.102
+seconds, exercising both vector phases; the original 13.128-second failure is
+retained. Publication and an observational process-uninitialized status do not
+establish query readiness.
 
-The unchanged Cron questions were compared on the same pinned source and Core/
-retrieval generations. Initial candidate packets gain and lose physical source
-ranges; they do not establish net improvement. Both second-question initials
-locate `SpecSchedule.Next` and `TestNext` but deliver only their opening lines.
-A broad continuation preserves source and returns a child without adding lines;
-a separately offered single-source continuation advances `Next`. Existing
-function-body snippets deliver both complete bodies in roughly 0.10 seconds of
-additional CLI time. The baseline already found both IDs. Current Complete-child
-issuance permits this result; the earlier no-child assumption below is corrected.
+The Cron comparison remains exposed development evidence. Four fresh Sol 6.1
+readers made 84 successful public calls under equal narrow tool permissions.
+Candidate Q1/Q2 and baseline Q2 scored 6/6; baseline Q1 scored 5.5/6 for missing
+direct helper-body evidence, with no critical false claim. Different follow-up
+queries through unchanged StrictLiteral behavior caused that difference; it is
+not attributed to the changed broad planner. Both arms already discovered the
+relevant symbol IDs; existing function-body snippets supplied the complete
+implementation and test bodies. Candidate Q1 CLI time was 36.080 seconds versus
+baseline 10.634, including an unexplained 22.098-second initial packet. Q2 was
+10.946 versus 14.206. No quality or efficiency gain is established.
 
-Four fresh Sol 6.1 readers used equal narrow discovery/inspection/relationship
-permissions. All 84 calls returned zero. Answers and read inventories were frozen
-before an independent grade against the original sealed reference. Candidate
-Q1/Q2 and baseline Q2 score 6/6; baseline Q1 scores 5.5/6 for an unread expected
-helper body, with no critical false claim. Root review found different follow-up
-search queries caused the helper-read difference on the unchanged StrictLiteral
-route. This does not attribute an answer gain to the planner change. Call counts
-are equal within each pair (23 Q1, 19 Q2). Candidate Q1 CLI time is 36.080 seconds
-versus baseline 10.634, including an unexplained 22.098-second initial packet;
-Q2 is 10.946 versus 14.206. No efficiency gain is established. This is an exposed
-development comparison, not formal unseen or full-host acceptance.
+The PocketBase UI-to-backend case now has three frozen adaptive answers against
+the same pinned repository and SDK file. Independent blind raw grades are 93/100
+for ordinary tools and 90/100 for candidate and development microbaseline, with
+no critical contradiction or unsafe claim found. A grading addendum marks two
+shared archive-provenance points ungradable: archive bytes were not among the
+readers' assigned inputs. Original scores remain unchanged; no adjusted pass
+threshold is invented. Both CodeStory readers used symbolic discovery followed
+by ordinary source reads, so this result does not exercise or validate the broad
+query-view, role-eligibility or fusion changes. Runtime UI/deletion, formal
+controls and comparative gain remain unproved.
 
-The planner changes remain provisional. Numeric sentence endings and displaced
-Tiny-plan free queries have focused controls and actual agent-test coverage, but
-neither broad role eligibility nor extra query views is an established cause of
-the original whole-question failures. Both questions already request tests.
-Strict local library Clippy passes after the observed retrieval findings and
-29 downstream normal-library findings are repaired. Existing focused checks pass:
-10 query-window, 43 evidence-compiler, 243 runtime-agent (two ignored),
-119 service and 56 grounding tests. The complete Mac CLI library suite passes
-553 tests with five ignored. These executions use Rust 1.95.0 and retained
-working-tree patch identities; hosted Draft uses pinned 1.97.1. Independent
-source review verifies guard ordering, callback lifetimes and failure boundaries.
-No exact-head release gate is claimed.
+The baseline reader's query-based callees request failed on Local profile and
+an uninitialized embedding runtime. Root reproduces identical failure bytes on
+the current normal candidate. A returned-ID callees control succeeds with fresh
+Core, eight nodes and no retrieval publication. The closed CLI query-selector
+class bypasses the existing Agent-profile/backend opener; its local repair must
+preserve Full admission, missing-publication refusal and core-only ID/snippet
+navigation. That repair is now implemented through the existing Agent opener.
+Three focused tests reproduce the original failures and pass after the change.
+The full 17-test runtime-backed flow binary, corrected Core-only DSL refusal,
+query no-cache and output-preflight controls pass. Four existing query fixtures
+now prepare their required attested Full publication; refusal gates remain.
+Independent source review accepts the production and fixture changes. A rebuilt
+normal artifact must still replay the original query and ID control.
 
-The next recovered breadth case is the original PocketBase U11-C05 public
-UI-to-backend collection-deletion question. Reuse its pinned source and SDK input
-identity while keeping retained answers and evaluator keys separated.
+Architecture checks now pass all 56 cases. The fix restores the accepted compiler
+boundary assertions, centralizes the existing trace-path read and moves one
+byte-identical test module to its conventional directory. A second adapter scan
+reuses the existing test-module exclusion. Two earlier path-scanner expansions
+were rejected by independent review and are retained as failed attempts. The
+selected change leaves the scanner and its regression fixture unchanged. The
+moved dispatcher test, ten trace-export tests and four replay tests pass.
+Strict Clippy passes for retrieval/runtime/CLI libraries and the three changed
+CLI integration targets on Rust 1.95.0. These are focused working-tree checks,
+not clean-head release acceptance; the next pushed head requires its own CI.
+The broad query/ranking candidate remains provisional.
 
-A bounded normal PocketBase preparation exposed a product defect: incremental
-vector attempts can decline before full fallback, but the CLI rejects timing
-receipts containing both phases. The command failed after 13.128 seconds with
-no resource guard. A later observational status finds a new retrieval
-generation, while the embedding runtime is uninitialized; publication alone
-does not prove query readiness. Focused Rust tests reproduce the rejection and
-a separate fractional-millisecond IPC overcount. The repair sums serial vector attempts with checked arithmetic,
-bounds emitted IPC by emitted parent milliseconds, and retains concurrent-worker,
-wall and overflow guards. Post-change accounting tests pass (eight CLI and three
-producer tests); the normal command still needs a rebuilt candidate and replay.
+Two new source-only development investigations, Pluggy wrapper composition and
+inih callback/error handling, have independently authored questions and sealed
+references. Reader comparisons will deliver a standard packet from the unchanged
+question before adaptive investigation in each CodeStory arm. The ordinary arm
+has the same tracked-source access. This directly exercises broad retrieval,
+which earlier adaptive readers largely bypassed. Questions, references, inputs,
+order, failures and costs are retained externally. No reader has begun this
+comparison at this source checkpoint; it is not formal unseen acceptance.
+
+The approved distinct maintenance-rebuild-02 archive, executable/native manifest,
+installed plugin bytes and 20-tool catalog digest have been reauthenticated
+read-only. Historical acceptance covers package and isolated installation only;
+no executable was launched in this recovery. Current runtime/accelerator/readiness
+and formal eligibility remain unproved. This comparator is different from the
+frozen development microbaseline.
 
 Both PC endpoints became unreachable during the isolated Linux source attempt;
 its result remains unknown. The maintainer directed continuation with available
-resources. The old 50-GiB free-disk reserve was not binding; current retained
-resource limits are forecasts, and each local run records fresh capacity and
-owner-scoped guards. A separate copy-on-write build-cache clone preserves the
-original target and archives. No formal study, installation, qualification or
-release has started. Continue breadth convergence, then assemble the original
-independent 12-target/72-task/3-arm acceptance; do not replace that outcome with
-these supporting source repairs or a single development comparison.
+resources. Historical disk reserves are not current authority; local runs use
+fresh forecasts and owner-scoped guards. The separate copy-on-write build cache
+preserves original targets and archives. No formal study, qualification or release
+has begun. Finish concrete product defects and breadth convergence, then the
+original independent 12-target/72-task/3-arm acceptance. Executor isolation,
+complete host-owned I/O/accounting and the complete task freeze remain unproved.
 
 ## Preserved handoff
 

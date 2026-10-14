@@ -4780,7 +4780,7 @@ pub mod representation_budget_test_support {
     pub fn replay_captured_observed(
         capture: &serde_json::Value,
         public_packet_id: &str,
-        mut measure: impl FnMut(&PacketProjectionV3Dto) -> Result<usize, ()>,
+        measure: impl FnMut(&PacketProjectionV3Dto) -> Result<usize, ()>,
         mut observe: impl FnMut(&RepresentedPacketProductV3, usize),
     ) -> Result<(RepresentedPacketProductV3, Vec<serde_json::Value>), ApiError> {
         let mut measure = bounded_packet_transport_measure_v3(measure);
@@ -4844,13 +4844,13 @@ pub mod representation_budget_test_support {
                         product.clone()
                     } else {
                         project_packet_v3_using_record_builder(&publication.project_id, "codestory-stdio", &request,
-                            &baseline_packet, &mut measure, |input| crate::agent::packet_execution_record_v3::build_packet_execution_record_replay_v3(
+                            baseline_packet, &mut measure, |input| crate::agent::packet_execution_record_v3::build_packet_execution_record_replay_v3(
                                 input, &publication, run, baseline_packet.answer.retrieval_trace.retrieval_publication.clone(), public_packet_id))?
                     };
                     baseline_projection = Some(projected.projection);
                 }
                 packet_projection_preserves_baseline_v3(baseline_projection.as_ref().unwrap(),
-                    &product.projection, &prepared.resolved_baseline_option_witnesses(&baseline_packet, &packet),
+                    &product.projection, &prepared.resolved_baseline_option_witnesses(baseline_packet, &packet),
                     &packet.support.iter().filter(|row| row.kind == SupportUnitKindDto::SourceRange && !baseline_packet.support.contains(row)).cloned().collect::<Vec<_>>())
             } else { true };
             let bytes = if guard_ok && matches!(product.projection, PacketProjectionV3Dto::Complete { .. }) {
@@ -4960,7 +4960,7 @@ pub mod representation_budget_test_support {
     pub fn select_prepared(
         input: PacketCompilationInputV1,
         request: &AgentPacketRequestDto,
-        mut measure: impl FnMut(&PacketProjectionV3Dto) -> Result<usize, ()>,
+        measure: impl FnMut(&PacketProjectionV3Dto) -> Result<usize, ()>,
     ) -> Result<RepresentedPacketProductV3, ApiError> {
         let mut measure = bounded_packet_transport_measure_v3(measure);
         let prepared = PreparedPacketCompilationV1::from_fixture_input(input);
@@ -4992,14 +4992,14 @@ pub mod representation_budget_test_support {
                         {
                             product.clone()
                         } else {
-                            project_packet(request, &base, &mut measure)?
+                            project_packet(request, base, &mut measure)?
                         };
                         baseline_projection = Some(projected.projection);
                     }
                     packet_projection_preserves_baseline_v3(
                         baseline_projection.as_ref().unwrap(),
                         &product.projection,
-                        &prepared.resolved_baseline_option_witnesses(&base, &packet),
+                        &prepared.resolved_baseline_option_witnesses(base, &packet),
                         &packet
                             .support
                             .iter()

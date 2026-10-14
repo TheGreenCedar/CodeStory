@@ -199,6 +199,8 @@ mod workspace_state;
 use affected::{AffectedOperationIdentityIndex, IndexFreshnessObservation};
 #[doc(hidden)]
 pub use agent::packet_replay::write_packet_stdio_replay_from_env;
+#[doc(hidden)]
+pub use agent::trace_export::packet_step_trace_destination_from_env;
 pub use agent::{
     bind_packet_follow_up_program, enforce_packet_output_budget_for_representation,
     packet_step_trace_json, plan_packet,

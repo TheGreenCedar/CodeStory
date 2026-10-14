@@ -1,4 +1,5 @@
 use super::super::artifacts::{ensure_dot_only_for_trail, preflight_output_file};
+use super::super::lifecycle::{OpenedAgentSurface, open_agent_surface};
 use super::super::rendering::build_query_resolution_output_with_runtime;
 use super::super::resolution::{quote_command_value, resolve_source_target_or_emit_ambiguity};
 use super::affected_rendering::render_files_markdown;
@@ -92,10 +93,9 @@ pub(in crate::app) fn run_query(cmd: QueryCommand) -> Result<()> {
         .context("Query cannot be empty.")?;
     let ast =
         codestory_runtime::parse_graph_query(query).map_err(|error| anyhow::anyhow!("{error}"))?;
-    let runtime = RuntimeContext::new(&cmd.project)?;
-    let opened = runtime.ensure_open(cmd.refresh)?;
-    ensure_index_ready(&opened, "query")?;
-    let operation = runtime.run_public_operation("graph", || {
+    let OpenedAgentSurface { runtime, .. } =
+        open_agent_surface(&cmd.project, None, None, cmd.refresh, "query")?;
+    let operation = runtime.run_public_operation("graph_assisted", || {
         let items = runtime
             .browser
             .query(&ast)

@@ -76,6 +76,14 @@ the shared activation remains owned by its other callers.
 Generated `--help` owns option syntax. User guides own workflows. This page owns
 the adapter boundary.
 
+CLI query targets in symbol, trail, impact, test-map, explore and bookmark-add
+commands use the existing Agent-profile opener and backend preflight. Their
+runtime operations still require a complete Full retrieval publication. The
+query DSL uses that same opening and graph-assisted operation class. Exact-ID
+navigation and source snippets retain their Core read path. Format, output-file
+and target-selector validation precede opening; runtime owns later resolution,
+freshness, admission and retry decisions.
+
 The canonical packet probe is a tagged JSON object. CLI `--probe` and stdio
 `probes[]` accept the same typed probe kinds. The retired free-string
 `--extra-probe` and `extra_probes[]` inputs are rejected; callers that need a

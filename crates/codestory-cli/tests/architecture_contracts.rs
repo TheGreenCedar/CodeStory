@@ -400,12 +400,13 @@ fn ordinary_cli_retrieval_operations_route_through_runtime() {
 ///
 /// The scan matches the crate name rather than the `codestory_retrieval::`
 /// path prefix, so importing the crate and calling it unqualified is caught
-/// too. `#[cfg(test)]` items are stripped by `production_source`: only what a
-/// release build compiles can violate the transport boundary, and the
-/// non-vacuity block below proves the stripping did not empty the scan.
+/// too. Test-only module files are excluded by `test_gated_module_files`, and
+/// inline `#[cfg(test)]` items are stripped by `production_source`. The
+/// non-vacuity checks below keep the production transport scan populated.
 #[test]
 fn cli_transport_adapters_do_not_probe_retrieval_directly() {
     let source_root = repo_root().join("crates/codestory-cli/src");
+    let test_gated_modules = test_gated_module_files(&source_root);
     let mut files = Vec::new();
     collect_rs_files(&source_root, &mut files);
     files.sort();
@@ -440,6 +441,12 @@ fn cli_transport_adapters_do_not_probe_retrieval_directly() {
 
     let mut violations = Vec::new();
     for path in &adapters {
+        let relative = path
+            .strip_prefix(&source_root)
+            .expect("transport source lives below the CLI source root");
+        if test_gated_modules.contains(relative) {
+            continue;
+        }
         let source = fs::read_to_string(path).expect("read CLI transport source");
         for line in production_source(&source).lines() {
             if line.contains("codestory_retrieval") {
@@ -680,15 +687,15 @@ fn repository_derived_compiler_is_the_public_evidence_planning_boundary() {
         );
     }
     let orchestrator = read("crates/codestory-runtime/src/agent/orchestrator.rs");
-    let compiler_freeze = orchestrator
-        .find("let frozen_compilation = freeze_packet_compilation")
-        .expect("runtime freezes admitted repository evidence for the compiler");
+    let compiler_preparation = orchestrator
+        .find("let prepared_compilation = prepare_packet_compilation")
+        .expect("runtime prepares authenticated repository evidence for the compiler");
     let presentation_cap = orchestrator
         .find("let budget = apply_packet_budget")
         .expect("runtime applies the presentation budget");
     assert!(
-        compiler_freeze < presentation_cap,
-        "compiler input and output must be frozen before presentation capping"
+        compiler_preparation < presentation_cap,
+        "authenticated compiler input must be prepared before presentation capping"
     );
     assert!(!orchestrator.contains("append_packet_source_evidence"));
     assert!(!orchestrator.contains("directed_relations_from_graphs(&answer.graphs"));
@@ -702,35 +709,56 @@ fn repository_derived_compiler_is_the_public_evidence_planning_boundary() {
         !adapter.contains("observe_source_coverage("),
         "packet compiler coverage must stay admission-scoped"
     );
-    let freeze = source_between(
+    let preparation = source_between(
         &adapter,
-        "pub(crate) fn freeze_packet_compilation",
-        "fn attach_file_navigation_paths",
+        "pub(crate) fn prepare_packet_compilation",
+        "pub(crate) fn replay_prepare_from_sealed_admissions",
     );
-    let compact_freeze = freeze.split_whitespace().collect::<String>();
-    assert!(compact_freeze.contains(
-        "hydrate_admitted_sources_with_ranges(controller,&storage,&admissions,&mutadmission_gaps,&ranges,&mutsource_refusals,)"
+    let compact_preparation = preparation.split_whitespace().collect::<String>();
+    assert!(compact_preparation.contains(
+        "hydrate_admitted_sources_with_ranges(controller,&storage,&admissions,&mutadmission_gaps,&ranges,&mutsource_refusals,&mutsource_page_alternatives,)"
     ));
-    let range_authentication = freeze
+    let range_authentication = preparation
         .find("authenticated_continuation_ranges(")
         .expect("runtime authenticates continuation ranges before source hydration");
-    let source_hydration = freeze
+    let source_hydration = preparation
         .find("hydrate_admitted_sources_with_ranges(")
         .expect("runtime hydrates admitted sources with authenticated ranges");
     assert!(range_authentication < source_hydration);
-    let input_build = freeze
+    let input_build = preparation
         .find("let input = PacketCompilationInputV1")
         .expect("runtime builds typed compiler input");
-    let compile = freeze
-        .find("compile_repository_evidence(&input)")
-        .expect("runtime compiles the frozen typed input");
-    let navigation = freeze
-        .find("attach_file_navigation_paths(&mut product.support, &file_navigation_paths)")
+    let prepared = preparation
+        .find("Ok(PreparedPacketCompilationV1 {")
+        .expect("runtime retains the authenticated compiler input");
+    assert!(source_hydration < input_build && input_build < prepared);
+    let default_product = source_between(
+        &adapter,
+        "pub(crate) fn default_product",
+        "pub(crate) fn into_frozen",
+    );
+    let compile = default_product
+        .find("compile_repository_evidence(&self.input)")
+        .expect("runtime compiles only the prepared typed input");
+    let navigation = default_product
+        .find("attach_file_navigation_paths(&mut product.support, &self.file_navigation_paths)")
         .expect("runtime attaches authenticated navigation paths after pure compilation");
+    assert!(compile < navigation);
+    let freeze = source_between(
+        &adapter,
+        "pub(crate) fn into_frozen",
+        "pub(crate) fn apply_proposal",
+    );
+    let navigation = freeze
+        .find("attach_file_navigation_paths(&mut product.support, &self.file_navigation_paths)")
+        .expect("runtime binds navigation before freezing the selected product");
     let frozen = freeze
-        .find("Ok(FrozenPacketCompilationV1 {")
+        .rfind("FrozenPacketCompilationV1 {")
         .expect("runtime returns the compiled packet only after navigation attachment");
-    assert!(input_build < compile && compile < navigation && navigation < frozen);
+    assert!(navigation < frozen);
+    assert!(freeze.contains("hydrated_sources: self.input.sources"));
+    assert!(orchestrator.contains("prepared_compilation.select_for_representation_with_baseline("));
+    assert!(orchestrator.contains("commit_measured_packet_compilation(&packet, frozen)"));
     let services = read("crates/codestory-runtime/src/services.rs");
     let agent_service = source_between(
         &services,

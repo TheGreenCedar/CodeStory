@@ -2916,7 +2916,7 @@ mod tests {
             classify_packet_disposition(
                 &packet,
                 request,
-                &[selector.clone()],
+                std::slice::from_ref(&selector),
                 sources,
                 "project",
                 "core".into(),
@@ -2924,7 +2924,7 @@ mod tests {
             )
         };
         let baseline = classify(&[], None).drill.unwrap();
-        let labeled = classify(&[source.clone()], None).drill.unwrap();
+        let labeled = classify(std::slice::from_ref(&source), None).drill.unwrap();
         let option = &labeled.options[0];
         assert_eq!(
             option.source_label.as_ref().unwrap().path.as_deref(),
@@ -3568,11 +3568,11 @@ mod tests {
                     .support
                     .iter()
                     .find(|r| r.kind == SupportUnitKindDto::SourceRange);
-                if let Some(row) = row {
-                    if row.end_line == Some(old.end_line) {
-                        floor_measured = true;
-                        return Ok(Some(1024));
-                    }
+                if let Some(row) = row
+                    && row.end_line == Some(old.end_line)
+                {
+                    floor_measured = true;
+                    return Ok(Some(1024));
                 }
                 Ok(None)
             })
@@ -4691,7 +4691,7 @@ mod tests {
                 assert_eq!(receipt.next_start_line, Some(end));
                 assert_eq!(
                     receipt.remaining_source_bytes,
-                    text.split_inclusive('\n').last().unwrap().len() as u64
+                    text.split_inclusive('\n').next_back().unwrap().len() as u64
                 );
             }
         }
@@ -4810,7 +4810,7 @@ mod tests {
             end_line: 80,
         };
         let original = DrillOptionDto::omitted_symbol("gap", "-42").with_source_range(range);
-        let decoded = drill_options_from_ids(&[original.id.clone()]);
+        let decoded = drill_options_from_ids(std::slice::from_ref(&original.id));
         assert_eq!(decoded[0].id, original.id);
         assert_eq!(decoded[0].symbol_id.as_deref(), Some("-42"));
         assert_eq!(decoded[0].source_range, Some(range));
@@ -5794,7 +5794,7 @@ mod tests {
             parser_completeness: PacketParserCompletenessV1::Complete,
         };
         let mut option = drill_option_from_selector(&selector).unwrap();
-        option.source_label = continuation_source_label(&selector, &[source.clone()]);
+        option.source_label = continuation_source_label(&selector, std::slice::from_ref(&source));
         baseline.disposition.drill = Some(BoundedDrillPlanDto {
             parent_packet_id: baseline.packet_id.clone(),
             core_generation_id: "core".into(),

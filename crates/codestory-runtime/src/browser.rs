@@ -1093,7 +1093,7 @@ mod source_response_budget_tests {
             serde_json::to_value(original).unwrap()
         );
         let cut = page.render_for_representation(exact - 1, measure).unwrap();
-        assert!(measure(&cut).unwrap() <= exact - 1);
+        assert!(measure(&cut).unwrap() < exact);
         assert_eq!(cut.ranges.len(), 2);
         // A smaller max_total_bytes numeral can save bytes without dropping
         // source. Exact-minus-one need not imply an incomplete source window.

@@ -104,6 +104,23 @@ pub(super) fn open_agent_surface(
     })
 }
 
+/// Query selectors use the full retrieval facade; exact IDs retain graph opening.
+pub(crate) fn open_target_surface(
+    project: &ProjectArgs,
+    refresh: args::RefreshMode,
+    target: &args::TargetSelection,
+    surface: &'static str,
+) -> Result<(RuntimeContext, runtime::OpenedProject)> {
+    if matches!(target, args::TargetSelection::Query { .. }) {
+        let opened = open_agent_surface(project, None, None, refresh, surface)?;
+        return Ok((opened.runtime, opened.opened));
+    }
+    let runtime = RuntimeContext::new(project)?;
+    let opened = runtime.ensure_open(refresh)?;
+    ensure_index_ready(&opened, surface)?;
+    Ok((runtime, opened))
+}
+
 pub(super) fn open_search_surface(
     project: &ProjectArgs,
     profile: Option<args::CliSidecarProfile>,

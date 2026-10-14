@@ -5814,7 +5814,7 @@ mod tests {
     #[test]
     fn callable_lexical_source_retains_late_words_without_changing_dense_doc() {
         let root = TempDir::new().unwrap();
-        let mut store = Store::open(&root.path().join("core.sqlite3")).unwrap();
+        let mut store = Store::open(root.path().join("core.sqlite3")).unwrap();
         let text = "def worker():\n    setup()\n    step()\n    step()\n    step()\n    step()\n    step()\n    record(\"expired lease\")\n";
         let (node, doc) = callable_fixture(&mut store, text);
         let sources = HashMap::from([("src/worker.py", text)]);
@@ -5869,8 +5869,8 @@ mod tests {
     #[test]
     fn callable_source_body_changes_invalidate_compact_document_reuse() {
         let root = TempDir::new().unwrap();
-        let mut previous = Store::open(&root.path().join("previous.sqlite3")).unwrap();
-        let mut current = Store::open(&root.path().join("current.sqlite3")).unwrap();
+        let mut previous = Store::open(root.path().join("previous.sqlite3")).unwrap();
+        let mut current = Store::open(root.path().join("current.sqlite3")).unwrap();
         callable_fixture(&mut previous, "def worker():\n    setup()\n    old()\n");
         callable_fixture(&mut current, "def worker():\n    setup()\n    old()\n");
         assert!(symbol_documents_match(root.path(), &current, &previous).unwrap());
@@ -5881,8 +5881,8 @@ mod tests {
     #[test]
     fn callable_file_eligibility_changes_invalidate_predecessor_source_capsule() {
         let root = TempDir::new().unwrap();
-        let mut previous = Store::open(&root.path().join("previous.sqlite3")).unwrap();
-        let mut current = Store::open(&root.path().join("current.sqlite3")).unwrap();
+        let mut previous = Store::open(root.path().join("previous.sqlite3")).unwrap();
+        let mut current = Store::open(root.path().join("current.sqlite3")).unwrap();
         let text = "def worker():\n    work()\n";
         callable_fixture(&mut previous, text);
         callable_fixture(&mut current, text);
@@ -5904,8 +5904,8 @@ mod tests {
     #[test]
     fn callable_to_noncallable_invalidates_predecessor_source_capsule() {
         let root = TempDir::new().unwrap();
-        let mut previous = Store::open(&root.path().join("previous.sqlite3")).unwrap();
-        let mut current = Store::open(&root.path().join("current.sqlite3")).unwrap();
+        let mut previous = Store::open(root.path().join("previous.sqlite3")).unwrap();
+        let mut current = Store::open(root.path().join("current.sqlite3")).unwrap();
         callable_fixture(&mut previous, "def worker():\n    work()\n");
         let (mut node, mut doc) = callable_fixture(&mut current, "def worker():\n    work()\n");
         node.kind = NodeKind::CLASS;

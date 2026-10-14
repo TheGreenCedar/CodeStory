@@ -1481,7 +1481,7 @@ fn app_controller_opens_project() {
     assert_files_and_affected_read_existing_cache(workspace.path(), cache_dir.path());
     search_dir_snapshot.assert_unchanged("files and affected");
 
-    assert_query_search_uses_core_without_full_sidecars(workspace.path(), cache_dir.path());
+    assert_query_search_fails_closed_without_full_sidecars(workspace.path(), cache_dir.path());
     search_dir_snapshot.assert_unchanged("query search");
     assert_packet_builds_broad_task_contract(workspace.path(), cache_dir.path());
     search_dir_snapshot.assert_unchanged("packet");
@@ -2745,7 +2745,7 @@ fn run_git(workspace: &Path, args: &[&str]) {
     );
 }
 
-fn assert_query_search_uses_core_without_full_sidecars(workspace: &Path, cache_dir: &Path) {
+fn assert_query_search_fails_closed_without_full_sidecars(workspace: &Path, cache_dir: &Path) {
     let output = run_cli(
         workspace,
         cache_dir,
@@ -2759,22 +2759,18 @@ fn assert_query_search_uses_core_without_full_sidecars(workspace: &Path, cache_d
         ],
     );
     assert!(
-        output.status.success(),
-        "query search DSL should use the complete core without sidecars: {}",
+        !output.status.success(),
+        "query search DSL must fail closed without full sidecars\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let query: Value = serde_json::from_slice(&output.stdout)
-        .unwrap_or_else(|error| panic!("parse query-search output: {error}; output={output:#?}"));
-    assert!(
-        query["items"].as_array().is_some_and(|items| {
-            items.iter().any(|item| {
-                item["display_name"] == "AppController"
-                    && item["source"] == "search"
-                    && item["file_path"] == "src/lib.rs"
-            })
-        }),
-        "query search DSL should return the exact core symbol: {query:#}"
+    let failure: Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("parse query-search refusal: {error}; output={output:#?}"));
+    assert_eq!(
+        failure["error"]["code"], "retrieval_unavailable",
+        "query search DSL must report the retrieval gate: {failure:#}"
     );
+    assert_retrieval_failure_output(output);
 }
 
 fn assert_context_id_fails_closed_without_full_sidecars(
