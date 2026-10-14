@@ -215,6 +215,15 @@ impl PreparedPacketCompilationV1 {
                     "Issued source floor cannot omit any previously served row.",
                 ));
             }
+            // Issued history is immutable. A valid, never-served default is
+            // protected only after the complete caller frame proves it fits;
+            // otherwise select its current baseline through that same renderer.
+            // Invalid source witnesses retain the fail-closed predicate without
+            // reaching the representation callback.
+            let preserve_original_context = self.issued_context_sources.is_some()
+                || !source_floor_retained(&original_context.support, &original_context.support)
+                || bounded_measure(&self, &original_context, None)?
+                    .is_some_and(|bytes| bytes <= PUBLIC_PACKET_SERIALIZED_MAX_BYTES);
             let mut candidates_examined = 0usize;
             let mut floor_predicate_rejected = 0usize;
             let mut floor_preserving_measurements = 0usize;
@@ -230,7 +239,15 @@ impl PreparedPacketCompilationV1 {
                         &mut displayed.support,
                         &self.file_navigation_paths,
                     );
-                    if !source_floor_retained(&displayed.support, &original_context.support) {
+                    if (preserve_original_context
+                        && !source_floor_retained(&displayed.support, &original_context.support))
+                        || (!preserve_original_context
+                            && (!displayed
+                                .support
+                                .iter()
+                                .any(|row| row.kind == SupportUnitKindDto::SourceRange)
+                                || !source_floor_retained(&displayed.support, &displayed.support)))
+                    {
                         floor_predicate_rejected += 1;
                         return Ok(None);
                     }
@@ -419,7 +436,7 @@ impl PreparedPacketCompilationV1 {
                 }
             }
             // Original plus three verified caps. <=8*51 baseline callbacks,
-            // <=4*139 joint callbacks and one final replay fit the unchanged
+            // <=4*139 joint callbacks, one context-default probe and one final replay fit the unchanged
             // whole-request guard (1049). Unsupported inventories fail closed.
             if joint_extents.len() > 4 {
                 return Err(codestory_contracts::api::ApiError::internal(
@@ -3900,8 +3917,6 @@ mod tests {
             ambiguities: Vec::new(),
             admission_gaps: Vec::new(),
         };
-        let mut legacy = PreparedPacketCompilationV1::from_fixture_input(input.clone());
-        legacy.requested_source_identities.insert("node:5".into());
         let measured = |_: &PreparedPacketCompilationV1, p: &RepositoryDerivedCompilationV1| {
             Ok(Some(
                 p.support
@@ -3911,10 +3926,6 @@ mod tests {
                     * 2100,
             ))
         };
-        assert!(
-            legacy.select_for_representation(measured).is_err(),
-            "legacy new-context inventory refuses unchanged cap"
-        );
         let mut issued = PreparedPacketCompilationV1::from_fixture_input(input);
         issued.requested_source_identities.insert("node:5".into());
         issued.issued_context_sources = Some(originals.clone());
@@ -4328,6 +4339,19 @@ mod tests {
     fn requested_source_selection_preserves_context_or_refuses_progress() {
         use crate::evidence_projection_v3::representation_budget_test_support as fixture;
         use codestory_contracts::packet_projection_v3::PacketProjectionV3Dto;
+
+        fn mirrored_size(projection: &PacketProjectionV3Dto) -> Result<usize, ()> {
+            let root = serde_json::to_value(projection).map_err(|_| ())?;
+            let text = serde_json::to_string(&root).map_err(|_| ())?;
+            serde_json::to_vec(&serde_json::json!({
+                "content": [{"type": "text", "text": text}],
+                "structuredContent": root,
+                "isError": false
+            }))
+            .map(|bytes| bytes.len())
+            .map_err(|_| ())
+        }
+
         for (context_count, requested_lines, context_lines) in [(2, 40, 100), (4, 150, 5)] {
             let texts = std::iter::once(
                 "    selected_operation(value); // retained source line\n".repeat(requested_lines),
@@ -4398,58 +4422,238 @@ mod tests {
             let mut prepared = PreparedPacketCompilationV1::from_fixture_input(input);
             prepared.source_page_alternatives = alternatives;
             prepared.requested_source_identities.insert("node:0".into());
+            assert!(prepared.issued_context_sources.is_none());
             let expected_end = prepared.input.sources[0].end_line;
-            let mut accepted = None;
-            let mut choices = Vec::new();
-            let mut fitting_context_depths = Vec::new();
-            let frozen = prepared.select_for_representation(|prepared, product| {
+            let project = |prepared: &PreparedPacketCompilationV1,
+                           product: &RepositoryDerivedCompilationV1|
+             -> Result<_, codestory_contracts::api::ApiError> {
                 let mut candidate = base.clone();
                 prepared.apply_proposal(&mut candidate, Some(&request), product);
-                // Match the production internal gate before measuring the mirrored public DTO.
-                crate::agent::packet_budget::enforce_packet_output_budget(Path::new("/fixture"), &mut candidate);
-                assert_eq!(candidate.support, product.support, "the internal presentation gate must not change compiled source delivery");
-                let projected = fixture::project_packet(&request, &candidate, |projection| {
-                    let root = serde_json::to_value(projection).unwrap();
-                    Ok(serde_json::to_vec(&serde_json::json!({"content":[{"type":"text", "text":serde_json::to_string(&root).unwrap()}], "structuredContent":root, "isError":false})).unwrap().len())
-                })?;
-                let PacketProjectionV3Dto::Complete { .. } = projected.projection else { return Ok(None); };
-                let root = serde_json::to_value(&projected.projection).unwrap();
-                let bytes = serde_json::to_vec(&serde_json::json!({"content":[{"type":"text", "text":serde_json::to_string(&root).unwrap()}], "structuredContent":root, "isError":false})).unwrap().len();
-                choices.push((candidate.support.iter().find(|row| row.symbol_id.as_deref() == Some("0")).and_then(|row| row.end_line), candidate.support.iter().filter(|row| row.source_delivery.is_some()).count(), serde_json::to_vec(&candidate).unwrap().len(), bytes));
+                crate::agent::packet_budget::enforce_packet_output_budget(
+                    Path::new("/fixture"),
+                    &mut candidate,
+                );
+                assert_eq!(
+                    candidate.support, product.support,
+                    "the internal presentation gate must not change compiled source delivery"
+                );
+                let projected = fixture::project_packet(&request, &candidate, mirrored_size)?;
+                Ok((candidate, projected))
+            };
+            // Establish the independent current baseline with the same actual
+            // renderer before asking runtime to protect it beside progress.
+            let mut context = prepared.clone();
+            context
+                .input
+                .sources
+                .retain(|source| source.stable_identity != "node:0");
+            let default_context = context.default_product();
+            let default_projection = project(&context, &default_context).unwrap().1.projection;
+            let selected_context = compile_repository_evidence_baseline_for_representation(
+                &context.input,
+                &context.call_navigation,
+                |product| -> Result<Option<usize>, codestory_contracts::api::ApiError> {
+                    let projection = project(&context, product)?.1.projection;
+                    if matches!(&projection, PacketProjectionV3Dto::Complete { .. }) {
+                        Ok(Some(mirrored_size(&projection).unwrap()))
+                    } else {
+                        Ok(None)
+                    }
+                },
+            )
+            .unwrap();
+            let RepresentationBudgetSelectionV1::Complete {
+                product: selected_context,
+                representation_bytes,
+                ..
+            } = selected_context
+            else {
+                panic!("an independently measured current context must fit this renderer")
+            };
+            assert!(representation_bytes <= PUBLIC_PACKET_SERIALIZED_MAX_BYTES);
+            assert!(
+                selected_context
+                    .support
+                    .iter()
+                    .any(|row| row.kind == SupportUnitKindDto::SourceRange)
+            );
+            if context_lines == 100 {
+                assert!(
+                    matches!(
+                        default_projection,
+                        PacketProjectionV3Dto::BudgetExceeded { .. }
+                    ),
+                    "the hostile default must really exceed the mirrored public envelope"
+                );
+                assert_ne!(selected_context.support, default_context.support);
+            } else {
+                assert!(matches!(
+                    default_projection,
+                    PacketProjectionV3Dto::Complete { .. }
+                ));
+                assert_eq!(
+                    selected_context, default_context,
+                    "an already fitting default context must remain unchanged"
+                );
+            }
+            // Independently exhibit requested progress beside the exact floor
+            // using only already hydrated, authenticated page alternatives.
+            let mut combined = prepared.clone();
+            for source in &mut combined.input.sources {
+                let protected = selected_context.support.iter().any(|row| {
+                    row.kind == SupportUnitKindDto::SourceRange
+                        && final_support_stable_identity(row).as_deref()
+                            == Some(source.stable_identity.as_str())
+                        && row.path.as_deref() == Some(source.path.as_str())
+                        && row.start_line == Some(source.start_line)
+                        && row.end_line == Some(source.end_line)
+                        && row.snippet.as_deref() == Some(source.source.as_str())
+                        && row.source_delivery == source.delivery
+                });
+                if !protected {
+                    *source = prepared.source_page_alternatives[&512]
+                        .iter()
+                        .find(|page| page.stable_identity == source.stable_identity)
+                        .expect("existing smallest authenticated page")
+                        .clone();
+                }
+            }
+            let combined_selection = compile_repository_evidence_baseline_for_representation(
+                &combined.input,
+                &combined.call_navigation,
+                |product| -> Result<Option<usize>, codestory_contracts::api::ApiError> {
+                    if !source_floor_retained(&product.support, &selected_context.support)
+                        || !product.support.iter().any(|row| {
+                            row.kind == SupportUnitKindDto::SourceRange
+                                && row.symbol_id.as_deref() == Some("0")
+                                && row.source_delivery.is_some()
+                        })
+                    {
+                        return Ok(None);
+                    }
+                    let projection = project(&combined, product)?.1.projection;
+                    let bytes = mirrored_size(&projection).unwrap();
+                    println!(
+                        "combined-page diagnostic context_lines={context_lines} baseline_bytes={representation_bytes} requested_end={:?} requested_cursor={:?} projected_bytes={bytes} projection={:?}",
+                        product.support.iter().find(|row| row.symbol_id.as_deref() == Some("0")).and_then(|row| row.end_line),
+                        product.support.iter().find(|row| row.symbol_id.as_deref() == Some("0")).and_then(|row| row.source_delivery.as_ref()).and_then(|delivery| delivery.next_start_line),
+                        match &projection {
+                            PacketProjectionV3Dto::Complete { .. } => "complete".to_string(),
+                            PacketProjectionV3Dto::BudgetExceeded { required_complete_bytes, .. } => format!("budget_exceeded:required={required_complete_bytes}"),
+                        }
+                    );
+                    if matches!(projection, PacketProjectionV3Dto::Complete { .. }) {
+                        Ok(Some(bytes))
+                    } else {
+                        Ok(None)
+                    }
+                },
+            )
+            .unwrap();
+            assert!(
+                matches!(combined_selection, RepresentationBudgetSelectionV1::Complete { representation_bytes, .. }
+                    if representation_bytes <= PUBLIC_PACKET_SERIALIZED_MAX_BYTES),
+                "an independently authenticated combined candidate must fit before requiring runtime progress"
+            );
+            let mut accepted = None;
+            let mut choices = Vec::new();
+            let mut measurements = 0;
+            let mut fitting_context_depths = Vec::new();
+            let frozen = prepared.select_for_representation(|prepared, product| {
+                measurements += 1;
+                let (candidate, projected) = project(prepared, product)?;
+                let PacketProjectionV3Dto::Complete { .. } = projected.projection else {
+                    return Ok(None);
+                };
+                let bytes = mirrored_size(&projected.projection).unwrap();
+                choices.push((
+                    candidate
+                        .support
+                        .iter()
+                        .find(|row| row.symbol_id.as_deref() == Some("0"))
+                        .and_then(|row| row.end_line),
+                    candidate
+                        .support
+                        .iter()
+                        .filter(|row| row.source_delivery.is_some())
+                        .count(),
+                    serde_json::to_vec(&candidate).unwrap().len(),
+                    bytes,
+                ));
                 if bytes <= 16384 {
-                    let contexts = candidate.support.iter().filter(|row|
-                        row.source_delivery.is_some() && row.symbol_id.as_deref() != Some("0")
-                    ).collect::<Vec<_>>();
-                    assert!(contexts.iter().all(|row| row.start_line == Some(1)
-                        && row.source_delivery.as_ref().is_some_and(|delivery|
-                            delivery.requested_range.end_line == context_lines as u32
-                                && delivery.matches_delivery(1, row.end_line.unwrap()))));
-                    if candidate.support.iter().any(|row| row.symbol_id.as_deref() == Some("0")
-                        && row.end_line == Some(expected_end)) {
-                        fitting_context_depths.push((contexts.len(), contexts.iter()
-                            .filter_map(|row| row.end_line).max().unwrap_or(0)));
+                    let contexts = candidate
+                        .support
+                        .iter()
+                        .filter(|row| {
+                            row.source_delivery.is_some() && row.symbol_id.as_deref() != Some("0")
+                        })
+                        .collect::<Vec<_>>();
+                    assert!(contexts.iter().all(|row| {
+                        row.start_line == Some(1)
+                            && row.source_delivery.as_ref().is_some_and(|delivery| {
+                                delivery.requested_range.end_line == context_lines as u32
+                                    && delivery.matches_delivery(1, row.end_line.unwrap())
+                            })
+                    }));
+                    if candidate.support.iter().any(|row| {
+                        row.symbol_id.as_deref() == Some("0") && row.end_line == Some(expected_end)
+                    }) {
+                        fitting_context_depths.push((
+                            contexts.len(),
+                            contexts
+                                .iter()
+                                .filter_map(|row| row.end_line)
+                                .max()
+                                .unwrap_or(0),
+                        ));
                     }
                     accepted = Some((candidate, bytes));
                 }
                 Ok(Some(bytes))
             });
-            let frozen = match frozen {
-                Ok(frozen) => frozen,
-                Err(_) => {
-                    assert_eq!(
-                        context_lines, 100,
-                        "only oversized original context may refuse"
-                    );
-                    assert!(accepted.is_none(), "no reduced-context frame may escape");
-                    continue;
-                }
-            };
+            let frozen = frozen.expect(
+                "protect the fitting renderer-selected current baseline beside requested progress",
+            );
             let (packet, bytes) = accepted.unwrap();
+            assert_eq!(frozen.context_floor, selected_context.support);
+            for old in selected_context
+                .support
+                .iter()
+                .filter(|row| row.kind == SupportUnitKindDto::SourceRange)
+            {
+                let retained = packet
+                    .support
+                    .iter()
+                    .find(|row| {
+                        row.kind == SupportUnitKindDto::SourceRange
+                            && row.symbol_id == old.symbol_id
+                    })
+                    .expect("the selected context source remains present");
+                assert_eq!(
+                    (
+                        &retained.path,
+                        retained.start_line,
+                        retained.end_line,
+                        &retained.snippet,
+                        &retained.source_delivery
+                    ),
+                    (
+                        &old.path,
+                        old.start_line,
+                        old.end_line,
+                        &old.snippet,
+                        &old.source_delivery
+                    ),
+                    "requested progress must not change a selected current source witness"
+                );
+            }
             let selected = packet
                 .support
                 .iter()
                 .find(|row| row.symbol_id.as_deref() == Some("0") && row.source_delivery.is_some())
-                .unwrap();
+                .expect(
+                    "the independently fitting combined candidate must retain requested progress",
+                );
             assert!(
                 selected
                     .end_line
@@ -4460,15 +4664,13 @@ mod tests {
             assert!(delivery.matches_delivery(1, selected.end_line.unwrap()));
             assert_eq!(
                 delivery.next_start_line,
-                Some(selected.end_line.unwrap() + 1)
+                (selected.end_line.unwrap() < requested_lines as u32)
+                    .then_some(selected.end_line.unwrap() + 1)
             );
-            assert!(
-                selected
-                    .source_delivery
-                    .as_ref()
-                    .unwrap()
-                    .remaining_source_bytes
-                    > 0
+            assert_eq!(
+                delivery.remaining_source_bytes > 0,
+                selected.end_line.unwrap() < requested_lines as u32,
+                "a complete requested range has no invented tail"
             );
             for original in frozen
                 .context_floor
@@ -4481,6 +4683,11 @@ mod tests {
                 ));
             }
             assert!(bytes <= 16384);
+            assert!(
+                measurements
+                    <= 8 * codestory_agent::evidence_compiler::REPOSITORY_EVIDENCE_MAX_MEASURED_CANDIDATES_V1 + 1,
+                "all complete, refused and final replay callbacks use the unchanged whole-request bound"
+            );
             assert!(
                 choices.len() <= 358,
                 "seven extents, at most fifty-one row proposals and one replay"
