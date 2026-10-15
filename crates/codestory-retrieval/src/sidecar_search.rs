@@ -165,7 +165,20 @@ impl SearchExecutionContext {
 
     fn run<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
         self.check_cancelled()?;
-        let value = operation()?;
+        let value = operation().or_else(|error| {
+            let interrupted = error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::Interrupted)
+                || matches!(
+                    error.downcast_ref::<rusqlite::Error>(),
+                    Some(rusqlite::Error::SqliteFailure(error, _))
+                        if error.code == rusqlite::ErrorCode::OperationInterrupted
+                );
+            if interrupted {
+                self.check_cancelled()?;
+            }
+            Err(error)
+        })?;
         self.check_cancelled()?;
         Ok(value)
     }
@@ -460,16 +473,16 @@ impl SidecarSearch for LiveSidecarSearch {
         candidates: &mut [CandidateHit],
         context: &SearchExecutionContext,
     ) -> Result<()> {
-        context.check_cancelled()?;
         let stop = context.clone();
-        self.lexical.enrich_packet_calls(
-            &self.layout,
-            &self.sidecar_generation,
-            &self.sidecar_input_hash,
-            candidates,
-            Arc::new(move || stop.is_cancelled()),
-        )?;
-        context.check_cancelled()
+        context.run(|| {
+            self.lexical.enrich_packet_calls(
+                &self.layout,
+                &self.sidecar_generation,
+                &self.sidecar_input_hash,
+                candidates,
+                Arc::new(move || stop.is_cancelled()),
+            )
+        })
     }
 
     fn layout(&self) -> Option<&SidecarLayout> {
@@ -817,6 +830,77 @@ mod tests {
             error.to_string(),
             "retrieval stopped: reason=deadline boundary=unknown"
         );
+    }
+
+    #[test]
+    fn interrupted_reads_only_become_stops_for_the_same_stopped_context() {
+        for failure in ["io", "sqlite", "corruption"] {
+            for stop in ["none", "cancelled", "deadline"] {
+                let cancelled = Arc::new(AtomicBool::new(false));
+                let context = SearchExecutionContext::new(
+                    Instant::now() + Duration::from_millis(100),
+                    Arc::clone(&cancelled),
+                    Arc::new(AtomicBool::new(false)),
+                );
+                let error = context
+                    .run::<()>(|| {
+                        if stop == "cancelled" {
+                            cancelled.store(true, Ordering::Release);
+                        } else if stop == "deadline" {
+                            while !context.is_cancelled() {
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                        }
+                        match failure {
+                            "io" => Err(std::io::Error::new(
+                                std::io::ErrorKind::Interrupted,
+                                "call metadata read cancelled",
+                            )
+                            .into()),
+                            "sqlite" => {
+                                let connection = rusqlite::Connection::open_in_memory()?;
+                                connection.progress_handler(1, Some(|| true))?;
+                                connection.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))?;
+                                panic!("SQLite progress callback must interrupt the read");
+                            }
+                            _ => anyhow::bail!("call metadata component changed after validation"),
+                        }
+                    })
+                    .expect_err("the read must fail");
+                let message = retrieval_stop_message(&error);
+                assert_eq!(
+                    message.is_some(),
+                    failure != "corruption" && stop != "none",
+                    "{failure}/{stop}: {error:#}"
+                );
+                if failure == "corruption" {
+                    assert_eq!(
+                        error.to_string(),
+                        "call metadata component changed after validation"
+                    );
+                } else if stop == "none" {
+                    if failure == "io" {
+                        assert_eq!(
+                            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                            std::io::ErrorKind::Interrupted
+                        );
+                    } else {
+                        assert!(matches!(
+                            error.downcast_ref::<rusqlite::Error>(),
+                            Some(rusqlite::Error::SqliteFailure(error, _))
+                                if error.code == rusqlite::ErrorCode::OperationInterrupted
+                        ));
+                    }
+                } else {
+                    let reason = if stop == "cancelled" {
+                        "request_cancelled"
+                    } else {
+                        "deadline"
+                    };
+                    assert!(message.unwrap().contains(&format!("reason={reason}")));
+                }
+            }
+        }
     }
 
     #[test]

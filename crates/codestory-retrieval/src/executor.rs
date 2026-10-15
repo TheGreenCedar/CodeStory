@@ -13,7 +13,7 @@ use crate::planner::{PlannedStage, RetrievalStageKind};
 use crate::query_features::{QueryFeatures, QueryLookupMode, classify_query};
 use crate::query_policy::LexicalAdmissionPolicy;
 use crate::ranker::{rank_candidates, retain_primary_candidates_for_query};
-use crate::sidecar_search::{SearchExecutionContext, SidecarSearch};
+use crate::sidecar_search::{SearchExecutionContext, SidecarSearch, retrieval_stop_message};
 use anyhow::{Result, bail};
 use codestory_store::RetrievalIndexManifest;
 use serde::{Deserialize, Serialize};
@@ -386,7 +386,11 @@ impl<'a> QueryExecutor<'a> {
                 Arc::clone(&self.cancelled),
                 Arc::new(AtomicBool::new(false)),
             );
-            self.sidecars.enrich_packet_calls(&mut hits, &context)?;
+            if let Err(error) = self.sidecars.enrich_packet_calls(&mut hits, &context)
+                && (!context.is_cancelled() || retrieval_stop_message(&error).is_none())
+            {
+                return Err(error);
+            }
         }
 
         if self.cancelled.load(Ordering::Acquire) {
@@ -1785,6 +1789,116 @@ mod tests {
                 .iter()
                 .all(|hit| hit.source_excerpt.is_none() && hit.target.is_none())
         );
+    }
+
+    #[test]
+    fn descriptor_metadata_stop_preserves_ranked_hits_without_masking_failures() {
+        struct MetadataSidecars {
+            outcome: &'static str,
+            cancelled: Arc<AtomicBool>,
+        }
+
+        impl SidecarSearch for MetadataSidecars {
+            fn lexical_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                let mut hit = CandidateHit::with_source(
+                    "src/descriptor.rs",
+                    Some("descriptor_symbol".into()),
+                    0.9,
+                    CandidateSource::Lexical,
+                );
+                hit.node_id = Some("17".into());
+                hit.start_line = Some(1);
+                hit.source_bytes_upper_bound = Some(512);
+                Ok(vec![hit])
+            }
+
+            fn semantic_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+
+            fn scip_anchor(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+
+            fn scip_expand(
+                &self,
+                _anchors: &[CandidateHit],
+                _limit: usize,
+            ) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+
+            fn enrich_packet_calls(
+                &self,
+                candidates: &mut [CandidateHit],
+                context: &SearchExecutionContext,
+            ) -> Result<()> {
+                assert_eq!(
+                    candidates.len(),
+                    1,
+                    "enrichment must follow successful ranking"
+                );
+                assert_eq!(candidates[0].node_id.as_deref(), Some("17"));
+                match self.outcome {
+                    "deadline" | "failure_after_deadline" => {
+                        while !context.is_cancelled() {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                    }
+                    "cancelled" | "failure_after_cancel" => {
+                        self.cancelled.store(true, Ordering::Release);
+                    }
+                    _ => {}
+                }
+                if self.outcome.starts_with("failure") {
+                    bail!("call metadata component changed after validation");
+                }
+                context.check_cancelled()
+            }
+        }
+
+        for outcome in [
+            "deadline",
+            "cancelled",
+            "failure",
+            "failure_after_cancel",
+            "failure_after_deadline",
+            "complete",
+        ] {
+            let cancelled = cancellation_flag();
+            let mut cache = RetrievalCache::new();
+            let result = QueryExecutor {
+                sidecars: Arc::new(MetadataSidecars {
+                    outcome,
+                    cancelled: Arc::clone(&cancelled),
+                }),
+                cache: &mut cache,
+                manifest: Some(sample_manifest()),
+                file_roles: Arc::new(HashMap::new()),
+                cancelled,
+                mode_override: Some(RetrievalDegradedMode::Full),
+            }
+            .execute_packet_descriptors("descriptor_symbol", Some(800));
+            if outcome.starts_with("failure") {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("component changed after validation"),
+                    "{outcome}: publication failures must remain fatal"
+                );
+            } else {
+                let result = result.unwrap_or_else(|error| panic!("{outcome}: {error:#}"));
+                assert_eq!(result.hits.len(), 1, "{outcome}");
+                assert_eq!(result.hits[0].node_id.as_deref(), Some("17"), "{outcome}");
+                assert_eq!(
+                    result.trace.cancel_reason.as_deref(),
+                    (outcome != "complete").then_some(outcome),
+                    "{outcome}"
+                );
+            }
+            assert_eq!(cache.is_empty(), outcome != "complete", "{outcome}");
+        }
     }
 
     #[cfg(feature = "benchmark-support")]

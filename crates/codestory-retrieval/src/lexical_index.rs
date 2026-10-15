@@ -4052,7 +4052,11 @@ fn read_open_database_metadata(
     cancelled: &dyn Fn() -> bool,
 ) -> Result<LexicalShardMetadata> {
     if cancelled() {
-        bail!("lexical search cancelled");
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "lexical search cancelled",
+        )
+        .into());
     }
     lexical_database_schema_version(connection)?;
     let required_tables: u32 = connection.query_row(
@@ -4918,7 +4922,11 @@ pub(crate) fn read_published_call_metadata(
         bail!("call metadata seed bound exceeded");
     }
     if cancelled() {
-        bail!("call metadata read cancelled");
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "call metadata read cancelled",
+        )
+        .into());
     }
     let project = shard
         .file_name()
@@ -4941,7 +4949,11 @@ pub(crate) fn read_published_call_metadata(
             .is_some()
     };
     if cancelled() {
-        bail!("call metadata read cancelled");
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "call metadata read cancelled",
+        )
+        .into());
     }
     if !warm {
         return Ok(HashMap::new());
@@ -4949,7 +4961,11 @@ pub(crate) fn read_published_call_metadata(
     let mut out = HashMap::new();
     for (identity, expected_path) in seeds {
         if cancelled() {
-            bail!("call metadata read cancelled");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "call metadata read cancelled",
+            )
+            .into());
         }
         let Some(id) = identity.strip_prefix("node:") else {
             continue;
@@ -5027,7 +5043,11 @@ pub(crate) fn read_published_call_metadata(
         }
     }
     if cancelled() {
-        bail!("call metadata read cancelled");
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "call metadata read cancelled",
+        )
+        .into());
     }
     Ok(out)
 }
@@ -7117,18 +7137,25 @@ mod tests {
             .unwrap()
             .contains_key("node:7")
         );
-        let last = calls.load(std::sync::atomic::Ordering::SeqCst) - 1;
-        let later = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        assert!(
-            read_published_call_metadata(
+        for stop_at in 0..calls.load(std::sync::atomic::Ordering::SeqCst) {
+            let later = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let error = read_published_call_metadata(
                 &shard,
                 "hash",
                 &seeds,
-                Arc::new(move || later.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= last)
+                Arc::new(move || {
+                    later.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= stop_at
+                }),
             )
-            .is_err(),
-            "cancellation at final boundary discards collected annotations"
-        );
+            .expect_err("every cancellation boundary must discard collected annotations");
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .map(std::io::Error::kind),
+                Some(std::io::ErrorKind::Interrupted),
+                "checkpoint {stop_at}: {error:#}"
+            );
+        }
         // Replace only this test-owned immutable artifact with identical bytes.
         // Its native identity changes, invalidating the warm receipt.
         let file = shard.join(LEXICAL_INDEX_FILE);
