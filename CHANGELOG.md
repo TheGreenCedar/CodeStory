@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Search deadlines and cancellations no longer recommend rebuilding retrieval data; deadline failures suggest retrying or narrowing the query.
+- Search deadlines, cancellations and exhausted packet budgets no longer recommend rebuilding retrieval data; deadline failures suggest retrying or narrowing the request.
 
 - CLI search, packets and query-based navigation prepare missing retrieval data during automatic or full refresh, so a fresh index can be used without a separate retrieval command.
 

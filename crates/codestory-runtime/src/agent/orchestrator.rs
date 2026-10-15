@@ -30,8 +30,9 @@ use crate::agent::profiles::{ResolvedProfile, TrailPlan, resolve_profile};
 use crate::agent::retrieval_primary::{
     RETRIEVAL_VERSION_SIDECAR, SidecarPrimarySearchOutcome, maybe_run_retrieval_shadow,
     preadmit_packet_descriptor_queries_with_policy, sidecar_query_rejection_error,
-    sidecar_retrieval_blocks_nucleo_supplement, sidecar_retrieval_primary_enabled,
-    sidecar_retrieval_unavailable_error, try_sidecar_primary_search_with_policy,
+    sidecar_request_stop_error, sidecar_retrieval_blocks_nucleo_supplement,
+    sidecar_retrieval_primary_enabled, sidecar_retrieval_unavailable_error,
+    try_sidecar_primary_search_with_policy,
 };
 use crate::agent::trace::{TraceRecorder, field};
 use crate::agent::trace_export;
@@ -749,8 +750,9 @@ fn packet_remaining_for_handoff(
         ));
     }
     packet_latency.remaining_for_handoff().ok_or_else(|| {
-        sidecar_retrieval_unavailable_error(
+        sidecar_request_stop_error(
             controller,
+            "deadline",
             format!("packet latency budget exhausted before {phase}"),
         )
     })
@@ -2324,4 +2326,49 @@ fn merge_scored_hits(
     });
     merged.truncate(max_candidates);
     *into = merged;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exhausted_packet_handoff_preserves_phase_without_index_repair() {
+        let fixture = crate::services::activation_tests::ready_activation_fixture();
+        let budget = PacketLatencyBudget {
+            started_at: Instant::now() - std::time::Duration::from_millis(1_001),
+            target_ms: 1_000,
+        };
+        let error = packet_remaining_for_handoff(
+            &fixture.runtime.controller,
+            budget,
+            "descriptor admission",
+        )
+        .expect_err("an exhausted handoff must refuse before descriptor admission");
+        assert_eq!(error.code, "retrieval_unavailable");
+        assert!(
+            error
+                .message
+                .contains("packet latency budget exhausted before descriptor admission")
+        );
+        let details = error.details.as_ref().expect("typed packet budget cause");
+        assert!(
+            details.next_commands.is_empty()
+                && details.minimum_next.is_empty()
+                && details.full_repair.is_empty(),
+            "an exhausted handoff must not prescribe index repair: {error:?}"
+        );
+        assert_eq!(details.cause_code.as_deref(), Some("deadline"));
+        assert_eq!(details.failed_layer.as_deref(), Some("retrieval_query"));
+        assert_eq!(
+            details.project.as_deref(),
+            Some(
+                fixture
+                    .project
+                    .path()
+                    .to_str()
+                    .expect("fixture project path")
+            )
+        );
+    }
 }

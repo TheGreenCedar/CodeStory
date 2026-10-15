@@ -734,26 +734,34 @@ pub(crate) fn sidecar_query_rejection_error(
     if sidecar_mode_can_serve_primary(retrieval_mode)
         && let Some(stop @ ("deadline" | "stage_deadline" | "cancelled")) = cancel_reason
     {
-        let mut details = ApiErrorDetails::cause(stop);
-        details.failed_layer = Some("retrieval_query".into());
-        details.project = Some(
-            controller
-                .require_project_root()
-                .map(|path| path.to_string_lossy().to_string())
-                .unwrap_or_else(|_| "<project>".into()),
-        );
-        let action = if stop == "cancelled" {
-            "The query was cancelled; no index repair is required."
-        } else {
-            "Retry the query or narrow it to a more specific target."
-        };
-        return ApiError::with_details(
-            "retrieval_unavailable",
-            format!("{}; {action}", reason.into()),
-            details,
-        );
+        return sidecar_request_stop_error(controller, stop, reason);
     }
     sidecar_retrieval_unavailable_error(controller, reason)
+}
+
+pub(crate) fn sidecar_request_stop_error(
+    controller: &AppController,
+    stop: &str,
+    reason: impl Into<String>,
+) -> ApiError {
+    let mut details = ApiErrorDetails::cause(stop);
+    details.failed_layer = Some("retrieval_query".into());
+    details.project = Some(
+        controller
+            .require_project_root()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "<project>".into()),
+    );
+    let action = if stop == "cancelled" {
+        "The request was cancelled; no index repair is required."
+    } else {
+        "Retry the request or narrow the question to a more specific target."
+    };
+    ApiError::with_details(
+        "retrieval_unavailable",
+        format!("{}; {action}", reason.into()),
+        details,
+    )
 }
 
 fn sidecar_retrieval_recovery_commands_for_runtime(

@@ -3233,8 +3233,9 @@ impl PublicOperationService {
             return Ok(());
         };
         packet_latency.remaining_for_handoff().ok_or_else(|| {
-            crate::agent::retrieval_primary::sidecar_retrieval_unavailable_error(
+            crate::agent::retrieval_primary::sidecar_request_stop_error(
                 &self.controller,
+                "deadline",
                 format!("packet latency budget exhausted before {phase}"),
             )
         })?;
@@ -3332,8 +3333,9 @@ impl PublicOperationService {
         }
         if active_budget.remaining_for_handoff().is_none() {
             return Some(Err(
-                crate::agent::retrieval_primary::sidecar_retrieval_unavailable_error(
+                crate::agent::retrieval_primary::sidecar_request_stop_error(
                     &self.controller,
+                    "deadline",
                     "packet latency budget exhausted before public packet admission",
                 ),
             ));
@@ -6123,6 +6125,19 @@ pub(crate) mod activation_tests {
             .expect("outer packet completes after the test releases cancellation");
     }
 
+    fn assert_packet_budget_refusal_has_no_index_repair(error: &ApiError) {
+        assert_eq!(error.code, "retrieval_unavailable");
+        let details = error.details.as_ref().expect("typed packet budget cause");
+        assert!(
+            details.next_commands.is_empty()
+                && details.minimum_next.is_empty()
+                && details.full_repair.is_empty(),
+            "an exhausted packet allowance must not prescribe index repair: {error:?}"
+        );
+        assert_eq!(details.cause_code.as_deref(), Some("deadline"));
+        assert_eq!(details.failed_layer.as_deref(), Some("retrieval_query"));
+    }
+
     #[test]
     fn packet_public_owner_refuses_an_expired_inherited_allowance() {
         let fixture = ready_activation_fixture();
@@ -6145,6 +6160,7 @@ pub(crate) mod activation_tests {
                         .contains("packet latency budget exhausted before public packet admission"),
                     "unexpected expired-allowance error: {error:?}"
                 );
+                assert_packet_budget_refusal_has_no_index_repair(&error);
                 Ok(())
             })
             .expect("outer owner retains its post-build checks");
@@ -6311,6 +6327,7 @@ pub(crate) mod activation_tests {
                 .contains("packet latency budget exhausted before public packet admission"),
             "retry must consume the original allowance: {error:?}"
         );
+        assert_packet_budget_refusal_has_no_index_repair(&error);
         let observation = crate::agent::packet_batch::packet_operation_observation_for_test()
             .expect("active packet operation observation");
         assert_eq!(observation.public_admission_reached_count, 2);
@@ -6359,6 +6376,7 @@ pub(crate) mod activation_tests {
                 .contains("packet latency budget exhausted before public packet admission"),
             "retry must preserve the existing admission error: {error:?}"
         );
+        assert_packet_budget_refusal_has_no_index_repair(&error);
         let observation = crate::agent::packet_batch::packet_operation_observation_for_test()
             .expect("active packet operation observation");
         assert_eq!(observation.public_admission_reached_count, 2);
@@ -6391,6 +6409,7 @@ pub(crate) mod activation_tests {
                 .contains("packet latency budget exhausted before public packet admission"),
             "first refusal must preserve the existing admission error: {error:?}"
         );
+        assert_packet_budget_refusal_has_no_index_repair(&error);
         let observation = crate::agent::packet_batch::packet_operation_observation_for_test()
             .expect("active packet operation observation");
         assert_eq!(observation.public_admission_reached_count, 1);
