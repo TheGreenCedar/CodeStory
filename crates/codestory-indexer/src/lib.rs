@@ -2135,7 +2135,7 @@ impl WorkspaceIndexer {
             .saturating_add(duration_ms_u64(type_usage_finalize_started.elapsed()));
 
         // 3.5 Resolve call/import edges post-pass
-        let (resolution_scope_file_ids, expanded_resolution_scope_files) =
+        let (mut resolution_scope_file_ids, expanded_resolution_scope_files) =
             if plan.mode == codestory_workspace::BuildMode::Incremental {
                 let mut file_ids = Self::collect_touched_file_ids(&root, &plan.files_to_index);
                 // Expansion looks for callers unblocked by *new* definitions, so
@@ -2150,13 +2150,29 @@ impl WorkspaceIndexer {
             } else {
                 (HashSet::new(), 0)
             };
+        // Module ownership can invalidate or newly enable a qualified call in an
+        // unchanged file, including a removal-only refresh with no new edges.
+        let mut rust_qualified_caller_files = HashSet::new();
+        let prepared_resolver = if stats.graph_projection_changed || go_return_inputs_changed {
+            let resolver = resolution::ResolutionPass::for_workspace(&root, storage)?;
+            let (invalidated, caller_files) =
+                resolver.invalidate_changed_rust_qualified_call_resolutions(storage)?;
+            stats.graph_projection_changed |= invalidated > 0;
+            rust_qualified_caller_files = caller_files;
+            resolution_scope_file_ids.extend(rust_qualified_caller_files.iter().copied());
+            Some(resolver)
+        } else {
+            None
+        };
         if (stats.graph_projection_changed || go_return_inputs_changed)
             && (had_edges
                 || expanded_resolution_scope_files > 0
                 || !removal_affected_caller_file_ids.is_empty()
-                || go_return_inputs_changed)
+                || go_return_inputs_changed
+                || !rust_qualified_caller_files.is_empty())
         {
-            let resolver = resolution::ResolutionPass::for_workspace(&root, storage)?;
+            let resolver =
+                prepared_resolver.expect("graph changes prepared the resolution context");
             let resolution_scope = if go_return_inputs_changed {
                 // Factory signatures and module ownership can change without a
                 // caller source byte changing. Reset and recompute this narrow
@@ -4718,6 +4734,17 @@ fn rebase_cached_index_artifact(
         input.caller = input
             .caller
             .map(|caller| id_remap.get(&caller).copied().unwrap_or(caller));
+        if let Some(path) = &mut input.ordinary_rust_path {
+            path.associated_owner = path
+                .associated_owner
+                .map(|owner| id_remap.get(&owner).copied().unwrap_or(owner));
+            if let Some(import) = &mut path.import {
+                import.import = id_remap
+                    .get(&import.import)
+                    .copied()
+                    .unwrap_or(import.import);
+            }
+        }
         use cache::CachedResolutionBinding;
         input.binding = match input.binding.clone() {
             CachedResolutionBinding::SameFile {
@@ -17515,6 +17542,17 @@ mod proof_resolution_cache_tests {
                         },
                         method_name: "target".to_owned(),
                     },
+                    ordinary_rust_path: Some(cache::CachedRustQualifiedPath {
+                        module_path: Vec::new(),
+                        components: vec!["C".to_owned(), "target".to_owned()],
+                        import: Some(cache::CachedRustUseBinding {
+                            module_path: Vec::new(),
+                            local_name: "C".to_owned(),
+                            components: vec!["crate".to_owned(), "C".to_owned()],
+                            import: old_import,
+                        }),
+                        associated_owner: Some(old_owner),
+                    }),
                     language: "typescript".to_owned(),
                     adapter_version: "reference-v9".to_owned(),
                     parser_fingerprint: "b".repeat(64),
@@ -17531,6 +17569,7 @@ mod proof_resolution_cache_tests {
                         },
                         method_name: "target".to_owned(),
                     },
+                    ordinary_rust_path: None,
                     language: "typescript".to_owned(),
                     adapter_version: "reference-v9".to_owned(),
                     parser_fingerprint: "b".repeat(64),
@@ -17633,6 +17672,19 @@ mod proof_resolution_cache_tests {
                 class_binding: CachedClassBinding::StaticImport { import, .. }, ..
             } if *import == new_import
         ));
+        let ordinary_path = rebased.call_resolution_inputs[0]
+            .ordinary_rust_path
+            .as_ref()
+            .expect("ordinary Rust metadata");
+        assert_eq!(ordinary_path.associated_owner, Some(new_owner));
+        assert_eq!(
+            ordinary_path
+                .import
+                .as_ref()
+                .expect("ordinary import")
+                .import,
+            new_import
+        );
         let file = rebased.resolution_file.expect("resolution file");
         assert_eq!(file.file_id, new_file);
         assert_eq!(file.top_level_declarations[0].declaration, new_method);

@@ -14609,12 +14609,12 @@ fn rust_old_root_adapter_rejects_replay_then_reparses_and_reuses() -> anyhow::Re
         let mut artifact = decode_index_artifact_json(&blob)?;
         // Simulated prior version identity on current syntax payload. Root
         // identity itself is derived during projection, not serialized here.
-        artifact["resolution_file"]["adapter_version"] = "reference-v19".into();
+        artifact["resolution_file"]["adapter_version"] = "reference-v20".into();
         for call in artifact["call_resolution_inputs"]
             .as_array_mut()
             .expect("cached calls")
         {
-            call["adapter_version"] = "reference-v19".into();
+            call["adapter_version"] = "reference-v20".into();
         }
         store.get_connection().execute(
             "UPDATE index_artifact_cache SET artifact_blob = ?1 WHERE rowid = ?2",
@@ -14662,7 +14662,7 @@ fn rust_old_root_adapter_rejects_replay_then_reparses_and_reuses() -> anyhow::Re
             store
                 .get_proof_resolution_facts()?
                 .iter()
-                .all(|fact| fact.provenance.language_adapter_version == "reference-v20")
+                .all(|fact| fact.provenance.language_adapter_version == "reference-v21")
         );
     }
     Ok(())
@@ -14933,7 +14933,7 @@ fn rust_glob_local_calls_preserve_repeated_source_coordinates_and_provenance() -
     );
     assert!(facts.iter().all(|fact| {
         fact.provenance.language_adapter == "rust"
-            && fact.provenance.language_adapter_version == "reference-v20"
+            && fact.provenance.language_adapter_version == "reference-v21"
             && fact.provenance.dependency_file_hashes.len() == 1
             && matches!(
                 fact.evidence_chain.as_slice(),
@@ -15429,7 +15429,7 @@ fn proof_resolution_roster_tracks_the_current_adapter_version() -> anyhow::Resul
             .iter()
             .find(|adapter| adapter.language == "rust")
             .map(|adapter| adapter.adapter_version.as_str()),
-        Some("reference-v20")
+        Some("reference-v21")
     );
     assert_eq!(
         receipt
@@ -15558,7 +15558,7 @@ fn rust_bounded_callsite_regions_preserve_coordinates_order_and_provenance() -> 
             (start as usize - line_start + 1) as u32
         );
         assert_eq!(fact.provenance.language_adapter, "rust");
-        assert_eq!(fact.provenance.language_adapter_version, "reference-v20");
+        assert_eq!(fact.provenance.language_adapter_version, "reference-v21");
         assert_eq!(fact.provenance.dependency_file_hashes.len(), 1);
         assert!(matches!(
             fact.evidence_chain.as_slice(),

@@ -301,7 +301,7 @@ fn stale_rust_extraction_replaces_old_macro_duplicates_even_with_current_cached_
         end_col: Some(10),
         ..Node::default()
     })?;
-    let legacy_revision = "rust-callable-declaration-v2";
+    let legacy_revision = "rust-callable-declaration-v3";
     assert_ne!(
         revision, legacy_revision,
         "the previous Rust producer must be retired"

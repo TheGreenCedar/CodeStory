@@ -55,9 +55,20 @@ pub(crate) struct CachedCallResolutionInput {
     pub callsite: ExactCallsite,
     pub caller: Option<NodeId>,
     pub binding: CachedResolutionBinding,
+    #[serde(default)]
+    pub ordinary_rust_path: Option<CachedRustQualifiedPath>,
     pub language: String,
     pub adapter_version: String,
     pub parser_fingerprint: String,
+}
+
+/// Source-bound navigation metadata, independent of strict Exact admission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedRustQualifiedPath {
+    pub module_path: Vec<String>,
+    pub components: Vec<String>,
+    pub import: Option<CachedRustUseBinding>,
+    pub associated_owner: Option<NodeId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -294,6 +305,10 @@ pub(crate) struct CachedRustModule {
     pub module_path: Vec<String>,
     pub declaration: Option<NodeId>,
     pub domain_complete: bool,
+    // Nominal navigation can retain explicit names beside cfg siblings/globs;
+    // strict Exact admission continues to use domain_complete. Old caches refuse.
+    #[serde(default)]
+    pub ordinary_path_complete: bool,
     #[serde(default)]
     pub value_blockers: Vec<String>,
     #[serde(default)]

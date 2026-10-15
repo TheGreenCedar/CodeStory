@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Rust call navigation preserves explicit local module paths, so a same-named wrapper is not mistaken for the called function. Unsupported or ambiguous qualified paths remain unresolved. Existing Rust indexes rebuild on their next refresh.
+
 - Change-impact results show typed symbols before unknown occurrences within the result limit, keeping identifiable downstream impacts visible. Direct evidence describes indexed symbols or occurrences without claiming each is a declaration.
 
 - Rust import navigation reaches declarations when several files import the same symbol, rather than another import occurrence or a weaker partial-name module match. Tied matches in Rust semantic resolution remain unresolved. Existing Rust indexes rebuild once on their next refresh.

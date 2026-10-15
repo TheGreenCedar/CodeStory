@@ -744,6 +744,7 @@ pub struct ResolutionPass {
     policy: ResolutionPolicy,
     semantic_resolvers: SemanticResolverRegistry,
     go_context: Option<GoResolutionContext>,
+    rust_qualified_calls: HashMap<i64, Option<i64>>,
 }
 
 #[derive(Debug)]
@@ -1131,13 +1132,64 @@ impl ResolutionPass {
             policy,
             semantic_resolvers: SemanticResolverRegistry::new(flags.enable_semantic),
             go_context: None,
+            rust_qualified_calls: HashMap::new(),
         }
     }
 
     pub(crate) fn for_workspace(root: &Path, storage: &Storage) -> Result<Self> {
         let mut pass = Self::new();
         pass.go_context = Some(GoResolutionContext::load(root, storage)?);
+        pass.rust_qualified_calls =
+            crate::proof_resolution::ordinary_rust_qualified_call_resolutions(storage)?;
         Ok(pass)
+    }
+
+    pub(crate) fn invalidate_changed_rust_qualified_call_resolutions(
+        &self,
+        storage: &Storage,
+    ) -> Result<(usize, HashSet<i64>)> {
+        if self.rust_qualified_calls.is_empty() {
+            return Ok((0, HashSet::new()));
+        }
+        let conn = storage.get_connection();
+        let mut statement = conn.prepare_cached(
+            "SELECT id, file_node_id, resolved_target_node_id FROM edge WHERE kind = ?1",
+        )?;
+        let changed = statement
+            .query_map([EdgeKind::CALL as i32], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            })?
+            .filter_map(|row| match row {
+                Ok((edge, Some(file), previous))
+                    if self
+                        .rust_qualified_calls
+                        .get(&edge)
+                        .is_some_and(|current| *current != previous) =>
+                {
+                    Some(Ok((edge, file, previous.is_some())))
+                }
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        let mut clear = conn.prepare_cached(
+            "UPDATE edge SET resolved_target_node_id = NULL, confidence = NULL,
+             certainty = NULL, candidate_target_node_ids = NULL WHERE id = ?1 AND kind = ?2",
+        )?;
+        let mut invalidated = 0;
+        let mut caller_files = HashSet::new();
+        for (edge, file, previously_resolved) in changed {
+            caller_files.insert(file);
+            if previously_resolved {
+                invalidated += clear.execute(params![edge, EdgeKind::CALL as i32])?;
+            }
+        }
+        Ok((invalidated, caller_files))
     }
 
     pub(crate) fn invalidate_go_package_function_resolutions(
@@ -4678,6 +4730,7 @@ mod tests {
             policy: ResolutionPolicy::for_flags(flags),
             semantic_resolvers: SemanticResolverRegistry::new(true),
             go_context: None,
+            rust_qualified_calls: HashMap::new(),
         };
         let rows = vec![
             (
@@ -4729,6 +4782,7 @@ mod tests {
             policy: ResolutionPolicy::for_flags(flags),
             semantic_resolvers: SemanticResolverRegistry::new(true),
             go_context: None,
+            rust_qualified_calls: HashMap::new(),
         };
         let rows = vec![(
             1_i64,
@@ -4781,6 +4835,7 @@ mod tests {
             policy: ResolutionPolicy::for_flags(flags),
             semantic_resolvers: SemanticResolverRegistry::new(false),
             go_context: None,
+            rust_qualified_calls: HashMap::new(),
         };
         let row = (
             1_i64,

@@ -17,6 +17,14 @@ pub(super) fn compute_call_resolution(
         callsite_identity,
         caller_kind,
     ) = row;
+    if let Some(target) = pass.rust_qualified_calls.get(edge_id) {
+        let selected = target.map(|target| (target, pass.policy.call_same_module));
+        let candidates = target.iter().copied().collect::<Vec<_>>();
+        return Ok(ComputedResolution {
+            update: build_resolved_edge_update(*edge_id, selected, &candidates)?,
+            strategy: target.map(|_| ResolutionStrategy::CallSameModule),
+        });
+    }
     let receiver_owner = receiver_owner_from_callsite(callsite_identity.as_deref());
     let receiver_module = receiver_module_from_callsite(callsite_identity.as_deref());
     let dart_import_modules = receiver_module.and_then(dart_unprefixed_import_modules);
@@ -945,6 +953,7 @@ mod tests {
             policy: ResolutionPolicy::for_flags(flags),
             semantic_resolvers: SemanticResolverRegistry::new(flags.enable_semantic),
             go_context: None,
+            rust_qualified_calls: HashMap::new(),
         }
     }
 

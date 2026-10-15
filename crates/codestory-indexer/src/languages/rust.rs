@@ -87,7 +87,7 @@ fn rust_language() -> tree_sitter::Language {
     tree_sitter_rust::LANGUAGE.into()
 }
 
-pub(crate) const CALLABLE_DECLARATION_REVISION: &str = "rust-callable-declaration-v3";
+pub(crate) const CALLABLE_DECLARATION_REVISION: &str = "rust-callable-declaration-v4";
 
 pub(crate) fn callable_declaration_span(node: TsNode<'_>) -> GraphNodeSpan {
     let mut span = ts_node_graph_span(node);
