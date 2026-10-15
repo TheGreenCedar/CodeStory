@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Change-impact results show typed symbols before unknown occurrences within the result limit, keeping identifiable downstream impacts visible. Direct evidence describes indexed symbols or occurrences without claiming each is a declaration.
+
 - Rust import navigation reaches declarations when several files import the same symbol, rather than another import occurrence or a weaker partial-name module match. Tied matches in Rust semantic resolution remain unresolved. Existing Rust indexes rebuild once on their next refresh.
 
 - Search results retain indexed display names beside their source locations, including matches without captured excerpts. Custom strict clients must support publication stamp schema 5; the evidence payload family remains schema 3.

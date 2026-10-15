@@ -1220,10 +1220,10 @@ fn affected_unrelated_stale_file_does_not_downgrade_fresh_requested_identity() {
     let project = tempdir().expect("project");
     let source_dir = project.path().join("src");
     fs::create_dir(&source_dir).expect("create source directory");
-    let requested = source_dir.join("requested.rs");
-    let unrelated = source_dir.join("unrelated.rs");
-    fs::write(&requested, "pub fn requested() {}\n").expect("write requested source");
-    fs::write(&unrelated, "pub fn unrelated() {}\n").expect("write unrelated source");
+    let requested = source_dir.join("requested.js");
+    let unrelated = source_dir.join("unrelated.js");
+    fs::write(&requested, "export function requested() {}\n").expect("write requested source");
+    fs::write(&unrelated, "export function unrelated() {}\n").expect("write unrelated source");
     let requested_mtime = fs::metadata(&requested)
         .expect("requested metadata")
         .modified()
@@ -1239,7 +1239,7 @@ fn affected_unrelated_stale_file_does_not_downgrade_fresh_requested_identity() {
             FileInfo {
                 id: 1,
                 path: requested.clone(),
-                language: "rust".to_string(),
+                language: "javascript".to_string(),
                 modification_time: requested_mtime,
                 indexed: true,
                 complete: true,
@@ -1249,7 +1249,7 @@ fn affected_unrelated_stale_file_does_not_downgrade_fresh_requested_identity() {
             FileInfo {
                 id: 2,
                 path: unrelated.clone(),
-                language: "rust".to_string(),
+                language: "javascript".to_string(),
                 modification_time: 0,
                 indexed: true,
                 complete: true,
@@ -1293,7 +1293,7 @@ fn affected_unrelated_stale_file_does_not_downgrade_fresh_requested_identity() {
 
     let result = controller
         .affected_analysis(AffectedAnalysisRequest {
-            input: AffectedAnalysisInput::Paths(vec!["src/requested.rs".to_string()]),
+            input: AffectedAnalysisInput::Paths(vec!["src/requested.js".to_string()]),
             depth: Some(1),
             filter: None,
         })
@@ -2159,6 +2159,182 @@ fn affected_graph_cycle_terminates_and_result_caps_are_enforced() {
 }
 
 #[test]
+fn affected_symbol_prefix_retains_typed_impacts_before_unknown_occurrences() {
+    let process_cache = tempdir().expect("owned runtime cache root");
+    let project = tempdir().expect("project");
+    let source_path = project.path().join("src/lib.rs");
+    let test_path = project.path().join("tests/downstream.rs");
+    fs::create_dir_all(source_path.parent().unwrap()).expect("source directory");
+    fs::create_dir_all(test_path.parent().unwrap()).expect("test directory");
+    fs::write(
+        &source_path,
+        "pub fn control_beta() {}\npub fn control_alpha() {}\n",
+    )
+    .expect("source");
+    fs::write(
+        &test_path,
+        "#[test]\nfn control_downstream() { control_alpha(); }\n",
+    )
+    .expect("test source");
+    {
+        let mut storage = Storage::open(project.path().join("codestory.db")).expect("storage");
+        for (id, path) in [(1, &source_path), (10, &test_path)] {
+            let modification_time = fs::metadata(path)
+                .expect("metadata")
+                .modified()
+                .expect("mtime")
+                .duration_since(UNIX_EPOCH)
+                .expect("mtime since epoch")
+                .as_millis()
+                .min(i64::MAX as u128) as i64;
+            storage
+                .insert_file(&FileInfo {
+                    id,
+                    path: path.clone(),
+                    language: "rust".to_string(),
+                    modification_time,
+                    indexed: true,
+                    complete: true,
+                    line_count: 2,
+                    file_role: codestory_store::FileRole::Source,
+                })
+                .expect("insert file");
+        }
+        let mut nodes = vec![
+            Node {
+                id: CoreNodeId(1),
+                kind: NodeKind::FILE,
+                serialized_name: source_path.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            Node {
+                id: CoreNodeId(10),
+                kind: NodeKind::FILE,
+                serialized_name: test_path.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+        ];
+        for (id, name, file_id, line) in [
+            (2, "control_beta", 1, 1),
+            (3, "control_alpha", 1, 2),
+            (20, "control_downstream", 10, 2),
+        ] {
+            nodes.push(Node {
+                id: CoreNodeId(id),
+                kind: NodeKind::FUNCTION,
+                serialized_name: name.to_string(),
+                file_node_id: Some(CoreNodeId(file_id)),
+                start_line: Some(line),
+                ..Default::default()
+            });
+        }
+        // More than the public cap of direct callsite occurrences must not
+        // hide the identifiable caller reached outside the changed file.
+        for index in 0..205_i64 {
+            nodes.push(Node {
+                id: CoreNodeId(1_000 + index),
+                kind: NodeKind::UNKNOWN,
+                serialized_name: format!("placeholder_{index:03}"),
+                file_node_id: Some(CoreNodeId(1)),
+                start_line: Some(1),
+                ..Default::default()
+            });
+        }
+        storage.insert_nodes_batch(&nodes).expect("insert nodes");
+        storage
+            .insert_edges_batch(&[Edge {
+                id: EdgeId(2_000),
+                source: CoreNodeId(20),
+                target: CoreNodeId(3),
+                kind: EdgeKind::CALL,
+                file_node_id: Some(CoreNodeId(10)),
+                line: Some(2),
+                confidence: Some(0.95),
+                certainty: Some(ResolutionCertainty::Certain),
+                ..Default::default()
+            }])
+            .expect("insert downstream call");
+    }
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
+    controller
+        .open_project(OpenProjectRequest {
+            path: project.path().to_string_lossy().into_owned(),
+        })
+        .expect("open project");
+    for (filter, total, direct, propagated) in [
+        (None, 208, 207, 1),
+        (Some("control"), 3, 2, 1),
+        (Some("placeholder"), 205, 205, 0),
+    ] {
+        let result = controller
+            .affected_analysis(AffectedAnalysisRequest {
+                input: AffectedAnalysisInput::Paths(vec!["src/lib.rs".to_string()]),
+                depth: Some(2),
+                filter: filter.map(str::to_string),
+            })
+            .expect("affected analysis");
+        if filter != Some("placeholder") {
+            assert_eq!(
+                result
+                    .impacted_symbols
+                    .iter()
+                    .take(3)
+                    .map(|symbol| symbol.node_id.0.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["3", "2", "20"],
+                "known symbols keep distance/name order and precede unknown occurrences"
+            );
+            let hint = result
+                .impacted_tests
+                .iter()
+                .find(|hint| hint.path == "tests/downstream.rs")
+                .expect("retained downstream test hint");
+            assert_eq!(hint.impacted_symbol_count, 1);
+            assert_eq!(hint.distance, 1);
+            assert_eq!(hint.graph_depth, 1);
+            assert_eq!(hint.confidence, "certain");
+            assert!(hint.reason.contains("reached by affected graph walk"));
+        }
+        let unknowns = result
+            .impacted_symbols
+            .iter()
+            .filter(|symbol| symbol.kind == crate::NodeKind::UNKNOWN)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            unknowns.len(),
+            if filter == Some("control") {
+                0
+            } else if filter.is_none() {
+                197
+            } else {
+                200
+            }
+        );
+        for occurrence in unknowns {
+            assert_eq!(occurrence.distance, 0);
+            assert_eq!(occurrence.confidence, "direct");
+            assert!(occurrence.reason.contains("occurrence"));
+            assert!(!occurrence.reason.contains("declared"));
+        }
+        assert_eq!(result.impacted_symbols.len(), total.min(200));
+        assert_eq!(result.bounds.impacted_symbol_limit, 200);
+        assert_eq!(result.bounds.visited_node_count, 209);
+        assert_eq!(result.bounds.visited_edge_count, 1);
+        assert_eq!(result.completeness.direct_impact_count, direct);
+        assert_eq!(result.completeness.propagated_impact_count, propagated);
+        assert_eq!(result.completeness.truncated, total > 200);
+        assert_eq!(
+            result.completeness.truncation_reasons,
+            if total > 200 {
+                vec![format!("impacted_symbols retained 200 of {total} results")]
+            } else {
+                Vec::new()
+            }
+        );
+    }
+}
+
+#[test]
 fn indexable_source_path_tracks_indexer_structural_and_template_surfaces() {
     for relative_path in [
         "src/lib.rs",
@@ -2556,7 +2732,7 @@ fn insert_current_indexed_file(storage: &Storage, id: i64, path: &Path) {
         .insert_file(&FileInfo {
             id,
             path: path.to_path_buf(),
-            language: "rust".into(),
+            language: "javascript".into(),
             modification_time,
             indexed: true,
             complete: true,
@@ -2569,9 +2745,9 @@ fn insert_current_indexed_file(storage: &Storage, id: i64, path: &Path) {
 #[test]
 fn newly_discovered_hardlink_alias_remains_new_for_freshness() {
     let project = tempdir().expect("project");
-    let indexed = project.path().join("lib.rs");
-    let alias = project.path().join("alias.rs");
-    fs::write(&indexed, "pub fn indexed() {}\n").expect("write indexed source");
+    let indexed = project.path().join("lib.js");
+    let alias = project.path().join("alias.js");
+    fs::write(&indexed, "export function indexed() {}\n").expect("write indexed source");
     fs::hard_link(&indexed, &alias).expect("create source hardlink alias");
     let workspace = WorkspaceManifest::open(project.path().to_path_buf()).expect("workspace");
     let storage = Storage::new_in_memory().expect("storage");
@@ -2584,16 +2760,16 @@ fn newly_discovered_hardlink_alias_remains_new_for_freshness() {
     assert_eq!(freshness.new_file_count, 1);
     assert_eq!(freshness.removed_file_count, 0);
     assert!(freshness.samples.iter().any(|sample| {
-        sample.kind == IndexFreshnessChangeKindDto::New && sample.path == "alias.rs"
+        sample.kind == IndexFreshnessChangeKindDto::New && sample.path == "alias.js"
     }));
 }
 
 #[test]
 fn unsupported_extension_hardlink_alias_stays_outside_freshness() {
     let project = tempdir().expect("project");
-    let indexed = project.path().join("lib.rs");
+    let indexed = project.path().join("lib.js");
     let alias = project.path().join("source-alias.unsupported-binary");
-    fs::write(&indexed, "pub fn indexed() {}\n").expect("write indexed source");
+    fs::write(&indexed, "export function indexed() {}\n").expect("write indexed source");
     fs::hard_link(&indexed, &alias).expect("create unsupported hardlink alias");
     assert!(!indexable_source_path(&alias));
     let workspace = WorkspaceManifest::open(project.path().to_path_buf()).expect("workspace");
@@ -2648,8 +2824,8 @@ fn incomplete_run_fence_wins_before_indexed_inventory() {
 #[test]
 fn owned_freshness_observation_pins_fence_and_inventory_across_a_concurrent_writer() {
     let project = tempdir().expect("project");
-    let source_path = project.path().join("lib.rs");
-    fs::write(&source_path, "pub fn indexed() {}\n").expect("write source");
+    let source_path = project.path().join("lib.js");
+    fs::write(&source_path, "export function indexed() {}\n").expect("write source");
     let modification_time = fs::metadata(&source_path)
         .expect("source metadata")
         .modified()
@@ -2665,7 +2841,7 @@ fn owned_freshness_observation_pins_fence_and_inventory_across_a_concurrent_writ
         .insert_file(&FileInfo {
             id: 1,
             path: source_path,
-            language: "rust".into(),
+            language: "javascript".into(),
             modification_time,
             indexed: true,
             complete: true,
@@ -2688,7 +2864,7 @@ fn owned_freshness_observation_pins_fence_and_inventory_across_a_concurrent_writ
     let (release_writer, writer_released) = std::sync::mpsc::channel();
     let (writer_done, await_writer) = std::sync::mpsc::channel();
     let writer_storage_path = storage_path.clone();
-    let projected_after_fence = project.path().join("removed-after-fence.rs");
+    let projected_after_fence = project.path().join("removed-after-fence.js");
     let writer = std::thread::spawn(move || {
         writer_released.recv().expect("release concurrent writer");
         let storage = Storage::open(&writer_storage_path).expect("open concurrent writer");
@@ -2699,7 +2875,7 @@ fn owned_freshness_observation_pins_fence_and_inventory_across_a_concurrent_writ
             .insert_file(&FileInfo {
                 id: 2,
                 path: projected_after_fence,
-                language: "rust".into(),
+                language: "javascript".into(),
                 modification_time: 0,
                 indexed: true,
                 complete: true,
@@ -2744,8 +2920,8 @@ fn owned_freshness_observation_pins_fence_and_inventory_across_a_concurrent_writ
 #[test]
 fn parser_partial_freshness_distinguishes_file_level_errors() {
     let project = tempdir().expect("project");
-    let source_path = project.path().join("lib.rs");
-    fs::write(&source_path, "pub fn indexed() {}\n").expect("write source");
+    let source_path = project.path().join("lib.js");
+    fs::write(&source_path, "export function indexed() {}\n").expect("write source");
     let modification_time = fs::metadata(&source_path)
         .expect("metadata")
         .modified()
@@ -2760,7 +2936,7 @@ fn parser_partial_freshness_distinguishes_file_level_errors() {
         .insert_file(&FileInfo {
             id: 1,
             path: source_path,
-            language: "rust".into(),
+            language: "javascript".into(),
             modification_time,
             indexed: true,
             complete: false,
