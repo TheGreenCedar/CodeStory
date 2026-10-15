@@ -148,6 +148,16 @@ logical row attempts, prepared-statement executions, and estimated raw bind
 payload bytes by family; the byte count describes input shape, not database,
 WAL, or physical-write bytes.
 
+Schema v37 adds durable `file_extraction_identity` rows binding a file's
+language, verified source hash and extraction revision. They commit with the
+file/hash/graph projection and are removed with the file. Migration creates no
+identity for legacy projections. The existing schema compatibility fence
+requires one full rebuild for an older Core; later same-schema revision
+mismatches select only affected files through normal refresh planning. Python
+and Rust require this identity, including files with no callables. Status and
+doctor only observe incompatible or outdated state, and failed or cancelled
+staged work leaves the previous published generation available.
+
 Legacy promotion journals record candidate and rollback structural identities.
 Their recovery validates the recorded manifest and current row digest before
 accepting a database. Current publication installs a sealed immutable generation
@@ -187,6 +197,24 @@ unique candidate. Ambiguity never guesses: the annotation becomes a visible,
 user-owned orphan carrying `orphan_reason` and its last known evidence until an
 explicit relink or delete.
 
+Generated Rust ordinal keys use the permanent `rust-ordinal-v2:` namespace after
+retiring duplicate macro-caller declarations. The epoch covers references and
+all other generated ordinal kinds as well as declarations; FILE, type-like and
+preserved special keys keep their existing identities. Fresh extraction and
+cached rebasing use the authoritative language and the same namespace. Rebase
+retains an authenticated current-epoch ordinal while replacing its file prefix.
+Rust's extraction revision retires prior durable and parser-cache projections.
+
+An old or missing canonical key cannot enter this namespace merely because its
+file/name/kind tuple is unique now. A unique current tuple requires affirmative
+prior tuple uniqueness, or an exactly matching strong `shape:` signature that
+was previously unique within the file. Missing historical evidence, weak or
+changed signatures, and ambiguous current tuples produce a visible orphan
+immediately. Repeated resolution preserves that refusal and the old evidence.
+Epoching edge targets can itself change a shape signature, so this exception
+does not promise migration for every old macro helper. Same-epoch canonical
+lookup retains its existing priority, including across body edits.
+
 The two inferences are looked up from opposite ends, because a rename and a move
 change opposite halves of the anchor. A move keeps the qualified name and
 changes the file, so it is found by name in another file and then checked
@@ -208,7 +236,8 @@ accepts either, because the qualified name has already identified the symbol and
 the signature only has to agree.
 
 Each bind also records how well its evidence separated the symbol at the time —
-whether the signature matched exactly one symbol of that kind in the file, and
+whether the complete file/name/kind tuple was unique, whether the signature
+matched exactly one symbol of that kind in the file, and
 whether the qualified name matched exactly one symbol anywhere. An inference may
 only rest on evidence that was discriminating when it was proven, so a surviving
 same-shaped sibling never inherits a deleted symbol's annotation.
@@ -218,7 +247,9 @@ rebind resolves every bookmark before writing and commits the outcomes in one
 sidecar transaction; a failed query or write leaves the prior evidence intact.
 That persisted generation is the retry checkpoint: the next core writer catches
 it up against the still-current complete generation before publishing another.
-The adjacent-generation rule for changed anchors remains unchanged.
+The adjacent-generation rule for changed anchors remains unchanged. The old-Core
+catch-up computes this evidence before replacing the publication. Old serialized
+discrimination defaults missing tuple uniqueness to false without a schema bump.
 
 The migration is paired with the schema-31 core writer barrier. Forward-only
 migration already refuses a newer schema, so a 0.16.3 CLI opening a migrated
@@ -276,3 +307,18 @@ helpers, not an operator workflow.
 - a structural cache row is copied through the generic parser cache or is
   published without matching source and projection identities;
 - a partial promotion can be reported as successful.
+
+## Bounded graph navigation
+
+Trail expansion prioritizes certain edges to known effective neighbors before
+the streamed edge and BFS node caps. Explicit certainty wins over confidence;
+legacy confidence uses the shared certain threshold only when certainty is absent.
+All other edges retain deterministic edge-ID order. This ordering does not change
+edge certainty, perform resolution, or establish runtime call behavior.
+Unknown or speculative targets remain visible when capacity permits.
+
+When an edge cap truncates a fetch, BFS still drains its existing bounded queue
+up to the node cap. It skips further expansion once the global edge budget is
+exhausted. Truncation and omitted-edge receipts remain explicit; the result cannot
+establish graph completeness. Caller scope, utility and edge filters still run
+before accepted edges consume the fetch budget.

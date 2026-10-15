@@ -1,6 +1,6 @@
 //! Bounded, post-publication retention for one sidecar namespace.
 
-use crate::config::{SidecarLayout, SidecarProfile, SidecarRuntimeConfig};
+use crate::config::{SidecarLayout, SidecarRuntimeConfig};
 use anyhow::{Context, Result, bail};
 use codestory_contracts::bounded_locks::{
     self, FileLockError, FileLockKind, LockDeadline, PUBLICATION_LOCK_WAIT, acquire_with_deadline,
@@ -38,17 +38,9 @@ const RETENTION_LOCK_EXTENSION: &str = "lock";
 pub const GLOBAL_GENERATION_GC_LOCK_SCOPE: &str = "global_generation_gc";
 
 pub fn global_generation_gc_state_file(runtime: &SidecarRuntimeConfig) -> PathBuf {
-    let base = match runtime.profile {
-        SidecarProfile::Local => runtime.layout.state_file.parent(),
-        SidecarProfile::Agent => runtime
-            .layout
-            .state_file
-            .parent()
-            .and_then(Path::parent)
-            .and_then(Path::parent),
-    }
-    .unwrap_or_else(|| Path::new("."));
-    base.join("generation-retention-coordination.state")
+    runtime
+        .cache_root
+        .join("generation-retention-coordination.state")
 }
 
 /// Workspace registration carried by a schema-2 marker.
@@ -594,9 +586,28 @@ impl ObservedRetentionLock {
 pub(crate) struct GenerationRetentionLease {
     _global: GenerationRetentionLock,
     _project: GenerationRetentionLock,
+    _origin: Option<GenerationRetentionLock>,
 }
 
 impl GenerationRetentionLease {
+    pub(crate) fn retain_origin(
+        &mut self,
+        consumer: &SidecarRuntimeConfig,
+        producer: &SidecarRuntimeConfig,
+        project_id: &str,
+    ) -> Result<()> {
+        if !codestory_workspace::same_workspace_path(
+            &consumer.layout.state_file,
+            &producer.layout.state_file,
+        ) {
+            self._origin = Some(
+                GenerationRetentionLock::acquire_shared(&producer.layout.state_file, project_id)
+                    .context("pin producer-owned retrieval generation")?,
+            );
+        }
+        Ok(())
+    }
+
     pub(crate) fn acquire_for_query(
         runtime: &SidecarRuntimeConfig,
         project_id: &str,
@@ -612,6 +623,7 @@ impl GenerationRetentionLease {
         Ok(Self {
             _global: global,
             _project: project,
+            _origin: None,
         })
     }
 }
@@ -626,7 +638,6 @@ pub fn retention_lock_path(state_file: &Path, scope_id: &str) -> Result<PathBuf>
     Ok(retention_dir(state_file).join(format!("{scope_id}.lock")))
 }
 
-#[cfg(test)]
 pub fn read_retention_marker(
     state_file: &Path,
     workspace_id: &str,
@@ -714,10 +725,22 @@ pub fn scan_retention_protection(
         // ladder, so a scan of another project's cache would rewrite a
         // database this process does not own. An observer that refuses is
         // reported as unreadable protection evidence instead.
-        match Store::open_observational(&storage_path)
-            .and_then(|store| store.list_retrieval_index_publications())
-        {
+        match Store::observe_retrieval_index_publications(&storage_path) {
             Ok(publications) => {
+                // Every row can protect a shared scope, including a foreign
+                // project row. Invalid identities are uncertainty, not absence.
+                let invalid = publications.iter().find_map(|(current, rollback)| {
+                    std::iter::once(current)
+                        .chain(rollback.as_ref().map(|record| &record.manifest))
+                        .find_map(|manifest| canonical_manifest_generation(manifest).err())
+                });
+                if let Some(error) = invalid {
+                    scan.record_incomplete(format!(
+                        "observe retrieval manifests in {}: invalid protection identity: {error:#}",
+                        storage_path.display()
+                    ));
+                    continue;
+                }
                 let manifests = publications
                     .iter()
                     .map(|(manifest, _)| manifest.clone())
@@ -1822,11 +1845,13 @@ pub(crate) fn directory_size(path: &Path) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::SidecarProfile;
     use std::time::{Duration, Instant};
     use tempfile::tempdir;
 
     fn manifest(project_id: &str, suffix: &str, built_at_epoch_ms: i64) -> RetrievalIndexManifest {
         RetrievalIndexManifest {
+            artifact_scope: None,
             project_id: project_id.into(),
             lexical_version: "v1".into(),
             semantic_generation: format!("codestory_{project_id}_{suffix}"),
@@ -1880,9 +1905,155 @@ mod tests {
     }
 
     #[test]
+    fn legacy_cache_protects_shared_current_and_rollback_without_migration() {
+        let root = tempdir().expect("root");
+        let layout = layout(root.path());
+        let project = "repo-v1-project";
+        let active = manifest(project, "aaaaaaaaaaaaaaaa", 2);
+        let rollback = codestory_store::RetrievalIndexRollbackRecord {
+            manifest: manifest(project, "bbbbbbbbbbbbbbbb", 1),
+            verified_at_epoch_ms: 2,
+        };
+        let path = root.path().join("old-neighbour").join("codestory.db");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut store = Store::open(&path).unwrap();
+        store
+            .publish_retrieval_index_publication(&active, Some(&rollback))
+            .unwrap();
+        drop(store);
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .pragma_update(None, "user_version", 32)
+            .unwrap();
+        for suffix in ["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb", "cccccccccccccccc"] {
+            write_bundle(&layout, project, suffix, [1, 1, 1]);
+        }
+        let before = std::fs::read(&path).unwrap();
+        let protection = scan_retention_protection(root.path(), None, &layout.state_file);
+        assert!(!protection.protection_incomplete, "{:?}", protection.errors);
+        assert!(protection.storage_paths_scanned.contains(&path));
+        let plan = plan_generation_retention(&layout, project, &protection);
+        assert!(!plan.pruning_suppressed, "{:?}", plan.errors);
+        assert_eq!(
+            plan.bundles
+                .iter()
+                .map(|bundle| bundle.state)
+                .collect::<Vec<_>>(),
+            [
+                GenerationRetentionState::Active,
+                GenerationRetentionState::Rollback,
+                GenerationRetentionState::Reclaimable
+            ]
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(Store::open_observational(&path).is_err());
+    }
+
+    #[test]
+    fn unknown_or_malformed_cache_remains_incomplete_protection() {
+        for mutation in [
+            "PRAGMA user_version = 31",
+            // Stay outside the sequential Core migration range as it advances.
+            "PRAGMA user_version = 2147483647",
+            "UPDATE retrieval_index_manifest SET sidecar_generation = 'not-canonical'",
+            "UPDATE retrieval_index_manifest SET rollback_record_json = 'not-json'",
+        ] {
+            let root = tempdir().unwrap();
+            let layout = layout(root.path());
+            let project = "repo-v1-project";
+            let path = root
+                .path()
+                .join("unreadable-neighbour")
+                .join("codestory.db");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut store = Store::open(&path).unwrap();
+            store
+                .upsert_retrieval_index_manifest(&manifest(project, "aaaaaaaaaaaaaaaa", 1))
+                .unwrap();
+            drop(store);
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection.pragma_update(None, "user_version", 32).unwrap();
+            connection.execute_batch(mutation).unwrap();
+            drop(connection);
+            write_bundle(&layout, project, "cccccccccccccccc", [1, 1, 1]);
+            let before = std::fs::read(&path).unwrap();
+            let protection = scan_retention_protection(root.path(), None, &layout.state_file);
+            assert!(protection.protection_incomplete, "{mutation}");
+            let plan = plan_generation_retention(&layout, project, &protection);
+            assert!(plan.pruning_suppressed);
+            assert_eq!(plan.reclaimable_bytes, 0);
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_external_pointer_keeps_retention_protection_incomplete() {
+        let root = tempdir().unwrap();
+        let layout = layout(root.path());
+        let project = "repo-v1-project";
+        let project_root = root.path().join("source");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let storage_path = root.path().join("neighbour").join("codestory.db");
+        std::fs::create_dir_all(storage_path.parent().unwrap()).unwrap();
+        // Retain a direct legacy file so the cache-wide scanner discovers this
+        // published neighbour through its ordinary storage inventory.
+        drop(Store::open(&storage_path).unwrap());
+        crate::test_support::publish_empty_complete_generation_only_core_fixture(
+            &project_root,
+            &storage_path,
+        )
+        .unwrap();
+        let core_layout =
+            codestory_store::CorePublicationLayout::from_storage_path(&storage_path).unwrap();
+        let mut storage = Store::open(&storage_path).unwrap();
+        storage
+            .upsert_retrieval_index_manifest(&manifest(project, "aaaaaaaaaaaaaaaa", 1))
+            .unwrap();
+        drop(storage);
+        let pointer = core_layout.retrieval_publication_path();
+        let target = root.path().join("outside-pointer.sqlite3");
+        std::fs::rename(&pointer, &target).unwrap();
+        std::os::unix::fs::symlink(&target, &pointer).unwrap();
+        let core = core_layout
+            .resolve_generation_database("11111111-1111-4111-8111-111111111111")
+            .unwrap();
+        let before = [
+            target.clone(),
+            storage_path.clone(),
+            core,
+            core_layout.publication_path(),
+        ]
+        .map(|path| (path.clone(), std::fs::read(path).unwrap()));
+        write_bundle(&layout, project, "cccccccccccccccc", [1, 1, 1]);
+        let protection = scan_retention_protection(root.path(), None, &layout.state_file);
+        assert!(protection.protection_incomplete);
+        assert!(
+            protection
+                .errors
+                .iter()
+                .any(|error| error.contains("pointer is not a regular file")
+                    && error.contains("neighbour")),
+            "{:?}",
+            protection.errors
+        );
+        let plan = plan_generation_retention(&layout, project, &protection);
+        assert!(plan.pruning_suppressed);
+        assert_eq!(plan.reclaimable_bytes, 0);
+        for (path, bytes) in before {
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            for suffix in ["-wal", "-shm", "-journal"] {
+                assert!(!PathBuf::from(format!("{}{suffix}", path.display())).exists());
+            }
+        }
+        assert_eq!(std::fs::read_link(&pointer).unwrap(), target);
+    }
+
+    #[test]
     fn local_and_agent_profiles_share_one_global_gc_coordination_file() {
         let root = tempdir().expect("root");
         let runtime = |profile, state_file| SidecarRuntimeConfig {
+            cache_root: root.path().to_path_buf(),
             project_identity: None,
             layout: SidecarLayout {
                 state_file,

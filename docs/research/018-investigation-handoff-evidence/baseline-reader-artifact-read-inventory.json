@@ -1,0 +1,33 @@
+{
+  "role": "independent behavioral reader",
+  "scope": "Two v495 questions and parent-supplied public deliveries only; canonical grounding guide also allowed.",
+  "read_paths": [
+    "continuation-labels-v410/v495-question-1.json",
+    "continuation-labels-v410/v495-question-2.json",
+    "<SOURCE>/plugins/codestory/skills/codestory-grounding/SKILL.md",
+    "continuation-labels-v410/v495-baseline-1.packet.json",
+    "continuation-labels-v410/v495-baseline-2.packet.json",
+    "continuation-labels-v410/v495-continuation-1.packet.json",
+    "continuation-labels-v410/v495-continuation-2.packet.json",
+    "continuation-labels-v410/v495-reader-search-1.public.json",
+    "continuation-labels-v410/v495-reader-snippet-2-corrected-public.json",
+    "continuation-labels-v410/v495-reader-snippet-1-config-public.json",
+    "continuation-labels-v410/v495-reader-snippet-1-tests-public.json",
+    "continuation-labels-v410/v495-reader-daymatches.public.json",
+    "continuation-labels-v410/v495-reader-gettime.public.json",
+    "continuation-labels-v410/v495-reader-parser-bounds-public.json",
+    "continuation-labels-v410/v495-reader-every5min.public.json",
+    "continuation-labels-v410/v495-reader-every5min5s.public.json",
+    "continuation-labels-v410/v495-reader-constructor-search.public.json"
+  ],
+  "methods": "Shell reads and JSON display transformations of these allowed artifacts; parent performs all serial product dispatch.",
+  "source_repository_native_reads": false,
+  "web_reads": false,
+  "product_or_model_commands": false,
+  "build_application_or_test_commands": false,
+  "author_reference_files_opened": false,
+  "team_status_metadata_exposure": "One collaboration.list_agents call to check parent status exposed other completed-agent summaries, including patch/topic/reference-seal metadata. No linked files or author/reference answers were opened; this metadata did not inform the software answers. Behavioral boundaries are not hard tool isolation.",
+  "pending_final_public_deliveries": false,
+  "authored_deliverables": ["answer-1.md", "answer-2.md", "artifact-read-inventory.json", "coverage-assessment.md"],
+  "own_deliverable_reads": "SHA-256 verification reads of the four authored deliverables at freeze; no other repository reads."
+}

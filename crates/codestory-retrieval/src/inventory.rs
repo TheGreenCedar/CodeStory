@@ -71,6 +71,13 @@ fn generation_retention_plan_for_storage(
     runtime: &SidecarRuntimeConfig,
 ) -> Result<GenerationRetentionPlan> {
     let project_id = crate::index::sidecar_project_id_for_runtime(project_root, runtime)?;
+    let _global = crate::publication_scope::observe_publication_global(runtime)?;
+    let resolved = crate::publication_scope::runtime_for_stored_publication(
+        project_root,
+        storage_path,
+        runtime,
+    )?;
+    let runtime = &resolved;
     let (_lock, unrooted_state) = inventory_retention_view(runtime, &project_id)?;
     Ok(build_generation_retention_plan(
         storage_path,
@@ -103,6 +110,12 @@ fn apply_generation_retention_for_storage(
     runtime: &SidecarRuntimeConfig,
 ) -> Result<GenerationRetentionApplyReport> {
     let project_id = crate::index::sidecar_project_id_for_runtime(project_root, runtime)?;
+    let resolved = crate::publication_scope::runtime_for_stored_publication(
+        project_root,
+        storage_path,
+        runtime,
+    )?;
+    let runtime = &resolved;
     let _lock = GenerationRetentionLock::acquire(&runtime.layout.state_file, &project_id)
         .context("lock retrieval generation retention apply")?;
     let plan = build_generation_retention_plan(
@@ -282,14 +295,13 @@ mod tests {
         drop(connection);
     }
 
-    /// A version-skewed neighbour: another project's cache left at the schema
-    /// an older binary wrote. The activating open path would migrate it in
-    /// place; an inventory has no right to.
+    /// A future-schema neighbour whose protection cannot be interpreted by
+    /// this reader. Inventory must retain the uncertainty without rewriting it.
     fn skewed_neighbour_cache(cache_root: &Path, name: &str) -> PathBuf {
         let storage = cache_root.join(name).join("codestory.db");
         create_store(&storage);
         let current = schema_version(&storage);
-        set_schema_version(&storage, current - 1);
+        set_schema_version(&storage, current + 1);
         storage
     }
 
@@ -317,7 +329,7 @@ mod tests {
         );
         assert_eq!(
             schema_version(&neighbour),
-            active_schema - 1,
+            active_schema + 1,
             "the neighbour cache must still be at the schema its owner left it on"
         );
         let plan = report
@@ -334,6 +346,35 @@ mod tests {
                 .any(|error| error.contains("observe retrieval manifests in")
                     && error.contains("00112233445566aa")),
             "the skewed neighbour must be reported as unobservable, got {:?}",
+            plan.errors
+        );
+    }
+
+    #[test]
+    fn dry_run_inventory_observes_compatible_legacy_neighbour_without_migration() {
+        let cache = tempdir().expect("cache root");
+        let project = tempdir().expect("project root");
+        let workspace_id = codestory_workspace::workspace_id_v3_for_root(project.path());
+        let active_storage = cache.path().join(&workspace_id).join("codestory.db");
+        create_store(&active_storage);
+        let neighbour = cache.path().join("00112233445566aa").join("codestory.db");
+        create_store(&neighbour);
+        set_schema_version(&neighbour, 32);
+        let before = snapshot_tree(cache.path());
+        let report = with_test_cache_root(cache.path(), || {
+            let runtime = SidecarRuntimeConfig::for_project_auto(project.path());
+            sidecar_inventory_with_storage(project.path(), &active_storage, &runtime)
+                .expect("dry-run inventory")
+        });
+        assert_eq!(snapshot_tree(cache.path()), before);
+        assert_eq!(schema_version(&neighbour), 32);
+        let plan = report.generation_retention.expect("retention plan");
+        assert!(
+            !plan
+                .errors
+                .iter()
+                .any(|error| error.contains("00112233445566aa")),
+            "compatible neighbour must be observed, not migrated or skipped: {:?}",
             plan.errors
         );
     }

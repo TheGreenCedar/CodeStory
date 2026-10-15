@@ -74,7 +74,7 @@ fn prepare_drill(cmd: &DrillCommand) -> Result<PreparedDrill> {
         cmd.refresh,
         "drill",
     )?;
-    if cmd.refresh != args::RefreshMode::None {
+    if cmd.refresh == args::RefreshMode::Incremental {
         retrieval::finalize_retrieval_index_for_runtime(&runtime)
             .context("drill retrieval index finalize")?;
     }

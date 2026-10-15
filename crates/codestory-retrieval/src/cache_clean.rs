@@ -890,6 +890,7 @@ mod tests {
 
     fn manifest(project_id: &str, suffix: &str) -> RetrievalIndexManifest {
         RetrievalIndexManifest {
+            artifact_scope: None,
             project_id: project_id.into(),
             lexical_version: "v1".into(),
             semantic_generation: format!("codestory_{project_id}_{suffix}"),

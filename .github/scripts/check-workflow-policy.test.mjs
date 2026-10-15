@@ -59,7 +59,7 @@ import {
 
 const fullSha = "0123456789abcdef0123456789abcdef01234567";
 const proofTopology = "proof5-v1-f1f03863d1fa5a61a86f02f1e1ca06bc2a619a401ab0f557ec2d74964f34fef0";
-const cacheManifestIdentity = "${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**/Cargo.toml') }}";
+const cacheManifestIdentity = "${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**/Cargo.toml', 'vendor/llama-cpp-sys-2-patches/**') }}";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
 function draftSourceJob() {
@@ -8221,7 +8221,7 @@ test("a script that absorbs its own failure must hand that failure to something 
     draftStep(workflows.get("plugin-static.yml").jobs["plugin-static"], "Check workflow policy")
       ["continue-on-error"] = true;
     assert.deepEqual(absorbedFailureViolations(workflows), [
-      "plugin-static.yml jobs.plugin-static.steps.7 (Check workflow policy) absorbs its own"
+      "plugin-static.yml jobs.plugin-static.steps.8 (Check workflow policy) absorbs its own"
         + " failure and must have an id whose outcome a later blocking step requires",
     ]);
     assert.match(validateWorkflows(workflows).join("\n"), /Check workflow policy\) absorbs its own failure/u);

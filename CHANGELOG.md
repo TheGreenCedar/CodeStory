@@ -2,6 +2,59 @@
 
 ## Unreleased
 
+- Packets retain already found evidence when optional call metadata reaches its deadline, with the incomplete retrieval recorded instead of discarding the results.
+
+- ID-based navigation reports exact matches instead of labelling correctly selected IDs as fuzzy.
+
+- Rust call navigation preserves explicit local module paths, so a same-named wrapper is not mistaken for the called function. Unsupported or ambiguous qualified paths remain unresolved. Existing Rust indexes rebuild on their next refresh.
+
+- Change-impact results show typed symbols before unknown occurrences within the result limit, keeping identifiable downstream impacts visible. Direct evidence describes indexed symbols or occurrences without claiming each is a declaration.
+
+- Rust import navigation reaches declarations when several files import the same symbol, rather than another import occurrence or a weaker partial-name module match. Tied matches in Rust semantic resolution remain unresolved. Existing Rust indexes rebuild once on their next refresh.
+
+- Search results retain indexed display names beside their source locations, including matches without captured excerpts. Custom strict clients must support publication stamp schema 5; the evidence payload family remains schema 3.
+
+- Search and packet requests reuse completed readiness checks within the same pinned operation while continuing to check retrieval health and source freshness.
+
+- Search deadlines, cancellations and exhausted packet budgets no longer recommend rebuilding retrieval data; deadline failures suggest retrying or narrowing the request.
+
+- CLI search, packets and query-based navigation prepare missing retrieval data during automatic or full refresh, so a fresh index can be used without a separate retrieval command.
+
+- Search honors the requested result limit across symbol and repository-text matches and reports when additional matches are omitted.
+
+- Packets can include complete small configuration and text files found by lexical search even when the symbol index has no file entry. Delivered text is checked against the published and current file, stays within the existing source limit, and remains protected during CLI source continuation.
+
+- Python function and method source includes directly attached decorators, so test parameterization and other declaration settings stay with the inspected callable. Calls in decorator arguments are attributed to their enclosing function. Existing indexes rebuild once on their next refresh.
+
+- Rust function and method source includes attached attributes, keeping test cases and platform conditions with the inspected declaration. Existing Rust indexes rebuild once on their next refresh.
+
+- Rust functions that call macros no longer appear as duplicate definitions. Refreshing existing Rust indexes also updates affected symbol IDs; bookmarks migrate with sufficient prior evidence, and unresolved bookmarks retain their comments and previous anchors.
+
+- CLI query-based symbol, call-graph, exploration and bookmark commands initialize the required retrieval runtime, avoiding failures caused by the default local profile. ID-based navigation remains available from the Core index.
+
+- Retrieval refreshes account for incremental vector work followed by a full rebuild, avoiding a timing-report error after fallback completes.
+
+- Tiny packet plans retain the additional free-query probes you supply when a multi-sentence question adds supplemental retrieval views.
+
+- Multi-project stdio refuses an exact `--cache-dir` override. To use one retained cache, bind stdio to its `--project`; multi-project requests use separate per-project caches.
+
+- Root-symbol MCP resources return bounded, complete JSON pages with remaining counts and continuation links. Custom resource clients must read the versioned page object’s `symbols` array instead of a bare array and follow `continuation_uri` for the remaining symbols.
+
+- Packet continuation labels show available source paths, symbol names and exact requested ranges to help you choose a follow-up.
+
+- Packet continuations accept the returned request patch directly, including fields that clear the previous selection.
+
+- Fresh sessions retain the existing index when source symlinks have unchanged verified content, keeping continuations tied to that index.
+
+- Source continuations choose context within the complete response limit before adding a requested page; previously served source stays intact.
+
+- Managed tools can refresh once after a content check catches a delayed filesystem notification, within the original call deadline. Source-backed reads still refuse stale bytes; retained graph results remain labelled historical.
+
+- Packet retrieval considers matching source when an ordinary question includes example values absent from the code. Explicit search queries retain their quoted-term requirements.
+- Lexical search treats fenced configuration examples as context while preserving inline quoted entity requirements.
+- Packet JSON uses compact formatting when indentation would exceed its byte limit, preserving source evidence and publication metadata within the same limit.
+- Graph indexing no longer initializes optional embedding transport to report its result. Retrieval readiness remains unobserved until you request retrieval status or a full retrieval operation.
+- Symbol source excerpts retain complete lines and report unread bytes. A bounded follow-up advances to the next unread line in the same verified index.
 - Windows runtime setup and startup work from long installation paths, including Codex's managed plugin-data directories.
 
 - Child-symbol lists retain distinct declarations with the same name, so you can navigate each declaration in a file.

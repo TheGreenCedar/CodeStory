@@ -619,9 +619,17 @@ pub(crate) fn packet_retrieval_trace_summary(
 
 /// Env-gated developer step-trace artifact. Detailed execution diagnostics
 /// stay here rather than in budget-visible public annotations.
+#[doc(hidden)]
+pub fn packet_step_trace_destination_from_env() -> Option<std::path::PathBuf> {
+    std::env::var_os(codestory_contracts::config_registry::PACKET_STEP_TRACE_OUT_ENV)
+        .map(std::path::PathBuf::from)
+}
+
 pub(crate) fn write_packet_step_trace_from_env(answer: &AgentAnswerDto) -> Option<String> {
-    let trace_path =
-        std::env::var(codestory_contracts::config_registry::PACKET_STEP_TRACE_OUT_ENV).ok()?;
+    let trace_path = packet_step_trace_destination_from_env()?
+        .into_os_string()
+        .into_string()
+        .ok()?;
     write_packet_step_trace(&trace_path, answer)
 }
 

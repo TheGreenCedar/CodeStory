@@ -275,6 +275,7 @@ fn test_retrieval_manifest(
     dense_projection_count: i64,
 ) -> RetrievalIndexManifest {
     RetrievalIndexManifest {
+        artifact_scope: None,
         project_id: project_id.to_string(),
         lexical_version: "retained-v1".to_string(),
         semantic_generation: "retained-v1".to_string(),
@@ -691,6 +692,7 @@ pub(super) fn finalize_semantic_docs_for_test(
 ) -> Result<SemanticProjectionStats, ApiError> {
     crate::semantic_projection::finalize_staged_semantic_docs_for_runtime(
         storage,
+        None,
         None,
         None,
         "core:test-publication",
@@ -14302,3 +14304,6 @@ fn a_pre_cutover_bookmark_id_still_addresses_its_annotation_after_the_cutover() 
             .is_empty()
     );
 }
+
+#[path = "tests/root_symbol_pages.rs"]
+mod root_symbol_pages;

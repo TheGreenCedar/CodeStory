@@ -1844,7 +1844,7 @@ impl AppController {
             stored_embedding: None,
             fallback_reason: Some(RetrievalFallbackReasonDto::DisabledByConfig),
             fallback_message: Some(
-                "Search used the complete core symbol index; semantic and repository-text retrieval were not requested."
+                "Search used the complete core symbol index; semantic and repository-text retrieval were not requested. Core search applies one fuzzy pattern to each symbol name; separate names are not unioned. Use one symbol-name pattern per query and bounded separate lookups for separate targets. An empty result does not establish absence from source."
                     .to_string(),
             ),
         };
@@ -1924,12 +1924,12 @@ impl AppController {
                 &indexed_symbol_hits,
                 5,
             );
-            return Err(
-                agent::retrieval_primary::sidecar_retrieval_unavailable_error(
-                    self,
-                    format!("sidecar search rejected query: {reason}; {diagnostic}"),
-                ),
-            );
+            return Err(agent::retrieval_primary::sidecar_query_rejection_error(
+                self,
+                &query_result.trace.retrieval_mode,
+                query_result.trace.cancel_reason.as_deref(),
+                format!("sidecar search rejected query: {reason}; {diagnostic}"),
+            ));
         }
         let initial_sidecar_hits = indexed_symbol_hits.clone();
 
@@ -2030,6 +2030,11 @@ impl AppController {
         } else {
             None
         };
+        // Component reports remain graph diagnostics. Exclude them before the
+        // per-file breadth and result limits, so a derived report neither
+        // impersonates a physical source location nor displaces one.
+        indexed_symbol_hits
+            .retain(|hit| !crate::search_scoring::is_diagnostic_component_report_hit(hit));
         // Cover every candidate that will be ordered, including anchor symbols
         // promoted out of the repo-text and suggestion channels and every hit
         // reached when no plan ran. Ordering a candidate the map never saw would

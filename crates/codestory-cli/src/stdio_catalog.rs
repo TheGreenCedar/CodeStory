@@ -1653,13 +1653,23 @@ static GRAPH_TOOL_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
 );
 
 static SNIPPET_RANGE_SCHEMA: SchemaObject = SchemaObject::object(
-    "One requested source range from a batched snippet.paths call.",
+    "One requested window and its actual source delivery receipt from snippet.paths.",
     &[
         SchemaProperty::string("path", "Project-relative file path."),
         SchemaProperty::integer("start_line", "1-based first line."),
         SchemaProperty::integer("end_line", "1-based last line."),
         SchemaProperty::string("snippet", "Source snippet text."),
         SchemaProperty::boolean("snippet_truncated", "Whether this range hit a byte cap."),
+        SchemaProperty::integer("delivered_start_line", "Actual first delivered physical line, or null.").nullable(),
+        SchemaProperty::integer("delivered_end_line", "Actual last delivered physical line, or null.").nullable(),
+        SchemaProperty::integer("source_total_lines", "File line count only when the read observed EOF.").nullable(),
+        SchemaProperty::boolean("last_line_terminated", "Whether the last delivered source line ended in LF.").nullable(),
+        SchemaProperty::string("source_range_sha256", "Digest of delivered raw source bytes, not an indexed file digest.").nullable(),
+        SchemaProperty::string("source_kind", "Source provenance.").with_enum(&["workspace_read"]),
+        SchemaProperty::boolean("complete", "Requested window complete, including natural EOF clipping; not complete-file coverage."),
+        SchemaProperty::string("omission_reason", "Why complete source lines were omitted.")
+            .with_enum(&["byte_budget", "line_exceeds_byte_budget"]).nullable(),
+        SchemaProperty::integer("next_start_line", "First omitted line; retry this line or use a larger ordinary file read for an oversized line.").nullable(),
     ],
     &[
         "path",
@@ -1700,8 +1710,12 @@ static SNIPPET_CONTEXT_SCHEMA: SchemaObject = SchemaObject::object(
         ),
         SchemaProperty::integer(
             "max_total_bytes",
-            "Total byte cap for a batched paths call.",
+            "Shared rendered-snippet byte cap for a batched paths call; metadata has a separate response bound.",
         ),
+        SchemaProperty::integer("max_response_bytes", "Serialized structured result byte bound, including metadata."),
+        SchemaProperty::integer("requested_count", "Number of requested ranges; all receive receipts."),
+        SchemaProperty::integer("omitted_count", "Number of windows with omitted source lines."),
+        SchemaProperty::boolean("complete", "Every requested window was delivered through its end or EOF."),
     ],
     &[],
 )
@@ -1831,6 +1845,53 @@ static CONTEXT_PACKET_SCHEMA: SchemaObject = SchemaObject::object(
     ],
 );
 
+static PACKET_SOURCE_RANGE_SCHEMA: SchemaObject = SchemaObject::object(
+    "Inclusive complete-line source range.",
+    &[
+        SchemaProperty::integer("start_line", "First requested line.")
+            .with_bounds(1, u32::MAX as u64),
+        SchemaProperty::integer("end_line", "Last requested line.").with_bounds(1, u32::MAX as u64),
+    ],
+    &["start_line", "end_line"],
+);
+
+static PACKET_SOURCE_DELIVERY_SCHEMA: SchemaObject = SchemaObject::object(
+    "Verified source delivery and unread byte receipt.",
+    &[
+        SchemaProperty::object("requested_range", "Requested inclusive source range.")
+            .with_object_schema(&PACKET_SOURCE_RANGE_SCHEMA),
+        SchemaProperty::string("source_sha256", "Verified indexed source digest.")
+            .with_min_length(64)
+            .with_max_length(64),
+        SchemaProperty::integer("remaining_source_bytes", "Raw bytes not delivered.")
+            .with_bounds(0, u64::MAX),
+        SchemaProperty::integer("next_start_line", "Next complete line, when recoverable.")
+            .with_bounds(1, u32::MAX as u64)
+            .nullable(),
+        SchemaProperty::integer(
+            "blocked_line_rendered_bytes",
+            "Required rendered bytes for an overlong line.",
+        )
+        .with_bounds(1, u64::MAX)
+        .nullable(),
+    ],
+    &[
+        "requested_range",
+        "source_sha256",
+        "remaining_source_bytes",
+        "next_start_line",
+        "blocked_line_rendered_bytes",
+    ],
+);
+
+pub(crate) fn packet_source_delivery_schema() -> Value {
+    PACKET_SOURCE_DELIVERY_SCHEMA.to_json()
+}
+
+pub(crate) fn packet_continuation_probe_schema() -> Value {
+    PACKET_CONTINUATION_PROBE_SCHEMA.to_json()
+}
+
 static SUPPORT_UNIT_SCHEMA: SchemaObject = SchemaObject::object(
     "Compiled evidence atom the agent judges.",
     &[
@@ -1847,6 +1908,8 @@ static SUPPORT_UNIT_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::integer("start_line", "1-based start line."),
         SchemaProperty::integer("end_line", "1-based end line."),
         SchemaProperty::string("snippet", "Optional source excerpt."),
+        SchemaProperty::object("source_delivery", "Complete-line source delivery receipt.")
+            .with_object_schema(&PACKET_SOURCE_DELIVERY_SCHEMA),
         SchemaProperty::string("edge_kind", "Typed graph edge kind."),
         SchemaProperty::string("from_symbol", "Edge source symbol."),
         SchemaProperty::string("to_symbol", "Edge target symbol."),
@@ -2038,9 +2101,12 @@ static SOURCE_RANGE_SCHEMA: SchemaObject = SchemaObject::object(
 static SNIPPET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     "Return bounded source: either resolve one symbol, or read line ranges from files named by earlier evidence.",
     &[
+        SchemaProperty::integer("max_tool_result_bytes",
+            "Optional path-read allowance for UTF-8 serialized served MCP tool result, including revision text/structured mirroring and publication metadata. Excludes JSON-RPC and host framing; does not bound an investigation. Whole-line receipts may be partial; a receipt that cannot fit refuses.")
+            .with_bounds(256, 524_288),
         SchemaProperty::array(
             "paths",
-            "File ranges to read in one call, instead of resolving a symbol. Line-numbered and bounded in total; use the paths and lines that search, trail, or packet already returned.",
+            "File ranges to read in one call, instead of resolving a symbol. Line-numbered and bounded in total; use exact paths from files, search, trail, or packet; filenames are paths, not symbol IDs.",
             &SOURCE_RANGE_SCHEMA,
         ),
         SchemaProperty::string(
@@ -2348,6 +2414,11 @@ static PACKET_CONTINUATION_SELECTOR_SCHEMA: SchemaObject = SchemaObject::object(
             .with_max_length(PACKET_PROBE_MAX_TEXT_LENGTH as u64),
         SchemaProperty::string_required("reason", "Typed uncovered structural reason.")
             .with_enum(PACKET_STRUCTURAL_GAP_REASONS),
+        SchemaProperty::object(
+            "source_range",
+            "Optional pinned complete-line source request.",
+        )
+        .with_object_schema(&PACKET_SOURCE_RANGE_SCHEMA),
     ],
     &["stable_identity", "reason"],
 );
@@ -2412,7 +2483,7 @@ static PACKET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
             "Optional tagged exact-path, symbol-id, qualified-symbol, file-symbol, free-query, or generation-bound continuation probes.",
             PACKET_PROBE_SCHEMAS,
         )
-        .with_item_bounds(1, PACKET_PROBE_MAX_COUNT as u64),
+        .with_item_bounds(0, PACKET_PROBE_MAX_COUNT as u64),
         SchemaProperty::integer(
             "latency_budget_ms",
             "Optional packet retrieval latency budget in milliseconds; defaults to 18000 when omitted.",
@@ -2422,12 +2493,13 @@ static PACKET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::string(
             "parent_packet_id",
             "Parent packet id for a generation-bound continuation; repeat the original question unchanged.",
-        ),
+        )
+        .nullable(),
         SchemaProperty::string_array(
             "option_ids",
             "Continuation option ids returned by the parent packet. Execute them once; do not invent a second search.",
         )
-        .with_item_bounds(1, 8)
+        .with_item_bounds(0, 8)
         .with_item_min_length(1),
         SchemaProperty::string(
             "core_generation_id",
@@ -2436,7 +2508,8 @@ static PACKET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::string(
             "retrieval_generation",
             "Pinned retrieval generation for a continuation.",
-        ),
+        )
+        .nullable(),
     ],
     &["question"],
 );
@@ -2610,7 +2683,7 @@ static RESOURCE_TEMPLATES: &[ResourceTemplateSpec] = &[
         mime_type: "application/json",
     },
     ResourceTemplateSpec {
-        uri_template: "codestory://symbols/root{?project}",
+        uri_template: "codestory://symbols/root{?project,limit,cursor}",
         name: "Root symbols",
         mime_type: "application/json",
     },
@@ -3200,8 +3273,14 @@ mod tests {
                 "start_line": 10,
                 "end_line": 12,
                 "snippet": "fn run() {}",
-                "snippet_truncated": false
-            }]
+                "snippet_truncated": false,
+                "delivered_start_line": 10, "delivered_end_line": 12,
+                "source_total_lines": null, "last_line_terminated": true,
+                "source_range_sha256": "a".repeat(64), "source_kind": "workspace_read",
+                "complete": true, "omission_reason": null, "next_start_line": null
+            }],
+            "max_response_bytes": 131_072, "requested_count": 1,
+            "omitted_count": 0, "complete": true
         });
         let undeclared = undeclared_object_keys(&schema, &payload);
         assert!(

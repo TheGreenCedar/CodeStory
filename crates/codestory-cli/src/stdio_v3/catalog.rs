@@ -1,4 +1,5 @@
 use serde_json::{Map, Value, json};
+use std::sync::OnceLock;
 
 use super::{V3SurfaceSet, profile::McpRevisionV3};
 
@@ -40,6 +41,32 @@ pub(crate) fn tools_for_surface_v3(revision: McpRevisionV3, surface: V3SurfaceSe
         .into_iter()
         .map(|source| project_tool_v3(revision, &source))
         .collect()
+}
+
+pub(crate) fn modern_output_schema_v3(
+    tool_name: &str,
+    surface: V3SurfaceSet,
+) -> Option<&'static Value> {
+    static EVIDENCE_SCHEMAS: OnceLock<Vec<(String, Option<Value>)>> = OnceLock::new();
+    static PROOF_SCHEMAS: OnceLock<Vec<(String, Option<Value>)>> = OnceLock::new();
+    let schemas = match surface {
+        V3SurfaceSet::EvidenceOnly => &EVIDENCE_SCHEMAS,
+        V3SurfaceSet::WithProof => &PROOF_SCHEMAS,
+    }
+    .get_or_init(|| {
+        // Keep catalog order and missing schemas so the first tool match still owns lookup.
+        tools_for_surface_v3(McpRevisionV3::June2025, surface)
+            .into_iter()
+            .filter_map(|tool| {
+                let name = tool.get("name")?.as_str()?.to_owned();
+                Some((name, tool.get("outputSchema").cloned()))
+            })
+            .collect()
+    });
+    schemas
+        .iter()
+        .find(|(name, _)| name == tool_name)
+        .and_then(|(_, schema)| schema.as_ref())
 }
 
 pub(crate) fn proof_output_schema_v3() -> Value {
@@ -300,7 +327,7 @@ fn gap_identity_schema_v3() -> Value {
 }
 
 fn packet_evidence_schema_v3() -> Value {
-    closed_object_schema_v3(vec![
+    let mut schema = closed_object_schema_v3(vec![
         ("identity", evidence_identity_schema_v3()),
         (
             "kind",
@@ -320,7 +347,11 @@ fn packet_evidence_schema_v3() -> Value {
         ),
         ("end_line", nullable_schema_v3(unsigned_integer_schema_v3())),
         ("summary", nullable_schema_v3(string_schema_v3())),
-    ])
+    ]);
+    // The DTO omits this field for non-paged evidence and legacy source rows.
+    schema["properties"]["source_delivery"] = crate::stdio_catalog::packet_source_delivery_schema();
+    schema["properties"]["packet_request_patch"] = packet_request_patch_schema_v3();
+    schema
 }
 
 fn context_evidence_schema_v3() -> Value {
@@ -342,6 +373,13 @@ fn search_evidence_schema_v3() -> Value {
         ("identity", evidence_identity_schema_v3()),
         ("path", string_schema_v3()),
         ("symbol_id", nullable_schema_v3(string_schema_v3())),
+        (
+            "display_name",
+            nullable_schema_v3(json!({
+                "type":"string",
+                "maxLength":codestory_contracts::packet_projection_v3::SYMBOL_ID_MAX_BYTES_V3
+            })),
+        ),
         (
             "start_line",
             nullable_schema_v3(unsigned_integer_schema_v3()),
@@ -369,7 +407,7 @@ fn projection_gap_schema_v3() -> Value {
 }
 
 fn continuation_schema_v3() -> Value {
-    closed_object_schema_v3(vec![
+    let mut schema = closed_object_schema_v3(vec![
         ("continuation_id", string_schema_v3()),
         (
             "remaining_rounds",
@@ -379,6 +417,26 @@ fn continuation_schema_v3() -> Value {
             "gap_ids",
             bounded_array_schema_v3(gap_identity_schema_v3(), PROJECTION_REFERENCES_MAX_V3),
         ),
+    ]);
+    // Both action locations omit the field when no executable action exists.
+    schema["properties"]["packet_request_patch"] = packet_request_patch_schema_v3();
+    schema
+}
+
+fn packet_request_patch_schema_v3() -> Value {
+    let identity = json!({
+        "type":"string", "minLength":1,
+        "maxLength":codestory_contracts::packet_projection_v3::IDENTITY_MAX_BYTES_V3
+    });
+    closed_object_schema_v3(vec![
+        (
+            "probes",
+            bounded_array_schema_v3(crate::stdio_catalog::packet_continuation_probe_schema(), 1),
+        ),
+        ("parent_packet_id", nullable_schema_v3(identity.clone())),
+        ("option_ids", bounded_array_schema_v3(identity.clone(), 8)),
+        ("core_generation_id", identity.clone()),
+        ("retrieval_generation", nullable_schema_v3(identity)),
     ])
 }
 
@@ -850,6 +908,120 @@ mod tests {
     }
 
     #[test]
+    fn packet_action_schema_accepts_dto_replacements_and_rejects_malformed_actions() {
+        let page = json!({
+            "probes":[{"kind":"continuation", "contract_version":1,
+                "project_id":"project-1", "core_generation_id":"core-1",
+                "retrieval_generation":null,
+                "selector":{"stable_identity":"node:symbol-1", "symbol_id":"symbol-1",
+                    "reason":"source_budget_exceeded", "source_range":{"start_line":4,"end_line":20}}}],
+            "parent_packet_id":null, "option_ids":[], "core_generation_id":"core-1",
+            "retrieval_generation":null
+        });
+        let broad = json!({"probes":[], "parent_packet_id":"parent-1", "option_ids":["option-1"],
+            "core_generation_id":"core-1", "retrieval_generation":"retrieval-1"});
+        let patch_schema = packet_request_patch_schema_v3();
+        for patch in [&page, &broad] {
+            let dto: codestory_contracts::packet_projection_v3::PacketRequestPatchV3Dto =
+                serde_json::from_value(patch.clone()).expect("valid typed action");
+            let wire = serde_json::to_value(dto).unwrap();
+            assert!(
+                crate::stdio_arguments::validate_structured_content(&patch_schema, &wire).is_ok()
+            );
+            for field in [
+                "probes",
+                "parent_packet_id",
+                "option_ids",
+                "core_generation_id",
+                "retrieval_generation",
+            ] {
+                let mut missing = wire.clone();
+                missing.as_object_mut().unwrap().remove(field);
+                assert!(
+                    crate::stdio_arguments::validate_structured_content(&patch_schema, &missing)
+                        .is_err(),
+                    "missing {field}"
+                );
+            }
+        }
+        for invalid in [
+            json!(null),
+            {
+                let mut v = page.clone();
+                v["undeclared"] = json!(true);
+                v
+            },
+            {
+                let mut v = page.clone();
+                v["probes"][0]["selector"]["undeclared"] = json!(true);
+                v
+            },
+            {
+                let mut v = page.clone();
+                v["probes"][0]["selector"]["source_range"]["start_line"] = json!(0);
+                v
+            },
+            {
+                let mut v = page.clone();
+                v["probes"] = json!([page["probes"][0], page["probes"][0]]);
+                v
+            },
+            {
+                let mut v = page.clone();
+                v["probes"] = json!([{"kind":"free_query", "query":"q"}]);
+                v
+            },
+            {
+                let mut v = broad.clone();
+                v["option_ids"] = json!(vec!["option"; 9]);
+                v
+            },
+            {
+                let mut v = broad.clone();
+                v["parent_packet_id"] = json!(4);
+                v
+            },
+            {
+                let mut v = broad.clone();
+                v["core_generation_id"] = json!("");
+                v
+            },
+            {
+                let mut v = broad.clone();
+                v["retrieval_generation"] = json!(false);
+                v
+            },
+        ] {
+            assert!(
+                crate::stdio_arguments::validate_structured_content(&patch_schema, &invalid)
+                    .is_err(),
+                "accepted {invalid}"
+            );
+        }
+        // Optional action fields do not change required fields in either parent.
+        for (schema, mut row) in [
+            (
+                packet_evidence_schema_v3(),
+                json!({"identity":{"evidence_id":"e-1"},
+                "kind":"exact_source", "path":"metadata.rs", "symbol_id":"symbol-1",
+                "start_line":1,"end_line":3,"summary":"complete lines"}),
+            ),
+            (
+                continuation_schema_v3(),
+                json!({"continuation_id":"parent-1", "remaining_rounds":1,"gap_ids":[]}),
+            ),
+        ] {
+            assert!(crate::stdio_arguments::validate_structured_content(&schema, &row).is_ok());
+            for patch in [&page, &broad] {
+                row["packet_request_patch"] = patch.clone();
+                assert!(crate::stdio_arguments::validate_structured_content(&schema, &row).is_ok());
+            }
+            row["packet_request_patch"] = json!(null);
+            assert!(crate::stdio_arguments::validate_structured_content(&schema, &row).is_err());
+        }
+    }
+
+    #[test]
     fn packet_context_and_search_schemas_reject_open_or_malformed_dto_shapes() {
         let identity = json!({
             "packet_id":"b96ac0cc-e552-4c35-a0ba-c83b9ead67de",
@@ -892,12 +1064,86 @@ mod tests {
             "kind":"complete","schema_version":3,"identity":identity,"publication":publication,
             "status":"no_useful_evidence","evidence":[{
                 "identity":{"evidence_id":"evidence-1"},"path":"src/lib.rs","symbol_id":null,
-                "start_line":null,"end_line":null,"excerpt":null
+                "display_name":null,"start_line":null,"end_line":null,"excerpt":null
             }],
             "gaps":[],"continuation":null,"retrieval":{"state":"unavailable","generation_id":null},
             "diagnostics":diagnostics
         });
         let tools = tools_for_revision_v3(McpRevisionV3::June2025);
+        let search_schema = &tool(&tools, "search")["outputSchema"];
+        let mut labelled_search = search.clone();
+        labelled_search["evidence"][0]["display_name"] = json!("entry");
+        assert!(
+            crate::stdio_arguments::validate_structured_content(search_schema, &labelled_search)
+                .is_ok()
+        );
+        for invalid in [json!(false), json!("x".repeat(1_025))] {
+            let mut malformed = labelled_search.clone();
+            malformed["evidence"][0]["display_name"] = invalid;
+            assert!(
+                crate::stdio_arguments::validate_structured_content(search_schema, &malformed)
+                    .is_err(),
+                "accepted an invalid display label: {malformed}"
+            );
+        }
+        let mut missing_label = labelled_search;
+        missing_label["evidence"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("display_name");
+        assert!(
+            crate::stdio_arguments::validate_structured_content(search_schema, &missing_label)
+                .is_err(),
+            "the closed search row requires its nullable display label"
+        );
+        let packet_schema = &tool(&tools, "packet")["outputSchema"];
+        let mut paged_packet = packet_complete.clone();
+        paged_packet["evidence"][0]["source_delivery"] =
+            serde_json::to_value(codestory_contracts::compilation::PacketSourceDeliveryV1 {
+                requested_range: codestory_contracts::compilation::PacketSourceRangeV1 {
+                    start_line: 4,
+                    end_line: 20,
+                },
+                source_sha256: "a".repeat(64),
+                remaining_source_bytes: 100,
+                next_start_line: Some(10),
+                blocked_line_rendered_bytes: None,
+            })
+            .unwrap();
+        assert!(
+            crate::stdio_arguments::validate_structured_content(packet_schema, &paged_packet)
+                .is_ok()
+        );
+        for (field, invalid) in [
+            ("remaining_source_bytes", json!(-1)),
+            ("next_start_line", json!(0)),
+            ("source_sha256", json!("short")),
+            (
+                "requested_range",
+                json!({"start_line": 4, "end_line": 20, "undeclared": true}),
+            ),
+            ("undeclared", json!(true)),
+        ] {
+            let mut invalid_packet = paged_packet.clone();
+            invalid_packet["evidence"][0]["source_delivery"][field] = invalid;
+            assert!(
+                crate::stdio_arguments::validate_structured_content(packet_schema, &invalid_packet)
+                    .is_err(),
+                "accepted invalid source receipt field {field}"
+            );
+        }
+        let mut missing_receipt_field = paged_packet;
+        missing_receipt_field["evidence"][0]["source_delivery"]
+            .as_object_mut()
+            .unwrap()
+            .remove("next_start_line");
+        assert!(
+            crate::stdio_arguments::validate_structured_content(
+                packet_schema,
+                &missing_receipt_field
+            )
+            .is_err()
+        );
         let mut packet_location = packet_complete.clone();
         packet_location["evidence"][0]["kind"] = json!("source_location");
         packet_location["evidence"][0]["start_line"] = json!(null);

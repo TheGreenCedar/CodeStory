@@ -27,7 +27,7 @@ use crate::call_path_kernel::{
 #[cfg(test)]
 use crate::call_path_kernel::{RawCallEdgeAdmission, admit_raw_call_edge};
 use codestory_contracts::api::ApiError;
-use codestory_contracts::graph::{Node, NodeId, NodeKind};
+use codestory_contracts::graph::{Node, NodeId, NodeKind, RUST_ORDINAL_CANONICAL_ID_PREFIX};
 use codestory_contracts::proof_resolution::{CallResolutionFact, ProofResolutionStatus};
 use codestory_indexer::current_proof_resolution_adapter_roster;
 #[cfg(test)]
@@ -1530,14 +1530,19 @@ impl CanonicalSelectorIndex {
         if self.unavailable {
             return Err(());
         }
+        let (epoch, canonical_path) = canonical_id
+            .strip_prefix(RUST_ORDINAL_CANONICAL_ID_PREFIX)
+            .map_or(("", canonical_id), |path| {
+                (RUST_ORDINAL_CANONICAL_ID_PREFIX, path)
+            });
         let Some((relative_prefix, stored_prefixes)) = self
             .stored_prefixes_by_relative
-            .range(..=canonical_id.to_owned())
+            .range(..=canonical_path.to_owned())
             .next_back()
         else {
             return Ok(Vec::new());
         };
-        let Some(suffix) = canonical_id.strip_prefix(relative_prefix) else {
+        let Some(suffix) = canonical_path.strip_prefix(relative_prefix) else {
             return Ok(Vec::new());
         };
         if suffix.is_empty() {
@@ -1545,7 +1550,7 @@ impl CanonicalSelectorIndex {
         }
         let mut reconstructed = stored_prefixes
             .iter()
-            .map(|stored| format!("{stored}:{suffix}"))
+            .map(|stored| format!("{epoch}{stored}:{suffix}"))
             .collect::<Vec<_>>();
         reconstructed.sort();
         reconstructed.dedup();
@@ -1696,6 +1701,9 @@ fn canonical_id_authenticates_selected_files(
     node_ids: &[NodeId],
     identities: &mut OperationPathIdentityResolver,
 ) -> bool {
+    let canonical_id = canonical_id
+        .strip_prefix(RUST_ORDINAL_CANONICAL_ID_PREFIX)
+        .unwrap_or(canonical_id);
     if !canonical_id.contains('#') {
         return true;
     }
@@ -5464,51 +5472,80 @@ mod tests {
 
     #[test]
     fn canonical_selector_reconstructs_one_exact_project_relative_file_identity() {
-        let fixture = fixture(b"fn source() { target(); }\nfn target() {}\n");
-        let absolute_prefix = fixture.source_path.to_string_lossy();
-        fixture
-            .store
-            .get_connection()
-            .execute(
-                "UPDATE node SET canonical_id = ?1 WHERE id = 2",
-                [format!("{absolute_prefix}:crate::source#0")],
-            )
-            .unwrap();
-        fixture
-            .store
-            .get_connection()
-            .execute(
-                "UPDATE node SET canonical_id = ?1 WHERE id = 3",
-                [format!("{absolute_prefix}:crate::target#0")],
+        for epoch in ["", RUST_ORDINAL_CANONICAL_ID_PREFIX] {
+            let fixture = fixture(b"fn source() { target(); }\nfn target() {}\n");
+            let absolute_prefix = fixture.source_path.to_string_lossy();
+            fixture
+                .store
+                .get_connection()
+                .execute(
+                    "UPDATE node SET canonical_id = ?1 WHERE id = 2",
+                    [format!("{epoch}{absolute_prefix}:crate::source#0")],
+                )
+                .unwrap();
+            fixture
+                .store
+                .get_connection()
+                .execute(
+                    "UPDATE node SET canonical_id = ?1 WHERE id = 3",
+                    [format!("{epoch}{absolute_prefix}:crate::target#0")],
+                )
+                .unwrap();
+
+            let relative_source = format!("{epoch}src/lib.rs:crate::source#0");
+            let relative_target = format!("{epoch}src/lib.rs:crate::target#0");
+            let relative = contract(&relative_source, &[&relative_target]);
+            let observed = build_from_store_observed(
+                &fixture.store,
+                &fixture.root,
+                &fixture.project_id,
+                &fixture.publication,
+                &relative,
+                |path| fs::read(path),
             )
             .unwrap();
 
-        let relative = contract(
-            "src/lib.rs:crate::source#0",
-            &["src/lib.rs:crate::target#0"],
-        );
-        let observed = build_from_store_observed(
-            &fixture.store,
-            &fixture.root,
-            &fixture.project_id,
-            &fixture.publication,
-            &relative,
-            |path| fs::read(path),
-        )
-        .unwrap();
-
-        assert!(
-            !observed.trace.selector_early_return,
-            "{:#?}",
-            observed.trace
-        );
-        assert!(
-            observed
-                .trace
-                .selectors
-                .iter()
-                .all(|selector| matches!(selector.outcome, SelectorGateOutcome::Resolved { .. }))
-        );
+            assert!(
+                !observed.trace.selector_early_return,
+                "{:#?}",
+                observed.trace
+            );
+            assert!(
+                observed.trace.selectors.iter().all(|selector| matches!(
+                    selector.outcome,
+                    SelectorGateOutcome::Resolved { .. }
+                ))
+            );
+            let absolute_source = format!("{epoch}{absolute_prefix}:crate::source#0");
+            let absolute_target = format!("{epoch}{absolute_prefix}:crate::target#0");
+            let exact = contract(&absolute_source, &[&absolute_target]);
+            let exact = build_from_store_observed(
+                &fixture.store,
+                &fixture.root,
+                &fixture.project_id,
+                &fixture.publication,
+                &exact,
+                |path| fs::read(path),
+            )
+            .unwrap();
+            assert!(!exact.trace.selector_early_return, "{:#?}", exact.trace);
+            assert!(
+                exact.trace.selectors.iter().all(|selector| matches!(
+                    selector.outcome,
+                    SelectorGateOutcome::Resolved { .. }
+                ))
+            );
+            let files = fixture.store.get_files().unwrap();
+            let index = CanonicalSelectorIndex::prepare(
+                &fixture.root,
+                &files,
+                &mut OperationPathIdentityResolver::native(),
+            );
+            assert_eq!(
+                index.reconstruct(&relative_source),
+                Ok(vec![absolute_source])
+            );
+        }
     }
 
     #[test]
@@ -5516,6 +5553,7 @@ mod tests {
         let fixture = source_built_fixture("fn source() { target(); }\nfn target() {}\n");
         let source = source_callable(&fixture.store, "source");
         let old_canonical = canonical_id(&source).to_owned();
+        assert!(old_canonical.starts_with(RUST_ORDINAL_CANONICAL_ID_PREFIX));
         let moved = fixture.root.join("src/moved.rs");
         fs::rename(&fixture.source_path, &moved).unwrap();
         fixture
@@ -5555,93 +5593,114 @@ mod tests {
 
     #[test]
     fn canonical_selector_reconstruction_fails_closed_for_hostile_file_identity_cases() {
-        let fixture = fixture(b"fn source() { target(); }\nfn target() {}\n");
-        let absolute_prefix = fixture.source_path.to_string_lossy();
-        fixture
-            .store
-            .get_connection()
-            .execute(
-                "UPDATE node SET canonical_id = ?1 WHERE id = 3",
-                [format!("{absolute_prefix}:crate::target#0")],
-            )
-            .unwrap();
-        let files = fixture.store.files().get_files().unwrap();
-        let mut identities = OperationPathIdentityResolver::native();
-        let canonical_index =
-            CanonicalSelectorIndex::prepare(&fixture.root, &files, &mut identities);
-        let context = SelectorContext {
-            store: &fixture.store,
-            project_root: &fixture.root,
-            project_id: &fixture.project_id,
-            publication: &fixture.publication,
-            files: &files,
-            canonical_index: &canonical_index,
-        };
+        for epoch in ["", RUST_ORDINAL_CANONICAL_ID_PREFIX] {
+            let fixture = fixture(b"fn source() { target(); }\nfn target() {}\n");
+            let absolute_prefix = fixture.source_path.to_string_lossy();
+            fixture
+                .store
+                .get_connection()
+                .execute(
+                    "UPDATE node SET canonical_id = ?1 WHERE id = 3",
+                    [format!("{epoch}{absolute_prefix}:crate::target#0")],
+                )
+                .unwrap();
+            let files = fixture.store.files().get_files().unwrap();
+            let mut identities = OperationPathIdentityResolver::native();
+            let canonical_index =
+                CanonicalSelectorIndex::prepare(&fixture.root, &files, &mut identities);
+            let context = SelectorContext {
+                store: &fixture.store,
+                project_root: &fixture.root,
+                project_id: &fixture.project_id,
+                publication: &fixture.publication,
+                files: &files,
+                canonical_index: &canonical_index,
+            };
 
-        for missing in ["src/index:crate::target#0", "src/indexer:crate::target#0"] {
+            let alias_epoch = if epoch.is_empty() {
+                RUST_ORDINAL_CANONICAL_ID_PREFIX
+            } else {
+                ""
+            };
+            for missing in [
+                format!("{epoch}src/index:crate::target#0"),
+                format!("{epoch}src/indexer:crate::target#0"),
+                format!("{alias_epoch}src/lib.rs:crate::target#0"),
+                "unrecognized-epoch:src/lib.rs:crate::target#0".to_string(),
+            ] {
+                assert!(matches!(
+                    resolve_canonical(
+                        &context,
+                        &missing,
+                        &mut OperationPathIdentityResolver::native(),
+                    )
+                    .unwrap(),
+                    SelectorResolution::Missing
+                ));
+            }
+
+            fixture
+                .store
+                .insert_node(&node(
+                    4,
+                    NodeKind::FUNCTION,
+                    "target",
+                    &format!("{epoch}{absolute_prefix}:crate::target#0"),
+                    1,
+                    2,
+                    2,
+                ))
+                .unwrap();
             assert!(matches!(
                 resolve_canonical(
                     &context,
-                    missing,
+                    &format!("{epoch}src/lib.rs:crate::target#0"),
                     &mut OperationPathIdentityResolver::native(),
                 )
                 .unwrap(),
-                SelectorResolution::Missing
+                SelectorResolution::Ambiguous
             ));
-        }
 
-        fixture
-            .store
-            .insert_node(&node(
-                4,
-                NodeKind::FUNCTION,
-                "target",
-                &format!("{absolute_prefix}:crate::target#0"),
-                1,
-                2,
-                2,
-            ))
-            .unwrap();
-        assert!(matches!(
-            resolve_canonical(
-                &context,
-                "src/lib.rs:crate::target#0",
-                &mut OperationPathIdentityResolver::native(),
-            )
-            .unwrap(),
-            SelectorResolution::Ambiguous
-        ));
+            #[cfg(unix)]
+            {
+                let alias = fixture.root.join("src/alias.rs");
+                std::fs::hard_link(&fixture.source_path, &alias).unwrap();
+                let mut colliding_files = files.clone();
+                let mut alias_file = colliding_files[0].clone();
+                alias_file.id += 100;
+                alias_file.path = PathBuf::from("src/alias.rs");
+                colliding_files.push(alias_file);
+                let collision = CanonicalSelectorIndex::prepare(
+                    &fixture.root,
+                    &colliding_files,
+                    &mut OperationPathIdentityResolver::native(),
+                );
+                assert!(
+                    collision
+                        .reconstruct(&format!("{epoch}src/lib.rs:crate::target#0"))
+                        .is_err()
+                );
 
-        #[cfg(unix)]
-        {
-            let alias = fixture.root.join("src/alias.rs");
-            std::fs::hard_link(&fixture.source_path, &alias).unwrap();
-            let mut colliding_files = files.clone();
-            let mut alias_file = colliding_files[0].clone();
-            alias_file.id += 100;
-            alias_file.path = PathBuf::from("src/alias.rs");
-            colliding_files.push(alias_file);
-            let collision = CanonicalSelectorIndex::prepare(
-                &fixture.root,
-                &colliding_files,
-                &mut OperationPathIdentityResolver::native(),
-            );
-            assert!(collision.reconstruct("src/lib.rs:crate::target#0").is_err());
-
-            let outside = tempfile::tempdir().unwrap();
-            fs::write(outside.path().join("outside.rs"), "fn outside() {}\n").unwrap();
-            std::os::unix::fs::symlink(outside.path(), fixture.root.join("src/escape")).unwrap();
-            let mut escaped_files = files.clone();
-            let mut escaped_file = escaped_files[0].clone();
-            escaped_file.id += 101;
-            escaped_file.path = PathBuf::from("src/escape/outside.rs");
-            escaped_files.push(escaped_file);
-            let escaped = CanonicalSelectorIndex::prepare(
-                &fixture.root,
-                &escaped_files,
-                &mut OperationPathIdentityResolver::native(),
-            );
-            assert!(escaped.reconstruct("src/lib.rs:crate::target#0").is_err());
+                let outside = tempfile::tempdir().unwrap();
+                fs::write(outside.path().join("outside.rs"), "fn outside() {}\n").unwrap();
+                std::os::unix::fs::symlink(outside.path(), fixture.root.join("src/escape"))
+                    .unwrap();
+                let mut escaped_files = files.clone();
+                let mut escaped_file = escaped_files[0].clone();
+                escaped_file.id += 101;
+                escaped_file.path = PathBuf::from("src/escape/outside.rs");
+                escaped_files.push(escaped_file);
+                let escaped = CanonicalSelectorIndex::prepare(
+                    &fixture.root,
+                    &escaped_files,
+                    &mut OperationPathIdentityResolver::native(),
+                );
+                assert!(
+                    escaped
+                        .reconstruct(&format!("{epoch}src/lib.rs:crate::target#0"))
+                        .is_err()
+                );
+            }
         }
     }
 

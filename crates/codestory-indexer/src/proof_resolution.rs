@@ -3,8 +3,8 @@ use crate::cache::{
     CachedClassBinding, CachedClassDeclaration, CachedClassMethod, CachedDeclarationKind,
     CachedDirectExport, CachedGoMethod, CachedGoPackage, CachedGoType, CachedIndexArtifact,
     CachedInherentMethod, CachedJavaClassScope, CachedPhpNamespace, CachedResolutionBinding,
-    CachedResolutionFile, CachedRustFileModule, CachedRustModule, CachedRustType,
-    CachedRustUseBinding, CachedTopLevelDeclaration, decode_index_artifact,
+    CachedResolutionFile, CachedRustFileModule, CachedRustModule, CachedRustQualifiedPath,
+    CachedRustType, CachedRustUseBinding, CachedTopLevelDeclaration, decode_index_artifact,
     decoded_index_artifact_len,
 };
 use crate::source_content_hash;
@@ -248,7 +248,7 @@ fn ruby_php_resolution_work() -> usize {
 const ADAPTER_VERSION: &str = "reference-v17";
 const GO_ADAPTER_VERSION: &str = "reference-v19";
 const PYTHON_ADAPTER_VERSION: &str = "reference-v20";
-const RUST_ADAPTER_VERSION: &str = "reference-v20";
+const RUST_ADAPTER_VERSION: &str = "reference-v21";
 const TYPESCRIPT_ADAPTER_VERSION: &str = "reference-v19";
 const JAVA_ADAPTER_VERSION: &str = "reference-v4";
 const KOTLIN_ADAPTER_VERSION: &str = "reference-v3";
@@ -464,6 +464,19 @@ pub(crate) fn collect_call_resolution_inputs(
                 callsite,
                 caller,
                 binding,
+                ordinary_rust_path: rust_index.as_ref().and_then(|index| {
+                    lookup_input_complete
+                        .then(|| {
+                            index.ordinary_qualified_path(
+                                source,
+                                callee,
+                                form,
+                                &raw_target,
+                                callable_id,
+                            )
+                        })
+                        .flatten()
+                }),
                 language: language.to_string(),
                 adapter_version: adapter_version(language).to_string(),
                 parser_fingerprint: parser_fingerprint.to_string(),
@@ -11752,6 +11765,7 @@ impl<'tree> RustResolutionIndex<'tree> {
     ) {
         let mut domain_complete = !inherited_attributed;
         let mut identifier_module_complete = !inherited_attributed;
+        let mut ordinary_path_complete = !inherited_attributed;
         let mut file_children = Vec::new();
         let mut value_blockers = HashSet::new();
         let mut incomplete_value_names = HashSet::new();
@@ -11769,6 +11783,9 @@ impl<'tree> RustResolutionIndex<'tree> {
             if direct_domain_poison {
                 domain_complete = false;
                 identifier_module_complete = false;
+                if item.kind() != "attribute_item" {
+                    ordinary_path_complete = false;
+                }
             } else {
                 let conservative_macro_container =
                     !matches!(item.kind(), "function_item" | "mod_item" | "impl_item");
@@ -11789,6 +11806,7 @@ impl<'tree> RustResolutionIndex<'tree> {
                     }
                     if identifier_macro_container {
                         identifier_module_complete = false;
+                        ordinary_path_complete = false;
                     }
                 }
             }
@@ -11803,12 +11821,14 @@ impl<'tree> RustResolutionIndex<'tree> {
                         } else {
                             domain_complete = false;
                             identifier_module_complete = false;
+                            ordinary_path_complete = false;
                         }
                         continue;
                     }
                     let Some(name) = name else {
                         domain_complete = false;
                         identifier_module_complete = false;
+                        ordinary_path_complete = false;
                         continue;
                     };
                     let Some(declaration) = graph_nodes.callable(*item, source) else {
@@ -11837,6 +11857,7 @@ impl<'tree> RustResolutionIndex<'tree> {
                         } else {
                             domain_complete = false;
                             identifier_module_complete = false;
+                            ordinary_path_complete = false;
                         }
                         continue;
                     }
@@ -11846,6 +11867,7 @@ impl<'tree> RustResolutionIndex<'tree> {
                     ) else {
                         domain_complete = false;
                         identifier_module_complete = false;
+                        ordinary_path_complete = false;
                         continue;
                     };
                     self.types_by_module_name
@@ -11883,6 +11905,7 @@ impl<'tree> RustResolutionIndex<'tree> {
                         if names.is_empty() {
                             domain_complete = false;
                             identifier_module_complete = false;
+                            ordinary_path_complete = false;
                         } else {
                             incomplete_value_names.extend(names);
                         }
@@ -11925,6 +11948,7 @@ impl<'tree> RustResolutionIndex<'tree> {
                     let Some(name) = declaration_name(*item, source).map(str::to_string) else {
                         domain_complete = false;
                         identifier_module_complete = false;
+                        ordinary_path_complete = false;
                         continue;
                     };
                     if self.attributed_items.contains(&item.id()) {
@@ -11949,6 +11973,7 @@ impl<'tree> RustResolutionIndex<'tree> {
                         let Some(declaration) = module_declaration else {
                             domain_complete = false;
                             identifier_module_complete = false;
+                            ordinary_path_complete = false;
                             continue;
                         };
                         file_children.push(CachedRustFileModule { name, declaration });
@@ -11977,6 +12002,7 @@ impl<'tree> RustResolutionIndex<'tree> {
             module_path,
             declaration,
             domain_complete,
+            ordinary_path_complete,
             value_blockers: {
                 let mut blockers = value_blockers.into_iter().collect::<Vec<_>>();
                 blockers.sort();
@@ -12314,6 +12340,75 @@ impl<'tree> RustResolutionIndex<'tree> {
                 }
             }
         }
+    }
+
+    fn ordinary_qualified_path(
+        &self,
+        source: &str,
+        callee: TsNode<'tree>,
+        form: CalleeForm,
+        raw_target: &str,
+        callable_id: Option<usize>,
+    ) -> Option<CachedRustQualifiedPath> {
+        if form != CalleeForm::QualifiedPath {
+            return None;
+        }
+        let callable_id = callable_id?;
+        if !self.callsite_domain_complete(callable_id, callee.start_byte()) {
+            return None;
+        }
+        let module_path = self.callable_module_paths.get(&callable_id)?.clone();
+        let mut components = rust_scoped_call_components(callee, source)?;
+        if components.first().is_some_and(|name| name == "super") {
+            return None;
+        }
+        if self
+            .module_unsupported_value_names
+            .get(&module_path)
+            .is_some_and(|names| {
+                components
+                    .first()
+                    .is_some_and(|first| names.contains(first))
+            })
+        {
+            return None;
+        }
+        let associated_owner = if components.first().is_some_and(|name| name == "Self") {
+            if components.len() != 2 {
+                return None;
+            }
+            let owner_name = &self
+                .inherent_callable_contexts
+                .get(&callable_id)?
+                .owner_name;
+            let owners = self
+                .types_by_module_name
+                .get(&(module_path.clone(), owner_name.clone()))?;
+            let [owner] = owners.as_slice() else {
+                return None;
+            };
+            if self.generic_types.contains(owner) {
+                return None;
+            }
+            components = vec![owner_name.clone(), raw_target.to_string()];
+            Some(*owner)
+        } else {
+            None
+        };
+        let imports = self
+            .uses_by_module_name
+            .get(&(module_path.clone(), components.first()?.clone()));
+        let import = match imports.map(Vec::as_slice).unwrap_or_default() {
+            [] => None,
+            [binding] => Some(binding.clone()),
+            _ => return None,
+        };
+        Some(CachedRustQualifiedPath {
+            module_path,
+            components,
+            import,
+            associated_owner,
+        })
     }
 
     fn resolve_syntax_claim(
@@ -13883,6 +13978,332 @@ impl PreparedGovernedCachePaths {
             ));
         }
         Ok(self.relative_suffixes.contains(cache_path))
+    }
+}
+
+/// Resolve source-bound qualified Rust calls for ordinary graph navigation.
+/// This does not promote incomplete syntax claims to Exact proof or prove access control.
+pub(crate) fn ordinary_rust_qualified_call_resolutions(
+    store: &Store,
+) -> Result<HashMap<i64, Option<i64>>> {
+    let files = store
+        .get_files()?
+        .into_iter()
+        .filter(|file| file.indexed && file.language == "rust")
+        .map(|file| (file.id, file))
+        .collect::<HashMap<_, _>>();
+    if files.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let governed = files.values().collect::<Vec<_>>();
+    let identities = files
+        .values()
+        .filter_map(|file| {
+            workspace_path_identity(&file.path)
+                .ok()
+                .map(|identity| (file.id, identity))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut identity_owners = HashMap::new();
+    let mut ambiguous_files = HashSet::new();
+    for (file, identity) in &identities {
+        if let Some(previous) = identity_owners.insert(identity, *file) {
+            ambiguous_files.insert(previous);
+            ambiguous_files.insert(*file);
+        }
+    }
+    let cache_paths = PreparedGovernedCachePaths::prepare(&governed, &identities);
+    let mut records_by_id = HashMap::new();
+    let mut duplicate_records = HashSet::new();
+    for entry in store.get_index_artifact_cache_entries()? {
+        if !cache_paths.contains(&entry.file_path).unwrap_or(false) {
+            continue;
+        }
+        let Ok(artifact) = decode_index_artifact(&entry.artifact_blob) else {
+            continue;
+        };
+        let Some(file) = artifact.resolution_file.as_ref() else {
+            continue;
+        };
+        let Some(indexed) = files.get(&file.file_id.0) else {
+            continue;
+        };
+        let Some(config) = parser_config_for_indexed_language(&indexed.path, &indexed.language)
+        else {
+            continue;
+        };
+        let fingerprint = crate::resolution_parser_fingerprint(&config);
+        let Some(hash) = store.get_file_content_hash(indexed.id)? else {
+            continue;
+        };
+        if file.file_id != NodeId(indexed.id)
+            || !file.complete
+            || !indexed.complete
+            || !cached_resolution_inputs_are_current(&artifact, "rust", &fingerprint, &hash)
+            || artifact
+                .call_resolution_inputs
+                .iter()
+                .any(|call| call.callsite.file_id != FileId(indexed.id))
+            || cache_entry_identity_for_indexed_file(&entry.file_path, &indexed.path)
+                .ok()
+                .as_ref()
+                != identities.get(&indexed.id)
+        {
+            continue;
+        }
+        let record = ResolutionCacheRecord {
+            path: indexed.path.clone(),
+            file: artifact.resolution_file.expect("validated file"),
+            calls: artifact.call_resolution_inputs,
+        };
+        if records_by_id.insert(indexed.id, record).is_some() {
+            duplicate_records.insert(indexed.id);
+        }
+    }
+    records_by_id.retain(|file_id, _| {
+        !duplicate_records.contains(file_id)
+            && identities.contains_key(file_id)
+            && !ambiguous_files.contains(file_id)
+    });
+    // Complete/current records are the eligibility boundary for every path dependency.
+    let records = records_by_id.into_values().collect::<Vec<_>>();
+    let nodes = store.get_nodes()?;
+    let node_by_id = nodes
+        .iter()
+        .map(|node| (node.id, node))
+        .collect::<HashMap<_, _>>();
+    let edges = store.get_edges()?;
+    let edges = edges
+        .iter()
+        .filter(|edge| {
+            edge.kind == EdgeKind::CALL
+                && edge
+                    .file_node_id
+                    .is_some_and(|file| files.contains_key(&file.0))
+                && node_by_id.contains_key(&edge.target)
+        })
+        .collect::<Vec<_>>();
+    let eligible_files = records
+        .iter()
+        .map(|record| record.file.file_id)
+        .collect::<HashSet<_>>();
+    let mut decisions = edges
+        .iter()
+        .filter(|edge| {
+            !edge
+                .file_node_id
+                .is_some_and(|file| eligible_files.contains(&file))
+        })
+        .map(|edge| (edge.id.0, None))
+        .collect::<HashMap<_, _>>();
+    let Ok(rust_index) = RustProjectionIndex::prepare(&records) else {
+        return Ok(edges.iter().map(|edge| (edge.id.0, None)).collect());
+    };
+    let edge_inputs = edges
+        .iter()
+        .map(|edge| {
+            let raw = node_by_id[&edge.target];
+            let direct = matches!(raw.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                || raw.file_node_id != edge.file_node_id;
+            OrdinaryCallEdgeCorrelationInput {
+                file_id: edge.file_node_id.map(|file| FileId(file.0)),
+                line: edge.line,
+                caller: edge.source,
+                target: NodeId(0),
+                raw_edge_target: edge.target,
+                raw_file_id: if direct {
+                    edge.file_node_id
+                } else {
+                    raw.file_node_id
+                }
+                .map(|file| FileId(file.0)),
+                raw_line: if direct { edge.line } else { raw.start_line },
+                raw_target: graph_leaf_name(&raw.serialized_name),
+                callsite_identity: edge.callsite_identity.as_deref(),
+                semantic_exact: true,
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut edges_by_callsite = HashMap::<(FileId, u32, &str), Vec<(i64, NodeId)>>::new();
+    for (edge, input) in edges.iter().zip(&edge_inputs) {
+        if let (Some(file), Some(line)) = (input.file_id, input.line) {
+            edges_by_callsite
+                .entry((file, line, input.raw_target))
+                .or_default()
+                .push((edge.id.0, input.caller));
+        }
+    }
+    // Include bare calls in correlation so same-line callsite ordinals stay aligned.
+    let calls = records
+        .iter()
+        .flat_map(|record| {
+            record
+                .calls
+                .iter()
+                .filter_map(move |call| call.caller.map(|caller| (record, call, caller)))
+        })
+        .collect::<Vec<_>>();
+    let syntax = calls
+        .iter()
+        .map(|(_, call, caller)| ExactSyntaxCallsiteCorrelationInput {
+            file_id: call.callsite.file_id,
+            line: call.callsite.line,
+            start_byte: call.callsite.start_byte,
+            end_byte_exclusive: call.callsite.end_byte_exclusive,
+            column: call.callsite.column,
+            caller: *caller,
+            target: NodeId(0),
+            raw_target: &call.callsite.raw_target,
+        })
+        .collect::<Vec<_>>();
+    let correlations = correlate_exact_syntax_callsites(&syntax, &edge_inputs);
+    let mut refused_edges = HashSet::new();
+    for call in records
+        .iter()
+        .flat_map(|record| &record.calls)
+        .filter(|call| {
+            call.callsite.callee_form == CalleeForm::QualifiedPath && call.caller.is_none()
+        })
+    {
+        if let Some(matches) = edges_by_callsite.get(&(
+            call.callsite.file_id,
+            call.callsite.line,
+            call.callsite.raw_target.as_str(),
+        )) {
+            refused_edges.extend(matches.iter().map(|(edge, _)| *edge));
+        }
+    }
+    let mut claimed_edges = HashSet::new();
+    for ((record, call, caller), correlation) in calls.iter().zip(correlations) {
+        if call.callsite.callee_form != CalleeForm::QualifiedPath {
+            continue;
+        }
+        let Ok(edge_index) = correlation else {
+            // An uncorrelated qualified call must not escape through a leaf-name lookup.
+            if let Some(matches) = edges_by_callsite.get(&(
+                call.callsite.file_id,
+                call.callsite.line,
+                call.callsite.raw_target.as_str(),
+            )) {
+                refused_edges.extend(
+                    matches
+                        .iter()
+                        .filter(|(_, owner)| owner == caller)
+                        .map(|(edge, _)| *edge),
+                );
+            }
+            continue;
+        };
+        if !claimed_edges.insert(edges[edge_index].id.0) {
+            refused_edges.insert(edges[edge_index].id.0);
+        }
+        let target = call
+            .ordinary_rust_path
+            .as_ref()
+            .and_then(|path| {
+                ordinary_rust_path_target(&rust_index, record, path, &call.callsite.raw_target)
+            })
+            .filter(|target| {
+                node_by_id.get(target).is_some_and(|node| {
+                    matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                        && node
+                            .file_node_id
+                            .is_some_and(|file| rust_index.node_file(*target) == Some(file.0))
+                })
+            });
+        decisions.insert(edges[edge_index].id.0, target.map(|target| target.0));
+    }
+    for edge in refused_edges {
+        decisions.insert(edge, None);
+    }
+    Ok(decisions)
+}
+
+fn ordinary_rust_path_target(
+    index: &RustProjectionIndex<'_>,
+    record: &ResolutionCacheRecord,
+    path: &CachedRustQualifiedPath,
+    raw_target: &str,
+) -> Option<NodeId> {
+    let module = index.module(record, &path.module_path)?;
+    if !record.file.complete || !module.ordinary_path_complete {
+        return None;
+    }
+    // Reuse the strict selector when eligible; complete/current file dependencies are
+    // guaranteed by construction, without changing the separate Exact proof facts.
+    let strict = resolve_rust_path_binding(
+        index,
+        record,
+        &path.module_path,
+        &path.components,
+        path.import.as_ref(),
+        path.associated_owner,
+        raw_target,
+    );
+    if let RustPathResolution::Function { target, .. }
+    | RustPathResolution::Associated { target, .. } = strict
+    {
+        return Some(target);
+    }
+    if path.import.is_some() {
+        return None;
+    }
+    let first = path.components.first()?;
+    if module.incomplete_value_names.contains(first) {
+        return None;
+    }
+    let owners = index.types(record, &path.module_path, first);
+    if path.components.len() == 2 && !owners.is_empty() {
+        let [owner] = owners else {
+            return None;
+        };
+        if owner.generic
+            || path
+                .associated_owner
+                .is_some_and(|expected| expected != owner.declaration)
+        {
+            return None;
+        }
+        let methods = index
+            .methods(record, &path.module_path, first, raw_target)
+            .iter()
+            .copied()
+            .filter(|method| {
+                !method.has_self
+                    && method.domain_complete
+                    && method.owner == Some(owner.declaration)
+            })
+            .collect::<Vec<_>>();
+        return match methods.as_slice() {
+            [method] => Some(method.declaration),
+            _ => None,
+        };
+    }
+    if module.value_blockers.contains(first) {
+        return None;
+    }
+    let mut components = path.components.clone();
+    if !matches!(first.as_str(), "crate" | "self" | "super") {
+        // Only an explicitly declared local module can establish this native path.
+        components.insert(0, "self".to_string());
+    }
+    let (target_module, target_name, _, _) =
+        index.resolve_module_path(record, &path.module_path, &components)?;
+    let target_input = index.module(target_module.record, &target_module.relative_module)?;
+    if !target_module.record.file.complete
+        || !target_input.ordinary_path_complete
+        || target_input.value_blockers.contains(&target_name)
+        || target_input.incomplete_value_names.contains(&target_name)
+    {
+        return None;
+    }
+    match index.declarations(
+        target_module.record,
+        &target_module.relative_module,
+        &target_name,
+    ) {
+        [declaration] => Some(declaration.declaration),
+        _ => None,
     }
 }
 
@@ -20982,6 +21403,7 @@ mod rust_complexity_tests {
                 module_path: vec![format!("module_{index}")],
                 declaration: Some(NodeId(10_000 + index as i64)),
                 domain_complete: true,
+                ordinary_path_complete: true,
                 value_blockers: Vec::new(),
                 incomplete_value_names: Vec::new(),
                 file_children: Vec::new(),

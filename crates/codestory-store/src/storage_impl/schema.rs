@@ -1,5 +1,13 @@
 use super::*;
 
+const FILE_EXTRACTION_IDENTITY_TABLE: &str = "CREATE TABLE IF NOT EXISTS file_extraction_identity (
+    file_id INTEGER PRIMARY KEY,
+    language TEXT NOT NULL CHECK(length(language) > 0),
+    source_content_hash TEXT NOT NULL CHECK(length(source_content_hash) = 64),
+    extraction_revision TEXT NOT NULL CHECK(length(extraction_revision) > 0),
+    FOREIGN KEY(file_id) REFERENCES file(id) ON DELETE CASCADE
+)";
+
 const TABLE_STATEMENTS: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS node (
         id INTEGER PRIMARY KEY,
@@ -57,6 +65,7 @@ const TABLE_STATEMENTS: &[&str] = &[
         id INTEGER PRIMARY KEY CHECK (id = 1),
         started_at_epoch_ms INTEGER NOT NULL
     )",
+    FILE_EXTRACTION_IDENTITY_TABLE,
     "CREATE TABLE IF NOT EXISTS index_publication (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         generation INTEGER NOT NULL CHECK (generation > 0),
@@ -870,6 +879,21 @@ pub(super) fn apply_schema_migrations(storage: &Storage) -> Result<(), StorageEr
         create_proof_resolution_fk_indexes(&storage.conn)?;
     }
     create_indexes(&storage.conn, index_mode)?;
+
+    if stored_version < FILE_EXTRACTION_IDENTITY_SCHEMA_VERSION
+        || stored_version == INCOMPLETE_INCREMENTAL_SCHEMA_VERSION
+    {
+        let tx = storage.conn.unchecked_transaction()?;
+        tx.execute(FILE_EXTRACTION_IDENTITY_TABLE, [])?;
+        if stored_version != INCOMPLETE_INCREMENTAL_SCHEMA_VERSION {
+            tx.pragma_update(
+                None,
+                "user_version",
+                FILE_EXTRACTION_IDENTITY_SCHEMA_VERSION,
+            )?;
+        }
+        tx.commit()?;
+    }
 
     if stored_version < SCHEMA_VERSION {
         storage.set_schema_version(SCHEMA_VERSION)?;

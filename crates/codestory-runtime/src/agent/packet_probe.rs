@@ -1024,6 +1024,8 @@ mod tests {
 
     fn retrieval_descriptor(index: usize) -> PacketCandidateDescriptorV1 {
         PacketCandidateDescriptorV1 {
+            published_calls: None,
+            published_calls_conflicted: false,
             stable_identity: format!("node:retrieval-{index}"),
             path: format!("src/retrieval-{index}.rs"),
             symbol: Some(format!("retrieval_{index}")),

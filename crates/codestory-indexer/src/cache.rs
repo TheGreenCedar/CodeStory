@@ -55,9 +55,20 @@ pub(crate) struct CachedCallResolutionInput {
     pub callsite: ExactCallsite,
     pub caller: Option<NodeId>,
     pub binding: CachedResolutionBinding,
+    #[serde(default)]
+    pub ordinary_rust_path: Option<CachedRustQualifiedPath>,
     pub language: String,
     pub adapter_version: String,
     pub parser_fingerprint: String,
+}
+
+/// Source-bound navigation metadata, independent of strict Exact admission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedRustQualifiedPath {
+    pub module_path: Vec<String>,
+    pub components: Vec<String>,
+    pub import: Option<CachedRustUseBinding>,
+    pub associated_owner: Option<NodeId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -294,6 +305,10 @@ pub(crate) struct CachedRustModule {
     pub module_path: Vec<String>,
     pub declaration: Option<NodeId>,
     pub domain_complete: bool,
+    // Nominal navigation can retain explicit names beside cfg siblings/globs;
+    // strict Exact admission continues to use domain_complete. Old caches refuse.
+    #[serde(default)]
+    pub ordinary_path_complete: bool,
     #[serde(default)]
     pub value_blockers: Vec<String>,
     #[serde(default)]
@@ -409,6 +424,7 @@ impl CachedIndexArtifact {
         IntermediateStorage {
             files: self.files,
             file_content_hashes: Vec::new(),
+            file_extraction_identities: Vec::new(),
             nodes: self.nodes,
             structural_unit_node_ids: Vec::new(),
             structural_text_units: Vec::new(),
@@ -693,6 +709,7 @@ impl CachedStructuralArtifact {
         IntermediateStorage {
             files: self.files,
             file_content_hashes: self.file_content_hashes,
+            file_extraction_identities: Vec::new(),
             nodes: self.nodes,
             structural_unit_node_ids: self.structural_unit_node_ids,
             structural_text_units: self.structural_text_units,
@@ -746,6 +763,9 @@ pub(crate) fn build_index_artifact_cache_key(
     mix_str(&mut state, language_config.language_name);
     mix_str(&mut state, language_config.graph_query);
     mix_optional_str(&mut state, language_config.tags_query);
+    if let Some(revision) = crate::current_file_extraction_revision(language_config.language_name) {
+        mix_str(&mut state, revision);
+    }
     // Rust-side callable identity/scope extraction changed independently of the
     // graph rules. Invalidate affected languages without discarding unrelated
     // parser artifacts or changing the shared cache serialization schema.
@@ -754,6 +774,9 @@ pub(crate) fn build_index_artifact_cache_key(
         "c" | "cpp" | "javascript" | "typescript"
     ) {
         mix_str(&mut state, "callable-identity-and-scope-v3");
+    }
+    if matches!(language_config.language_name, "c" | "cpp") {
+        mix_str(&mut state, "native-control-flow-declarator-v1");
     }
     if language_config.language_name == "go" {
         mix_str(&mut state, "go-method-receiver-capture-v1");
@@ -1116,6 +1139,100 @@ mod tests {
     }
 
     #[test]
+    fn callable_declaration_cache_revision_leaves_other_languages_reusable() {
+        for extension in ["py", "rs", "go", "c", "cpp", "js", "ts", "tsx"] {
+            let config = crate::get_language_for_ext(extension).expect("parser config");
+            let root = Path::new("project");
+            let path = Path::new("source");
+            let source = b"unchanged source";
+            let mut previous = FNV_OFFSET_BASIS;
+            mix_str(&mut previous, "index-artifact");
+            mix_u32(&mut previous, INDEX_ARTIFACT_CACHE_VERSION);
+            mix_path(&mut previous, path).expect("portable path");
+            mix_bytes(&mut previous, source);
+            mix_str(&mut previous, config.language_name);
+            mix_str(&mut previous, config.graph_query);
+            mix_optional_str(&mut previous, config.tags_query);
+            if matches!(
+                config.language_name,
+                "c" | "cpp" | "javascript" | "typescript"
+            ) {
+                mix_str(&mut previous, "callable-identity-and-scope-v3");
+            }
+            if matches!(config.language_name, "c" | "cpp") {
+                mix_str(&mut previous, "native-control-flow-declarator-v1");
+            }
+            if config.language_name == "go" {
+                mix_str(&mut previous, "go-method-receiver-capture-v1");
+                mix_str(&mut previous, "go-member-export-access-v1");
+            }
+            if FRAMEWORK_ROUTE_LANGUAGE_NAMES.contains(&config.language_name) {
+                mix_str(&mut previous, "framework-route-declaration-identity-v1");
+            }
+            mix_bool(&mut previous, false);
+            mix_bool(&mut previous, true);
+            mix_compilation_info(&mut previous, root, None).expect("portable config");
+            let previous = format!("v{INDEX_ARTIFACT_CACHE_VERSION}:{previous:016x}");
+            let current =
+                build_index_artifact_cache_key(root, path, source, &config, None, false, true)
+                    .expect("cache key");
+            assert_eq!(
+                current != previous,
+                matches!(extension, "py" | "rs"),
+                "{extension}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_control_flow_cache_revision_is_limited_to_native() {
+        for extension in ["c", "cpp", "go", "rs", "py", "js", "ts", "tsx"] {
+            let config = crate::get_language_for_ext(extension).expect("parser config");
+            let root = Path::new("project");
+            let path = Path::new("source");
+            let source = b"unchanged source";
+            // Freeze the prior key's native naming semantics: a repaired
+            // definition must not be read from an old parser artifact.
+            let mut previous = FNV_OFFSET_BASIS;
+            mix_str(&mut previous, "index-artifact");
+            mix_u32(&mut previous, INDEX_ARTIFACT_CACHE_VERSION);
+            mix_path(&mut previous, path).expect("portable path");
+            mix_bytes(&mut previous, source);
+            mix_str(&mut previous, config.language_name);
+            mix_str(&mut previous, config.graph_query);
+            mix_optional_str(&mut previous, config.tags_query);
+            if let Some(revision) = crate::current_file_extraction_revision(config.language_name) {
+                mix_str(&mut previous, revision);
+            }
+            if matches!(
+                config.language_name,
+                "c" | "cpp" | "javascript" | "typescript"
+            ) {
+                mix_str(&mut previous, "callable-identity-and-scope-v3");
+            }
+            if config.language_name == "go" {
+                mix_str(&mut previous, "go-method-receiver-capture-v1");
+                mix_str(&mut previous, "go-member-export-access-v1");
+            }
+            if FRAMEWORK_ROUTE_LANGUAGE_NAMES.contains(&config.language_name) {
+                mix_str(&mut previous, "framework-route-declaration-identity-v1");
+            }
+            mix_bool(&mut previous, false);
+            mix_bool(&mut previous, true);
+            mix_compilation_info(&mut previous, root, None).expect("portable config");
+            let previous = format!("v{INDEX_ARTIFACT_CACHE_VERSION}:{previous:016x}");
+            let current =
+                build_index_artifact_cache_key(root, path, source, &config, None, false, true)
+                    .expect("cache key");
+            assert_eq!(
+                current != previous,
+                matches!(extension, "c" | "cpp"),
+                "{extension}"
+            );
+        }
+    }
+
+    #[test]
     fn callable_scope_cache_revision_is_limited_to_affected_languages() {
         for extension in ["c", "cpp", "js", "ts", "tsx", "rs", "py"] {
             let config = crate::get_language_for_ext(extension).expect("parser config");
@@ -1132,6 +1249,12 @@ mod tests {
             mix_str(&mut previous, config.language_name);
             mix_str(&mut previous, config.graph_query);
             mix_optional_str(&mut previous, config.tags_query);
+            if let Some(revision) = crate::current_file_extraction_revision(config.language_name) {
+                mix_str(&mut previous, revision);
+            }
+            if matches!(config.language_name, "c" | "cpp") {
+                mix_str(&mut previous, "native-control-flow-declarator-v1");
+            }
             if FRAMEWORK_ROUTE_LANGUAGE_NAMES.contains(&config.language_name) {
                 mix_str(&mut previous, "framework-route-declaration-identity-v1");
             }
@@ -1168,6 +1291,9 @@ mod tests {
             mix_str(&mut previous, config.language_name);
             mix_str(&mut previous, config.graph_query);
             mix_optional_str(&mut previous, config.tags_query);
+            if let Some(revision) = crate::current_file_extraction_revision(config.language_name) {
+                mix_str(&mut previous, revision);
+            }
             if config.language_name == "go" {
                 mix_str(&mut previous, "go-member-export-access-v1");
             }
@@ -1176,6 +1302,9 @@ mod tests {
                 "c" | "cpp" | "javascript" | "typescript"
             ) {
                 mix_str(&mut previous, "callable-identity-and-scope-v3");
+            }
+            if matches!(config.language_name, "c" | "cpp") {
+                mix_str(&mut previous, "native-control-flow-declarator-v1");
             }
             if FRAMEWORK_ROUTE_LANGUAGE_NAMES.contains(&config.language_name) {
                 mix_str(&mut previous, "framework-route-declaration-identity-v1");
@@ -1208,11 +1337,17 @@ mod tests {
             mix_str(&mut previous, config.language_name);
             mix_str(&mut previous, config.graph_query);
             mix_optional_str(&mut previous, config.tags_query);
+            if let Some(revision) = crate::current_file_extraction_revision(config.language_name) {
+                mix_str(&mut previous, revision);
+            }
             if matches!(
                 config.language_name,
                 "c" | "cpp" | "javascript" | "typescript"
             ) {
                 mix_str(&mut previous, "callable-identity-and-scope-v3");
+            }
+            if matches!(config.language_name, "c" | "cpp") {
+                mix_str(&mut previous, "native-control-flow-declarator-v1");
             }
             if config.language_name == "go" {
                 mix_str(&mut previous, "go-method-receiver-capture-v1");
@@ -1252,11 +1387,17 @@ mod tests {
             mix_str(&mut previous, config.language_name);
             mix_str(&mut previous, config.graph_query);
             mix_optional_str(&mut previous, config.tags_query);
+            if let Some(revision) = crate::current_file_extraction_revision(config.language_name) {
+                mix_str(&mut previous, revision);
+            }
             if matches!(
                 config.language_name,
                 "c" | "cpp" | "javascript" | "typescript"
             ) {
                 mix_str(&mut previous, "callable-identity-and-scope-v3");
+            }
+            if matches!(config.language_name, "c" | "cpp") {
+                mix_str(&mut previous, "native-control-flow-declarator-v1");
             }
             if config.language_name == "go" {
                 mix_str(&mut previous, "go-method-receiver-capture-v1");

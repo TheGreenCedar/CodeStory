@@ -12,6 +12,7 @@ use crate::{
 use super::lifecycle::new_agent_surface_runtime;
 
 pub(super) async fn run_serve(cmd: ServeCommand) -> Result<()> {
+    validate_serve_cache_routing(&cmd)?;
     if !cmd.stdio {
         ensure_http_serve_bind_allowed(&cmd.addr, cmd.allow_non_loopback)?;
     }
@@ -37,6 +38,16 @@ pub(super) async fn run_serve(cmd: ServeCommand) -> Result<()> {
             }
             Err(error) => eprintln!("serve accept failed: {error}"),
         }
+    }
+    Ok(())
+}
+
+fn validate_serve_cache_routing(cmd: &ServeCommand) -> Result<()> {
+    if cmd.multi_project && cmd.project.cache_dir.is_some() {
+        bail!(
+            "serve --multi-project cannot use --cache-dir; use single-project serve with \
+--project and --cache-dir, or omit --cache-dir for per-project cache routing"
+        );
     }
     Ok(())
 }
@@ -77,4 +88,35 @@ pub(super) fn run_generate_completions(cmd: GenerateCompletionsCommand) -> Resul
     let mut command = Cli::command();
     generate(shell, &mut command, "codestory-cli", &mut std::io::stdout());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::args::{Command, ProjectArgs};
+    use clap::Parser;
+
+    #[test]
+    fn serve_cache_routing_rejects_programmatic_multi_project_override() {
+        let parsed = Cli::try_parse_from(["codestory-cli", "serve", "--stdio", "--multi-project"])
+            .expect("valid multi-project command");
+        let Command::Serve(mut command) = parsed.command else {
+            panic!("expected serve command");
+        };
+        validate_serve_cache_routing(&command).expect("default multi-project routing");
+        command.project = ProjectArgs {
+            project: "unopened-project".into(),
+            cache_dir: Some("unopened-cache".into()),
+        };
+        let error = validate_serve_cache_routing(&command)
+            .expect_err("programmatic callers must not bypass the parse-time conflict");
+        assert!(
+            error
+                .to_string()
+                .contains("--multi-project cannot use --cache-dir")
+        );
+        command.multi_project = false;
+        validate_serve_cache_routing(&command)
+            .expect("single-project exact override remains valid");
+    }
 }

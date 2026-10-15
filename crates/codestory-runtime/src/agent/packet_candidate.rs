@@ -8,11 +8,12 @@ use codestory_contracts::api::{
 #[cfg(test)]
 use codestory_contracts::compilation::PACKET_RETRIEVAL_SCORE_VERSION_V1;
 use codestory_contracts::compilation::{
-    INTERIM_MAX_ADMITTED_CANDIDATES, INTERIM_MAX_ADMITTED_SOURCE_BYTES, PacketAdmissionGapKindV1,
-    PacketAdmissionGapV1, PacketAdmissionOriginV1, PacketAdmissionReceiptV1,
-    PacketCandidateDescriptorV1,
+    INTERIM_MAX_ADMITTED_CANDIDATES, INTERIM_MAX_ADMITTED_SOURCE_BYTES,
+    INTERIM_SOURCE_CONTINUATION_UPPER_BOUND, PacketAdmissionGapKindV1, PacketAdmissionGapV1,
+    PacketAdmissionOriginV1, PacketAdmissionReceiptV1, PacketCandidateDescriptorV1,
 };
 use codestory_contracts::graph::NodeId as CoreNodeId;
+use codestory_retrieval::LexicalAdmissionPolicy;
 use codestory_retrieval::{QueryResult, RetrievalPublicationIdentity};
 use sha2::{Digest, Sha256};
 #[cfg(any(test, feature = "benchmark-support"))]
@@ -42,6 +43,8 @@ pub(crate) enum PacketGraphDirection {
 /// many source bytes they may charge before exact hydration.
 #[derive(Debug)]
 pub(crate) struct PacketProofSession {
+    pub(crate) issued_source_record:
+        RefCell<Option<super::packet_served_sources::ServedSourceRecord>>,
     /// Packet-scoped count of candidates selected for source/graph hydration.
     /// Horizon A admits at most [`INTERIM_MAX_ADMITTED_CANDIDATES`] across the
     /// whole packet before hydration, not per subquery.
@@ -53,7 +56,10 @@ pub(crate) struct PacketProofSession {
     gaps: RefCell<Vec<PacketAdmissionGapV1>>,
     retrieval_admission_sealed: RefCell<bool>,
     descriptor_results: RefCell<Vec<RetainedPacketDescriptorResult>>,
+    admitted_call_annotations:
+        RefCell<HashMap<String, codestory_contracts::compilation::PacketPublishedCallsV1>>,
     include_dense_semantic: bool,
+    replay_ranked_descriptors: RefCell<Option<Vec<PacketCandidateDescriptorV1>>>,
     #[cfg(any(test, feature = "benchmark-support"))]
     descriptor_query_count: Cell<u32>,
     #[cfg(any(test, feature = "benchmark-support"))]
@@ -64,8 +70,44 @@ pub(crate) struct PacketProofSession {
     descriptor_stage_candidates: RefCell<BTreeMap<String, u64>>,
 }
 
+/// Origin is retained before query text enters execution or result lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PacketRetrievalQuery {
+    pub query: String,
+    pub lexical_policy: LexicalAdmissionPolicy,
+}
+
+impl PacketRetrievalQuery {
+    #[cfg(test)]
+    pub(crate) fn strict(query: &str) -> Self {
+        Self {
+            query: query.trim().to_string(),
+            lexical_policy: LexicalAdmissionPolicy::StrictLiteralV1,
+        }
+    }
+}
+
+pub(crate) fn packet_retrieval_queries(
+    plan: &codestory_contracts::api::PacketPlanDto,
+) -> Vec<PacketRetrievalQuery> {
+    plan.queries
+        .iter()
+        .map(|query| PacketRetrievalQuery {
+            query: query.query.clone(),
+            lexical_policy: if codestory_agent::packet_plan::packet_plan_query_is_typed_free_query(
+                query,
+            ) {
+                LexicalAdmissionPolicy::StrictLiteralV1
+            } else {
+                LexicalAdmissionPolicy::BroadQuestionV1
+            },
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 struct RetainedPacketDescriptorResult {
+    lexical_policy: LexicalAdmissionPolicy,
     query: String,
     include_dense_semantic: bool,
     publication: RetrievalPublicationIdentity,
@@ -99,16 +141,102 @@ pub(crate) enum PacketAdmissionDecision {
 }
 
 impl PacketProofSession {
+    pub(crate) fn enable_replay_metadata(&self) {
+        *self.replay_ranked_descriptors.borrow_mut() = Some(Vec::new());
+    }
+
+    pub(crate) fn retain_replay_ranked_descriptors(
+        &self,
+        descriptors: &[PacketCandidateDescriptorV1],
+    ) {
+        let mut retained = self.replay_ranked_descriptors.borrow_mut();
+        if let Some(rows) = retained.as_mut() {
+            let mut seen = HashSet::new();
+            rows.extend(
+                descriptors
+                    .iter()
+                    .filter(|row| seen.insert(row.stable_identity.clone()))
+                    .cloned(),
+            );
+        }
+    }
+
+    pub(crate) fn replay_descriptor_metadata(&self) -> serde_json::Value {
+        let lane = |evidence: Option<&codestory_retrieval::CandidateLaneEvidence>| {
+            evidence.map(|evidence| {
+                serde_json::json!({
+                    "rank": evidence.rank,
+                    "raw_score": evidence.raw_score,
+                    "raw_score_bits": evidence.raw_score.to_bits(),
+                })
+            })
+        };
+        let queries = self
+            .descriptor_results
+            .borrow()
+            .iter()
+            .enumerate()
+            .map(|(query_index, entry)| {
+                let eligible_descriptors = entry
+                    .result
+                    .hits
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, hit)| !codestory_retrieval::is_phantom_sidecar_hit(hit))
+                    .filter_map(|(returned_index, hit)| {
+                        let descriptor = hit.packet_descriptor()?;
+                        Some(serde_json::json!({
+                            "returned_index": returned_index,
+                            "stable_identity": descriptor.stable_identity,
+                            "retrieval_lane": descriptor.retrieval_lane,
+                            "retrieval_score": {
+                                "version": descriptor.retrieval_score.version,
+                                "value": descriptor.retrieval_score.value,
+                                "bits": descriptor.retrieval_score.value.to_bits(),
+                            },
+                            "source_bytes_upper_bound": descriptor.source_bytes_upper_bound,
+                            "lane_scores": {
+                                "lexical": lane(hit.lane_scores.lexical.as_ref()),
+                                "semantic": lane(hit.lane_scores.semantic.as_ref()),
+                                "graph": lane(hit.lane_scores.graph.as_ref()),
+                            },
+                        }))
+                    })
+                    .collect::<Vec<_>>();
+                serde_json::json!({
+                    "query_index": query_index,
+                    "query_sha256": format!("{:x}", Sha256::digest(entry.query.as_bytes())),
+                    "query": entry.query,
+                    "lexical_policy": format!("{:?}", entry.lexical_policy),
+                    "include_dense_semantic": entry.include_dense_semantic,
+                    "publication": entry.publication,
+                    "candidate_count": entry.result.hits.len(),
+                    "shape": entry.result.features.shape,
+                    "trace": entry.result.trace,
+                    "eligible_descriptors": eligible_descriptors,
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "ranked_eligible_descriptors":*self.replay_ranked_descriptors.borrow(),
+            "queries": queries,
+            "unavailable_evidence": ["rank_features", "native_query_window_details"],
+        })
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             hydrated_admissions: RefCell::new(0),
+            issued_source_record: RefCell::new(None),
             admitted_source_bytes: RefCell::new(0),
             admitted_identities: RefCell::new(HashMap::new()),
             receipts: RefCell::new(Vec::new()),
             gaps: RefCell::new(Vec::new()),
             retrieval_admission_sealed: RefCell::new(false),
             descriptor_results: RefCell::new(Vec::new()),
+            admitted_call_annotations: RefCell::new(HashMap::new()),
             include_dense_semantic: true,
+            replay_ranked_descriptors: RefCell::new(None),
             #[cfg(any(test, feature = "benchmark-support"))]
             descriptor_query_count: Cell::new(0),
             #[cfg(any(test, feature = "benchmark-support"))]
@@ -130,6 +258,64 @@ impl PacketProofSession {
 
     pub(crate) fn includes_dense_semantic(&self) -> bool {
         self.include_dense_semantic
+    }
+
+    pub(crate) fn retain_admitted_call_annotation(&self, descriptor: &PacketCandidateDescriptorV1) {
+        let mut annotations = self.admitted_call_annotations.borrow_mut();
+        if descriptor.published_calls_conflicted {
+            annotations.remove(&descriptor.stable_identity);
+            return;
+        }
+        if let Some(annotation) = &descriptor.published_calls {
+            // Caller has already validated publication/owner through pure
+            // admission ordering. Store only a currently admitted owner.
+            if self
+                .admitted_identities
+                .borrow()
+                .contains_key(&descriptor.stable_identity)
+                && annotation
+                    .neighborhood
+                    .is_valid_for(&descriptor.stable_identity)
+            {
+                annotations.insert(descriptor.stable_identity.clone(), annotation.clone());
+            }
+        }
+    }
+
+    pub(crate) fn admitted_call_navigation(
+        &self,
+    ) -> Vec<codestory_contracts::compilation::PacketDirectedRelationV1> {
+        use codestory_contracts::compilation::*;
+        let admitted = self.admitted_identities.borrow();
+        let mut links = Vec::new();
+        for (source, annotation) in self.admitted_call_annotations.borrow().iter() {
+            if !admitted.contains_key(source) {
+                continue;
+            }
+            for target in &annotation.neighborhood.targets {
+                if source == &target.stable_identity
+                    || !admitted.contains_key(&target.stable_identity)
+                {
+                    continue;
+                }
+                links.push(PacketDirectedRelationV1 {
+                    relation_id: format!("navigation:{}:{}", source, target.representative_edge_id),
+                    from_identity: source.clone(),
+                    to_identity: target.stable_identity.clone(),
+                    relation_kind: PacketRelationKindV1::Call,
+                    certainty: target.certainty,
+                });
+            }
+        }
+        links.sort_by(|a, b| {
+            (&a.from_identity, &a.to_identity, &a.relation_id).cmp(&(
+                &b.from_identity,
+                &b.to_identity,
+                &b.relation_id,
+            ))
+        });
+        links.dedup_by(|a, b| a.from_identity == b.from_identity && a.to_identity == b.to_identity);
+        links
     }
 
     #[cfg(any(test, feature = "benchmark-support"))]
@@ -181,24 +367,45 @@ impl PacketProofSession {
     /// publication. A later hydration stage may reuse only an identical key;
     /// it cannot silently rerun under a shorter budget or cross a packet,
     /// policy, or publication boundary.
+    #[cfg(test)]
     pub(crate) fn retain_descriptor_result(
         &self,
         result: &QueryResult,
         include_dense_semantic: bool,
         publication: &RetrievalPublicationIdentity,
     ) -> Result<(), &'static str> {
+        self.retain_descriptor_result_with_policy(
+            result,
+            LexicalAdmissionPolicy::StrictLiteralV1,
+            include_dense_semantic,
+            publication,
+        )
+    }
+
+    pub(crate) fn retain_descriptor_result_with_policy(
+        &self,
+        result: &QueryResult,
+        expected_policy: LexicalAdmissionPolicy,
+        include_dense_semantic: bool,
+        publication: &RetrievalPublicationIdentity,
+    ) -> Result<(), &'static str> {
+        if result.features.lexical_policy != expected_policy {
+            return Err("descriptor execution policy does not match requested policy");
+        }
         if result.publication_identity.as_ref() != Some(publication) {
             return Err("descriptor result publication does not match the packet pin");
         }
         let mut retained = self.descriptor_results.borrow_mut();
         if retained.iter().any(|entry| {
             entry.query == result.query
+                && entry.lexical_policy == expected_policy
                 && entry.include_dense_semantic == include_dense_semantic
                 && entry.publication == *publication
         }) {
             return Err("descriptor result was retained twice for one packet query");
         }
         retained.push(RetainedPacketDescriptorResult {
+            lexical_policy: expected_policy,
             query: result.query.clone(),
             include_dense_semantic,
             publication: publication.clone(),
@@ -213,11 +420,28 @@ impl PacketProofSession {
         include_dense_semantic: bool,
         publication: &RetrievalPublicationIdentity,
     ) -> Option<QueryResult> {
+        self.descriptor_result_with_policy(
+            query,
+            LexicalAdmissionPolicy::StrictLiteralV1,
+            include_dense_semantic,
+            publication,
+        )
+    }
+
+    pub(crate) fn descriptor_result_with_policy(
+        &self,
+        query: &str,
+        lexical_policy: LexicalAdmissionPolicy,
+        include_dense_semantic: bool,
+        publication: &RetrievalPublicationIdentity,
+    ) -> Option<QueryResult> {
         self.descriptor_results
             .borrow()
             .iter()
             .find(|entry| {
                 entry.query == query
+                    && entry.lexical_policy == lexical_policy
+                    && entry.result.features.lexical_policy == lexical_policy
                     && entry.include_dense_semantic == include_dense_semantic
                     && entry.publication == *publication
             })
@@ -230,6 +454,28 @@ impl PacketProofSession {
 
     pub(crate) fn remaining_source_bytes(&self) -> usize {
         INTERIM_MAX_ADMITTED_SOURCE_BYTES.saturating_sub(*self.admitted_source_bytes.borrow())
+    }
+
+    // Verified metadata consumes the existing whole-packet limits before
+    // optional descriptor retrieval; loading the record itself reads no body.
+    pub(crate) fn protect_served_sources(
+        &self,
+        record: super::packet_served_sources::ServedSourceRecord,
+    ) -> Result<(), codestory_contracts::api::ApiError> {
+        for (ordinal, witness) in record.witnesses.iter().enumerate() {
+            if self.admit_exact_selector(
+                &witness.stable_identity(),
+                witness.rendered_bytes,
+                ordinal as u32,
+            ) != PacketAdmissionDecision::Admitted
+            {
+                return Err(codestory_contracts::api::ApiError::invalid_argument(
+                    "Issued source inventory exceeds remaining packet admission.",
+                ));
+            }
+        }
+        *self.issued_source_record.borrow_mut() = Some(record);
+        Ok(())
     }
 
     #[cfg(test)]
@@ -303,6 +549,51 @@ impl PacketProofSession {
         )
     }
 
+    pub(crate) fn retrieval_admission_is_sealed(&self) -> bool {
+        *self.retrieval_admission_sealed.borrow()
+    }
+
+    /// Authorize only an exact issued receipt backed by this pin's retained
+    /// lexical metadata. Query text never crosses into source compilation.
+    pub(crate) fn authorizes_published_file(
+        &self,
+        receipt: &PacketAdmissionReceiptV1,
+        publication: &RetrievalPublicationIdentity,
+    ) -> bool {
+        if !self.retrieval_admission_is_sealed()
+            || !receipt.stable_identity.starts_with("path:")
+            || !self
+                .receipts
+                .borrow()
+                .iter()
+                .any(|issued| issued == receipt)
+        {
+            return false;
+        }
+        (receipt.origin == PacketAdmissionOriginV1::ExactTypedSelector
+            && self
+                .issued_source_record
+                .borrow()
+                .as_ref()
+                .is_some_and(|record| {
+                    record.authorizes_published_file(&receipt.stable_identity, publication)
+                }))
+            || self.descriptor_results.borrow().iter().any(|entry| {
+                &entry.publication == publication
+                    && entry.result.publication_identity.as_ref() == Some(publication)
+                    && entry.result.hits.iter().any(|candidate| {
+                        candidate.source == codestory_retrieval::CandidateSource::Lexical
+                            && candidate.node_id.is_none()
+                            && candidate.symbol_name.is_none()
+                            && candidate.qualified_name.is_none()
+                            && candidate.target.is_none()
+                            && candidate.packet_descriptor().is_some_and(|descriptor| {
+                                descriptor.stable_identity == receipt.stable_identity
+                            })
+                    })
+            })
+    }
+
     pub(crate) fn seal_retrieval_admission(&self) {
         *self.retrieval_admission_sealed.borrow_mut() = true;
     }
@@ -374,6 +665,91 @@ impl PacketProofSession {
             stable_identity,
             exact_selector_ordinal,
         });
+    }
+
+    /// Grow only a retained identity's source reservation after descriptor
+    /// admission is sealed. The caller authenticates a typed source cursor
+    /// before invoking this and hydrates its next page afterward.
+    ///
+    /// Existing reservations, identity count, and ordering remain intact.
+    /// Partial capacity is charged conservatively; repeated requests cannot
+    /// replenish the shared packet budget or reclaim a failed reservation.
+    #[cfg(test)]
+    pub(crate) fn reserve_continuation_source(&self, stable_identity: &str) -> Option<usize> {
+        if !self.retrieval_admission_is_sealed() {
+            return None;
+        }
+        let mut receipts = self.receipts.borrow_mut();
+        let receipt = receipts
+            .iter_mut()
+            .find(|receipt| receipt.stable_identity == stable_identity)?;
+        let current = receipt.reserved_source_bytes as usize;
+        let extra = INTERIM_SOURCE_CONTINUATION_UPPER_BOUND
+            .saturating_sub(current)
+            .min(self.remaining_source_bytes());
+        let mut identities = self.admitted_identities.borrow_mut();
+        let reserved = identities.get_mut(stable_identity)?;
+        debug_assert_eq!(*reserved, current);
+        *reserved += extra;
+        *self.admitted_source_bytes.borrow_mut() += extra;
+        receipt.reserved_source_bytes = u32::try_from(current + extra).unwrap_or(u32::MAX);
+        Some(current + extra)
+    }
+
+    /// Reserve spare capacity for authenticated requested source ranges first,
+    /// fairly within that group, then share the remainder across context nodes.
+    /// Existing reservations stay charged even when later hydration fails.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn reserve_source_pages(&self, requested: &HashSet<String>) {
+        self.reserve_source_pages_with_demands(requested, &HashMap::new());
+    }
+
+    /// Authenticated rendered demand limits growth, never refunds an earlier
+    /// reservation. Unknown demand retains the conservative page upper bound.
+    pub(crate) fn reserve_source_pages_with_demands(
+        &self,
+        requested: &HashSet<String>,
+        demands: &HashMap<String, usize>,
+    ) {
+        if !self.retrieval_admission_is_sealed() {
+            return;
+        }
+        let mut receipts = self.receipts.borrow_mut();
+        let mut identities = self.admitted_identities.borrow_mut();
+        let mut used = self.admitted_source_bytes.borrow_mut();
+        for requested_group in [true, false] {
+            while *used < INTERIM_MAX_ADMITTED_SOURCE_BYTES {
+                let mut progressed = false;
+                for receipt in receipts.iter_mut() {
+                    let current = receipt.reserved_source_bytes as usize;
+                    if *used == INTERIM_MAX_ADMITTED_SOURCE_BYTES {
+                        break;
+                    }
+                    if requested.contains(&receipt.stable_identity) != requested_group
+                        || !receipt.stable_identity.starts_with("node:")
+                        || current
+                            >= demands
+                                .get(&receipt.stable_identity)
+                                .copied()
+                                .unwrap_or(INTERIM_SOURCE_CONTINUATION_UPPER_BOUND)
+                                .min(INTERIM_SOURCE_CONTINUATION_UPPER_BOUND)
+                    {
+                        continue;
+                    }
+                    let Some(reserved) = identities.get_mut(&receipt.stable_identity) else {
+                        continue;
+                    };
+                    debug_assert_eq!(*reserved, current);
+                    *reserved += 1;
+                    *used += 1;
+                    receipt.reserved_source_bytes += 1;
+                    progressed = true;
+                }
+                if !progressed {
+                    break;
+                }
+            }
+        }
     }
 
     pub(crate) fn receipts(&self) -> Vec<PacketAdmissionReceiptV1> {
@@ -707,6 +1083,268 @@ mod tests {
     };
     use codestory_contracts::compilation::{PacketRetrievalLaneV1, VersionedRetrievalScoreV1};
 
+    #[test]
+    fn replay_metadata_preserves_all_query_contributions_without_source_payloads() {
+        use codestory_retrieval::{
+            CandidateHit, CandidateLaneEvidence, CandidateLaneScores, CandidateSource, QueryTrace,
+            RetrievalStageKind, StageCompletionStatus, StageTrace, classify_query,
+        };
+        use serde_json::json;
+
+        let session = PacketProofSession::new();
+        session.enable_replay_metadata();
+        assert_eq!(
+            session.admit("node:9000", 1),
+            PacketAdmissionDecision::Admitted
+        );
+        let publication = RetrievalPublicationIdentity {
+            artifact_scope: None,
+            core_generation_id: "core".into(),
+            core_run_id: "run".into(),
+            sidecar_generation: "sidecar".into(),
+            sidecar_input_hash: "input".into(),
+            semantic_generation: "semantic".into(),
+        };
+        let hit = |id: usize, score| {
+            let mut hit = CandidateHit::with_source(
+                "src/public.rs",
+                Some(format!("entry_{id}")),
+                score,
+                CandidateSource::Lexical,
+            );
+            hit.node_id = Some(id.to_string());
+            hit.source_bytes_upper_bound = Some(512);
+            hit.source_excerpt = Some("EXCERPT_MUST_NOT_BE_EXPORTED".into());
+            hit.lane_scores = CandidateLaneScores {
+                lexical: Some(CandidateLaneEvidence {
+                    rank: 1,
+                    raw_score: 0.5,
+                    provenance: vec!["LANE_PROVENANCE_MUST_NOT_BE_EXPORTED".into()],
+                }),
+                ..Default::default()
+            };
+            hit
+        };
+        for query_index in 0..5 {
+            let query = format!("  literal query {query_index} é\r\n");
+            let mut features = classify_query(&query);
+            features.lexical_policy = LexicalAdmissionPolicy::BroadQuestionV1;
+            let mut phantom = hit(8000, 1.0);
+            phantom.file_path = "lexical:synthetic".into();
+            let mut unbounded = hit(8001, 1.0);
+            unbounded.source_bytes_upper_bound = None;
+            let mut hits = vec![phantom, unbounded];
+            for row in 0..18 {
+                let id = if query_index == 4 && row == 0 {
+                    0
+                } else {
+                    query_index * 100 + row
+                };
+                let score = if query_index == 4 && row == 0 {
+                    f32::from_bits(0x3f7fffff)
+                } else if query_index == 0 && row == 0 {
+                    f32::from_bits(0x3eaaaaab)
+                } else {
+                    0.5
+                };
+                let mut candidate = hit(id, score);
+                candidate.lane_scores.lexical.as_mut().unwrap().rank = row as u32 + 1;
+                if row == 0 {
+                    candidate.lane_scores.semantic = Some(CandidateLaneEvidence {
+                        rank: 19,
+                        raw_score: -0.0,
+                        provenance: Vec::new(),
+                    });
+                }
+                if row == 17 {
+                    candidate.lane_scores.graph = Some(CandidateLaneEvidence {
+                        rank: 2,
+                        raw_score: f32::from_bits(0x3eaaaaab),
+                        provenance: Vec::new(),
+                    });
+                }
+                hits.push(candidate);
+            }
+            let stage = |stage, completion_status| StageTrace {
+                stage,
+                budget_ms: 200,
+                elapsed_ms: 4,
+                admission_wait_ms: 0,
+                queue_wait_ms: Some(0),
+                execution_ms: Some(4),
+                candidates_added: 18,
+                marginal_gain: 1.0,
+                cancel_reason: None,
+                cache_hit: false,
+                degraded: false,
+                stub_reason: None,
+                completion_status,
+            };
+            let result = QueryResult {
+                publication_identity: Some(publication.clone()),
+                query,
+                features,
+                hits,
+                trace: QueryTrace {
+                    retrieval_mode: "full".into(),
+                    degraded_reason: None,
+                    total_budget_ms: 400,
+                    elapsed_ms: 8,
+                    cancel_reason: None,
+                    cache_hit: false,
+                    stages: vec![
+                        stage(
+                            RetrievalStageKind::Stage1Lexical,
+                            StageCompletionStatus::Completed,
+                        ),
+                        stage(
+                            RetrievalStageKind::Stage1bSemantic,
+                            if query_index == 4 {
+                                StageCompletionStatus::Skipped
+                            } else {
+                                StageCompletionStatus::Completed
+                            },
+                        ),
+                    ],
+                },
+            };
+            session
+                .retain_descriptor_result_with_policy(
+                    &result,
+                    LexicalAdmissionPolicy::BroadQuestionV1,
+                    true,
+                    &publication,
+                )
+                .unwrap();
+        }
+        let before = session.descriptor_results.borrow().clone();
+        let admissions = serde_json::to_value(session.receipts()).unwrap();
+        let metadata = session.replay_descriptor_metadata();
+        let queries = metadata["queries"].as_array().unwrap();
+        assert_eq!(queries.len(), 5);
+        assert_eq!(
+            queries[0]["query_sha256"],
+            "ada9b88eb22ab770078f5c3b1c97c42fe9d353eaa8f09df6958c0d8d541ae16a"
+        );
+        assert_eq!(
+            metadata["unavailable_evidence"],
+            json!(["rank_features", "native_query_window_details"])
+        );
+        for (query_index, query) in queries.iter().enumerate() {
+            assert_eq!(query["query_index"], query_index);
+            assert_eq!(query["lexical_policy"], "BroadQuestionV1");
+            assert_eq!(query["include_dense_semantic"], true);
+            assert_eq!(
+                query["query"],
+                format!("  literal query {query_index} é\r\n")
+            );
+            assert_eq!(query["candidate_count"], 20);
+            assert_eq!(
+                query["publication"],
+                serde_json::to_value(&publication).unwrap()
+            );
+            assert_eq!(
+                query["trace"],
+                serde_json::to_value(&before[query_index].result.trace).unwrap()
+            );
+            assert_eq!(
+                query["shape"],
+                serde_json::to_value(before[query_index].result.features.shape).unwrap()
+            );
+            let rows = query["eligible_descriptors"].as_array().unwrap();
+            assert_eq!(rows.len(), 18);
+            for (row, descriptor) in rows.iter().enumerate() {
+                let id = if query_index == 4 && row == 0 {
+                    0
+                } else {
+                    query_index * 100 + row
+                };
+                assert_eq!(descriptor["stable_identity"], format!("node:{id}"));
+                assert_eq!(descriptor["returned_index"], row + 2);
+                assert_eq!(descriptor["retrieval_lane"], "lexical");
+                assert_eq!(descriptor["source_bytes_upper_bound"], 512);
+                let expected_bits = if query_index == 4 && row == 0 {
+                    0x3f7fffffu32
+                } else if query_index == 0 && row == 0 {
+                    0x3eaaaaabu32
+                } else {
+                    0x3f000000u32
+                };
+                assert_eq!(descriptor["retrieval_score"]["bits"], expected_bits);
+                assert_eq!(
+                    descriptor["retrieval_score"]["value"],
+                    json!(f32::from_bits(expected_bits))
+                );
+                assert!(
+                    descriptor["retrieval_score"]["version"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with(PACKET_RETRIEVAL_SCORE_VERSION_V1)
+                );
+                assert_eq!(
+                    descriptor["lane_scores"]["lexical"],
+                    json!({"rank":row+1,"raw_score":0.5,"raw_score_bits":0x3f000000u32})
+                );
+            }
+            assert_eq!(
+                rows[0]["lane_scores"]["semantic"],
+                json!({"rank":19,"raw_score":-0.0,"raw_score_bits":0x80000000u32})
+            );
+            assert!(rows[1]["lane_scores"]["semantic"].is_null());
+            assert!(rows[1]["lane_scores"]["graph"].is_null());
+            assert_eq!(
+                rows[17]["lane_scores"]["graph"]["raw_score_bits"],
+                0x3eaaaaabu32
+            );
+            assert_eq!(rows[1]["retrieval_score"]["bits"], 0x3f000000u32);
+            assert_eq!(rows[2]["retrieval_score"]["bits"], 0x3f000000u32);
+        }
+        assert_eq!(
+            queries[0]["eligible_descriptors"][0]["retrieval_score"]["bits"],
+            0x3eaaaaabu32
+        );
+        assert_eq!(
+            queries[4]["eligible_descriptors"][0]["retrieval_score"]["bits"],
+            0x3f7fffffu32
+        );
+        assert_eq!(
+            queries[4]["trace"]["stages"][1]["completion_status"],
+            "skipped"
+        );
+        let serialized = metadata.to_string();
+        for forbidden in [
+            "EXCERPT_MUST_NOT_BE_EXPORTED",
+            "LANE_PROVENANCE_MUST_NOT_BE_EXPORTED",
+            "source_excerpt",
+            "structural_kind",
+        ] {
+            assert!(!serialized.contains(forbidden));
+        }
+        assert_eq!(session.descriptor_results.borrow().len(), before.len());
+        for (expected, actual) in before
+            .iter()
+            .zip(session.descriptor_results.borrow().iter())
+        {
+            assert_eq!(expected.query, actual.query);
+            assert_eq!(expected.result.hits, actual.result.hits);
+            assert_eq!(expected.result.features, actual.result.features);
+            assert_eq!(
+                expected.result.publication_identity,
+                actual.result.publication_identity
+            );
+            assert_eq!(
+                serde_json::to_value(&expected.result.trace).unwrap(),
+                serde_json::to_value(&actual.result.trace).unwrap()
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(session.receipts()).unwrap(),
+            admissions
+        );
+        assert_eq!(*session.hydrated_admissions.borrow(), 1);
+        assert_eq!(*session.admitted_source_bytes.borrow(), 1);
+    }
+
     #[cfg(feature = "benchmark-support")]
     #[test]
     fn benchmark_retrieval_proof_records_executed_descriptor_stages() {
@@ -804,6 +1442,8 @@ mod tests {
         }
         for index in 0..8 {
             let descriptor = PacketCandidateDescriptorV1 {
+                published_calls: None,
+                published_calls_conflicted: false,
                 stable_identity: format!("node:retrieved-{index}"),
                 path: format!("src/retrieved-{index}.rs"),
                 symbol: Some(format!("retrieved_{index}")),
@@ -822,6 +1462,8 @@ mod tests {
         }
 
         let rejected = PacketCandidateDescriptorV1 {
+            published_calls: None,
+            published_calls_conflicted: false,
             stable_identity: "node:seventeenth".into(),
             path: "src/seventeenth.rs".into(),
             symbol: Some("seventeenth".into()),
@@ -846,6 +1488,249 @@ mod tests {
     }
 
     #[test]
+    fn demand_capped_reservations_keep_context_without_refunding_or_widening() {
+        let make = || {
+            let session = PacketProofSession::new();
+            for id in 0..16 {
+                session.admit(&format!("node:{id}"), 512);
+            }
+            session.seal_retrieval_admission();
+            session
+        };
+        let old = make();
+        old.reserve_source_pages(&HashSet::from(["node:0".into()]));
+        assert_eq!(old.receipts()[0].reserved_source_bytes, 4096);
+        assert!(old.receipts()[1].reserved_source_bytes < 1024);
+        let session = make();
+        let before = session.receipts();
+        let mut demands = (0..16)
+            .map(|id| (format!("node:{id}"), 512))
+            .collect::<HashMap<_, _>>();
+        demands.insert("node:0".into(), 2048);
+        demands.insert("node:1".into(), 1024);
+        let selected = HashSet::from(["node:0".into()]);
+        session.reserve_source_pages_with_demands(&selected, &demands);
+        let after = session.receipts();
+        assert_eq!(after[0].reserved_source_bytes, 2048);
+        assert_eq!(after[1].reserved_source_bytes, 1024);
+        assert!(
+            after
+                .iter()
+                .zip(&before)
+                .all(|(a, b)| a.reserved_source_bytes >= b.reserved_source_bytes)
+        );
+        assert!(after.iter().all(|a| a.reserved_source_bytes <= 4096));
+        assert!(
+            after
+                .iter()
+                .map(|a| a.reserved_source_bytes as usize)
+                .sum::<usize>()
+                <= INTERIM_MAX_ADMITTED_SOURCE_BYTES
+        );
+        session.reserve_source_pages_with_demands(&selected, &demands);
+        assert_eq!(session.receipts(), after);
+        demands.insert("node:0".into(), 1);
+        session.reserve_source_pages_with_demands(&selected, &demands);
+        assert_eq!(
+            session.receipts(),
+            after,
+            "a smaller observation cannot refund a charge"
+        );
+    }
+
+    #[test]
+    fn requested_source_pages_share_priority_without_refunds_or_new_identities() {
+        for requested_count in [1, 2, 4, 16] {
+            let session = PacketProofSession::new();
+            for id in 0..16 {
+                session.admit(&format!("node:{id}"), 512);
+            }
+            let mut requested = (0..requested_count)
+                .map(|id| format!("node:{id}"))
+                .collect::<HashSet<_>>();
+            requested.insert("node:unadmitted".into());
+            let initial = session.receipts();
+            session.reserve_source_pages(&requested);
+            assert_eq!(
+                session.receipts(),
+                initial,
+                "unsealed admission cannot allocate pages"
+            );
+            session.seal_retrieval_admission();
+            session.reserve_source_pages(&requested);
+            let pages = session.receipts();
+            let priority = &pages[..requested_count];
+            let least = priority
+                .iter()
+                .map(|page| page.reserved_source_bytes)
+                .min()
+                .unwrap();
+            let most = priority
+                .iter()
+                .map(|page| page.reserved_source_bytes)
+                .max()
+                .unwrap();
+            assert!(most - least <= 1, "requested sources share capacity fairly");
+            assert_eq!(least as usize, (512 + 8192 / requested_count).min(4096));
+            assert!(
+                pages
+                    .iter()
+                    .all(|page| (512..=4096).contains(&page.reserved_source_bytes))
+            );
+            assert_eq!(pages.len(), 16, "unadmitted selectors add no identity");
+            let charged = *session.admitted_source_bytes.borrow();
+            assert_eq!(charged, 16384);
+            assert_eq!(
+                pages
+                    .iter()
+                    .map(|page| page.reserved_source_bytes as usize)
+                    .sum::<usize>(),
+                charged
+            );
+            session.reserve_source_pages(&requested);
+            assert_eq!(session.receipts(), pages);
+            session.consume_unresolved_reservation("node:0");
+            session.reserve_source_pages(&requested);
+            assert_eq!(
+                *session.admitted_source_bytes.borrow(),
+                charged,
+                "failed hydration never refunds capacity"
+            );
+            assert_eq!(session.receipts(), pages[1..]);
+        }
+    }
+
+    #[test]
+    fn source_pages_share_sealed_capacity_without_refunds_or_extra_identities() {
+        for count in [1, 3, 8, 16] {
+            let session = PacketProofSession::new();
+            for index in 0..count {
+                assert_eq!(
+                    session.admit(&format!("node:{index}"), 512),
+                    PacketAdmissionDecision::Admitted
+                );
+            }
+            let original = session.receipts();
+            session.reserve_source_pages(&HashSet::new());
+            assert_eq!(session.receipts(), original);
+            session.seal_retrieval_admission();
+            session.reserve_source_pages(&HashSet::new());
+            let pages = session.receipts();
+            assert_eq!(pages.len(), count);
+            let minimum = pages
+                .iter()
+                .map(|page| page.reserved_source_bytes)
+                .min()
+                .unwrap();
+            let maximum = pages
+                .iter()
+                .map(|page| page.reserved_source_bytes)
+                .max()
+                .unwrap();
+            assert!(maximum - minimum <= 1);
+            assert_eq!(
+                minimum as usize,
+                (INTERIM_MAX_ADMITTED_SOURCE_BYTES / count)
+                    .min(INTERIM_SOURCE_CONTINUATION_UPPER_BOUND)
+            );
+            assert!(
+                pages
+                    .iter()
+                    .map(|page| page.reserved_source_bytes as usize)
+                    .sum::<usize>()
+                    <= INTERIM_MAX_ADMITTED_SOURCE_BYTES
+            );
+            session.reserve_source_pages(&HashSet::new());
+            assert_eq!(pages, session.receipts());
+        }
+    }
+
+    #[test]
+    fn source_continuations_use_only_remaining_sealed_packet_capacity() {
+        let session = PacketProofSession::new();
+        for index in 0..INTERIM_MAX_ADMITTED_CANDIDATES {
+            assert_eq!(
+                session.admit(&format!("node:{index}"), 512),
+                PacketAdmissionDecision::Admitted
+            );
+        }
+        let original = session.receipts();
+        assert_eq!(session.reserve_continuation_source("node:0"), None);
+        assert_eq!(session.receipts(), original);
+        session.seal_retrieval_admission();
+        assert_eq!(session.reserve_continuation_source("node:missing"), None);
+        assert_eq!(session.reserve_continuation_source("node:0"), Some(4096));
+        assert_eq!(session.reserve_continuation_source("node:0"), Some(4096));
+        assert_eq!(session.reserve_continuation_source("node:1"), Some(4096));
+        assert_eq!(session.reserve_continuation_source("node:2"), Some(1536));
+        assert_eq!(session.reserve_continuation_source("node:3"), Some(512));
+        assert_eq!(session.remaining_source_bytes(), 0);
+        assert_eq!(
+            *session.admitted_source_bytes.borrow(),
+            INTERIM_MAX_ADMITTED_SOURCE_BYTES
+        );
+        assert_eq!(
+            *session.hydrated_admissions.borrow(),
+            INTERIM_MAX_ADMITTED_CANDIDATES
+        );
+        let receipts = session.receipts();
+        for (before, after) in original.iter().zip(&receipts) {
+            assert_eq!(before.stable_identity, after.stable_identity);
+            assert_eq!(before.packet_ordinal, after.packet_ordinal);
+            assert_eq!(before.origin, after.origin);
+            assert_eq!(before.score_version, after.score_version);
+            assert_eq!(
+                session.admitted_identities.borrow()[&after.stable_identity],
+                after.reserved_source_bytes as usize
+            );
+        }
+        assert_eq!(
+            receipts
+                .iter()
+                .map(|receipt| receipt.reserved_source_bytes as usize)
+                .sum::<usize>(),
+            INTERIM_MAX_ADMITTED_SOURCE_BYTES
+        );
+    }
+
+    #[test]
+    fn source_continuation_reservation_follows_the_canonical_identity() {
+        let session = PacketProofSession::new();
+        assert_eq!(
+            session.admit_exact_selector("selector:qualified_symbol:shared", 512, 0),
+            PacketAdmissionDecision::Admitted
+        );
+        session.canonicalize_identity("selector:qualified_symbol:shared", "node:2");
+        session.seal_retrieval_admission();
+        assert_eq!(
+            session.reserve_continuation_source("selector:qualified_symbol:shared"),
+            None
+        );
+        assert_eq!(session.reserve_continuation_source("node:2"), Some(4096));
+        assert_eq!(session.reserve_continuation_source("node:2"), Some(4096));
+        assert_eq!(session.receipts().len(), 1);
+        assert_eq!(session.receipts()[0].stable_identity, "node:2");
+        assert_eq!(session.receipts()[0].reserved_source_bytes, 4096);
+        assert_eq!(*session.admitted_source_bytes.borrow(), 4096);
+        assert_eq!(*session.hydrated_admissions.borrow(), 1);
+    }
+
+    #[test]
+    fn source_continuations_do_not_refund_failed_selector_reservations() {
+        let session = PacketProofSession::new();
+        assert_eq!(
+            session.admit_exact_selector("node:failed", 512, 0),
+            PacketAdmissionDecision::Admitted
+        );
+        session.consume_unresolved_reservation("node:failed");
+        session.seal_retrieval_admission();
+        assert_eq!(session.reserve_continuation_source("node:failed"), None);
+        assert!(session.receipts().is_empty());
+        assert_eq!(*session.admitted_source_bytes.borrow(), 512);
+        assert_eq!(*session.hydrated_admissions.borrow(), 1);
+    }
+
+    #[test]
     fn admission_rejects_source_overflow_before_mutating_the_session() {
         let session = PacketProofSession::new();
         assert_eq!(
@@ -857,10 +1742,71 @@ mod tests {
     }
 
     #[test]
+    fn paragraph_queries_preserve_generic_and_explicit_free_query_origin() {
+        let seed = codestory_contracts::compilation::RetrievalSeedPlanV1 {
+            contract_version: 1,
+            generic_query: "alpha flow\n\nbeta ordering".into(),
+            exact_selectors: Vec::new(),
+            free_queries: vec!["beta ordering".into()],
+        };
+        let plan = codestory_agent::packet_plan::build_packet_plan_from_seed_plan(
+            &seed,
+            codestory_contracts::api::PacketBudgetModeDto::Standard,
+        );
+        let queries = packet_retrieval_queries(&plan);
+        assert_eq!(queries.len(), 4);
+        assert!(
+            queries[..3]
+                .iter()
+                .all(|query| query.lexical_policy == LexicalAdmissionPolicy::BroadQuestionV1)
+        );
+        assert_eq!(queries[2].query, queries[3].query);
+        assert_eq!(
+            queries[3].lexical_policy,
+            LexicalAdmissionPolicy::StrictLiteralV1
+        );
+        assert_eq!(
+            plan.queries
+                .iter()
+                .map(|query| &query.query)
+                .collect::<Vec<_>>(),
+            queries.iter().map(|query| &query.query).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn identical_generic_and_free_query_keep_distinct_origin() {
+        let seed = codestory_contracts::compilation::RetrievalSeedPlanV1 {
+            contract_version: 1,
+            generic_query: "text empty `absent`".into(),
+            exact_selectors: Vec::new(),
+            free_queries: vec!["text empty `absent`".into(), "text empty `absent`".into()],
+        };
+        let plan = codestory_agent::packet_plan::build_packet_plan_from_seed_plan(
+            &seed,
+            codestory_contracts::api::PacketBudgetModeDto::Standard,
+        );
+        let queries = packet_retrieval_queries(&plan);
+        assert_eq!(queries.len(), 2);
+        assert_eq!(queries[0].query, seed.generic_query);
+        assert_eq!(queries[1].query, seed.generic_query);
+        assert_eq!(
+            queries[0].lexical_policy,
+            LexicalAdmissionPolicy::BroadQuestionV1
+        );
+        assert_eq!(
+            queries[1].lexical_policy,
+            LexicalAdmissionPolicy::StrictLiteralV1
+        );
+    }
+
+    #[test]
     fn sealed_retrieval_admission_rejects_late_descriptors() {
         let session = PacketProofSession::new();
         session.seal_retrieval_admission();
         let descriptor = PacketCandidateDescriptorV1 {
+            published_calls: None,
+            published_calls_conflicted: false,
             stable_identity: "node:late".into(),
             path: "src/late.rs".into(),
             symbol: Some("late".into()),
@@ -889,6 +1835,8 @@ mod tests {
             );
         }
         let stale = PacketCandidateDescriptorV1 {
+            published_calls: None,
+            published_calls_conflicted: false,
             stable_identity: "node:999999".into(),
             path: "src/stale.rs".into(),
             symbol: Some("stale".into()),

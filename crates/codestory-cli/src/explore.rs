@@ -12,6 +12,7 @@ use std::{
     time::Duration,
 };
 
+use crate::app::open_target_surface;
 use crate::args::{
     self, ExploreBudgetOutput, ExploreCommand, ExploreOutput, ExploreProfile, ExploreProfileOutput,
     ExploreRelationshipEvidenceOutput, ExploreSearchOutput, ExploreSourceFileOutput,
@@ -22,7 +23,7 @@ use crate::output::{
     RenderedPublicOutput, emit_rendered_public_operation, render_retrieval_state,
     render_snippet_markdown, render_symbol_markdown, render_trail_markdown,
 };
-use crate::runtime::{self, RuntimeContext, ensure_index_ready, map_api_error, refresh_label};
+use crate::runtime::{self, RuntimeContext, map_api_error, refresh_label};
 use crate::{
     build_query_resolution_output, build_search_hit_output, ensure_dot_only_for_trail,
     preflight_output_file, resolve_target_or_emit_ambiguity,
@@ -47,9 +48,8 @@ struct BuiltExplore {
 pub(crate) fn run_explore(cmd: ExploreCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "explore")?;
     preflight_output_file(cmd.output_file.as_deref())?;
-    let runtime = RuntimeContext::new(&cmd.project)?;
-    let opened = runtime.ensure_open(cmd.refresh)?;
-    ensure_index_ready(&opened, "explore")?;
+    let selection = cmd.target.selection()?;
+    let (runtime, opened) = open_target_surface(&cmd.project, cmd.refresh, &selection, "explore")?;
     let profile = resolve_explore_profile(cmd.profile, cmd.depth, cmd.max_nodes);
     let file_filter = cmd.target.file_filter();
     let operation = if cmd.target.query.is_some() {
@@ -60,7 +60,7 @@ pub(crate) fn run_explore(cmd: ExploreCommand) -> Result<()> {
     let operation = runtime.run_public_operation(operation, || {
         let target = resolve_target_or_emit_ambiguity(
             &runtime,
-            cmd.target.selection()?,
+            selection.clone(),
             file_filter.as_deref(),
             cmd.format,
             cmd.output_file.as_deref(),

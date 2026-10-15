@@ -8,6 +8,9 @@ name: retrieval-engine-smoke
 on:
   pull_request:
     paths:
+      - .github/actions/native-source/**
+      - scripts/bootstrap-research-native-vendor.py
+      - vendor/llama-cpp-sys-2-patches/**
       - Cargo.toml
       - Cargo.lock
       - crates/**/Cargo.toml
@@ -57,6 +60,9 @@ on:
       - main
       - dev/codestory-next
     paths:
+      - .github/actions/native-source/**
+      - scripts/bootstrap-research-native-vendor.py
+      - vendor/llama-cpp-sys-2-patches/**
       - Cargo.toml
       - Cargo.lock
       - crates/**/Cargo.toml
@@ -118,6 +124,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Reconstruct pinned native source
+        uses: ./.github/actions/native-source
+
       - uses: actions/setup-node@v5
         with:
           node-version: "24"
@@ -165,12 +174,15 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-retrieval-contracts-proof5-v1-f1f03863d1fa5a61a86f02f1e1ca06bc2a619a401ab0f557ec2d74964f34fef0-default-features-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**/Cargo.toml') }}-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-retrieval-contracts-proof5-v1-f1f03863d1fa5a61a86f02f1e1ca06bc2a619a401ab0f557ec2d74964f34fef0-default-features-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**/Cargo.toml', 'vendor/llama-cpp-sys-2-patches/**') }}-${{ hashFiles('Cargo.lock') }}
 
       - name: Runtime retrieval and packet contract tests
         run: |
           cargo test --locked -p codestory-runtime --lib agent::retrieval_primary::tests
           cargo test --locked -p codestory-runtime --lib agent::packet_search::tests
+          cargo test --locked -p codestory-runtime --lib agent::packet_candidate::tests
+          cargo test --locked -p codestory-runtime --lib agent::packet_served_sources::tests
+          cargo test --locked -p codestory-runtime --lib browser::packet_capacity_refusal_tests
           cargo test --locked -p codestory-agent --test packet_generalization_boundary
           cargo test --locked -p codestory-runtime --lib -- --exact tests::search_scoring_tests::search_rejects_natural_language_queries_without_full_sidecars
           cargo test --locked -p codestory-runtime --lib -- --exact tests::repo_text_tests::search_results_ignores_repo_text_hits_without_full_sidecars
@@ -182,7 +194,6 @@ jobs:
       # per-PR lane (#1735).
       - name: Evidence, readiness, hooks, and workspace contract tests
         run: |
-          cargo test --locked -p codestory-runtime --lib agent::packet_evidence::
           cargo test --locked -p codestory-runtime --lib agent::packet_compiler::tests
           cargo test --locked -p codestory-runtime --lib agent::packet_batch::
           cargo test --locked -p codestory-runtime --lib tests::search_scoring_tests::
@@ -210,6 +221,7 @@ jobs:
           # which only exists under test-support (EV-9, #1652). Without this
           # invocation the whole module is compiled out of the PR lane.
           cargo test --locked -p codestory-retrieval --features test-support --lib rollback::
+          cargo test --locked -p codestory-retrieval --features test-support --lib publication_scope::
 
       - name: Architecture ownership contract tests
         run: cargo test --locked -p codestory-cli --test architecture_contracts
@@ -243,6 +255,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Reconstruct pinned native source
+        uses: ./.github/actions/native-source
+
       - name: Install Rust stable
         shell: pwsh
         run: |
@@ -275,7 +290,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-windows-ready-command-v2-a6923d8bb320ad402d87ba9fa9cd27449db876f2c15eac25b865ed25a63ac790-generator-ninja-cmake-${{ steps.rust-cache-key.outputs.cmake }}-ninja-${{ steps.rust-cache-key.outputs.ninja }}-default-features-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**/Cargo.toml') }}-${{ hashFiles('.github/scripts/install-windows-vulkan-sdk.ps1') }}-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-windows-ready-command-v2-a6923d8bb320ad402d87ba9fa9cd27449db876f2c15eac25b865ed25a63ac790-generator-ninja-cmake-${{ steps.rust-cache-key.outputs.cmake }}-ninja-${{ steps.rust-cache-key.outputs.ninja }}-default-features-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**/Cargo.toml', 'vendor/llama-cpp-sys-2-patches/**') }}-${{ hashFiles('.github/scripts/install-windows-vulkan-sdk.ps1') }}-${{ hashFiles('Cargo.lock') }}
 
       - name: Prove Windows ready_command manifest-missing contract
         shell: pwsh

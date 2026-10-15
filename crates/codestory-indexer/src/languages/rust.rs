@@ -31,14 +31,21 @@
 //! * `LanguageRuleset::Rust`, which stays in `lib.rs` because the enum is the
 //!   compiled-rule cache key for every language at once.
 //!
-//! This is a move, not a rewrite. `tests/language_extraction_snapshot.rs` pins
-//! the rendered projection of both Rust fixtures so the move stays
-//! output-equal.
+//! The original language-module split preserved extraction behavior;
+//! `tests/language_extraction_snapshot.rs` pins both Rust fixture projections.
+//! Callable declaration envelopes now also retain attached outer attributes
+//! after symbol identity and execution ownership have been resolved.
 
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
+use codestory_contracts::graph::{Node, NodeKind};
+use tree_sitter::{Node as TsNode, Tree};
+
 use super::LanguageExtraction;
-use crate::{CompiledLanguageRules, LanguageRuleset};
+use crate::{
+    CompiledLanguageRules, GraphNodeSpan, LanguageRuleset, ts_node_graph_span, walk_tree_nodes,
+};
 
 const GRAPH_QUERY: &str = include_str!("../../rules/rust.graph.scm");
 const TAGS_QUERY: &str = include_str!("../../rules/rust.tags.scm");
@@ -78,4 +85,64 @@ pub(crate) const EXTRACTION: LanguageExtraction = LanguageExtraction {
 
 fn rust_language() -> tree_sitter::Language {
     tree_sitter_rust::LANGUAGE.into()
+}
+
+pub(crate) const CALLABLE_DECLARATION_REVISION: &str = "rust-callable-declaration-v4";
+
+pub(crate) fn callable_declaration_span(node: TsNode<'_>) -> GraphNodeSpan {
+    let mut span = ts_node_graph_span(node);
+    if !matches!(node.kind(), "function_item" | "function_signature_item") {
+        return span;
+    }
+    let mut previous = node.prev_named_sibling();
+    while let Some(sibling) = previous {
+        match sibling.kind() {
+            "attribute_item" => {
+                let attribute = ts_node_graph_span(sibling);
+                span.start_line = attribute.start_line;
+                span.start_col = attribute.start_col;
+            }
+            "line_comment" | "block_comment" => {}
+            _ => break,
+        }
+        previous = sibling.prev_named_sibling();
+    }
+    span
+}
+
+/// Expand displayed source only after lexical ownership and stable identities are resolved.
+pub(crate) fn apply_callable_declaration_envelopes(tree: &Tree, nodes: &mut [Node]) {
+    if tree.root_node().has_error() {
+        return;
+    }
+    let mut envelopes = HashMap::<GraphNodeSpan, GraphNodeSpan>::new();
+    walk_tree_nodes(tree.root_node(), &mut |node| {
+        if !matches!(node.kind(), "function_item" | "function_signature_item") {
+            return;
+        }
+        let span = ts_node_graph_span(node);
+        let envelope = callable_declaration_span(node);
+        if envelope != span {
+            envelopes.insert(span, envelope);
+        }
+    });
+    for node in nodes {
+        if !matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD) {
+            continue;
+        }
+        let (Some(start_line), Some(start_col), Some(end_line), Some(end_col)) =
+            (node.start_line, node.start_col, node.end_line, node.end_col)
+        else {
+            continue;
+        };
+        if let Some(envelope) = envelopes.get(&GraphNodeSpan {
+            start_line,
+            start_col,
+            end_line,
+            end_col,
+        }) {
+            node.start_line = Some(envelope.start_line);
+            node.start_col = Some(envelope.start_col);
+        }
+    }
 }

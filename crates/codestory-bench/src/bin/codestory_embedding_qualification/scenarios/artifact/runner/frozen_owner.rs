@@ -34,7 +34,10 @@ impl<'a> ScenarioRunner<'a> {
                 ),
                 ("timeout_ms", json!(8_000)),
                 ("clock_domain", json!(output.clock.domain)),
-                ("clock_boot_id", json!(output.clock.boot_id)),
+                (
+                    "clock_boot_id",
+                    json!(output.clock.qualification_boot_id()?),
+                ),
             ]),
         );
         // Observation: the predicate accepts any snapshot, so the first observe

@@ -153,6 +153,25 @@ pub(crate) fn render_public_operation_json_content<T, V: Serialize>(
     render_output_content(OutputFormat::Json, &json, "")
 }
 
+/// Render the full canonical response using compact JSON when indentation would
+/// exceed the caller's byte budget. The final newline is included in the size.
+/// This preserves every field and may still exceed the budget; the caller owns
+/// typed budget refusal and must measure and emit through this same renderer.
+pub(crate) fn render_public_operation_json_content_with_byte_budget<T, V: Serialize>(
+    operation: &codestory_runtime::PublicOperation<T>,
+    response: &V,
+    maximum_bytes: usize,
+) -> Result<String> {
+    let json = crate::runtime::public_operation_json_value(operation, response)?;
+    let pretty = render_output_content(OutputFormat::Json, &json, "")?;
+    if pretty.len() <= maximum_bytes {
+        return Ok(pretty);
+    }
+    let mut compact = serde_json::to_string(&json).context("Failed to serialize JSON output")?;
+    compact.push('\n');
+    Ok(compact)
+}
+
 pub(crate) fn emit_rendered_public_operation<T>(
     format: OutputFormat,
     operation: &codestory_runtime::PublicOperation<T>,
@@ -269,11 +288,14 @@ pub(crate) fn render_index_markdown(output: &IndexOutput<'_>) -> String {
         output.summary.stats.error_count
     );
     append_index_members(&mut markdown, output);
-    let _ = writeln!(
-        markdown,
-        "retrieval: {}",
-        render_retrieval_state(output.retrieval)
-    );
+    match output.retrieval {
+        Some(retrieval) => {
+            let _ = writeln!(markdown, "retrieval: {}", render_retrieval_state(retrieval));
+        }
+        None => {
+            let _ = writeln!(markdown, "retrieval: not observed (Core-only index)");
+        }
+    }
     if let Some(timings) = output.phase_timings {
         append_index_phase_timings(&mut markdown, timings);
     }

@@ -33,8 +33,11 @@ pub mod outbound_http;
 mod per_user_embedding;
 mod planner;
 mod process_identity;
+mod publication_scope;
 mod query;
 mod query_features;
+mod query_policy;
+mod query_windows;
 mod ranker;
 mod retention;
 mod rollback;
@@ -348,17 +351,17 @@ pub use per_user_embedding::{
     embedding_qualification_watchdog_marker_filename, embedding_retry_state,
     install_embedding_client_transport, install_embedding_client_transport_factory,
     qualification_gate_environment, run_per_user_embedding_qualification,
-    run_per_user_embedding_server,
+    run_per_user_embedding_server, validate_qualification_clock_gate,
 };
 pub use planner::{PlannedStage, RetrievalPlan, RetrievalStageKind, plan_query};
 pub use process_identity::{
     ProcessOwnerState, ProcessStartProbe, probe_process_start_identity, process_owner_state,
 };
 pub use query::{
-    PacketDescriptorBatchObservation, PinnedQuerySession, QueryBatchItem, QueryBatchRequest,
-    QueryRequest, RETRIEVAL_PUBLICATION_CHANGED_CODE, RetrievalPublicationChanged,
-    execute_retrieval_query, execute_retrieval_query_with_cache,
-    execute_retrieval_query_with_cache_for_runtime,
+    PacketDescriptorBatchObservation, PinnedQuerySession, PublishedFileSourceFenceError,
+    PublishedFileSourceWitness, QueryBatchItem, QueryBatchRequest, QueryRequest,
+    RETRIEVAL_PUBLICATION_CHANGED_CODE, RetrievalPublicationChanged, execute_retrieval_query,
+    execute_retrieval_query_with_cache, execute_retrieval_query_with_cache_for_runtime,
     execute_strict_retrieval_query_batch_with_cache,
     execute_strict_retrieval_query_batch_with_cache_for_runtime, is_retrieval_publication_changed,
     retrieval_publication_identity_from_storage,
@@ -391,3 +394,8 @@ pub use sidecar_search::{
 };
 
 pub use codestory_store::RetrievalIndexManifest;
+
+pub use query_policy::LexicalAdmissionPolicy;
+
+#[cfg(any(test, feature = "test-support"))]
+pub use lexical_index::replay_published_call_metadata;

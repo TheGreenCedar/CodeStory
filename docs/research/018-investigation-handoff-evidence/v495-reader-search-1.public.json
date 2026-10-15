@@ -1,0 +1,250 @@
+{
+  "_meta": {
+    "codestory_publication": {
+      "contract_runtime": {
+        "cli_sha256": null,
+        "cli_source": "direct_cli_launch",
+        "cli_version": "0.17.7",
+        "known_override_skew_channel": false,
+        "pinned_pair_matches": null,
+        "plugin_cli_version": null,
+        "plugin_version": null
+      },
+      "core_publication": {
+        "generation": 1,
+        "generation_id": "1731ee82-b30e-4c5f-8ced-9d87c6a809c5",
+        "mode": "full",
+        "published_at_epoch_ms": 1791502992064,
+        "run_id": "b5714e8a-1fa0-4acc-a69d-0d6d4baa390c"
+      },
+      "freshness": {
+        "served_generation": "1731ee82-b30e-4c5f-8ced-9d87c6a809c5",
+        "state": "fresh"
+      },
+      "minimum_compatible_schema_version": 3,
+      "operation": {
+        "attempt": 1,
+        "operation_id": "public-1"
+      },
+      "publication": {
+        "generation": 1,
+        "generation_id": "1731ee82-b30e-4c5f-8ced-9d87c6a809c5",
+        "mode": "full",
+        "published_at_epoch_ms": 1791502992064,
+        "run_id": "b5714e8a-1fa0-4acc-a69d-0d6d4baa390c"
+      },
+      "retrieval_publication": {
+        "core_generation_id": "1731ee82-b30e-4c5f-8ced-9d87c6a809c5",
+        "core_run_id": "b5714e8a-1fa0-4acc-a69d-0d6d4baa390c",
+        "retrieval_generation": "24f5f6e74fca24e6-ae4ec05bdab9064a",
+        "retrieval_input_hash": "ae4ec05bdab9064a3234655a64bfb06b08280c7efe7163d02caf6f0d2602d43f",
+        "semantic_generation": "codestory_24f5f6e74fca24e6_ae4ec05bdab9064a"
+      },
+      "schema_version": 4,
+      "served_from": "complete_publication"
+    }
+  },
+  "continuation": null,
+  "diagnostics": {
+    "availability": "unavailable"
+  },
+  "evidence": [
+    {
+      "end_line": 71,
+      "excerpt": null,
+      "identity": {
+        "evidence_id": "search-0--1667004008352814472"
+      },
+      "path": "<CRON_ROOT>/parser.go",
+      "start_line": 71,
+      "symbol_id": "-1667004008352814472"
+    },
+    {
+      "end_line": 700,
+      "excerpt": null,
+      "identity": {
+        "evidence_id": "search-1--817250917897779198"
+      },
+      "path": "<CRON_ROOT>/cron_test.go",
+      "start_line": 700,
+      "symbol_id": "-817250917897779198"
+    },
+    {
+      "end_line": 236,
+      "excerpt": null,
+      "identity": {
+        "evidence_id": "search-2-3870206140202113073"
+      },
+      "path": "<CRON_ROOT>/parser.go",
+      "start_line": 236,
+      "symbol_id": "3870206140202113073"
+    },
+    {
+      "end_line": 19,
+      "excerpt": null,
+      "identity": {
+        "evidence_id": "search-3-2340103021962982066"
+      },
+      "path": "<CRON_ROOT>/option.go",
+      "start_line": 19,
+      "symbol_id": "2340103021962982066"
+    },
+    {
+      "end_line": 184,
+      "excerpt": null,
+      "identity": {
+        "evidence_id": "search-4--4579949334744064723"
+      },
+      "path": "<CRON_ROOT>/parser_test.go",
+      "start_line": 184,
+      "symbol_id": "-4579949334744064723"
+    },
+    {
+      "end_line": 26,
+      "excerpt": null,
+      "identity": {
+        "evidence_id": "search-5-7806810224577198136"
+      },
+      "path": "<CRON_ROOT>/option.go",
+      "start_line": 26,
+      "symbol_id": "7806810224577198136"
+    },
+    {
+      "end_line": 353,
+      "excerpt": null,
+      "identity": {
+        "evidence_id": "search-6--4556148245323181959"
+      },
+      "path": "<CRON_ROOT>/parser_test.go",
+      "start_line": 353,
+      "symbol_id": "-4556148245323181959"
+    },
+    {
+      "end_line": 2,
+      "excerpt": "Package cron implements a cron spec parser and job runner.",
+      "identity": {
+        "evidence_id": "search-7--8384359191468123996"
+      },
+      "path": "doc.go",
+      "start_line": 2,
+      "symbol_id": null
+    },
+    {
+      "end_line": 41,
+      "excerpt": null,
+      "identity": {
+        "evidence_id": "search-8-4842853215314135495"
+      },
+      "path": "<CRON_ROOT>/cron_test.go",
+      "start_line": 41,
+      "symbol_id": "4842853215314135495"
+    },
+    {
+      "end_line": 39,
+      "excerpt": "  - 0f01e6b parser: fix combining of Dow and Dom (#70)",
+      "identity": {
+        "evidence_id": "search-9--6484694448032472300"
+      },
+      "path": "README.md",
+      "start_line": 39,
+      "symbol_id": null
+    },
+    {
+      "end_line": 152,
+      "excerpt": "\t\t{secondParser, \"@every 5m\", ConstantDelaySchedule{5 * time.Minute}},",
+      "identity": {
+        "evidence_id": "search-10-7993869364072660128"
+      },
+      "path": "<CRON_ROOT>/parser_test.go",
+      "start_line": 152,
+      "symbol_id": null
+    },
+    {
+      "end_line": 5,
+      "excerpt": "// SpecSchedule specifies a duty cycle (to the second granularity), based on a",
+      "identity": {
+        "evidence_id": "search-11-1770726259542734900"
+      },
+      "path": "<CRON_ROOT>/spec.go",
+      "start_line": 5,
+      "symbol_id": null
+    },
+    {
+      "end_line": 214,
+      "excerpt": "// Start the cron scheduler in its own goroutine, or no-op if already started.",
+      "identity": {
+        "evidence_id": "search-12--7689693261992666628"
+      },
+      "path": "<CRON_ROOT>/cron.go",
+      "start_line": 214,
+      "symbol_id": null
+    },
+    {
+      "end_line": 13,
+      "excerpt": "// Any fields less than a Second are truncated.",
+      "identity": {
+        "evidence_id": "search-13--2686870969125539206"
+      },
+      "path": "<CRON_ROOT>/constantdelay.go",
+      "start_line": 13,
+      "symbol_id": null
+    },
+    {
+      "end_line": 14,
+      "excerpt": "// Many tests schedule a job for every second, and then wait at most a second",
+      "identity": {
+        "evidence_id": "search-14--7817104406869303282"
+      },
+      "path": "<CRON_ROOT>/cron_test.go",
+      "start_line": 14,
+      "symbol_id": null
+    },
+    {
+      "end_line": 17,
+      "excerpt": "// WithSeconds overrides the parser used for interpreting job schedules to",
+      "identity": {
+        "evidence_id": "search-15--3351836979785446496"
+      },
+      "path": "<CRON_ROOT>/option.go",
+      "start_line": 17,
+      "symbol_id": null
+    },
+    {
+      "end_line": 34,
+      "excerpt": "\t\t// Predefined schedules",
+      "identity": {
+        "evidence_id": "search-16-2804638018603234564"
+      },
+      "path": "<CRON_ROOT>/spec_test.go",
+      "start_line": 34,
+      "symbol_id": null
+    }
+  ],
+  "gaps": [],
+  "identity": {
+    "packet_id": "3b165d5b-1f14-4296-be4a-9f08737783cd",
+    "question_sha256": "0d3b62cc9e9576489aa4e831288301b25f270ff600295ad0db58a5462cf9b162",
+    "request_id": "search-0d3b62cc9e9576489aa4e831288301b25f270ff600295ad0db58a5462cf9b162"
+  },
+  "kind": "complete",
+  "publication": {
+    "core": {
+      "generation_id": "1731ee82-b30e-4c5f-8ced-9d87c6a809c5",
+      "project_id": "24f5f6e74fca24e6",
+      "run_id": "b5714e8a-1fa0-4acc-a69d-0d6d4baa390c"
+    },
+    "retrieval": {
+      "core_generation_id": "1731ee82-b30e-4c5f-8ced-9d87c6a809c5",
+      "core_run_id": "b5714e8a-1fa0-4acc-a69d-0d6d4baa390c",
+      "retrieval_generation": "24f5f6e74fca24e6-ae4ec05bdab9064a",
+      "retrieval_input_sha256": "ae4ec05bdab9064a3234655a64bfb06b08280c7efe7163d02caf6f0d2602d43f",
+      "semantic_generation": "codestory_24f5f6e74fca24e6_ae4ec05bdab9064a"
+    }
+  },
+  "retrieval": {
+    "generation_id": "24f5f6e74fca24e6-ae4ec05bdab9064a",
+    "state": "full"
+  },
+  "schema_version": 3,
+  "status": "available"
+}

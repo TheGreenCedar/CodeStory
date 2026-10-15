@@ -214,7 +214,10 @@ impl<'a> ScenarioRunner<'a> {
                     "contract_idle_timeout_ms",
                     json!(PER_USER_EMBEDDING_SERVER_IDLE_TIMEOUT_MS),
                 ),
-                ("clock_boot_id", json!(reclaimed.clock.boot_id)),
+                (
+                    "clock_boot_id",
+                    json!(reclaimed.clock.qualification_boot_id()?),
+                ),
             ]),
         );
         self.transition(

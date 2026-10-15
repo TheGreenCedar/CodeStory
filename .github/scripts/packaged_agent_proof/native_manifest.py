@@ -317,7 +317,8 @@ def _build_fields(runtime: Path, parts: ManifestParts) -> dict[str, str]:
     )
     for field, value in marker_server_proof.items():
         require(
-            parts.server_proof.get(field) == value,
+            type(parts.server_proof.get(field)) is type(value)
+            and parts.server_proof[field] == value,
             f"packaged executable embedding server proof field {field} does not match manifest",
         )
     require(

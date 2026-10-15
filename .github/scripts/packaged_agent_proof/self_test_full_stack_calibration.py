@@ -14,8 +14,11 @@ from .calibration_self_test import (
 from .calibration_verification import verify_calibration_bundle
 from .constant_calibration import _validate_driver_output
 from .contract_primitives import canonical_sha256, sha256, write_json
-from .foundation import TARGET_CONTRACTS, ProofFailure, require
-from .measurement_protocol import load_measurement_protocol
+from .foundation import SERVER_CONSTANT_SET, SERVER_PROTOCOL, TARGET_CONTRACTS, ProofFailure, require
+from .measurement_protocol import (
+    load_measurement_protocol,
+    load_server_measurement_contract,
+)
 from .measurement_samples import selected_qualification_matrix_cell
 from .package_contracts import verify_package_server_contracts
 from .qualification_measurements import (
@@ -23,6 +26,57 @@ from .qualification_measurements import (
     _qualification_measurement_sample,
 )
 from .self_test_full_stack_types import CalibrationFixture, FullStackFixture
+
+
+def _server_contract_schema_tests(fixture: FullStackFixture) -> None:
+    current = load_server_measurement_contract(fixture.measurement_protocol)
+    require(
+        current["protocol"]["schema_version"] == 2
+        and current["protocol"]["snapshot"]["schema_version"] == 2
+        and current["constant_set"]["schema_version"] == 1,
+        "server and constant-set schema identities were conflated",
+    )
+    root = fixture.root / "hostile-server-contract-schemas"
+    root.mkdir()
+    paths = {
+        name: root / path.name
+        for name, path in (
+            ("protocol", SERVER_PROTOCOL),
+            ("constant_set", SERVER_CONSTANT_SET),
+            ("measurement_protocol", fixture.measurement_protocol),
+        )
+    }
+    for name, path in paths.items():
+        write_json(path, current[name])
+    for name, nested, versions, expected in (
+        (
+            "protocol", None, (1, 3, True, None),
+            "embedding server protocol schema is unsupported",
+        ),
+        (
+            "protocol", "snapshot", (1, 3, True, None),
+            "embedding server snapshot schema is unsupported",
+        ),
+        (
+            "constant_set", None, (0, 2, True, None),
+            "embedding server constant set schema is unsupported",
+        ),
+    ):
+        for version in versions:
+            hostile = json.loads(json.dumps(current[name]))
+            owner = hostile if nested is None else hostile[nested]
+            owner["schema_version"] = version
+            write_json(paths[name], hostile)
+            try:
+                load_server_measurement_contract(paths["measurement_protocol"])
+            except ProofFailure as error:
+                require(
+                    str(error) == expected,
+                    f"contract schema rejection changed: {error}",
+                )
+            else:
+                raise ProofFailure(f"{name} schema {version!r} was accepted")
+            write_json(paths[name], current[name])
 
 
 def _qualification_matrix_tests(fixture: FullStackFixture) -> dict:
@@ -713,6 +767,7 @@ def _constant_collector_driver_tests(
 
 
 def run_calibration_self_tests(fixture: FullStackFixture) -> dict:
+    _server_contract_schema_tests(fixture)
     measurement_contract = _qualification_matrix_tests(fixture)
     calibration = _calibration_bundle_tests(fixture, measurement_contract)
     _measurement_window_semantics_tests(fixture, calibration)

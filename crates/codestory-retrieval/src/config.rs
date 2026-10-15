@@ -364,6 +364,70 @@ impl SidecarRuntimeConfig {
         selected
     }
 
+    pub(crate) fn publication_artifact_scope(
+        &self,
+    ) -> Result<codestory_store::RetrievalArtifactScope> {
+        use codestory_store::RetrievalArtifactScope;
+        let scope = match self.profile {
+            SidecarProfile::Local => RetrievalArtifactScope::Local,
+            SidecarProfile::Agent => RetrievalArtifactScope::Agent {
+                workspace_id: self
+                    .project_identity
+                    .as_ref()
+                    .context("agent publication requires workspace identity")?
+                    .workspace_id
+                    .clone(),
+                run_id: self
+                    .run_id
+                    .clone()
+                    .context("agent publication requires run identity")?,
+            },
+        };
+        scope.validate()?;
+        Ok(scope)
+    }
+
+    /// Resolve producer location without changing the consumer's profile or policy.
+    pub(crate) fn with_publication_artifact_scope(
+        &self,
+        scope: &codestory_store::RetrievalArtifactScope,
+    ) -> Result<Self> {
+        use codestory_store::RetrievalArtifactScope;
+        scope.validate()?;
+        let (profile, run_id) = match scope {
+            RetrievalArtifactScope::Local => (SidecarProfile::Local, None),
+            RetrievalArtifactScope::Agent {
+                workspace_id,
+                run_id,
+            } => {
+                let identity = self
+                    .project_identity
+                    .as_ref()
+                    .context("publication scope requires workspace identity")?;
+                if &identity.workspace_id != workspace_id
+                    || normalized_label_component(run_id).as_ref() != Some(run_id)
+                {
+                    anyhow::bail!(
+                        "retrieval publication artifact scope does not match captured workspace or canonical run identity"
+                    );
+                }
+                (SidecarProfile::Agent, Some(run_id.as_str()))
+            }
+        };
+        let defaults =
+            SidecarProcessDefaults::new(self.cache_root.clone(), SidecarRuntimeDefaults::default());
+        let producer = Self::for_project_identity_profile_with_process_defaults(
+            self.project_identity.clone(),
+            profile,
+            run_id,
+            &defaults,
+            &SidecarRuntimeOverrides::default(),
+        );
+        let mut resolved = self.clone();
+        resolved.layout = producer.layout;
+        Ok(resolved)
+    }
+
     pub(crate) fn validated_project_identity(
         &self,
         project_root: &Path,

@@ -38,7 +38,7 @@ There is no MCP `index`, `doctor`, `ready`, `explore`, `drill`, `query`,
 | `definition` | `query` or `id` | `choose` | |
 | `references` | `query` or `id` | `choose` | Incoming references. |
 | `symbols` | | `parent_id`, `limit` | Root symbols, or children of `parent_id`. |
-| `snippet` | `query`, `id`, `paths`, `path`, `file_path`, or `symbol_id` | `line`, `start_line`, `end_line`, `context`, `lines`, `scope`, `function_body`, `choose` | Read a selected source target; ordinary host reads remain available. |
+| `snippet` | `query`, `id`, `paths`, `path`, `file_path`, or `symbol_id` | `line`, `start_line`, `end_line`, `context`, `lines`, `scope`, `function_body`, `choose`, `max_tool_result_bytes` (path reads only, 256..524288) | Read a selected source target; ordinary host reads remain available. The optional path allowance bounds the served tool result, excluding outer JSON-RPC and host framing; cumulative task limits remain separate. |
 | `context` | `query`, `id`, or `bookmark` | `include_evidence`, `max_results` | One concrete target, not a broad question. |
 ## Resources and prompts
 

@@ -325,12 +325,22 @@ fn load_index_freshness_inventory(
         ));
     }
 
-    let stored_files = storage.files().inventory().map_err(|error| {
+    let mut stored_files = storage.files().inventory().map_err(|error| {
         (
             NotCheckedReason::unavailable(format!("failed to read refresh inventory: {error}")),
             indexed_file_count,
         )
     })?;
+    crate::search_state_cache::mark_extraction_revision_mismatches(storage, &mut stored_files)
+        .map_err(|error| {
+            (
+                NotCheckedReason::unavailable(format!(
+                    "failed to check extraction identity: {}",
+                    error.message
+                )),
+                indexed_file_count,
+            )
+        })?;
     let removed_paths = files
         .iter()
         .map(|file| (file.id, file.path.clone()))

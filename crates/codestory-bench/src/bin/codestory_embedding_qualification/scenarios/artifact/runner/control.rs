@@ -429,13 +429,13 @@ mod tests {
 
     fn snapshot() -> EmbeddingServerSnapshot {
         EmbeddingServerSnapshot {
-            schema_version: 1,
+            schema_version: codestory_retrieval::PER_USER_EMBEDDING_SERVER_SNAPSHOT_SCHEMA_VERSION,
             event_sequence: 8,
             lifecycle: "listening".into(),
             clock: EmbeddingServerClockSnapshot {
                 domain: "awake_monotonic".into(),
                 api: "test".into(),
-                boot_id: "boot".into(),
+                boot_id: Some("boot".into()),
                 resolution_ns: 1,
             },
             protocol: EmbeddingServerProtocolSnapshot::current(),
@@ -500,7 +500,7 @@ mod tests {
             clock: EmbeddingServerClockSnapshot {
                 domain: "awake_monotonic".into(),
                 api: "test".into(),
-                boot_id: "boot".into(),
+                boot_id: Some("boot".into()),
                 resolution_ns: 1,
             },
             started_ns: 1,

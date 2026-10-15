@@ -10,6 +10,11 @@
 //! never enough, and an ambiguous match never guesses: it becomes a visible,
 //! user-owned orphan carrying its last known evidence.
 //!
+//! Crossing into Rust's new ordinal namespace is a narrower compatibility
+//! case: even a unique current tuple requires prior tuple uniqueness or an
+//! exactly matching strong shape that was unique in the old file. A refusal
+//! stops immediately and retains the old anchor; same-epoch lookup is unchanged.
+//!
 //! The two inferences are looked up from opposite ends, because a rename and a
 //! move change opposite halves of the anchor:
 //!
@@ -32,6 +37,7 @@
 //! has to identify code on its own, and an `outline` signature (a callable
 //! whose body projected nothing, leaving only kind and line count) cannot.
 
+use codestory_contracts::graph::RUST_ORDINAL_CANONICAL_ID_PREFIX;
 use serde::{Deserialize, Serialize};
 
 use crate::annotations::AnnotationBookmark;
@@ -128,6 +134,10 @@ pub struct BookmarkAnchorEvidence {
 /// resolves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnchorDiscrimination {
+    /// The complete file/name/kind tuple identified exactly one prior symbol.
+    /// Old serialized evidence cannot assert this historical fact.
+    #[serde(default)]
+    pub anchor_tuple_unique: bool,
     /// The normalized signature matched exactly one symbol of this kind in the
     /// anchor's own file.
     pub signature_unique_in_file: bool,
@@ -260,7 +270,36 @@ pub fn resolve_bookmark(
     };
 
     match unique_candidate(index.candidates_by_anchor_tuple(file_identity, qualified_name, kind)?) {
-        CandidateSet::Unique(candidate) => return bound(candidate, generation, index),
+        CandidateSet::Unique(candidate) => {
+            let enters_rust_epoch = candidate
+                .canonical_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with(RUST_ORDINAL_CANONICAL_ID_PREFIX))
+                && !bookmark
+                    .canonical_id
+                    .as_deref()
+                    .is_some_and(|id| id.starts_with(RUST_ORDINAL_CANONICAL_ID_PREFIX));
+            if enters_rust_epoch {
+                let discrimination = bookmark
+                    .last_known_evidence
+                    .as_ref()
+                    .and_then(|evidence| evidence.discrimination);
+                let prior_tuple_unique = discrimination.is_some_and(|it| it.anchor_tuple_unique);
+                let prior_shape_matches = discrimination
+                    .is_some_and(|it| it.signature_unique_in_file)
+                    && bookmark
+                        .normalized_signature
+                        .as_deref()
+                        .is_some_and(|signature| {
+                            is_shape_signature(signature)
+                                && candidate.normalized_signature.as_deref() == Some(signature)
+                        });
+                if !prior_tuple_unique && !prior_shape_matches {
+                    return Ok(orphaned(OrphanReason::AmbiguousMatch));
+                }
+            }
+            return bound(candidate, generation, index);
+        }
         CandidateSet::Ambiguous => return Ok(orphaned(OrphanReason::AmbiguousMatch)),
         CandidateSet::Empty => {}
     }
@@ -363,6 +402,18 @@ fn anchor_discrimination(
     let Some(kind) = candidate.kind else {
         return Ok(None);
     };
+    let anchor_tuple_unique = match (
+        candidate.file_identity.as_deref(),
+        candidate.qualified_name.as_deref(),
+    ) {
+        (Some(file_identity), Some(qualified_name)) => {
+            index
+                .candidates_by_anchor_tuple(file_identity, qualified_name, kind)?
+                .len()
+                == 1
+        }
+        _ => false,
+    };
     let signature_unique_in_file = match (
         candidate.normalized_signature.as_deref(),
         candidate.file_identity.as_deref(),
@@ -385,6 +436,7 @@ fn anchor_discrimination(
         None => false,
     };
     Ok(Some(AnchorDiscrimination {
+        anchor_tuple_unique,
         signature_unique_in_file,
         qualified_name_unique,
     }))

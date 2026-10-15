@@ -13,6 +13,8 @@ from .foundation import (
     REQUIRED_HOLDOUT_TASK_FILES,
     SERVER_CONSTANT_SET,
     SERVER_PROTOCOL,
+    SERVER_PROTOCOL_SCHEMA_VERSION,
+    SERVER_SNAPSHOT_SCHEMA_VERSION,
     ProofFailure,
     require,
 )
@@ -40,14 +42,20 @@ def load_measurement_protocol(path: Path) -> tuple[dict, str]:
     return protocol, sha256(path)
 
 
-def load_json_contract(path: Path, label: str) -> tuple[dict, str]:
+def load_json_contract(
+    path: Path, label: str, *, schema_version: int
+) -> tuple[dict, str]:
     require(path.is_file(), f"{label} is missing: {path}")
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise ProofFailure(f"{label} is not valid JSON: {exc}") from exc
     require(isinstance(document, dict), f"{label} must be an object")
-    require(document.get("schema_version") == 1, f"{label} schema is unsupported")
+    require(
+        type(document.get("schema_version")) is int
+        and document["schema_version"] == schema_version,
+        f"{label} schema is unsupported",
+    )
     return document, sha256(path)
 
 
@@ -58,11 +66,21 @@ def load_server_measurement_contract(measurement_protocol_path: Path) -> dict:
     protocol_path = measurement_protocol_path.with_name(SERVER_PROTOCOL.name)
     constant_set_path = measurement_protocol_path.with_name(SERVER_CONSTANT_SET.name)
     protocol, protocol_sha256 = load_json_contract(
-        protocol_path, "embedding server protocol"
+        protocol_path,
+        "embedding server protocol",
+        schema_version=SERVER_PROTOCOL_SCHEMA_VERSION,
+    )
+    snapshot = protocol.get("snapshot")
+    require(
+        isinstance(snapshot, dict)
+        and type(snapshot.get("schema_version")) is int
+        and snapshot["schema_version"] == SERVER_SNAPSHOT_SCHEMA_VERSION,
+        "embedding server snapshot schema is unsupported",
     )
     constant_set, constant_set_sha256 = load_json_contract(
         constant_set_path,
         "embedding server constant set",
+        schema_version=1,
     )
     return {
         "measurement_protocol": measurement,

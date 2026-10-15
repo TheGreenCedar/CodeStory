@@ -105,6 +105,9 @@ jobs:
           ref: ${{ inputs.ref }}
           fetch-depth: 0
 
+      - name: Reconstruct pinned native source
+        uses: ./.github/actions/native-source
+
       - name: Require exact source identity
         id: source-identity
         shell: bash
@@ -252,6 +255,8 @@ jobs:
             --relevant-input crates/codestory-llama-sys/build.rs
             --relevant-input crates/codestory-llama-sys/model-contract.json
             --relevant-input scripts/prepare-embedded-model.mjs
+            --relevant-input vendor/llama-cpp-sys-2-patches/manifest.json
+            --relevant-input vendor/llama-cpp-sys-2-patches/0.1.151.patch
           )
           extra_identity=(
             --identity cargo_incremental=0
@@ -1405,6 +1410,9 @@ jobs:
         uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref }}
+
+      - name: Reconstruct pinned native source
+        uses: ./.github/actions/native-source
 
       - name: Require exact frozen source
         shell: bash

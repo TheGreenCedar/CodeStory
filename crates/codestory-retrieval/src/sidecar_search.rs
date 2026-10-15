@@ -3,6 +3,7 @@ use crate::config::{SidecarLayout, SidecarRuntimeConfig};
 use crate::embedded_vector::EmbeddedVectorIndex;
 use crate::embeddings::EmbeddingDeviceReadiness;
 use crate::lexical_client::LexicalClient;
+use crate::query_policy::LexicalAdmissionPolicy;
 use crate::scip_client::ScipClient;
 use anyhow::Result;
 use codestory_store::{RetrievalIndexManifest, Store};
@@ -164,7 +165,20 @@ impl SearchExecutionContext {
 
     fn run<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
         self.check_cancelled()?;
-        let value = operation()?;
+        let value = operation().or_else(|error| {
+            let interrupted = error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::Interrupted)
+                || matches!(
+                    error.downcast_ref::<rusqlite::Error>(),
+                    Some(rusqlite::Error::SqliteFailure(error, _))
+                        if error.code == rusqlite::ErrorCode::OperationInterrupted
+                );
+            if interrupted {
+                self.check_cancelled()?;
+            }
+            Err(error)
+        })?;
         self.check_cancelled()?;
         Ok(value)
     }
@@ -190,6 +204,16 @@ pub trait SidecarSearch: Send + Sync {
     /// ownership alongside each lane's independent score. Test sidecars and
     /// callers without a core publication retain the no-op default.
     fn enrich_candidates(&self, _candidates: &mut [CandidateHit]) -> Result<()> {
+        Ok(())
+    }
+
+    /// Optional immutable descriptor metadata, after ranking and before cache.
+    /// Test sidecars retain a no-op; normal product readers bind one publication.
+    fn enrich_packet_calls(
+        &self,
+        _candidates: &mut [CandidateHit],
+        _context: &SearchExecutionContext,
+    ) -> Result<()> {
         Ok(())
     }
 
@@ -261,6 +285,58 @@ pub trait SidecarSearch: Send + Sync {
         context: &SearchExecutionContext,
     ) -> Result<Vec<CandidateHit>> {
         context.run(|| self.scip_expand(anchors, limit))
+    }
+    /// Broad admission requires an implementation that actually executes it.
+    fn lexical_search_with_policy_context(
+        &self,
+        query: &str,
+        limit: usize,
+        policy: LexicalAdmissionPolicy,
+        context: &SearchExecutionContext,
+    ) -> Result<Vec<CandidateHit>> {
+        match policy {
+            LexicalAdmissionPolicy::StrictLiteralV1 => {
+                self.lexical_search_with_context(query, limit, context)
+            }
+            LexicalAdmissionPolicy::BroadQuestionV1 => {
+                anyhow::bail!("sidecar does not implement broad lexical admission")
+            }
+        }
+    }
+
+    fn lexical_descriptor_search_with_policy_context(
+        &self,
+        query: &str,
+        limit: usize,
+        policy: LexicalAdmissionPolicy,
+        context: &SearchExecutionContext,
+    ) -> Result<Vec<CandidateHit>> {
+        match policy {
+            LexicalAdmissionPolicy::StrictLiteralV1 => {
+                self.lexical_descriptor_search_with_context(query, limit, context)
+            }
+            LexicalAdmissionPolicy::BroadQuestionV1 => {
+                anyhow::bail!("sidecar does not implement broad descriptor admission")
+            }
+        }
+    }
+
+    fn lexical_search_batch_with_policy(
+        &self,
+        queries: &[(String, usize, LexicalAdmissionPolicy)],
+        context: &SearchExecutionContext,
+    ) -> Result<Option<Vec<Vec<CandidateHit>>>> {
+        if queries
+            .iter()
+            .any(|(_, _, policy)| *policy != LexicalAdmissionPolicy::StrictLiteralV1)
+        {
+            return Ok(None);
+        }
+        let strict = queries
+            .iter()
+            .map(|(query, limit, _)| (query.clone(), *limit))
+            .collect::<Vec<_>>();
+        self.lexical_search_batch(&strict, context)
     }
 }
 
@@ -358,6 +434,14 @@ impl LiveSidecarSearch {
         })
     }
 
+    pub(crate) fn with_embedding_identity_pin(
+        mut self,
+        pin: Option<crate::embedding_server_compat::ProductEmbeddingIdentity>,
+    ) -> Self {
+        self.semantic = self.semantic.with_query_identity_pin(pin);
+        self
+    }
+
     pub(crate) fn with_core_candidate_context(
         mut self,
         project_root: &Path,
@@ -384,6 +468,23 @@ impl LiveSidecarSearch {
 }
 
 impl SidecarSearch for LiveSidecarSearch {
+    fn enrich_packet_calls(
+        &self,
+        candidates: &mut [CandidateHit],
+        context: &SearchExecutionContext,
+    ) -> Result<()> {
+        let stop = context.clone();
+        context.run(|| {
+            self.lexical.enrich_packet_calls(
+                &self.layout,
+                &self.sidecar_generation,
+                &self.sidecar_input_hash,
+                candidates,
+                Arc::new(move || stop.is_cancelled()),
+            )
+        })
+    }
+
     fn layout(&self) -> Option<&SidecarLayout> {
         Some(&self.layout)
     }
@@ -529,6 +630,58 @@ impl SidecarSearch for LiveSidecarSearch {
             limit,
             &|| context.is_cancelled(),
         )
+    }
+    fn lexical_search_with_policy_context(
+        &self,
+        query: &str,
+        limit: usize,
+        policy: LexicalAdmissionPolicy,
+        context: &SearchExecutionContext,
+    ) -> Result<Vec<CandidateHit>> {
+        let context = context.clone();
+        self.lexical.search_with_policy_cancel(
+            &self.layout,
+            &self.sidecar_generation,
+            &self.sidecar_input_hash,
+            query,
+            limit,
+            policy,
+            move || context.is_cancelled(),
+        )
+    }
+
+    fn lexical_descriptor_search_with_policy_context(
+        &self,
+        query: &str,
+        limit: usize,
+        policy: LexicalAdmissionPolicy,
+        context: &SearchExecutionContext,
+    ) -> Result<Vec<CandidateHit>> {
+        let context = context.clone();
+        self.lexical.search_descriptors_with_policy_cancel(
+            &self.layout,
+            &self.sidecar_generation,
+            &self.sidecar_input_hash,
+            query,
+            limit,
+            policy,
+            move || context.is_cancelled(),
+        )
+    }
+
+    fn lexical_search_batch_with_policy(
+        &self,
+        queries: &[(String, usize, LexicalAdmissionPolicy)],
+        context: &SearchExecutionContext,
+    ) -> Result<Option<Vec<Vec<CandidateHit>>>> {
+        let context = context.clone();
+        Ok(Some(self.lexical.search_batch_with_policy_cancel(
+            &self.layout,
+            &self.sidecar_generation,
+            &self.sidecar_input_hash,
+            queries,
+            Arc::new(move || context.is_cancelled()),
+        )?))
     }
 }
 
@@ -677,6 +830,77 @@ mod tests {
             error.to_string(),
             "retrieval stopped: reason=deadline boundary=unknown"
         );
+    }
+
+    #[test]
+    fn interrupted_reads_only_become_stops_for_the_same_stopped_context() {
+        for failure in ["io", "sqlite", "corruption"] {
+            for stop in ["none", "cancelled", "deadline"] {
+                let cancelled = Arc::new(AtomicBool::new(false));
+                let context = SearchExecutionContext::new(
+                    Instant::now() + Duration::from_millis(100),
+                    Arc::clone(&cancelled),
+                    Arc::new(AtomicBool::new(false)),
+                );
+                let error = context
+                    .run::<()>(|| {
+                        if stop == "cancelled" {
+                            cancelled.store(true, Ordering::Release);
+                        } else if stop == "deadline" {
+                            while !context.is_cancelled() {
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                        }
+                        match failure {
+                            "io" => Err(std::io::Error::new(
+                                std::io::ErrorKind::Interrupted,
+                                "call metadata read cancelled",
+                            )
+                            .into()),
+                            "sqlite" => {
+                                let connection = rusqlite::Connection::open_in_memory()?;
+                                connection.progress_handler(1, Some(|| true))?;
+                                connection.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))?;
+                                panic!("SQLite progress callback must interrupt the read");
+                            }
+                            _ => anyhow::bail!("call metadata component changed after validation"),
+                        }
+                    })
+                    .expect_err("the read must fail");
+                let message = retrieval_stop_message(&error);
+                assert_eq!(
+                    message.is_some(),
+                    failure != "corruption" && stop != "none",
+                    "{failure}/{stop}: {error:#}"
+                );
+                if failure == "corruption" {
+                    assert_eq!(
+                        error.to_string(),
+                        "call metadata component changed after validation"
+                    );
+                } else if stop == "none" {
+                    if failure == "io" {
+                        assert_eq!(
+                            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                            std::io::ErrorKind::Interrupted
+                        );
+                    } else {
+                        assert!(matches!(
+                            error.downcast_ref::<rusqlite::Error>(),
+                            Some(rusqlite::Error::SqliteFailure(error, _))
+                                if error.code == rusqlite::ErrorCode::OperationInterrupted
+                        ));
+                    }
+                } else {
+                    let reason = if stop == "cancelled" {
+                        "request_cancelled"
+                    } else {
+                        "deadline"
+                    };
+                    assert!(message.unwrap().contains(&format!("reason={reason}")));
+                }
+            }
+        }
     }
 
     #[test]

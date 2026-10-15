@@ -4,7 +4,7 @@ use codestory_contracts::api::PacketPlanDto;
 use std::collections::HashSet;
 
 pub fn dedupe_packet_plan_queries(plan: &mut PacketPlanDto) {
-    let mut seen = HashSet::<String>::new();
+    let mut seen = HashSet::<(String, String)>::new();
     let mut deduped = Vec::with_capacity(plan.queries.len());
     for query in plan.queries.drain(..) {
         let key = query.query.trim().to_ascii_lowercase();
@@ -12,7 +12,7 @@ pub fn dedupe_packet_plan_queries(plan: &mut PacketPlanDto) {
             deduped.push(query);
             continue;
         }
-        if seen.insert(key) {
+        if seen.insert((key, query.purpose.clone())) {
             deduped.push(query);
         }
     }

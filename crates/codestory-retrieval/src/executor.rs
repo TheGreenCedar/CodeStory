@@ -11,8 +11,9 @@ use crate::index::query_fingerprint;
 use crate::mode::{RetrievalDegradedMode, derive_degraded_mode};
 use crate::planner::{PlannedStage, RetrievalStageKind};
 use crate::query_features::{QueryFeatures, QueryLookupMode, classify_query};
+use crate::query_policy::LexicalAdmissionPolicy;
 use crate::ranker::{rank_candidates, retain_primary_candidates_for_query};
-use crate::sidecar_search::{SearchExecutionContext, SidecarSearch};
+use crate::sidecar_search::{SearchExecutionContext, SidecarSearch, retrieval_stop_message};
 use anyhow::{Result, bail};
 use codestory_store::RetrievalIndexManifest;
 use serde::{Deserialize, Serialize};
@@ -94,6 +95,8 @@ pub struct QueryTrace {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetrievalPublicationIdentity {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_scope: Option<codestory_store::RetrievalArtifactScope>,
     pub core_generation_id: String,
     pub core_run_id: String,
     pub sidecar_generation: String,
@@ -167,9 +170,16 @@ impl<'a> QueryExecutor<'a> {
     /// `total_budget_ms` caps retrieval work only; it does not include runtime candidate
     /// resolution, packet sufficiency checks, or answer composition.
     pub fn execute(&mut self, query: &str, total_budget_ms: Option<u64>) -> Result<QueryResult> {
-        self.execute_with_payload(query, total_budget_ms, CandidatePayloadMode::Full, true)
+        self.execute_with_payload(
+            query,
+            total_budget_ms,
+            CandidatePayloadMode::Full,
+            true,
+            LexicalAdmissionPolicy::StrictLiteralV1,
+        )
     }
 
+    #[cfg(test)]
     pub(crate) fn execute_packet_descriptors(
         &mut self,
         query: &str,
@@ -180,6 +190,7 @@ impl<'a> QueryExecutor<'a> {
             total_budget_ms,
             CandidatePayloadMode::DescriptorOnly,
             true,
+            LexicalAdmissionPolicy::StrictLiteralV1,
         )
     }
 
@@ -199,6 +210,47 @@ impl<'a> QueryExecutor<'a> {
             total_budget_ms,
             CandidatePayloadMode::DescriptorOnly,
             false,
+            LexicalAdmissionPolicy::StrictLiteralV1,
+        )
+    }
+
+    pub(crate) fn execute_with_lexical_policy(
+        &mut self,
+        query: &str,
+        budget_ms: Option<u64>,
+        policy: LexicalAdmissionPolicy,
+    ) -> Result<QueryResult> {
+        self.execute_with_payload(query, budget_ms, CandidatePayloadMode::Full, true, policy)
+    }
+
+    pub(crate) fn execute_packet_descriptors_with_lexical_policy(
+        &mut self,
+        query: &str,
+        budget_ms: Option<u64>,
+        policy: LexicalAdmissionPolicy,
+    ) -> Result<QueryResult> {
+        self.execute_with_payload(
+            query,
+            budget_ms,
+            CandidatePayloadMode::DescriptorOnly,
+            true,
+            policy,
+        )
+    }
+
+    #[cfg(feature = "benchmark-support")]
+    pub(crate) fn execute_packet_descriptors_without_dense_semantic_for_benchmark_with_lexical_policy(
+        &mut self,
+        query: &str,
+        budget_ms: Option<u64>,
+        policy: LexicalAdmissionPolicy,
+    ) -> Result<QueryResult> {
+        self.execute_with_payload(
+            query,
+            budget_ms,
+            CandidatePayloadMode::DescriptorOnly,
+            false,
+            policy,
         )
     }
 
@@ -208,11 +260,13 @@ impl<'a> QueryExecutor<'a> {
         total_budget_ms: Option<u64>,
         payload: CandidatePayloadMode,
         include_dense_semantic: bool,
+        lexical_policy: LexicalAdmissionPolicy,
     ) -> Result<QueryResult> {
         let request_started = Instant::now();
-        let features = classify_query(query);
+        let mut features = classify_query(query);
+        features.lexical_policy = lexical_policy;
         let fingerprint = payload.cache_fingerprint(
-            query_fingerprint(&features.raw_query),
+            lexical_policy.cache_fingerprint(query_fingerprint(&features.raw_query)),
             include_dense_semantic,
         );
 
@@ -229,8 +283,11 @@ impl<'a> QueryExecutor<'a> {
             && let Some(manifest) = self.manifest.as_ref()
         {
             let key = self.cache.key_for_manifest(manifest, fingerprint.clone());
-            if let Some(cached) = self.cache.get(&key) {
+            if let Some((executed_policy, cached)) =
+                self.cache.get_with_policy(&key, lexical_policy)
+            {
                 let cached = cached.to_vec();
+                features.lexical_policy = executed_policy;
                 if self.cancelled.load(Ordering::Acquire) {
                     return Ok(cancelled_query_result(
                         features,
@@ -318,7 +375,23 @@ impl<'a> QueryExecutor<'a> {
             sanitize_descriptor_candidates(&mut candidates);
         }
         let ranked = rank_candidates(&features, candidates);
-        let hits = ranked;
+        let mut hits = ranked;
+        if payload.is_descriptor()
+            && cancel_reason.is_none()
+            && !self.cancelled.load(Ordering::Acquire)
+            && Instant::now() < deadline
+        {
+            let context = SearchExecutionContext::new(
+                deadline,
+                Arc::clone(&self.cancelled),
+                Arc::new(AtomicBool::new(false)),
+            );
+            if let Err(error) = self.sidecars.enrich_packet_calls(&mut hits, &context)
+                && (!context.is_cancelled() || retrieval_stop_message(&error).is_none())
+            {
+                return Err(error);
+            }
+        }
 
         if self.cancelled.load(Ordering::Acquire) {
             cancel_reason = Some("cancelled".into());
@@ -333,7 +406,8 @@ impl<'a> QueryExecutor<'a> {
         {
             let key = self.cache.key_for_manifest(manifest, fingerprint);
             if !self.cancelled.load(Ordering::Acquire) {
-                self.cache.insert(key.clone(), hits.clone());
+                self.cache
+                    .insert_with_policy(key.clone(), hits.clone(), features.lexical_policy);
                 if self.cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
                     self.cache.remove(&key);
                     cancel_reason = Some(cancellation_reason(&self.cancelled).into());
@@ -447,9 +521,19 @@ impl<'a> QueryExecutor<'a> {
             }
             RetrievalStageKind::Stage1Lexical => {
                 if payload.is_descriptor() {
-                    sidecars.lexical_descriptor_search_with_context(query, stage.top_k, &context)
+                    sidecars.lexical_descriptor_search_with_policy_context(
+                        query,
+                        stage.top_k,
+                        features.lexical_policy,
+                        &context,
+                    )
                 } else {
-                    sidecars.lexical_search_with_context(query, stage.top_k, &context)
+                    sidecars.lexical_search_with_policy_context(
+                        query,
+                        stage.top_k,
+                        features.lexical_policy,
+                        &context,
+                    )
                 }
             }
             RetrievalStageKind::Stage1bSemantic => {
@@ -1116,6 +1200,25 @@ fn merge_candidates(acc: &mut Vec<CandidateHit>, incoming: Vec<CandidateHit>) ->
             .find(|existing| fused_candidate_identity_matches(existing, &hit));
         if let Some(existing) = duplicate {
             let replace_graph_evidence = graph_evidence_should_replace(existing, &hit);
+            // Bounds belong to compatible source metadata, not merely a
+            // shared display name or a merged lane score. Never hydrate Core
+            // to repair a descriptor. Preserve the conservative larger bound.
+            let compatible_source = existing.packet_stable_identity().is_some()
+                && existing.packet_stable_identity() == hit.packet_stable_identity()
+                && existing.file_path == hit.file_path
+                && match (existing.start_line, hit.start_line) {
+                    (Some(left), Some(right)) => left == right,
+                    _ => true,
+                };
+            if compatible_source {
+                existing.source_bytes_upper_bound = match (
+                    existing.source_bytes_upper_bound.filter(|bytes| *bytes > 0),
+                    hit.source_bytes_upper_bound.filter(|bytes| *bytes > 0),
+                ) {
+                    (Some(left), Some(right)) => Some(left.max(right)),
+                    (left, right) => left.or(right),
+                };
+            }
             existing.merge_lane_scores(&hit.lane_scores);
             if existing.node_id.is_none() {
                 existing.node_id = hit.node_id.clone();
@@ -1134,6 +1237,30 @@ fn merge_candidates(acc: &mut Vec<CandidateHit>, incoming: Vec<CandidateHit>) ->
             }
             if existing.source_excerpt.is_none() {
                 existing.source_excerpt = hit.source_excerpt.clone();
+            }
+            if existing
+                .provenance
+                .iter()
+                .chain(hit.provenance.iter())
+                .any(|p| p == "published-call-descriptors-conflict")
+            {
+                existing.published_calls = None;
+                existing.add_provenance("published-call-descriptors-conflict");
+            }
+            match (&existing.published_calls, &hit.published_calls) {
+                (None, Some(_))
+                    if !existing
+                        .provenance
+                        .iter()
+                        .any(|p| p == "published-call-descriptors-conflict") =>
+                {
+                    existing.published_calls = hit.published_calls.clone()
+                }
+                (Some(a), Some(b)) if a != b => {
+                    existing.published_calls = None;
+                    existing.add_provenance("published-call-descriptors-conflict");
+                }
+                _ => {}
             }
             if existing.file_role.is_none() {
                 existing.file_role = hit.file_role;
@@ -1154,6 +1281,13 @@ fn merge_candidates(acc: &mut Vec<CandidateHit>, incoming: Vec<CandidateHit>) ->
         added += 1;
     }
     added
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn replay_fuse_published_calls(hits: Vec<CandidateHit>) -> Vec<CandidateHit> {
+    let mut result = Vec::new();
+    merge_candidates(&mut result, hits);
+    result
 }
 
 fn graph_evidence_should_replace(existing: &CandidateHit, incoming: &CandidateHit) -> bool {
@@ -1250,8 +1384,93 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
+    #[test]
+    fn published_call_metadata_conflict_survives_nested_fusion_and_export() {
+        use codestory_contracts::compilation::*;
+        let make = |hash: &str| {
+            let mut hit = CandidateHit::lexical_stub("src/worker.rs", 0.8);
+            hit.node_id = Some("7".into());
+            hit.start_line = Some(1);
+            hit.source_bytes_upper_bound = Some(512);
+            hit.published_calls = Some(PacketPublishedCallsV1 {
+                sidecar_input_hash: hash.into(),
+                neighborhood: PacketCallNeighborhoodV1 {
+                    schema_version: PACKET_CALL_DESCRIPTOR_SCHEMA_V1,
+                    source_identity: "node:7".into(),
+                    truncated: false,
+                    targets: Vec::new(),
+                },
+            });
+            hit
+        };
+        let a = make("a");
+        let b = make("b");
+        let conflicted = replay_fuse_published_calls(vec![a.clone(), b.clone()])
+            .pop()
+            .unwrap();
+        for rows in [
+            vec![a.clone(), conflicted.clone(), b.clone()],
+            vec![conflicted.clone(), a.clone(), b.clone()],
+            vec![b.clone(), a.clone(), conflicted.clone()],
+        ] {
+            let result = replay_fuse_published_calls(rows);
+            assert_eq!(result.len(), 1);
+            assert!(result[0].published_calls.is_none());
+            let descriptor = result[0].packet_descriptor().unwrap();
+            assert!(descriptor.published_calls.is_none());
+            assert!(descriptor.published_calls_conflicted);
+        }
+        let mut semantic = a.clone();
+        semantic.source = CandidateSource::Semantic;
+        semantic.published_calls = None;
+        let result = replay_fuse_published_calls(vec![semantic, a.clone()]);
+        assert_eq!(result[0].published_calls, a.published_calls);
+    }
+
+    #[test]
+    fn descriptor_fusion_preserves_only_compatible_source_reservations() {
+        let mut unlocated = CandidateHit::with_source(
+            "src/service.rs",
+            Some("Service".into()),
+            0.8,
+            CandidateSource::Lexical,
+        );
+        unlocated.node_id = Some("41".into());
+        let mut anchor = unlocated.clone();
+        anchor.source = CandidateSource::Semantic;
+        anchor.source_bytes_upper_bound = Some(512);
+        let mut merged = vec![unlocated.clone()];
+        merge_candidates(&mut merged, vec![anchor.clone()]);
+        assert!(
+            merged[0].packet_descriptor().is_some(),
+            "valid semantic-only source bound survives lexical-first fusion"
+        );
+        let mut larger = anchor.clone();
+        larger.source_bytes_upper_bound = Some(1024);
+        merge_candidates(&mut merged, vec![larger]);
+        assert_eq!(merged[0].source_bytes_upper_bound, Some(1024));
+        for conflict in ["path", "line"] {
+            let mut left = unlocated.clone();
+            left.start_line = Some(4);
+            let mut right = anchor.clone();
+            right.start_line = Some(4);
+            if conflict == "path" {
+                right.file_path = "src/other.rs".into();
+            } else {
+                right.start_line = Some(9);
+            }
+            let mut merged = vec![left];
+            merge_candidates(&mut merged, vec![right]);
+            assert!(
+                merged[0].source_bytes_upper_bound.is_none(),
+                "conflicting {conflict} cannot transfer source authority"
+            );
+        }
+    }
+
     fn sample_manifest() -> RetrievalIndexManifest {
         RetrievalIndexManifest {
+            artifact_scope: None,
             project_id: "testproj".into(),
             lexical_version: "v1".into(),
             semantic_generation: "codestory_testproj".into(),
@@ -1316,6 +1535,133 @@ mod tests {
         assert!(!result.hits.is_empty());
         assert!(!result.trace.stages.is_empty());
         assert!(!result.trace.cache_hit);
+    }
+
+    #[test]
+    fn lexical_policy_cache_is_separate_in_both_orders_and_payloads() {
+        struct PolicySidecars;
+        impl SidecarSearch for PolicySidecars {
+            fn lexical_search(&self, _: &str, _: usize) -> Result<Vec<CandidateHit>> {
+                panic!("typed execution must reach policy owner")
+            }
+            fn lexical_search_with_policy_context(
+                &self,
+                query: &str,
+                _: usize,
+                policy: LexicalAdmissionPolicy,
+                context: &SearchExecutionContext,
+            ) -> Result<Vec<CandidateHit>> {
+                context.check_cancelled()?;
+                assert_eq!(query, "text empty `absent`");
+                let path = match policy {
+                    LexicalAdmissionPolicy::StrictLiteralV1 => "src/strict.rs",
+                    LexicalAdmissionPolicy::BroadQuestionV1 => "src/broad.rs",
+                };
+                let mut hit = CandidateHit::lexical_stub(path, 1.0);
+                hit.source_bytes_upper_bound = Some(32);
+                Ok(vec![hit])
+            }
+            fn lexical_descriptor_search_with_policy_context(
+                &self,
+                query: &str,
+                limit: usize,
+                policy: LexicalAdmissionPolicy,
+                context: &SearchExecutionContext,
+            ) -> Result<Vec<CandidateHit>> {
+                self.lexical_search_with_policy_context(query, limit, policy, context)
+            }
+            fn semantic_search(&self, _: &str, _: usize) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+            fn scip_anchor(&self, _: &str, _: usize) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+            fn scip_expand(&self, _: &[CandidateHit], _: usize) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+        }
+        for order in [
+            [
+                LexicalAdmissionPolicy::StrictLiteralV1,
+                LexicalAdmissionPolicy::BroadQuestionV1,
+            ],
+            [
+                LexicalAdmissionPolicy::BroadQuestionV1,
+                LexicalAdmissionPolicy::StrictLiteralV1,
+            ],
+        ] {
+            for payload in [
+                CandidatePayloadMode::Full,
+                CandidatePayloadMode::DescriptorOnly,
+            ] {
+                let mut cache = RetrievalCache::new();
+                let poisoned_key = cache.key_for_manifest(
+                    &sample_manifest(),
+                    payload.cache_fingerprint(
+                        LexicalAdmissionPolicy::BroadQuestionV1
+                            .cache_fingerprint(query_fingerprint("text empty `absent`")),
+                        true,
+                    ),
+                );
+                cache.insert(
+                    poisoned_key,
+                    vec![CandidateHit::lexical_stub("src/poisoned.rs", 1.0)],
+                );
+                let mut executor = QueryExecutor {
+                    sidecars: Arc::new(PolicySidecars),
+                    cache: &mut cache,
+                    manifest: Some(sample_manifest()),
+                    file_roles: Arc::new(HashMap::new()),
+                    cancelled: cancellation_flag(),
+                    mode_override: Some(RetrievalDegradedMode::Full),
+                };
+                for round in 0..2 {
+                    for policy in order {
+                        let result = executor
+                            .execute_with_payload(
+                                "text empty `absent`",
+                                Some(1_000),
+                                payload,
+                                true,
+                                policy,
+                            )
+                            .expect("policy execution");
+                        assert_eq!(result.features.lexical_policy, policy);
+                        assert_eq!(result.trace.cache_hit, round == 1);
+                        assert_eq!(
+                            result.hits[0].file_path,
+                            if policy == LexicalAdmissionPolicy::StrictLiteralV1 {
+                                "src/strict.rs"
+                            } else {
+                                "src/broad.rs"
+                            }
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_broad_sidecar_refuses_instead_of_running_strict() {
+        let mut cache = RetrievalCache::new();
+        let mut executor = QueryExecutor {
+            sidecars: Arc::new(MockSidecarSearch::default()),
+            cache: &mut cache,
+            manifest: Some(sample_manifest()),
+            file_roles: Arc::new(HashMap::new()),
+            cancelled: cancellation_flag(),
+            mode_override: Some(RetrievalDegradedMode::Full),
+        };
+        assert!(
+            executor
+                .execute_packet_descriptors_with_lexical_policy(
+                    "text empty `absent`",
+                    Some(1_000),
+                    LexicalAdmissionPolicy::BroadQuestionV1,
+                )
+                .is_err()
+        );
     }
 
     #[test]
@@ -1443,6 +1789,116 @@ mod tests {
                 .iter()
                 .all(|hit| hit.source_excerpt.is_none() && hit.target.is_none())
         );
+    }
+
+    #[test]
+    fn descriptor_metadata_stop_preserves_ranked_hits_without_masking_failures() {
+        struct MetadataSidecars {
+            outcome: &'static str,
+            cancelled: Arc<AtomicBool>,
+        }
+
+        impl SidecarSearch for MetadataSidecars {
+            fn lexical_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                let mut hit = CandidateHit::with_source(
+                    "src/descriptor.rs",
+                    Some("descriptor_symbol".into()),
+                    0.9,
+                    CandidateSource::Lexical,
+                );
+                hit.node_id = Some("17".into());
+                hit.start_line = Some(1);
+                hit.source_bytes_upper_bound = Some(512);
+                Ok(vec![hit])
+            }
+
+            fn semantic_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+
+            fn scip_anchor(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+
+            fn scip_expand(
+                &self,
+                _anchors: &[CandidateHit],
+                _limit: usize,
+            ) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+
+            fn enrich_packet_calls(
+                &self,
+                candidates: &mut [CandidateHit],
+                context: &SearchExecutionContext,
+            ) -> Result<()> {
+                assert_eq!(
+                    candidates.len(),
+                    1,
+                    "enrichment must follow successful ranking"
+                );
+                assert_eq!(candidates[0].node_id.as_deref(), Some("17"));
+                match self.outcome {
+                    "deadline" | "failure_after_deadline" => {
+                        while !context.is_cancelled() {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                    }
+                    "cancelled" | "failure_after_cancel" => {
+                        self.cancelled.store(true, Ordering::Release);
+                    }
+                    _ => {}
+                }
+                if self.outcome.starts_with("failure") {
+                    bail!("call metadata component changed after validation");
+                }
+                context.check_cancelled()
+            }
+        }
+
+        for outcome in [
+            "deadline",
+            "cancelled",
+            "failure",
+            "failure_after_cancel",
+            "failure_after_deadline",
+            "complete",
+        ] {
+            let cancelled = cancellation_flag();
+            let mut cache = RetrievalCache::new();
+            let result = QueryExecutor {
+                sidecars: Arc::new(MetadataSidecars {
+                    outcome,
+                    cancelled: Arc::clone(&cancelled),
+                }),
+                cache: &mut cache,
+                manifest: Some(sample_manifest()),
+                file_roles: Arc::new(HashMap::new()),
+                cancelled,
+                mode_override: Some(RetrievalDegradedMode::Full),
+            }
+            .execute_packet_descriptors("descriptor_symbol", Some(800));
+            if outcome.starts_with("failure") {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("component changed after validation"),
+                    "{outcome}: publication failures must remain fatal"
+                );
+            } else {
+                let result = result.unwrap_or_else(|error| panic!("{outcome}: {error:#}"));
+                assert_eq!(result.hits.len(), 1, "{outcome}");
+                assert_eq!(result.hits[0].node_id.as_deref(), Some("17"), "{outcome}");
+                assert_eq!(
+                    result.trace.cancel_reason.as_deref(),
+                    (outcome != "complete").then_some(outcome),
+                    "{outcome}"
+                );
+            }
+            assert_eq!(cache.is_empty(), outcome != "complete", "{outcome}");
+        }
     }
 
     #[cfg(feature = "benchmark-support")]
@@ -2950,6 +3406,18 @@ mod tests {
     #[test]
     fn executor_merges_duplicate_candidate_provenance() {
         let query = "how extension service starts";
+        // Raw lane scores are not comparable with fused ranking scores.
+        // Keep the fusion quality assertion in the same versioned units.
+        let lexical_only_score = rank_candidates(
+            &classify_query(query),
+            vec![CandidateHit::with_source(
+                "src/service.rs",
+                Some("ExtensionService".into()),
+                0.70,
+                CandidateSource::Lexical,
+            )],
+        )[0]
+        .score;
         let mut adjacency_hit = CandidateHit::with_source(
             "src/service.rs",
             Some("ExtensionService".into()),
@@ -2995,8 +3463,8 @@ mod tests {
             .find(|hit| hit.file_path == "src/service.rs")
             .expect("merged candidate");
         assert!(
-            hit.score > 0.70,
-            "merged candidate should keep ranker-adjusted score above lexical-only input: {hit:?}"
+            hit.score > lexical_only_score,
+            "merged candidate should exceed ranked lexical-only evidence ({lexical_only_score}): {hit:?}"
         );
         assert!(hit.provenance.iter().any(|label| label == "lexical_source"));
         assert!(hit.provenance.iter().any(|label| label == "graph_neighbor"));

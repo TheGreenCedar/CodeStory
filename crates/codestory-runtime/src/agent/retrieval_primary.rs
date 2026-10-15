@@ -1,5 +1,8 @@
 //! Mandatory sidecar retrieval integration for packet and agent ask paths.
 
+use super::packet_candidate::PacketRetrievalQuery;
+use codestory_retrieval::LexicalAdmissionPolicy;
+
 use crate::agent::nucleo_policy::with_sidecar_primary_retrieval;
 use crate::agent::packet_candidate::{
     PacketAdmissionDecision, PacketGraphDirection, PacketGraphEdgeProvenance, PacketSearchHit,
@@ -14,10 +17,11 @@ use crate::{
 use anyhow::Error as AnyhowError;
 use codestory_contracts::api::NodeKind as ApiNodeKind;
 use codestory_contracts::api::{
-    AgentAnswerDto, AgentPacketDto, ApiError, EmbeddingVectorPublicationIdentityDto, GraphNodeDto,
-    GraphResponse, PacketQueryCompletionDto, PacketSidecarQueryDiagnosticDto,
-    RetrievalCandidateResolutionCountDto, RetrievalCandidateSummaryDto, RetrievalScoreBreakdownDto,
-    RetrievalShadowDto, RetrievalStageTimingDto, SearchHit, SearchHitOrigin, SearchResultsDto,
+    AgentAnswerDto, AgentPacketDto, ApiError, ApiErrorDetails,
+    EmbeddingVectorPublicationIdentityDto, GraphNodeDto, GraphResponse, PacketQueryCompletionDto,
+    PacketSidecarQueryDiagnosticDto, RetrievalCandidateResolutionCountDto,
+    RetrievalCandidateSummaryDto, RetrievalScoreBreakdownDto, RetrievalShadowDto,
+    RetrievalStageTimingDto, SearchHit, SearchHitOrigin, SearchResultsDto,
 };
 use codestory_contracts::compilation::PacketAdmissionGapKindV1;
 use codestory_contracts::graph::{
@@ -87,6 +91,37 @@ fn active_pinned_retrieval_read(controller: &AppController) -> Option<Rc<PinnedR
             .filter(|(active_controller, _)| *active_controller == controller_identity)
             .map(|(_, pinned)| Rc::clone(pinned))
     })
+}
+
+pub(super) fn read_admitted_published_file(
+    controller: &AppController,
+    receipt: &codestory_contracts::compilation::PacketAdmissionReceiptV1,
+) -> Result<Option<codestory_retrieval::PublishedFileSourceWitness>, ApiError> {
+    let pinned = active_pinned_retrieval_read(controller)
+        .ok_or_else(|| ApiError::internal("Published file source is missing its operation pin."))?;
+    let session = active_packet_proof_session().ok_or_else(|| {
+        ApiError::invalid_argument("Published file source lacks an active packet admission.")
+    })?;
+    if !session.authorizes_published_file(receipt, pinned.session.publication_identity()) {
+        return Err(ApiError::invalid_argument(
+            "Published file source lacks sealed lexical admission.",
+        ));
+    }
+    let path = receipt
+        .stable_identity
+        .strip_prefix("path:")
+        .ok_or_else(|| {
+            ApiError::invalid_argument("Published file source requires a file identity.")
+        })?;
+    pinned
+        .session
+        .read_published_file_source(
+            path,
+            crate::services::active_public_operation_cancellation(),
+        )
+        .map_err(|error| {
+            ApiError::internal(format!("Published file source unavailable: {error:#}"))
+        })
 }
 
 struct ActivePinnedRetrievalReadGuard {
@@ -350,6 +385,31 @@ impl PinnedRetrievalRead {
         }
         result
     }
+
+    fn revalidate_after_response(&self) -> Result<(), ApiError> {
+        let mut span = super::packet_batch::observe_packet_operation_span(
+            super::packet_batch::PacketOperationObservationSpan::PinRevalidation,
+        );
+        let result = self.session.revalidate_after_response().map_err(|error| {
+            if let Some(fence) =
+                error.downcast_ref::<codestory_retrieval::PublishedFileSourceFenceError>()
+            {
+                let code = match fence {
+                    codestory_retrieval::PublishedFileSourceFenceError::Cancelled => "cancelled",
+                    codestory_retrieval::PublishedFileSourceFenceError::Changed { .. } => {
+                        "source_stale"
+                    }
+                };
+                ApiError::new(code, error.to_string())
+            } else {
+                map_pinned_query_error(error)
+            }
+        });
+        if result.is_ok() {
+            span.finish_success();
+        }
+        result
+    }
 }
 
 fn map_pinned_query_error(error: AnyhowError) -> ApiError {
@@ -472,8 +532,11 @@ pub(crate) fn with_pinned_retrieval_publication_value<T>(
         let value = build()?;
         return Ok((value, Some(publication)));
     }
-    if !sidecar_retrieval_primary_enabled(controller) {
-        return build().map(|value| (value, None));
+    // This helper owns Retrieval-class public admission. An unavailable
+    // generation cannot lend a pin to its response builder, even when Core is
+    // fresh. Preserve the readiness reason instead of running an unpinned body.
+    if let Some(reason) = sidecar_retrieval_unavailable_reason(controller) {
+        return Err(sidecar_retrieval_unavailable_error(controller, reason));
     }
 
     let pinned = Rc::new(PinnedRetrievalRead::begin(controller)?);
@@ -481,7 +544,7 @@ pub(crate) fn with_pinned_retrieval_publication_value<T>(
     let publication = publication_dto(&pinned);
     with_active_pinned_retrieval_read(controller, Rc::clone(&pinned), || {
         build().and_then(|value| {
-            pinned.revalidate()?;
+            pinned.revalidate_after_response()?;
             Ok((value, Some(publication)))
         })
     })
@@ -505,7 +568,7 @@ fn with_stable_retrieval_publication_inner<T: RetrievalPublicationResponse>(
         let result = with_active_pinned_retrieval_read(controller, Rc::clone(&pinned), || {
             build().and_then(|mut response| {
                 response.attach_retrieval_publication(publication.clone());
-                pinned.revalidate()?;
+                pinned.revalidate_after_response()?;
                 Ok(response)
             })
         });
@@ -566,18 +629,24 @@ fn shadow_env_enabled() -> Option<bool> {
 /// - Unset: retrieval is available when the manifest exists and the shared
 ///   per-user embedding server is healthy.
 pub(crate) fn sidecar_retrieval_primary_enabled(controller: &AppController) -> bool {
+    let eligible = || {
+        if controller.runtime_config.profile == SidecarProfile::Agent
+            && let Some(pinned) = active_pinned_retrieval_read(controller)
+            && let Some(readiness) = pinned.session.validate_primary_readiness_reuse()
+        {
+            return readiness.is_ok();
+        }
+        sidecar_retrieval_eligible(controller) && sidecar_mode_is_required_full(controller)
+    };
     match retrieval_env_override() {
         Some(false) => {
             tracing::error!("CODESTORY_RETRIEVAL=0 is unsupported; full retrieval is mandatory");
             false
         }
-        Some(true) => {
-            sidecar_retrieval_eligible(controller) && sidecar_mode_is_required_full(controller)
-        }
+        Some(true) => eligible(),
         None => {
             // Default product path: serve only from full agent-scoped retrieval.
-            let auto_on =
-                sidecar_retrieval_eligible(controller) && sidecar_mode_is_required_full(controller);
+            let auto_on = eligible();
             if auto_on {
                 tracing::info!(
                     "retrieval primary auto-on (unset CODESTORY_RETRIEVAL; agent retrieval full)"
@@ -660,6 +729,45 @@ pub(crate) fn sidecar_retrieval_unavailable_error(
         })
         .unwrap_or_else(|| sidecar_retrieval_recovery_commands_for_project(&project, None));
     ApiError::retrieval_unavailable(reason, project.clone(), recovery_commands)
+}
+
+pub(crate) fn sidecar_query_rejection_error(
+    controller: &AppController,
+    retrieval_mode: &str,
+    cancel_reason: Option<&str>,
+    reason: impl Into<String>,
+) -> ApiError {
+    if sidecar_mode_can_serve_primary(retrieval_mode)
+        && let Some(stop @ ("deadline" | "stage_deadline" | "cancelled")) = cancel_reason
+    {
+        return sidecar_request_stop_error(controller, stop, reason);
+    }
+    sidecar_retrieval_unavailable_error(controller, reason)
+}
+
+pub(crate) fn sidecar_request_stop_error(
+    controller: &AppController,
+    stop: &str,
+    reason: impl Into<String>,
+) -> ApiError {
+    let mut details = ApiErrorDetails::cause(stop);
+    details.failed_layer = Some("retrieval_query".into());
+    details.project = Some(
+        controller
+            .require_project_root()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "<project>".into()),
+    );
+    let action = if stop == "cancelled" {
+        "The request was cancelled; no index repair is required."
+    } else {
+        "Retry the request or narrow the question to a more specific target."
+    };
+    ApiError::with_details(
+        "retrieval_unavailable",
+        format!("{}; {action}", reason.into()),
+        details,
+    )
 }
 
 fn sidecar_retrieval_recovery_commands_for_runtime(
@@ -944,9 +1052,22 @@ pub(crate) fn run_sidecar_query(
 /// candidate source or graph hydration begins. The packet session retains
 /// these exact query results under its retrieval policy and publication pin;
 /// later resolution reuses them and may hydrate only identities admitted here.
+#[cfg(test)]
 pub(crate) fn preadmit_packet_descriptor_queries(
     controller: &AppController,
     queries: &[String],
+    latency_budget_ms: Option<u32>,
+) -> Result<(), ApiError> {
+    let typed = queries
+        .iter()
+        .map(|query| PacketRetrievalQuery::strict(query))
+        .collect::<Vec<_>>();
+    preadmit_packet_descriptor_queries_with_policy(controller, &typed, latency_budget_ms)
+}
+
+pub(crate) fn preadmit_packet_descriptor_queries_with_policy(
+    controller: &AppController,
+    queries: &[PacketRetrievalQuery],
     latency_budget_ms: Option<u32>,
 ) -> Result<(), ApiError> {
     let session = active_packet_proof_session().ok_or_else(|| {
@@ -1026,7 +1147,8 @@ pub(crate) fn preadmit_packet_descriptor_queries(
         let batch_items = queries
             .iter()
             .map(|query| QueryBatchItem {
-                query,
+                lexical_policy: query.lexical_policy,
+                query: &query.query,
                 budget_ms: Some(per_query_budget),
             })
             .collect::<Vec<_>>();
@@ -1069,21 +1191,24 @@ pub(crate) fn preadmit_packet_descriptor_queries(
         }
 
         for (expected_query, result) in queries.iter().zip(&query_results) {
-            if result.query != *expected_query {
+            if result.query != expected_query.query
+                || result.features.lexical_policy != expected_query.lexical_policy
+            {
                 return Err(sidecar_retrieval_unavailable_error(
                     controller,
                     format!(
-                        "packet descriptor batch query mismatch expected `{expected_query}` got `{}`",
-                        result.query
+                        "packet descriptor batch query mismatch expected `{}` got `{}`",
+                        expected_query.query, result.query
                     ),
                 ));
             }
             pinned.ensure_query_identity(result, "admitting packet descriptors")?;
         }
-        for result in &query_results {
+        for (expected, result) in queries.iter().zip(&query_results) {
             session
-                .retain_descriptor_result(
+                .retain_descriptor_result_with_policy(
                     result,
+                    expected.lexical_policy,
                     include_dense_semantic,
                     pinned.session.publication_identity(),
                 )
@@ -1093,10 +1218,41 @@ pub(crate) fn preadmit_packet_descriptor_queries(
                     ))
                 })?;
         }
+        // Observe the returned eligible view order before max-score pooling.
+        // Bounded metadata only; this cannot rerank, read or admit a candidate.
+        let mut view_rows = Vec::new();
+        let mut view_eligible_counts = Vec::new();
+        for result in query_results.iter().take(4) {
+            let mut rows = Vec::new();
+            let mut eligible = 0;
+            for (rank, hit) in result.hits.iter().enumerate() {
+                if is_phantom_sidecar_hit(hit) {
+                    continue;
+                }
+                if let Some(descriptor) = hit.packet_descriptor() {
+                    eligible += 1;
+                    if rows.len() < 16 {
+                        rows.push((
+                            descriptor.stable_identity,
+                            rank,
+                            descriptor.retrieval_score.value.to_bits(),
+                        ));
+                    }
+                }
+            }
+            view_rows.push(rows);
+            view_eligible_counts.push(eligible);
+        }
+        super::packet_batch::observe_packet_raf_query_views(
+            &view_rows,
+            &view_eligible_counts,
+            query_results.len(),
+        );
         let seal_started = Instant::now();
-        admit_packet_candidate_descriptors(
+        admit_packet_candidate_descriptors_bound(
             &session,
             query_results.iter().flat_map(|result| result.hits.iter()),
+            Some(&pinned.session.publication_identity().sidecar_input_hash),
         );
         let admission_seal_wall_ms = packet_descriptor_phase_wall_ms(seal_started);
         // The repository-wide freshness and core/vector attestation checks are
@@ -1137,9 +1293,18 @@ fn packet_descriptor_phase_wall_ms(started_at: Instant) -> u64 {
     millis.saturating_add(u64::from(!elapsed.subsec_nanos().is_multiple_of(1_000_000)))
 }
 
+#[cfg(test)]
 fn admit_packet_candidate_descriptors<'a>(
     session: &crate::agent::packet_candidate::PacketProofSession,
     candidates: impl IntoIterator<Item = &'a CandidateHit>,
+) {
+    admit_packet_candidate_descriptors_bound(session, candidates, None);
+}
+
+fn admit_packet_candidate_descriptors_bound<'a>(
+    session: &crate::agent::packet_candidate::PacketProofSession,
+    candidates: impl IntoIterator<Item = &'a CandidateHit>,
+    input_hash: Option<&str>,
 ) {
     let mut descriptors = Vec::new();
     for candidate in candidates
@@ -1165,6 +1330,7 @@ fn admit_packet_candidate_descriptors<'a>(
             .total_cmp(&left.retrieval_score.value)
             .then_with(|| left.stable_identity.cmp(&right.stable_identity))
     });
+    session.retain_replay_ranked_descriptors(&descriptors);
     let mut ranked_identities = Vec::new();
     let mut ranked_seen = HashSet::new();
     for descriptor in &descriptors {
@@ -1172,22 +1338,16 @@ fn admit_packet_candidate_descriptors<'a>(
             ranked_identities.push(descriptor.stable_identity.clone());
         }
     }
-    let mut seen = HashSet::new();
-    for descriptor in descriptors {
-        if !seen.insert(descriptor.stable_identity.clone()) {
-            continue;
-        }
-        match session.admit_descriptor(&descriptor) {
-            PacketAdmissionDecision::Admitted | PacketAdmissionDecision::AlreadyAdmitted => {}
-            PacketAdmissionDecision::CountBudgetExceeded
-                if session.remaining_hydration_slots() == 0 =>
-            {
-                break;
-            }
-            PacketAdmissionDecision::CountBudgetExceeded
-            | PacketAdmissionDecision::SourceBudgetExceeded => {}
-        }
-    }
+    let descriptors = published_call_admission_order(
+        &descriptors,
+        &session
+            .receipts()
+            .into_iter()
+            .map(|r| r.stable_identity)
+            .collect(),
+        input_hash,
+    );
+    admit_published_call_descriptors(session, &descriptors);
     session.seal_retrieval_admission();
     let admitted_identities = session
         .receipts()
@@ -1200,11 +1360,117 @@ fn admit_packet_candidate_descriptors<'a>(
     );
 }
 
+/// Admission remains count/source bounded. Retaining metadata is a separate
+/// pass over the same validated pool, so a late exact owner cannot lose its
+/// navigation annotation when a new identity first exceeds the count cap.
+fn admit_published_call_descriptors(
+    session: &crate::agent::packet_candidate::PacketProofSession,
+    descriptors: &[codestory_contracts::compilation::PacketCandidateDescriptorV1],
+) {
+    for descriptor in descriptors {
+        match session.admit_descriptor(descriptor) {
+            PacketAdmissionDecision::CountBudgetExceeded
+                if session.remaining_hydration_slots() == 0 =>
+            {
+                break;
+            }
+            _ => {}
+        }
+    }
+    for descriptor in descriptors {
+        session.retain_admitted_call_annotation(descriptor);
+    }
+}
+
+/// Validate and deduplicate one published eligible pool without changing new
+/// identity retrieval rank. Optional call hints remain annotations only. This
+/// reserves no extra source, performs no read, and cannot introduce a new target.
+fn published_call_admission_order(
+    ranked: &[codestory_contracts::compilation::PacketCandidateDescriptorV1],
+    already_admitted: &HashSet<String>,
+    input_hash: Option<&str>,
+) -> Vec<codestory_contracts::compilation::PacketCandidateDescriptorV1> {
+    use codestory_contracts::compilation::*;
+    let mut unique = Vec::<PacketCandidateDescriptorV1>::new();
+    let mut indices = HashMap::<String, usize>::new();
+    let mut conflicts = HashSet::new();
+    for row in ranked {
+        let mut row = row.clone();
+        if row.published_calls_conflicted {
+            conflicts.insert(row.stable_identity.clone());
+            row.published_calls = None;
+        }
+        row.published_calls = row.published_calls.filter(|m| {
+            Some(m.sidecar_input_hash.as_str()) == input_hash
+                && input_hash.is_some()
+                && m.neighborhood.is_valid_for(&row.stable_identity)
+        });
+        if let Some(&index) = indices.get(&row.stable_identity) {
+            let previous = &mut unique[index];
+            if conflicts.contains(&row.stable_identity) {
+                previous.published_calls = None;
+                previous.published_calls_conflicted = true;
+            }
+            match (&previous.published_calls, &row.published_calls) {
+                (None, Some(_)) if !conflicts.contains(&row.stable_identity) => {
+                    previous.published_calls = row.published_calls
+                }
+                (Some(a), Some(b)) if a != b => {
+                    previous.published_calls = None;
+                    previous.published_calls_conflicted = true;
+                    conflicts.insert(row.stable_identity);
+                }
+                _ => {}
+            }
+        } else {
+            indices.insert(row.stable_identity.clone(), unique.len());
+            unique.push(row);
+        }
+    }
+    // Already-issued owners retain their existing session receipts and are
+    // annotated in the separate full-pool pass. All new identities retain the
+    // unique versioned retrieval order; optional topology cannot evict them.
+    unique.sort_by_key(|row| already_admitted.contains(&row.stable_identity));
+    unique
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn replay_published_call_admissions(
+    ranked: &[codestory_contracts::compilation::PacketCandidateDescriptorV1],
+    input_hash: &str,
+) -> (
+    Vec<codestory_contracts::compilation::PacketAdmissionReceiptV1>,
+    Vec<codestory_contracts::compilation::PacketDirectedRelationV1>,
+) {
+    let session = crate::agent::packet_candidate::PacketProofSession::new();
+    let ordered = published_call_admission_order(ranked, &HashSet::new(), Some(input_hash));
+    admit_published_call_descriptors(&session, &ordered);
+    session.seal_retrieval_admission();
+    session.reserve_source_pages(&std::collections::HashSet::new());
+    (session.receipts(), session.admitted_call_navigation())
+}
+
 pub(crate) fn run_and_resolve_sidecar_query(
     controller: &AppController,
     query: &str,
     max_results: usize,
     latency_budget_ms: Option<u32>,
+) -> Result<(QueryResult, SidecarCandidateResolutionOutcome), ApiError> {
+    run_and_resolve_sidecar_query_with_policy(
+        controller,
+        query,
+        max_results,
+        latency_budget_ms,
+        LexicalAdmissionPolicy::StrictLiteralV1,
+    )
+}
+
+pub(crate) fn run_and_resolve_sidecar_query_with_policy(
+    controller: &AppController,
+    query: &str,
+    max_results: usize,
+    latency_budget_ms: Option<u32>,
+    lexical_policy: LexicalAdmissionPolicy,
 ) -> Result<(QueryResult, SidecarCandidateResolutionOutcome), ApiError> {
     with_pinned_retrieval_read(controller, |pinned| {
         let packet_session = crate::agent::packet_candidate::active_packet_proof_session();
@@ -1212,12 +1478,27 @@ pub(crate) fn run_and_resolve_sidecar_query(
             .as_ref()
             .is_none_or(|session| session.includes_dense_semantic());
         let retained = packet_session.as_ref().and_then(|session| {
-            session.descriptor_result(
+            session.descriptor_result_with_policy(
                 query,
+                lexical_policy,
                 include_dense_semantic,
                 pinned.session.publication_identity(),
             )
         });
+        if retained.is_none()
+            && packet_session
+                .as_ref()
+                .is_some_and(|session| session.retrieval_admission_is_sealed())
+        {
+            return Err(ApiError::internal(
+                "sealed packet is missing its admitted query/policy result",
+            ));
+        }
+        if packet_session.is_none() && lexical_policy != LexicalAdmissionPolicy::StrictLiteralV1 {
+            return Err(ApiError::internal(
+                "broad question retrieval requires typed packet origin",
+            ));
+        }
         let _executed_query = retained.is_none();
         let query_result = if let Some(result) = retained {
             result
@@ -1228,15 +1509,17 @@ pub(crate) fn run_and_resolve_sidecar_query(
                     if !include_dense_semantic {
                         return pinned
                         .session
-                        .execute_packet_descriptors_without_dense_semantic_for_benchmark_with_cache(
+                        .execute_packet_descriptors_without_dense_semantic_for_benchmark_with_admission_policy(
                             query,
+                            lexical_policy,
                             Some(sidecar_budget_ms(latency_budget_ms)),
                             crate::services::active_public_operation_cancellation(),
                             cache,
                         );
                     }
-                    pinned.session.execute_packet_descriptors_with_cache(
+                    pinned.session.execute_packet_descriptors_with_admission_policy(
                         query,
+                        lexical_policy,
                         Some(sidecar_budget_ms(latency_budget_ms)),
                         crate::services::active_public_operation_cancellation(),
                         cache,
@@ -1255,6 +1538,11 @@ pub(crate) fn run_and_resolve_sidecar_query(
         #[cfg(any(test, feature = "benchmark-support"))]
         if _executed_query && let Some(session) = packet_session {
             session.record_descriptor_trace(&query_result.trace);
+        }
+        if query_result.features.lexical_policy != lexical_policy {
+            return Err(ApiError::internal(
+                "sidecar result executed a different lexical admission policy",
+            ));
         }
         pinned.ensure_query_identity(&query_result, "resolving sidecar candidates")?;
         let resolution = resolve_sidecar_candidates_in_read(
@@ -1333,17 +1621,24 @@ fn sidecar_primary_error_outcome(error: ApiError) -> SidecarPrimarySearchOutcome
     }
 }
 
-pub(crate) fn try_sidecar_primary_search(
+pub(crate) fn try_sidecar_primary_search_with_policy(
     controller: &AppController,
     prompt: &str,
     max_results: usize,
     latency_budget_ms: Option<u32>,
+    lexical_policy: LexicalAdmissionPolicy,
 ) -> Option<SidecarPrimarySearchOutcome> {
     if !sidecar_retrieval_primary_enabled(controller) {
         return sidecar_retrieval_unavailable_reason(controller)
             .map(|reason| SidecarPrimarySearchOutcome::Unavailable { reason });
     }
-    match run_and_resolve_sidecar_query(controller, prompt, max_results, latency_budget_ms) {
+    match run_and_resolve_sidecar_query_with_policy(
+        controller,
+        prompt,
+        max_results,
+        latency_budget_ms,
+        lexical_policy,
+    ) {
         Ok((query_result, resolution)) => Some(sidecar_primary_search_outcome_from_resolution(
             controller,
             query_result,
@@ -1554,9 +1849,19 @@ fn search_sidecar_packet_batch_inner(
                 missing_indices.push(index);
             }
         }
+        if !missing_indices.is_empty()
+            && packet_session
+                .as_ref()
+                .is_some_and(|session| session.retrieval_admission_is_sealed())
+        {
+            return Err(ApiError::internal(
+                "sealed packet is missing a strict free-query result",
+            ));
+        }
         let missing_items = missing_indices
             .iter()
             .map(|index| QueryBatchItem {
+                lexical_policy: codestory_retrieval::LexicalAdmissionPolicy::StrictLiteralV1,
                 query: batch_queries[*index].0.as_str(),
                 budget_ms: Some(batch_queries[*index].1),
             })
@@ -1614,6 +1919,11 @@ fn search_sidecar_packet_batch_inner(
             })
             .collect::<Result<Vec<_>, _>>()?;
         for result in &query_results {
+            if result.features.lexical_policy != LexicalAdmissionPolicy::StrictLiteralV1 {
+                return Err(ApiError::internal(
+                    "free-query batch received a non-strict result",
+                ));
+            }
             pinned.ensure_query_identity(result, "resolving sidecar packet batch")?;
         }
         build_sidecar_packet_batch_outcome(
@@ -1689,6 +1999,14 @@ fn build_sidecar_packet_batch_outcome(
                 queries.len()
             ),
         ));
+    }
+    // Authenticate the entire positional batch before hydrating even its first hit.
+    for ((expected_query, _), result) in queries.iter().zip(&query_results) {
+        if result.query != *expected_query
+            || result.features.lexical_policy != LexicalAdmissionPolicy::StrictLiteralV1
+        {
+            return Err(ApiError::internal("free-query batch query/policy mismatch"));
+        }
     }
     let mut results = Vec::with_capacity(queries.len());
     let mut retryable_queries = Vec::new();
@@ -3042,25 +3360,17 @@ fn resolve_sidecar_candidates_in_storage(
             false
         };
         let node_id = if let Some(descriptor) = descriptor.as_ref() {
-            descriptor
-                .stable_identity
-                .strip_prefix("node:")
-                .and_then(|raw| raw.parse::<i64>().ok())
-                .map(CoreNodeId)
-                .or_else(|| {
-                    descriptor
-                        .stable_identity
-                        .strip_prefix("path:")
-                        .and_then(|_| {
-                            resolve_candidate_node_id(
-                                storage,
-                                node_names,
-                                project_root,
-                                &rel_path,
-                                candidate,
-                            )
-                        })
-                })
+            if let Some(raw_id) = descriptor.stable_identity.strip_prefix("node:") {
+                raw_id.parse::<i64>().ok().map(CoreNodeId)
+            } else if let Some(path) = descriptor.stable_identity.strip_prefix("path:") {
+                // A sealed path admits this file, not an inferred callable or
+                // a source-root alias. Use the same exact file lookup as
+                // subsequent packet source hydration.
+                super::packet_compiler::find_admitted_file(storage, project_root, path)?
+                    .map(|file| CoreNodeId(file.id))
+            } else {
+                None
+            }
         } else {
             resolve_candidate_node_id(storage, node_names, project_root, &rel_path, candidate)
         };
@@ -3290,6 +3600,12 @@ mod tests {
     }
 
     fn pinned_operation_fixture() -> PinnedOperationFixture {
+        pinned_operation_fixture_with_profile(codestory_retrieval::SidecarProfile::Local)
+    }
+
+    fn pinned_operation_fixture_with_profile(
+        profile: codestory_retrieval::SidecarProfile,
+    ) -> PinnedOperationFixture {
         use codestory_store::{IndexPublicationMode, IndexPublicationRecord};
 
         let project = tempfile::tempdir().expect("project");
@@ -3307,10 +3623,7 @@ mod tests {
         publish_test_complete_core(&mut store, project.path(), &publication);
         drop(store);
         let runtime = codestory_retrieval::with_test_cache_root(retrieval_cache.path(), || {
-            SidecarRuntimeConfig::for_project_profile(
-                Some(project.path()),
-                codestory_retrieval::SidecarProfile::Local,
-            )
+            SidecarRuntimeConfig::for_project_profile(Some(project.path()), profile)
         });
         publish_zero_dense_pinned_query_fixture(project.path(), &storage_path, &runtime)
             .expect("publish strict retrieval fixture");
@@ -3330,6 +3643,13 @@ mod tests {
     }
 
     fn public_packet_fixture_with_unindexed_lexical_artifact() -> PinnedOperationFixture {
+        public_packet_fixture_with_lexical_files(&[(
+            "LICENSE",
+            "The control plane assumes the control plane role, and worker nodes use the worker node role.\n",
+        )])
+    }
+
+    fn public_packet_fixture_with_lexical_files(files: &[(&str, &str)]) -> PinnedOperationFixture {
         let project = tempfile::tempdir().expect("project");
         let storage = tempfile::tempdir().expect("storage");
         let retrieval_cache = tempfile::tempdir().expect("retrieval cache");
@@ -3339,17 +3659,25 @@ mod tests {
             "// public packet freshness anchor\n",
         )
         .expect("write indexed freshness anchor");
-        std::fs::write(
-            project.path().join("LICENSE"),
-            "The control plane assumes the control plane role, and worker nodes use the worker node role.\n",
-        )
-        .expect("write unindexed lexical artifact");
+        for (path, content) in files {
+            let path = project.path().join(path);
+            std::fs::create_dir_all(path.parent().expect("artifact parent"))
+                .expect("create artifact parent");
+            std::fs::write(path, content).expect("write unindexed lexical artifact");
+        }
         let mut runtime = codestory_retrieval::with_test_cache_root(retrieval_cache.path(), || {
             SidecarRuntimeConfig::for_project_profile(
                 Some(project.path()),
                 codestory_retrieval::SidecarProfile::Agent,
             )
         });
+        assert_eq!(
+            crate::semantic_projection::semantic_doc_scope_from_value(
+                &runtime.retrieval.semantic_doc_scope
+            ),
+            crate::semantic_projection::SemanticDocScope::DurableSymbols,
+            "zero-dense public fixture requires the unchanged durable semantic scope",
+        );
         runtime.embedding.allow_cpu = true;
         let controller = AppController::new_with_config(runtime.clone());
         controller
@@ -3657,6 +3985,7 @@ mod tests {
             node_names: Arc::new(HashMap::new()),
         };
         let publication = codestory_retrieval::RetrievalPublicationIdentity {
+            artifact_scope: None,
             core_generation_id: cached.core_generation_id.clone(),
             core_run_id: cached.core_run_id.clone(),
             sidecar_generation: "sidecar-one".into(),
@@ -3785,6 +4114,94 @@ mod tests {
             after_pin,
             "borrowing the active pin must not buy another readiness fingerprint pass"
         );
+    }
+
+    #[test]
+    fn primary_eligibility_reuses_only_a_healthy_validated_agent_pin() {
+        let _lock = env_test_lock();
+        let fixture =
+            pinned_operation_fixture_with_profile(codestory_retrieval::SidecarProfile::Agent);
+        let _scope = codestory_workspace::SourceFreshnessScope::enter();
+        let pinned = Rc::new(
+            PinnedRetrievalRead::begin(&fixture.controller).expect("begin validated Agent pin"),
+        );
+        let after_pin = codestory_workspace::source_freshness_counts()
+            .expect("armed scope")
+            .readiness_fingerprint_passes;
+
+        with_active_pinned_retrieval_read(&fixture.controller, Rc::clone(&pinned), || {
+            assert!(
+                sidecar_retrieval_primary_enabled(&fixture.controller),
+                "the validated Agent pin remains eligible for primary retrieval"
+            );
+        });
+        assert_eq!(
+            codestory_workspace::source_freshness_counts()
+                .expect("armed scope")
+                .readiness_fingerprint_passes,
+            after_pin,
+            "primary eligibility must not re-fingerprint an already validated operation pin"
+        );
+
+        let foreign_controller =
+            AppController::new_with_config(fixture.controller.runtime_config.as_ref().clone());
+        {
+            let mut state = foreign_controller.state.lock();
+            state.project_root = Some(fixture._project.path().to_owned());
+            state.storage_path = Some(fixture.storage_path.clone());
+        }
+        with_active_pinned_retrieval_read(&fixture.controller, Rc::clone(&pinned), || {
+            assert!(sidecar_retrieval_primary_enabled(&foreign_controller));
+        });
+        let after_foreign = codestory_workspace::source_freshness_counts()
+            .expect("armed scope")
+            .readiness_fingerprint_passes;
+        assert!(
+            after_foreign > after_pin,
+            "a different controller must obtain its own ordinary readiness proof"
+        );
+
+        let descriptor = Rc::new(
+            PinnedRetrievalRead::begin_packet_descriptor(&fixture.controller)
+                .expect("begin an unvalidated descriptor pin"),
+        );
+        let before_descriptor_gate = codestory_workspace::source_freshness_counts()
+            .expect("armed scope")
+            .readiness_fingerprint_passes;
+        with_active_pinned_retrieval_read(&fixture.controller, descriptor, || {
+            assert!(sidecar_retrieval_primary_enabled(&fixture.controller));
+        });
+        assert!(
+            codestory_workspace::source_freshness_counts()
+                .expect("armed scope")
+                .readiness_fingerprint_passes
+                > before_descriptor_gate,
+            "a descriptor pin without full validation must retain ordinary readiness"
+        );
+
+        let local_fixture = pinned_operation_fixture();
+        let local_pin = Rc::new(
+            PinnedRetrievalRead::begin(&local_fixture.controller)
+                .expect("begin a validated Local-profile pin"),
+        );
+        with_active_pinned_retrieval_read(&local_fixture.controller, local_pin, || {
+            assert!(
+                !sidecar_retrieval_primary_enabled(&local_fixture.controller),
+                "a validated Local pin must not become Agent primary retrieval"
+            );
+        });
+
+        std::fs::rename(
+            &fixture.controller.runtime_config.layout.lexical_data_dir,
+            fixture._retrieval_cache.path().join("unavailable-lexical"),
+        )
+        .expect("withdraw only this owned fixture's lexical component");
+        with_active_pinned_retrieval_read(&fixture.controller, pinned, || {
+            assert!(
+                !sidecar_retrieval_primary_enabled(&fixture.controller),
+                "a validated pin must not hide a component that became unavailable"
+            );
+        });
     }
 
     /// The counters are scoped to the operation, never to the process.
@@ -4507,6 +4924,134 @@ mod tests {
     }
 
     #[test]
+    fn sealed_path_descriptors_keep_file_identity_and_exact_path_lookup() {
+        use crate::agent::packet_candidate::{PacketProofSession, install_packet_proof_session};
+        use codestory_store::{FileInfo, FileRole};
+
+        let project = tempfile::tempdir().expect("isolated project");
+        let mut storage = Store::new_in_memory().expect("storage");
+        for (id, path) in [
+            (1, project.path().join("src/first.rs")),
+            (4, PathBuf::from("src/second.rs")),
+            (7, PathBuf::from("src/main/java/Entry.java")),
+        ] {
+            storage
+                .insert_file(&FileInfo {
+                    id,
+                    path: path.clone(),
+                    language: "rust".into(),
+                    modification_time: 1,
+                    indexed: true,
+                    complete: true,
+                    line_count: 20,
+                    file_role: FileRole::Source,
+                })
+                .unwrap();
+            storage
+                .insert_nodes_batch(&[
+                    codestory_contracts::graph::Node {
+                        id: CoreNodeId(id),
+                        kind: NodeKind::FILE,
+                        serialized_name: path.to_string_lossy().into_owned(),
+                        file_node_id: Some(CoreNodeId(id)),
+                        start_line: Some(1),
+                        ..Default::default()
+                    },
+                    codestory_contracts::graph::Node {
+                        id: CoreNodeId(id + 1),
+                        kind: NodeKind::FUNCTION,
+                        serialized_name: "first_callable".into(),
+                        file_node_id: Some(CoreNodeId(id)),
+                        start_line: Some(2),
+                        end_line: Some(3),
+                        ..Default::default()
+                    },
+                    codestory_contracts::graph::Node {
+                        id: CoreNodeId(id + 2),
+                        kind: NodeKind::FUNCTION,
+                        serialized_name: "later_callable".into(),
+                        file_node_id: Some(CoreNodeId(id)),
+                        start_line: Some(10),
+                        end_line: Some(12),
+                        ..Default::default()
+                    },
+                ])
+                .unwrap();
+        }
+        for (path, file_id) in [("./src//first.rs", 1), ("src/second.rs", 4)] {
+            for symbol in [None, Some("later_callable")] {
+                let mut file_candidate = CandidateHit::with_source(
+                    path,
+                    symbol.map(str::to_owned),
+                    1.0,
+                    CandidateSource::Lexical,
+                );
+                file_candidate.source_bytes_upper_bound = Some(64);
+                let mut canonical = CandidateHit::with_source(
+                    path,
+                    Some("later_callable".into()),
+                    0.8,
+                    CandidateSource::Lexical,
+                );
+                canonical.node_id = Some((file_id + 2).to_string());
+                canonical.source_bytes_upper_bound = Some(64);
+                let candidates = [file_candidate, canonical];
+                let session = Rc::new(PacketProofSession::new());
+                admit_packet_candidate_descriptors(&session, candidates.iter());
+                assert!(session.retrieval_admission_is_sealed());
+                let receipts = session.receipts();
+                assert_eq!(receipts.len(), 2);
+                assert_eq!(
+                    receipts[0].stable_identity,
+                    format!("path:{}", path.trim_start_matches("./").replace("//", "/"))
+                );
+                assert_eq!(receipts[1].stable_identity, format!("node:{}", file_id + 2));
+                let _guard = install_packet_proof_session(Rc::clone(&session));
+                let outcome = resolve_sidecar_candidates_in_storage(
+                    &storage,
+                    &HashMap::new(),
+                    project.path(),
+                    &candidates,
+                    2,
+                )
+                .expect("resolve sealed file and canonical node descriptors");
+                assert_eq!(outcome.resolved_hits.len(), 2);
+                assert_eq!(outcome.resolved_hits[0].node_id.0, file_id.to_string());
+                assert_eq!(outcome.resolved_hits[0].kind, ApiNodeKind::FILE);
+                assert_eq!(
+                    outcome.resolved_hits[1].node_id.0,
+                    (file_id + 2).to_string()
+                );
+                assert_eq!(outcome.resolved_hits[1].kind, ApiNodeKind::FUNCTION);
+                assert!(outcome.packet_hits[0].graph.is_none());
+                assert!(outcome.packet_hits[0].graph_provenance.is_empty());
+                assert_eq!(session.receipts(), receipts);
+            }
+        }
+        // A metadata path cannot select a similarly spelled source-root alias.
+        let mut alias =
+            CandidateHit::with_source("main/java/Entry.java", None, 1.0, CandidateSource::Lexical);
+        alias.source_bytes_upper_bound = Some(64);
+        let session = Rc::new(PacketProofSession::new());
+        admit_packet_candidate_descriptors(&session, [&alias]);
+        let _guard = install_packet_proof_session(Rc::clone(&session));
+        let outcome = resolve_sidecar_candidates_in_storage(
+            &storage,
+            &HashMap::new(),
+            project.path(),
+            &[alias],
+            1,
+        )
+        .expect("unresolved exact path remains a diagnostic");
+        assert!(outcome.resolved_hits.is_empty());
+        assert_eq!(outcome.unresolved_candidate_count, 1);
+        assert_eq!(
+            session.receipts()[0].stable_identity,
+            "path:main/java/Entry.java"
+        );
+    }
+
+    #[test]
     fn seventeenth_packet_identity_is_rejected_before_core_hydration() {
         use crate::agent::packet_candidate::{
             PacketAdmissionDecision, PacketProofSession, install_packet_proof_session,
@@ -4562,6 +5107,386 @@ mod tests {
     }
 
     #[test]
+    fn published_call_admission_skips_unaffordable_rank_without_refunds() {
+        let mut rows = (1..=24)
+            .map(|id| {
+                let mut hit = CandidateHit::lexical_stub("src/opaque", 1.0);
+                hit.node_id = Some(id.to_string());
+                hit.source_bytes_upper_bound = Some(512);
+                hit.packet_descriptor().unwrap()
+            })
+            .collect::<Vec<_>>();
+        let session = crate::agent::packet_candidate::PacketProofSession::new();
+        let initial = session.remaining_source_bytes();
+        rows[0].source_bytes_upper_bound = Some((initial + 1) as u32);
+        let ordered = published_call_admission_order(&rows, &HashSet::new(), Some("h"));
+        admit_published_call_descriptors(&session, &ordered);
+        assert_eq!(
+            session
+                .receipts()
+                .iter()
+                .map(|r| r.stable_identity.clone())
+                .collect::<Vec<_>>(),
+            (2..=17).map(|id| format!("node:{id}")).collect::<Vec<_>>()
+        );
+        assert_eq!(session.remaining_source_bytes(), initial - 16 * 512);
+        assert_eq!(session.remaining_hydration_slots(), 0);
+        assert!(session.gaps().iter().any(|g| g.kind
+            == codestory_contracts::compilation::PacketAdmissionGapKindV1::SourceBudgetExceeded));
+    }
+
+    #[test]
+    fn published_call_hints_cannot_evict_feasible_retrieval_prefix() {
+        use codestory_contracts::compilation::*;
+        let mut rows = (1..=24)
+            .map(|id| {
+                let mut hit = CandidateHit::lexical_stub("src/opaque", 1.0);
+                hit.node_id = Some(id.to_string());
+                hit.source_bytes_upper_bound = Some(512);
+                hit.packet_descriptor().unwrap()
+            })
+            .collect::<Vec<_>>();
+        for (seed, target) in [(0, 20), (1, 23), (2, 24)] {
+            rows[seed].published_calls = Some(PacketPublishedCallsV1 {
+                sidecar_input_hash: "sealed".into(),
+                neighborhood: PacketCallNeighborhoodV1 {
+                    schema_version: 1,
+                    source_identity: rows[seed].stable_identity.clone(),
+                    truncated: true,
+                    targets: vec![PacketCallTargetV1 {
+                        stable_identity: format!("node:{target}"),
+                        representative_edge_id: target.to_string(),
+                        callsite_count: 32,
+                        certainty: PacketRelationCertaintyV1::Uncertain,
+                        minimum_confidence: Some(0.2),
+                    }],
+                },
+            });
+        }
+        let session = crate::agent::packet_candidate::PacketProofSession::new();
+        let ordered = published_call_admission_order(&rows, &HashSet::new(), Some("sealed"));
+        admit_published_call_descriptors(&session, &ordered);
+        assert_eq!(
+            session
+                .receipts()
+                .iter()
+                .map(|r| r.stable_identity.clone())
+                .collect::<Vec<_>>(),
+            (1..=16).map(|id| format!("node:{id}")).collect::<Vec<_>>()
+        );
+        assert!(
+            ordered[0]
+                .published_calls
+                .as_ref()
+                .unwrap()
+                .neighborhood
+                .truncated
+        );
+    }
+
+    #[test]
+    fn published_call_partial_positive_hints_and_zero_gain_rank_fallback() {
+        use codestory_contracts::compilation::*;
+        let make = |id: u32| {
+            let mut h = CandidateHit::lexical_stub("src/opaque", 1.0);
+            h.node_id = Some(id.to_string());
+            h.source_bytes_upper_bound = Some(512);
+            h.packet_descriptor().unwrap()
+        };
+        let mut rows = (1..=24).map(make).collect::<Vec<_>>();
+        let target = |id: u32| PacketCallTargetV1 {
+            stable_identity: format!("node:{id}"),
+            representative_edge_id: id.to_string(),
+            callsite_count: 1,
+            certainty: PacketRelationCertaintyV1::Uncertain,
+            minimum_confidence: Some(0.2),
+        };
+        rows[0].published_calls = Some(PacketPublishedCallsV1 {
+            sidecar_input_hash: "h".into(),
+            neighborhood: PacketCallNeighborhoodV1 {
+                schema_version: 1,
+                source_identity: "node:1".into(),
+                truncated: true,
+                targets: vec![target(20)],
+            },
+        });
+        let positive = published_call_admission_order(&rows, &HashSet::new(), Some("h"));
+        assert_eq!(positive[8].stable_identity, "node:9");
+        assert!(
+            positive[0]
+                .published_calls
+                .as_ref()
+                .unwrap()
+                .neighborhood
+                .truncated,
+            "incomplete coverage remains explicit"
+        );
+        rows[0]
+            .published_calls
+            .as_mut()
+            .unwrap()
+            .neighborhood
+            .targets = vec![target(2), target(20)];
+        // Lexicographic target identities, including a prefix-contained target.
+        assert_eq!(
+            published_call_admission_order(&rows, &HashSet::new(), Some("h"))[8].stable_identity,
+            "node:9",
+            "already covered seed cannot displace higher-ranked nonneighbors"
+        );
+        rows[0]
+            .published_calls
+            .as_mut()
+            .unwrap()
+            .neighborhood
+            .targets
+            .clear();
+        assert_eq!(
+            published_call_admission_order(&rows, &HashSet::new(), Some("h")),
+            rows,
+            "empty partial hints preserve original rank"
+        );
+    }
+
+    #[test]
+    fn published_call_seed_coverage_resists_hubs_and_symbol_spelling() {
+        use codestory_contracts::compilation::*;
+        let make = |id: u32| {
+            let mut hit = CandidateHit::lexical_stub("src/anonymous.rs", 1.0);
+            hit.node_id = Some(id.to_string());
+            hit.source_bytes_upper_bound = Some(512);
+            hit.packet_descriptor().unwrap()
+        };
+        let mut rows = (1..=24).map(make).collect::<Vec<_>>();
+        let targets = |ids: Vec<u32>| {
+            let mut t = ids
+                .into_iter()
+                .map(|id| PacketCallTargetV1 {
+                    stable_identity: format!("node:{id}"),
+                    representative_edge_id: id.to_string(),
+                    callsite_count: 1,
+                    certainty: PacketRelationCertaintyV1::Probable,
+                    minimum_confidence: Some(0.5),
+                })
+                .collect::<Vec<_>>();
+            t.sort_by(|a, b| a.stable_identity.cmp(&b.stable_identity));
+            t
+        };
+        for (i, ids) in [(0, (9..=24).collect()), (1, vec![23]), (2, vec![24])] {
+            rows[i].published_calls = Some(PacketPublishedCallsV1 {
+                sidecar_input_hash: "sealed".into(),
+                neighborhood: PacketCallNeighborhoodV1 {
+                    schema_version: 1,
+                    source_identity: rows[i].stable_identity.clone(),
+                    truncated: false,
+                    targets: targets(ids),
+                },
+            });
+        }
+        let ordered = published_call_admission_order(&rows, &HashSet::new(), Some("sealed"));
+        assert_eq!(ordered[8].stable_identity, "node:9");
+        assert_eq!(ordered[9].stable_identity, "node:10");
+        let identities = ordered
+            .iter()
+            .map(|d| d.stable_identity.clone())
+            .collect::<Vec<_>>();
+        for row in &mut rows {
+            row.symbol = Some("unrelated opaque spelling".into());
+            row.path = "other/language/fixture.xyz".into();
+            if let Some(m) = row.published_calls.as_mut() {
+                for t in &mut m.neighborhood.targets {
+                    t.callsite_count = 32;
+                }
+            }
+        }
+        assert_eq!(
+            published_call_admission_order(&rows, &HashSet::new(), Some("sealed"))
+                .iter()
+                .map(|d| d.stable_identity.clone())
+                .collect::<Vec<_>>(),
+            identities,
+            "selection must not inspect names, paths, language, or repeated callsite counts"
+        );
+    }
+
+    #[test]
+    fn published_call_late_exact_owner_retains_annotation_after_count_break() {
+        use codestory_contracts::compilation::*;
+        let rows = (1..=24)
+            .map(|id| {
+                let mut hit = CandidateHit::lexical_stub("src/opaque", 1.0);
+                hit.node_id = Some(id.to_string());
+                hit.source_bytes_upper_bound = Some(512);
+                hit.packet_descriptor().unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut rows = rows;
+        rows[23].published_calls = Some(PacketPublishedCallsV1 {
+            sidecar_input_hash: "h".into(),
+            neighborhood: PacketCallNeighborhoodV1 {
+                schema_version: 1,
+                source_identity: "node:24".into(),
+                truncated: true,
+                targets: vec![PacketCallTargetV1 {
+                    stable_identity: "node:15".into(),
+                    representative_edge_id: "1".into(),
+                    callsite_count: 1,
+                    certainty: PacketRelationCertaintyV1::Probable,
+                    minimum_confidence: None,
+                }],
+            },
+        });
+        let session = crate::agent::packet_candidate::PacketProofSession::new();
+        assert_eq!(
+            session.admit_exact_selector("node:24", 1, 0),
+            PacketAdmissionDecision::Admitted
+        );
+        let ordered =
+            published_call_admission_order(&rows, &HashSet::from(["node:24".into()]), Some("h"));
+        let mut probe_count = 1;
+        let mut rejection = None;
+        for (i, row) in ordered.iter().enumerate() {
+            if row.stable_identity == "node:24" {
+                continue;
+            }
+            if probe_count == 16 {
+                rejection = Some(i);
+                break;
+            }
+            probe_count += 1;
+        }
+        assert!(
+            rejection.unwrap()
+                < ordered
+                    .iter()
+                    .position(|r| r.stable_identity == "node:24")
+                    .unwrap(),
+            "negative control must put exact metadata behind the first rejected new ID"
+        );
+        admit_published_call_descriptors(&session, &ordered);
+        assert_eq!(session.receipts().len(), 16);
+        assert!(
+            session
+                .receipts()
+                .iter()
+                .any(|r| r.stable_identity == "node:24"
+                    && r.origin == PacketAdmissionOriginV1::ExactTypedSelector)
+        );
+        let links = session.admitted_call_navigation();
+        assert!(links.iter().any(|l| l.from_identity == "node:24"
+            && l.to_identity == "node:15"
+            && l.certainty == PacketRelationCertaintyV1::Probable));
+    }
+
+    #[test]
+    fn published_call_admission_falls_back_and_preserves_conflicts_and_exact_slots() {
+        use codestory_contracts::compilation::*;
+        let make = |id: u32| {
+            let mut hit = CandidateHit::lexical_stub("src/worker.rs", 1.0);
+            hit.node_id = Some(id.to_string());
+            hit.source_bytes_upper_bound = Some(512);
+            hit.packet_descriptor().unwrap()
+        };
+        let mut rows = (1..=24).map(make).collect::<Vec<_>>();
+        let metadata = |target: u32| PacketPublishedCallsV1 {
+            sidecar_input_hash: "bound".into(),
+            neighborhood: PacketCallNeighborhoodV1 {
+                schema_version: PACKET_CALL_DESCRIPTOR_SCHEMA_V1,
+                source_identity: "node:1".into(),
+                truncated: false,
+                targets: vec![PacketCallTargetV1 {
+                    stable_identity: format!("node:{target}"),
+                    representative_edge_id: "1".into(),
+                    callsite_count: 1,
+                    certainty: PacketRelationCertaintyV1::Unknown,
+                    minimum_confidence: None,
+                }],
+            },
+        };
+        let none = HashSet::new();
+        assert_eq!(
+            published_call_admission_order(&rows, &none, Some("bound")),
+            rows
+        );
+        rows[0].published_calls = Some(metadata(20));
+        let ordered = published_call_admission_order(&rows, &none, Some("bound"));
+        assert_eq!(ordered[8].stable_identity, "node:9");
+        assert_eq!(
+            published_call_admission_order(&rows, &none, Some("wrong"))[8].stable_identity,
+            "node:9"
+        );
+        assert!(
+            published_call_admission_order(&rows, &none, Some("wrong"))[0]
+                .published_calls
+                .is_none()
+        );
+        for invalid in 0..2 {
+            let mut skew = rows.clone();
+            let m = skew[0].published_calls.as_mut().unwrap();
+            match invalid {
+                0 => m.neighborhood.source_identity = "node:2".into(),
+                _ => m.neighborhood.targets[0].stable_identity = "node:999".into(),
+            }
+            if invalid == 0 {
+                assert!(
+                    published_call_admission_order(&skew, &none, Some("bound"))[0]
+                        .published_calls
+                        .is_none()
+                );
+            }
+            assert_eq!(
+                published_call_admission_order(&skew, &none, Some("bound"))[8].stable_identity,
+                "node:9"
+            );
+        }
+        let mut duplicate = rows[0].clone();
+        duplicate.published_calls = Some(metadata(21));
+        let conflicted =
+            published_call_admission_order(&[rows[0].clone(), duplicate], &none, Some("bound"));
+        assert!(conflicted[0].published_calls_conflicted);
+        assert!(conflicted[0].published_calls.is_none());
+        let twice = published_call_admission_order(
+            &[conflicted[0].clone(), rows[0].clone()],
+            &none,
+            Some("bound"),
+        );
+        assert!(twice[0].published_calls_conflicted);
+        assert!(twice[0].published_calls.is_none());
+        let exact = (1..=8)
+            .map(|id| format!("node:{id}"))
+            .collect::<HashSet<_>>();
+        let after_exact = published_call_admission_order(&rows, &exact, Some("bound"));
+        assert_eq!(
+            after_exact[..4]
+                .iter()
+                .map(|d| d.stable_identity.as_str())
+                .collect::<Vec<_>>(),
+            vec!["node:9", "node:10", "node:11", "node:12"]
+        );
+        assert_eq!(after_exact[4].stable_identity, "node:13");
+        let session = crate::agent::packet_candidate::PacketProofSession::new();
+        for id in 1..=8 {
+            assert_eq!(
+                session.admit_exact_selector(&format!("node:{id}"), 1, id),
+                PacketAdmissionDecision::Admitted
+            );
+        }
+        for descriptor in after_exact {
+            if matches!(
+                session.admit_descriptor(&descriptor),
+                PacketAdmissionDecision::CountBudgetExceeded
+            ) {
+                break;
+            }
+        }
+        assert_eq!(session.receipts().len(), 16);
+        assert!(
+            session.receipts()[..8]
+                .iter()
+                .all(|r| r.origin == PacketAdmissionOriginV1::ExactTypedSelector)
+        );
+    }
+
+    #[test]
     fn packet_admission_consumes_versioned_retrieval_score_order() {
         use crate::agent::packet_candidate::{PacketProofSession, install_packet_proof_session};
 
@@ -4585,6 +5510,8 @@ mod tests {
         high.node_id = Some("2".to_string());
         high.source_bytes_upper_bound = Some(64);
 
+        let expected_score_version = high.packet_descriptor().unwrap().retrieval_score.version;
+
         let _ = resolve_sidecar_candidates_in_storage(
             &storage,
             &HashMap::new(),
@@ -4596,10 +5523,7 @@ mod tests {
 
         assert_eq!(session.receipts().len(), 1);
         assert_eq!(session.receipts()[0].stable_identity, "node:2");
-        assert_eq!(
-            session.receipts()[0].score_version,
-            codestory_contracts::compilation::PACKET_RETRIEVAL_SCORE_VERSION_V1
-        );
+        assert_eq!(session.receipts()[0].score_version, expected_score_version);
     }
 
     #[test]
@@ -4779,6 +5703,100 @@ mod tests {
             );
             assert_eq!(observed.descriptor_remaining_before_handoff_ms, 12_000);
         });
+    }
+
+    #[test]
+    fn same_text_policy_results_retain_and_resolve_in_both_orders_and_refuse_sealed_miss() {
+        use crate::agent::packet_candidate::{PacketProofSession, install_packet_proof_session};
+        for order in [
+            [
+                LexicalAdmissionPolicy::StrictLiteralV1,
+                LexicalAdmissionPolicy::BroadQuestionV1,
+            ],
+            [
+                LexicalAdmissionPolicy::BroadQuestionV1,
+                LexicalAdmissionPolicy::StrictLiteralV1,
+            ],
+        ] {
+            let fixture = pinned_operation_fixture();
+            let pinned = Rc::new(
+                PinnedRetrievalRead::begin_packet_descriptor(&fixture.controller).expect("pin"),
+            );
+            let session = Rc::new(PacketProofSession::new());
+            let query = "renamed lattice transition";
+            let requests = order.map(|lexical_policy| PacketRetrievalQuery {
+                query: query.to_string(),
+                lexical_policy,
+            });
+            with_active_pinned_retrieval_read(&fixture.controller, Rc::clone(&pinned), || {
+                let _guard = install_packet_proof_session(Rc::clone(&session));
+                preadmit_packet_descriptor_queries_with_policy(
+                    &fixture.controller,
+                    &requests,
+                    None,
+                )
+                .expect("typed preadmit");
+                assert!(session.retrieval_admission_is_sealed());
+                assert_eq!(
+                    session.benchmark_retrieval_proof().descriptor_query_count,
+                    2
+                );
+                for policy in order {
+                    let (result, _) = run_and_resolve_sidecar_query_with_policy(
+                        &fixture.controller,
+                        query,
+                        4,
+                        None,
+                        policy,
+                    )
+                    .expect("retained typed resolution");
+                    assert_eq!(result.features.lexical_policy, policy);
+                    let wrong_policy = if policy == LexicalAdmissionPolicy::StrictLiteralV1 {
+                        LexicalAdmissionPolicy::BroadQuestionV1
+                    } else {
+                        LexicalAdmissionPolicy::StrictLiteralV1
+                    };
+                    assert!(
+                        PacketProofSession::new()
+                            .retain_descriptor_result_with_policy(
+                                &result,
+                                wrong_policy,
+                                true,
+                                pinned.session.publication_identity(),
+                            )
+                            .is_err(),
+                        "expected policy must authenticate actual execution"
+                    );
+                }
+                assert_eq!(
+                    session.benchmark_retrieval_proof().descriptor_query_count,
+                    2
+                );
+                assert!(
+                    run_and_resolve_sidecar_query_with_policy(
+                        &fixture.controller,
+                        "not preadmitted",
+                        4,
+                        None,
+                        LexicalAdmissionPolicy::BroadQuestionV1,
+                    )
+                    .is_err()
+                );
+                assert!(
+                    search_sidecar_packet_batch_inner(
+                        &fixture.controller,
+                        &[("not preadmitted".into(), 4)],
+                        None,
+                    )
+                    .is_err(),
+                    "strict free-query misses also refuse a post-seal rerun"
+                );
+                assert_eq!(
+                    session.benchmark_retrieval_proof().descriptor_query_count,
+                    2
+                );
+            });
+        }
     }
 
     #[test]
@@ -5083,6 +6101,38 @@ mod tests {
     }
 
     #[test]
+    fn fresh_strict_query_executes_outside_packet_proof_session() {
+        use codestory_contracts::api::PacketQueryCompletionDto;
+
+        assert!(active_packet_proof_session().is_none());
+        let fixture = public_packet_fixture_with_unindexed_lexical_artifact();
+        assert!(active_packet_proof_session().is_none());
+        let query = "metadata";
+        let outcome = search_sidecar_packet_batch_inner(
+            &fixture.controller,
+            &[(query.into(), 4)],
+            Some(18_000),
+        )
+        .expect("a fresh strict query outside a packet session remains eligible");
+
+        assert_eq!(outcome.results.len(), 1);
+        assert_eq!(outcome.results[0].0, query);
+        assert!(
+            !outcome.results[0].1.is_empty(),
+            "the fresh fixture must produce real strict-query hits"
+        );
+        assert_eq!(outcome.diagnostics.len(), 1);
+        assert_eq!(outcome.diagnostics[0].query, query);
+        assert_eq!(
+            outcome.diagnostics[0].completion,
+            PacketQueryCompletionDto::Completed
+        );
+        assert!(outcome.retained_deadline_queries.is_empty());
+        assert!(outcome.retryable_queries.is_empty());
+        assert!(active_packet_proof_session().is_none());
+    }
+
+    #[test]
     fn planned_query_preserves_sealed_deadline_hits_without_phantom_retry() {
         use crate::agent::packet_batch::{PacketLatencyBudget, run_packet_planned_subqueries};
         use crate::agent::packet_budget::packet_budget_limits;
@@ -5109,6 +6159,8 @@ mod tests {
                 let mut results = with_detached_sidecar_query_cache(&fixture.controller, |cache| {
                     pinned.session.execute_packet_descriptor_batch_with_cache(
                         &[QueryBatchItem {
+                            lexical_policy:
+                                codestory_retrieval::LexicalAdmissionPolicy::StrictLiteralV1,
                             query,
                             budget_ms: Some(18_000),
                         }],
@@ -5268,22 +6320,22 @@ mod tests {
                         ))
                 );
 
-                let fresh = search_sidecar_packet_batch_inner(
+                let error = search_sidecar_packet_batch_inner(
                     &fixture.controller,
                     &[("metadata".into(), 4)],
                     Some(18_000),
                 )
-                .expect("an absent descriptor key still executes an eligible fresh query");
+                .expect_err("sealed session must refuse an unretained strict query");
+                assert_eq!(error.code, "internal");
+                assert_eq!(
+                    error.message,
+                    "sealed packet is missing a strict free-query result"
+                );
                 assert_eq!(
                     session.benchmark_retrieval_proof().descriptor_query_count,
-                    2
+                    1,
+                    "a sealed miss must not execute another descriptor query"
                 );
-                assert!(fresh.retained_deadline_queries.is_empty());
-                assert_eq!(
-                    fresh.diagnostics[0].completion,
-                    PacketQueryCompletionDto::Completed
-                );
-                assert!(!fresh.results[0].1.is_empty());
 
                 assert_eq!(
                     serde_json::to_value(
@@ -6589,6 +7641,108 @@ mod tests {
     }
 
     #[test]
+    fn query_rejection_recovery_uses_trace_cause_without_prescribing_index_repair() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let project = tempfile::tempdir().expect("project root");
+        let defaults = codestory_retrieval::SidecarProcessDefaults::new(
+            process_cache.path().to_path_buf(),
+            codestory_retrieval::SidecarRuntimeDefaults::from_process_env(),
+        );
+        let config = SidecarRuntimeConfig::for_project_profile_with_process_defaults(
+            Some(project.path()),
+            SidecarProfile::Agent,
+            Some("query-recovery-fixture"),
+            &defaults,
+            &codestory_retrieval::SidecarRuntimeOverrides::default(),
+        );
+        let controller = AppController::new_with_config(config);
+        controller
+            .bind_project_paths_for_refresh(
+                project.path().to_path_buf(),
+                process_cache.path().join("codestory.db"),
+            )
+            .expect("bind project without opening retrieval");
+
+        for (mode, stop, query_stop) in [
+            ("full", Some("deadline"), true),
+            ("full", Some("stage_deadline"), true),
+            ("full", Some("cancelled"), true),
+            ("unavailable", Some("stage_deadline"), false),
+            ("unavailable", None, false),
+            ("no_semantic", Some("deadline"), false),
+            ("full", None, false),
+            ("full", Some("unrecognized_stop"), false),
+        ] {
+            let trace = QueryTrace {
+                retrieval_mode: mode.into(),
+                degraded_reason: (mode != "full").then(|| "retrieval_manifest_missing".into()),
+                total_budget_ms: 1_500,
+                elapsed_ms: 1_412,
+                cancel_reason: stop.map(str::to_string),
+                cache_hit: false,
+                stages: Vec::new(),
+            };
+            // Diagnostic prose must not decide whether the publication needs repair.
+            let diagnostic = if query_stop {
+                "opaque lookup diagnostic with retrieval_manifest_missing as a label"
+            } else {
+                "opaque stage_deadline diagnostic"
+            };
+            let error = sidecar_query_rejection_error(
+                &controller,
+                &trace.retrieval_mode,
+                trace.cancel_reason.as_deref(),
+                diagnostic,
+            );
+            assert_eq!(error.code, "retrieval_unavailable");
+            assert!(
+                error.message.contains(diagnostic),
+                "retain bounded diagnostic"
+            );
+            let details = error.details.as_ref().expect("typed recovery details");
+            assert_eq!(
+                details.project.as_deref(),
+                Some(project.path().to_str().expect("fixture project path"))
+            );
+            if query_stop {
+                assert!(
+                    details.next_commands.is_empty()
+                        && details.minimum_next.is_empty()
+                        && details.full_repair.is_empty(),
+                    "{stop:?} in full mode must not prescribe index repair: {error:?}"
+                );
+                assert_eq!(details.cause_code.as_deref(), stop);
+                assert_eq!(details.failed_layer.as_deref(), Some("retrieval_query"));
+                let message = error.message.to_ascii_lowercase();
+                if stop == Some("cancelled") {
+                    assert!(message.contains("cancelled"));
+                    assert!(
+                        !message.contains("retry"),
+                        "cancellation must not request retry"
+                    );
+                } else {
+                    assert!(
+                        message.contains("retry") && message.contains("narrow"),
+                        "a query deadline needs a useful query action: {error:?}"
+                    );
+                }
+            } else {
+                assert_eq!(details.failed_layer.as_deref(), Some("retrieval_engine"));
+                assert!(details.cause_code.is_none());
+                assert_eq!(details.next_commands.len(), 3);
+                assert!(details.next_commands[0].starts_with("codestory-cli retrieval index "));
+                assert!(details.next_commands[1].starts_with("codestory-cli retrieval status "));
+                assert!(details.next_commands[2].starts_with("codestory-cli doctor "));
+                for command in &details.next_commands[..2] {
+                    assert!(command.contains("--run-id query-recovery-fixture"));
+                }
+                assert_eq!(details.minimum_next, details.next_commands[..1]);
+                assert_eq!(details.full_repair, details.next_commands);
+            }
+        }
+    }
+
+    #[test]
     fn recovery_commands_quote_shell_sensitive_project_paths() {
         let commands =
             sidecar_retrieval_recovery_commands_for_project(r"C:\tmp\cost$cache`tick's repo", None);
@@ -6723,6 +7877,7 @@ mod tests {
         let mut storage = Store::open(&storage_path).expect("open storage");
         let mut manifest = retrieval_manifest_fixture(&project_id, hash);
         manifest.embedding_backend = Some("stale-backend".into());
+        manifest.artifact_scope = Some(codestory_store::RetrievalArtifactScope::Local);
         storage
             .upsert_retrieval_index_manifest(&manifest)
             .expect("manifest");
@@ -6748,6 +7903,7 @@ mod tests {
         let mut storage = Store::open(storage_path).expect("open storage");
         storage
             .upsert_retrieval_index_manifest(&codestory_store::RetrievalIndexManifest {
+                artifact_scope: None,
                 project_id: project_id.into(),
                 lexical_version: codestory_retrieval::LEXICAL_INDEX_VERSION.into(),
                 semantic_generation,
@@ -6969,8 +8125,790 @@ mod tests {
         );
     }
 
+    fn assert_published_file_packet_available(
+        fixture: &PinnedOperationFixture,
+        request: &AgentPacketRequestDto,
+        packet: &AgentPacketDto,
+    ) {
+        use codestory_contracts::packet_projection_v3::{GapKindV3Dto, PacketProjectionV3Dto};
+        use std::sync::atomic::AtomicBool;
+        assert_ne!(
+            packet.disposition.kind,
+            PacketDispositionKindDto::Unavailable,
+            "authenticated whole-file evidence must not imply unavailable retrieval: {:?}",
+            packet.disposition
+        );
+        let service = crate::PublicOperationService::new(fixture.controller.clone());
+        let _latency = crate::enter_packet_latency_scope(request.latency_budget_ms);
+        let projected = service
+            .run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
+                crate::project_packet_v3(&service, "codestory-cli", request, packet, |p| {
+                    serde_json::to_vec(p).map(|v| v.len()).map_err(|_| ())
+                })
+            })
+            .unwrap()
+            .value;
+        let gaps = match &projected.projection {
+            PacketProjectionV3Dto::Complete { gaps, .. }
+            | PacketProjectionV3Dto::BudgetExceeded { gaps, .. } => gaps,
+        };
+        assert!(
+            !gaps
+                .as_slice()
+                .iter()
+                .any(|g| g.kind == GapKindV3Dto::RetrievalUnavailable),
+            "authenticated lexical evidence must not emit packet-evidence-unavailable: {:?}",
+            projected.projection
+        );
+    }
+
     #[test]
-    fn browser_packet_serves_unindexed_lexical_artifact_without_evidence() {
+    fn browser_packet_delivers_small_published_lexical_file_without_core_symbols() {
+        assert_browser_packet_delivers_small_published_lexical_files(Vec::new());
+    }
+
+    #[test]
+    fn browser_packet_delivers_small_published_lexical_file_with_exact_probe_and_matching_query() {
+        assert_browser_packet_delivers_small_published_lexical_files(vec![
+            codestory_contracts::api::PacketProbeDto::ExactPath {
+                path: "settings.ini".into(),
+            },
+        ]);
+    }
+
+    fn assert_browser_packet_delivers_small_published_lexical_files(
+        probes: Vec<codestory_contracts::api::PacketProbeDto>,
+    ) {
+        use crate::agent::packet_candidate::{PacketProofSession, install_packet_proof_session};
+        use codestory_contracts::api::SupportUnitKindDto;
+        use sha2::{Digest, Sha256};
+
+        let files = [
+            (
+                "settings.ini",
+                "[settings]\nretry_limit = 3\nstop_on_error = true\n",
+            ),
+            (
+                "meson.build",
+                "project('configuration', 'c')\nadd_project_arguments('-DSTOP_ON_ERROR=1', language: 'c')\n",
+            ),
+        ];
+        let expected_sources = [
+            "```text\n>    1 | [settings]\n     2 | retry_limit = 3\n     3 | stop_on_error = true\n```",
+            "```text\n>    1 | project('configuration', 'c')\n     2 | add_project_arguments('-DSTOP_ON_ERROR=1', language: 'c')\n```",
+        ];
+        let question = "Where are retry_limit and stop_on_error configured and how does the build define STOP_ON_ERROR?";
+        let fixture = public_packet_fixture_with_lexical_files(&files);
+        let project_root = fixture._project.path();
+        let core = Store::open_read_only(&fixture.storage_path).expect("open pinned core");
+        for (path, _) in files {
+            assert!(!codestory_workspace::has_supported_source_route(Path::new(
+                path
+            )));
+            assert!(
+                super::super::packet_compiler::find_admitted_file(&core, project_root, path)
+                    .expect("look up exact Core file identity")
+                    .is_none(),
+                "lexical-only fixture must not seed a Core file row: {path}"
+            );
+        }
+        drop(core);
+
+        let pinned = Rc::new(
+            PinnedRetrievalRead::begin_packet_descriptor(&fixture.controller)
+                .expect("begin descriptor publication pin"),
+        );
+        let session = Rc::new(PacketProofSession::new());
+        with_active_pinned_retrieval_read(&fixture.controller, Rc::clone(&pinned), || {
+            let _guard = install_packet_proof_session(Rc::clone(&session));
+            preadmit_packet_descriptor_queries_with_policy(
+                &fixture.controller,
+                &[PacketRetrievalQuery {
+                    query: question.to_string(),
+                    lexical_policy: LexicalAdmissionPolicy::BroadQuestionV1,
+                }],
+                None,
+            )
+            .expect("retrieve and seal ordinary file descriptors");
+            let retained = session
+                .descriptor_result_with_policy(
+                    question,
+                    LexicalAdmissionPolicy::BroadQuestionV1,
+                    true,
+                    pinned.session.publication_identity(),
+                )
+                .expect("retain the same-publication descriptor result");
+            assert!(session.retrieval_admission_is_sealed());
+            let bare_path = PacketProofSession::new();
+            assert_eq!(
+                bare_path.admit_exact_selector("path:settings.ini", 512, 0),
+                PacketAdmissionDecision::Admitted
+            );
+            bare_path.seal_retrieval_admission();
+            assert!(
+                !bare_path.authorizes_published_file(
+                    &bare_path.receipts()[0],
+                    pinned.session.publication_identity()
+                ),
+                "a caller path alone cannot authorize published source bytes"
+            );
+            for (path, _) in files {
+                let identity = format!("path:{path}");
+                assert!(
+                    retained.hits.iter().any(|candidate| {
+                        candidate.file_path == path
+                            && candidate.source == CandidateSource::Lexical
+                            && candidate.node_id.is_none()
+                            && candidate
+                                .packet_descriptor()
+                                .is_some_and(|descriptor| descriptor.stable_identity == identity)
+                    }),
+                    "normal retrieval must retain an eligible file descriptor: {path}"
+                );
+                assert!(
+                    session.is_admitted_identity(&identity),
+                    "the file must cross sealed admission before source delivery: {path}"
+                );
+                let receipt = session
+                    .receipts()
+                    .into_iter()
+                    .find(|receipt| receipt.stable_identity == identity)
+                    .unwrap();
+                assert!(
+                    session
+                        .authorizes_published_file(&receipt, pinned.session.publication_identity())
+                );
+                let mut forged = receipt.clone();
+                forged.reserved_source_bytes += 1;
+                assert!(
+                    !session
+                        .authorizes_published_file(&forged, pinned.session.publication_identity())
+                );
+                forged = receipt.clone();
+                forged.packet_ordinal += 1;
+                assert!(
+                    !session
+                        .authorizes_published_file(&forged, pinned.session.publication_identity())
+                );
+                assert!(
+                    !PacketProofSession::new()
+                        .authorizes_published_file(&receipt, pinned.session.publication_identity())
+                );
+                let mut foreign = pinned.session.publication_identity().clone();
+                foreign.core_generation_id.push_str("-foreign");
+                assert!(!session.authorizes_published_file(&receipt, &foreign));
+            }
+        });
+        drop(pinned);
+
+        let request = AgentPacketRequestDto {
+            question: question.into(),
+            budget: PacketBudgetModeDto::Standard,
+            probes,
+            latency_budget_ms: Some(30_000),
+            parent_packet_id: None,
+            option_ids: Vec::new(),
+            core_generation_id: None,
+            retrieval_generation: None,
+        };
+        let packet = fixture
+            .controller
+            .browser_service()
+            .packet(request.clone())
+            .expect("ordinary packet over the real Core and lexical publication");
+
+        for ((path, content), expected) in files.into_iter().zip(expected_sources) {
+            let source = packet
+                .support
+                .iter()
+                .find(|row| {
+                    row.kind == SupportUnitKindDto::SourceRange
+                        && row.path.as_deref() == Some(path)
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "small admitted published file must reach physical source support: {path}; disposition={:?}",
+                        packet.disposition
+                    )
+                });
+            assert!(
+                source.symbol_id.is_none(),
+                "a file must not invent a graph ID"
+            );
+            let line_count = content.lines().count() as u32;
+            assert_eq!(
+                (source.start_line, source.end_line),
+                (Some(1), Some(line_count))
+            );
+            let snippet = source.snippet.as_deref().expect("physical source bytes");
+            assert_eq!(
+                snippet, expected,
+                "every original physical line must be delivered"
+            );
+            let delivery = source
+                .source_delivery
+                .as_ref()
+                .expect("published file must carry an authenticated source receipt");
+            assert_eq!(
+                delivery.source_sha256,
+                format!("{:x}", Sha256::digest(content))
+            );
+            assert_eq!(delivery.requested_range.start_line, 1);
+            assert_eq!(delivery.requested_range.end_line, line_count);
+            assert_eq!(delivery.remaining_source_bytes, 0);
+            assert!(delivery.next_start_line.is_none());
+            assert!(
+                packet
+                    .answer
+                    .source_coverage
+                    .iter()
+                    .any(|coverage| coverage.path == path
+                        && coverage.status
+                            == codestory_contracts::api::SourceCoverageStatusDto::NotEstablished
+                        && coverage.not_established_cause
+                            == Some(
+                                codestory_contracts::api::SourceCoverageNotEstablishedCauseDto::LookupUnavailable
+                            )),
+                "published source must preserve honest missing Core coverage: {path}"
+            );
+        }
+        assert_published_file_packet_available(&fixture, &request, &packet);
+    }
+
+    #[test]
+    fn mixed_published_file_packet_issuance_preserves_loaded_source_floor() {
+        use crate::agent::packet_candidate::{PacketProofSession, install_packet_proof_session};
+        use crate::agent::packet_served_sources;
+        use codestory_contracts::api::{PacketProbeDto, SupportUnitKindDto};
+        use codestory_contracts::packet_projection_v3::{EvidenceKindV3Dto, PacketProjectionV3Dto};
+        use std::sync::atomic::AtomicBool;
+        let content = "ini_flag = true\n";
+        assert_eq!(
+            crate::retrieval_file_role_from_path("tests/support.rs"),
+            crate::RetrievalFileRole::Test
+        );
+        let fixture = public_packet_fixture_with_lexical_files(&[
+            ("settings.ini", content),
+            ("tests/support.rs", "mod protected_context {}\n"),
+        ]);
+        let core = Store::open_read_only(&fixture.storage_path).unwrap();
+        let node = core
+            .get_nodes()
+            .unwrap()
+            .into_iter()
+            .find(|n| n.kind == NodeKind::MODULE && n.serialized_name.contains("protected_context"))
+            .expect("real parsed module must provide a numeric source identity");
+        let indexed_file = core
+            .get_file_by_id(node.file_node_id.expect("parsed symbol file").0)
+            .unwrap()
+            .unwrap();
+        assert!(indexed_file.path.ends_with("tests/support.rs"));
+        assert!(indexed_file.indexed && indexed_file.complete);
+        assert_eq!((node.start_line, node.end_line), (Some(1), Some(1)));
+        drop(core);
+        let service = crate::PublicOperationService::new(fixture.controller.clone());
+        let browser =
+            crate::ReadOnlyBrowserService::new(fixture.controller.clone(), service.clone());
+        let mut retained_request = None;
+        let mut completed_branches = Vec::new();
+        let mut executed_returned_patches = 0;
+        for retain_file in [false, true] {
+            let request = AgentPacketRequestDto {
+                question: "ini_flag".into(),
+                budget: PacketBudgetModeDto::Standard,
+                probes: vec![PacketProbeDto::SymbolId {
+                    id: node.id.0.to_string(),
+                }],
+                latency_budget_ms: Some(30_000),
+                parent_packet_id: None,
+                option_ids: Vec::new(),
+                core_generation_id: None,
+                retrieval_generation: None,
+            };
+            let _latency = crate::enter_packet_latency_scope(request.latency_budget_ms);
+            let follow_up = service.run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
+                let represented = browser.packet_for_representation_v3(request.clone(), "codestory-cli", &mut |projection| {
+                    let has_file = match projection {
+                        PacketProjectionV3Dto::Complete { evidence, .. } => evidence.as_slice().iter().any(|r| r.kind == EvidenceKindV3Dto::ExactSource && r.path.as_ref().is_some_and(|p| p.as_str() == "settings.ini")),
+                        _ => false,
+                    };
+                    if !retain_file && has_file { Ok(16_385) } else { serde_json::to_vec(projection).map(|v| v.len()).map_err(|_| ()) }
+                })?;
+                assert_ne!(represented.packet.disposition.kind, PacketDispositionKindDto::Unavailable, "mixed retained/omitted lexical file cannot mark numeric evidence unavailable: {:?}", represented.packet.disposition);
+                let gaps = match &represented.product.projection {
+                    PacketProjectionV3Dto::Complete { gaps, .. } | PacketProjectionV3Dto::BudgetExceeded { gaps, .. } => gaps,
+                };
+                assert!(!gaps.as_slice().iter().any(|g| g.kind == codestory_contracts::packet_projection_v3::GapKindV3Dto::RetrievalUnavailable), "mixed representation cannot emit packet-evidence-unavailable: {:?}", represented.product.projection);
+                assert!(represented.packet.packet_id.starts_with("psr1:"), "mixed prepared input must retain issued source identity even when a file is omitted");
+                if let Some(drill) = &represented.packet.disposition.drill {
+                    for option in &drill.options {
+                        if option.symbol_id.is_none() {
+                            assert!(option.source_range.is_none(), "whole-file paths must never advertise a numeric source cursor");
+                            assert!(!option.id.starts_with("range:path:"));
+                        }
+                    }
+                }
+                let path_option_offered = represented.packet.disposition.drill.as_ref().is_some_and(|drill| drill.options.iter().any(|o| o.path.as_deref() == Some("settings.ini") && o.symbol_id.is_none()));
+                if !retain_file {
+                    assert!(path_option_offered, "the selected omitted small file must expose the existing whole-file action for execution proof");
+                }
+                let offered_patch = if !retain_file {
+                    match &represented.product.projection {
+                        PacketProjectionV3Dto::Complete { continuation: Some(continuation), .. } => Some(continuation.packet_request_patch.clone().expect("public whole-file option must carry its executable request patch")),
+                        _ => panic!("offered whole-file action requires complete public continuation"),
+                    }
+                } else { None };
+                let originals = represented.packet.support.iter().filter(|r| r.kind == SupportUnitKindDto::SourceRange).cloned().collect::<Vec<_>>();
+                assert!(originals.iter().any(|r| r.symbol_id.as_deref() == Some(node.id.0.to_string().as_str())));
+                assert_eq!(originals.iter().any(|r| r.path.as_deref() == Some("settings.ini")), retain_file);
+                packet_served_sources::commit(&fixture.controller, "codestory-cli", &represented.product)?;
+                let mut continuation = request.clone();
+                continuation.parent_packet_id = Some(represented.packet.packet_id.clone());
+                let record = packet_served_sources::load(&fixture.controller, "codestory-cli", &continuation)?.expect("actual issued record must reload");
+                assert_eq!(record.witnesses.iter().any(|w| w.node_id.is_none()), retain_file);
+                let session = Rc::new(PacketProofSession::new());
+                session.protect_served_sources(record.clone())?;
+                session.seal_retrieval_admission();
+                let _guard = install_packet_proof_session(Rc::clone(&session));
+                let pinned = active_pinned_retrieval_read(&fixture.controller).expect("current public packet pin");
+                let prepare = || super::super::packet_compiler::prepare_packet_compilation(
+                    &fixture.controller, pinned.session.project_id(), &[], None, &session, None,
+                );
+                let prepared = prepare()?;
+                assert_eq!(session.benchmark_retrieval_proof().descriptor_query_count, 0, "issued path authority must not depend on new ranked hits");
+                let frozen = prepared.select_for_representation(|_, product| Ok(Some(serde_json::to_vec(&product.support).unwrap().len())))?;
+                for old in &originals {
+                    assert!(frozen.product.support.iter().any(|r| r.kind == SupportUnitKindDto::SourceRange && r.symbol_id == old.symbol_id && r.path == old.path && r.start_line == old.start_line && r.end_line == old.end_line && r.snippet == old.snippet && r.source_delivery == old.source_delivery), "loaded issued sources must remain exact protected context");
+                }
+                if retain_file {
+                    retained_request = Some(continuation.clone());
+                }
+                Ok(offered_patch.map(|patch| {
+                    let mut next = request.clone();
+                    next.probes = patch.probes.as_slice().to_vec();
+                    next.parent_packet_id = patch.parent_packet_id.as_ref().map(|v| v.as_str().to_owned());
+                    next.option_ids = patch.option_ids.as_slice().iter().map(|v| v.as_str().to_owned()).collect();
+                    next.core_generation_id = Some(patch.core_generation_id.as_str().to_owned());
+                    next.retrieval_generation = patch.retrieval_generation.as_ref().map(|v| v.as_str().to_owned());
+                    (next, originals)
+                }))
+            }).unwrap_or_else(|error| panic!("mixed retain_file={retain_file} stage=successful-issuance-reload-floor: {error:?}")).value;
+            completed_branches.push(retain_file);
+            assert_eq!(
+                follow_up.is_some(),
+                !retain_file,
+                "mixed retain_file={retain_file} stage=returned-whole-file-patch"
+            );
+            if let Some((next, originals)) = follow_up {
+                service.run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
+                    let represented = browser.packet_for_representation_v3(next.clone(), "codestory-cli", &mut |p| serde_json::to_vec(p).map(|v| v.len()).map_err(|_| ()))?;
+                    assert_ne!(represented.packet.disposition.kind, PacketDispositionKindDto::Unavailable);
+                    assert!(represented.packet.support.iter().any(|r| r.kind == SupportUnitKindDto::SourceRange && r.path.as_deref() == Some("settings.ini")), "ordinary whole-file follow-up must execute without the ranged-node refusal");
+                    for old in &originals {
+                        assert!(represented.packet.support.iter().any(|r| r.kind == SupportUnitKindDto::SourceRange && r.symbol_id == old.symbol_id && r.path == old.path && r.snippet == old.snippet && r.source_delivery == old.source_delivery), "executed returned patch preserves the issued numeric context");
+                    }
+                    Ok(())
+                }).unwrap_or_else(|error| panic!("mixed retain_file={retain_file} stage=execute-returned-whole-file-patch: {error:?}"));
+                executed_returned_patches += 1;
+            }
+        }
+        assert_eq!(completed_branches, vec![false, true]);
+        assert_eq!(executed_returned_patches, 1);
+
+        // Authenticate issued history under the actual owner, then mutate.
+        // The issued source floor must reject changed bytes before measurement.
+        // Restore only after the operation has returned.
+        let retained_request = retained_request.expect("retained branch issued path history");
+        let _hostile_latency =
+            crate::enter_packet_latency_scope(retained_request.latency_budget_ms);
+        let path = fixture._project.path().join("settings.ini");
+        let changed = content.replace("true", "fake");
+        assert_eq!(content.len(), changed.len());
+        let mut public_refusal = None;
+        let mut represented_product_returned = false;
+        let mut measurements = 0;
+        let hostile = service.run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
+            let record = packet_served_sources::load(
+                &fixture.controller,
+                "codestory-cli",
+                &retained_request,
+            )?
+            .expect("hostile operation loads authentic path history");
+            assert!(
+                record
+                    .witnesses
+                    .iter()
+                    .any(|w| w.node_id.is_none() && w.path == "settings.ini")
+            );
+            std::fs::write(&path, &changed).unwrap();
+            match browser.packet_for_representation_v3(
+                retained_request.clone(),
+                "codestory-cli",
+                &mut |projection| {
+                    measurements += 1;
+                    serde_json::to_vec(projection)
+                        .map(|bytes| bytes.len())
+                        .map_err(|_| ())
+                },
+            ) {
+                Err(error) => {
+                    public_refusal = Some((error.code.clone(), error.message.clone()));
+                    Err(error)
+                }
+                Ok(_) => {
+                    represented_product_returned = true;
+                    Ok(())
+                }
+            }
+        });
+        std::fs::write(&path, content).expect("restore hostile fixture outside the operation");
+        assert!(
+            !represented_product_returned,
+            "stage=hostile-public-representation must not return evidence for changed signed source"
+        );
+        assert_eq!(
+            measurements, 0,
+            "stage=hostile-public-representation must refuse before source projection measurement"
+        );
+        let (code, message) = public_refusal
+            .expect("stage=hostile-public-representation must refuse changed signed path bytes");
+        assert_eq!(
+            code, "invalid_argument",
+            "stage=hostile-public-representation actual code={code}, message={message}"
+        );
+        assert_eq!(
+            message, "Previously issued source witnesses changed or cannot be revalidated.",
+            "stage=hostile-public-representation: {message}"
+        );
+        let propagated = match hostile {
+            Err(error) => error,
+            Ok(_) => panic!(
+                "stage=hostile-public-operation must propagate the public representation refusal"
+            ),
+        };
+        assert_eq!((propagated.code, propagated.message), (code, message));
+    }
+
+    #[test]
+    fn browser_packet_refuses_published_file_changed_after_selection() {
+        use codestory_contracts::packet_projection_v3::{
+            EvidenceKindV3Dto, GapKindV3Dto, PacketProjectionV3Dto,
+        };
+        use std::sync::atomic::AtomicBool;
+        let original = "stop_on_error = true\n";
+        let changed = "stop_on_error = fake\n";
+        assert_eq!(original.len(), changed.len());
+        let fixture = public_packet_fixture_with_lexical_files(&[("settings.ini", original)]);
+        let service = crate::PublicOperationService::new(fixture.controller.clone());
+        let browser =
+            crate::ReadOnlyBrowserService::new(fixture.controller.clone(), service.clone());
+        let request = AgentPacketRequestDto {
+            question: "stop_on_error".into(),
+            budget: PacketBudgetModeDto::Standard,
+            probes: Vec::new(),
+            latency_budget_ms: Some(30_000),
+            parent_packet_id: None,
+            option_ids: Vec::new(),
+            core_generation_id: None,
+            retrieval_generation: None,
+        };
+        let _latency = crate::enter_packet_latency_scope(request.latency_budget_ms);
+        let baseline = service
+            .run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
+                browser.packet_for_representation_v3(
+                    request.clone(),
+                    "codestory-cli",
+                    &mut |projection| {
+                        serde_json::to_vec(projection)
+                            .map(|bytes| bytes.len())
+                            .map_err(|_| ())
+                    },
+                )
+            })
+            .expect("unchanged positive public representation control")
+            .value;
+        let expected_body = "```text\n>1 | stop_on_error = true\n```";
+        match &baseline.product.projection {
+            PacketProjectionV3Dto::Complete { evidence, .. } => {
+                assert!(evidence.as_slice().iter().any(|row| {
+                    row.kind == EvidenceKindV3Dto::ExactSource
+                        && row
+                            .path
+                            .as_ref()
+                            .is_some_and(|p| p.as_str() == "settings.ini")
+                        && row
+                            .summary
+                            .as_ref()
+                            .is_some_and(|s| s.as_str() == expected_body)
+                }))
+            }
+            other => panic!("positive whole-file control must be complete: {other:?}"),
+        }
+
+        let path = fixture._project.path().join("settings.ini");
+        let mut cutpoint_hits = 0;
+        let outcome = service.run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
+            browser.packet_for_representation_v3(request.clone(), "codestory-cli", &mut |projection| {
+                if cutpoint_hits == 0 && matches!(projection, PacketProjectionV3Dto::Complete { evidence, .. }
+                    if evidence.as_slice().iter().any(|row| row.kind == EvidenceKindV3Dto::ExactSource
+                        && row.path.as_ref().is_some_and(|p| p.as_str() == "settings.ini")
+                        && row.summary.as_ref().is_some_and(|s| s.as_str() == expected_body))) {
+                    std::fs::write(&path, changed).unwrap();
+                    cutpoint_hits += 1;
+                }
+                serde_json::to_vec(projection).map(|bytes| bytes.len()).map_err(|_| ())
+            })
+        });
+        std::fs::write(&path, original)
+            .expect("restore selected source after the operation returns");
+        assert_eq!(
+            cutpoint_hits, 1,
+            "hostile cutpoint must see the actual complete exact file body before mutation"
+        );
+        match outcome {
+            Err(error) => assert!(
+                matches!(
+                    error.code.as_str(),
+                    "publication_changed" | "source_stale" | "source_unavailable"
+                ),
+                "expected a typed source/publication refusal after selection, got {error:?}"
+            ),
+            Ok(operation) => {
+                let projection = &operation.value.product.projection;
+                let gaps = match projection {
+                    PacketProjectionV3Dto::Complete { evidence, gaps, .. } => {
+                        assert!(
+                            !evidence.as_slice().iter().any(|row| row.kind
+                                == EvidenceKindV3Dto::ExactSource
+                                && row
+                                    .path
+                                    .as_ref()
+                                    .is_some_and(|p| p.as_str() == "settings.ini")),
+                            "a completed packet served stale exact source after the selected file changed: {projection:?}"
+                        );
+                        gaps
+                    }
+                    PacketProjectionV3Dto::BudgetExceeded { gaps, .. } => gaps,
+                };
+                assert!(
+                    gaps.as_slice()
+                        .iter()
+                        .any(|gap| gap.kind == GapKindV3Dto::SourceUnavailable
+                            && gap.message.as_ref().is_some_and(|message| {
+                                let text = message.as_str();
+                                text.contains("settings.ini")
+                                    && [
+                                        "changed",
+                                        "stale",
+                                        "omitted",
+                                        "unavailable",
+                                        "not delivered",
+                                    ]
+                                    .iter()
+                                    .any(|reason| text.contains(reason))
+                            })),
+                    "a non-source result must explicitly retain the stale/omitted-file gap: {projection:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn published_file_hydration_checks_freshness_before_budget_and_preserves_admission() {
+        use crate::agent::packet_candidate::{PacketProofSession, install_packet_proof_session};
+        use codestory_contracts::compilation::{
+            PacketAdmissionGapKindV1, PacketParserCompletenessV1,
+        };
+        let files = [
+            ("short.ini", "short_setting = 1\n".to_string()),
+            ("raw.ini", format!("raw_setting = {}\n", "x".repeat(512))),
+            (
+                "lines.ini",
+                format!("line_setting = 1\n{}", "\n".repeat(80)),
+            ),
+            (
+                "stale.ini",
+                format!("stale_setting = {}\n", "s".repeat(512)),
+            ),
+        ];
+        let inputs = files
+            .iter()
+            .map(|(path, content)| (*path, content.as_str()))
+            .collect::<Vec<_>>();
+        let fixture = public_packet_fixture_with_lexical_files(&inputs);
+        let pinned =
+            Rc::new(PinnedRetrievalRead::begin_packet_descriptor(&fixture.controller).unwrap());
+        let session = Rc::new(PacketProofSession::new());
+        with_active_pinned_retrieval_read(&fixture.controller, Rc::clone(&pinned), || {
+            let _guard = install_packet_proof_session(Rc::clone(&session));
+            preadmit_packet_descriptor_queries_with_policy(
+                &fixture.controller,
+                &[PacketRetrievalQuery {
+                    query: "Explain short_setting raw_setting line_setting stale_setting".into(),
+                    lexical_policy: LexicalAdmissionPolicy::BroadQuestionV1,
+                }],
+                None,
+            )
+            .unwrap();
+            for (path, _) in &files {
+                assert!(session.is_admitted_identity(&format!("path:{path}")));
+            }
+            pinned.session.validate_full_readiness().unwrap();
+            let receipts = session.receipts();
+            let queries = session.benchmark_retrieval_proof().descriptor_query_count;
+            let mut forged = receipts
+                .iter()
+                .find(|r| r.stable_identity == "path:short.ini")
+                .unwrap()
+                .clone();
+            forged.reserved_source_bytes += 1;
+            assert!(read_admitted_published_file(&fixture.controller, &forged).is_err());
+            let stale = fixture._project.path().join("stale.ini");
+            let modified = std::fs::metadata(&stale).unwrap().modified().unwrap();
+            std::fs::write(&stale, files[3].1.replace('s', "t")).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&stale)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(modified))
+                .unwrap();
+            let prepared = super::super::packet_compiler::prepare_packet_compilation(
+                &fixture.controller,
+                pinned.session.project_id(),
+                &[],
+                None,
+                &session,
+                None,
+            )
+            .unwrap();
+            let input = prepared.replay_input();
+            let short = input
+                .sources
+                .iter()
+                .find(|source| source.stable_identity == "path:short.ini")
+                .expect("short whole file");
+            assert!(short.callable_body.is_none());
+            assert_eq!(
+                short.parser_completeness,
+                PacketParserCompletenessV1::Unknown
+            );
+            assert!(
+                input.relations.is_empty(),
+                "published paths must not become Core graph endpoints"
+            );
+            for path in ["raw.ini", "lines.ini"] {
+                let identity = format!("path:{path}");
+                assert!(
+                    input
+                        .admissions
+                        .iter()
+                        .any(|r| r.stable_identity == identity)
+                );
+                assert!(
+                    !input
+                        .sources
+                        .iter()
+                        .any(|source| source.stable_identity == identity)
+                );
+                assert!(
+                    input
+                        .admission_gaps
+                        .iter()
+                        .any(
+                            |gap| gap.stable_identity.as_deref() == Some(identity.as_str())
+                                && gap.kind == PacketAdmissionGapKindV1::SourceBudgetExceeded
+                        )
+                );
+            }
+            assert!(
+                !input
+                    .admissions
+                    .iter()
+                    .any(|r| r.stable_identity == "path:stale.ini")
+            );
+            assert!(
+                input
+                    .admission_gaps
+                    .iter()
+                    .any(
+                        |gap| gap.stable_identity.as_deref() == Some("path:stale.ini")
+                            && gap.kind == PacketAdmissionGapKindV1::SourceUnavailable
+                    )
+            );
+            assert!(
+                !input
+                    .admission_gaps
+                    .iter()
+                    .any(
+                        |gap| gap.stable_identity.as_deref() == Some("path:stale.ini")
+                            && gap.kind == PacketAdmissionGapKindV1::SourceBudgetExceeded
+                    )
+            );
+            assert_eq!(
+                session.receipts(),
+                receipts,
+                "failed source must not refund or grow sealed reservations"
+            );
+            assert_eq!(
+                session.benchmark_retrieval_proof().descriptor_query_count,
+                queries,
+                "source hydration must not issue another query"
+            );
+        });
+    }
+
+    #[test]
+    fn published_lexical_file_packet_refuses_changed_discovery_exclusion() {
+        let fixture = public_packet_fixture_with_lexical_files(&[
+            (".ignore", "/.ignore\n"),
+            ("settings.ini", "policy_setting = true\n"),
+        ]);
+        let request = AgentPacketRequestDto {
+            question: "policy_setting".into(),
+            budget: PacketBudgetModeDto::Standard,
+            probes: Vec::new(),
+            latency_budget_ms: Some(30_000),
+            parent_packet_id: None,
+            option_ids: Vec::new(),
+            core_generation_id: None,
+            retrieval_generation: None,
+        };
+        let before = fixture
+            .controller
+            .browser_service()
+            .packet(request.clone())
+            .unwrap();
+        assert!(
+            before
+                .support
+                .iter()
+                .any(|r| r.path.as_deref() == Some("settings.ini") && r.snippet.is_some())
+        );
+        std::fs::write(
+            fixture._project.path().join(".ignore"),
+            "/.ignore\n/settings.ini\n",
+        )
+        .unwrap();
+        let discovered =
+            codestory_workspace::WorkspaceManifest::open(fixture._project.path().to_path_buf())
+                .unwrap()
+                .source_files()
+                .unwrap();
+        assert!(
+            !discovered
+                .iter()
+                .any(|p| p.file_name().is_some_and(|n| n == "settings.ini"))
+        );
+        assert!(
+            discovered
+                .iter()
+                .any(|p| p.file_name().is_some_and(|n| n == "metadata.rs"))
+        );
+        fixture.controller.browser_service().packet(request).expect_err("changed discovery policy must refuse the fresh packet before serving the old published file");
+    }
+
+    #[test]
+    fn browser_packet_serves_published_lexical_artifact_without_core_symbols() {
         let question =
             "Which role is assumed by the control plane, and which is used by worker nodes?";
         let fixture = public_packet_fixture_with_unindexed_lexical_artifact();
@@ -6989,25 +8927,39 @@ mod tests {
         drop(core);
         let browser = fixture.controller.browser_service();
 
-        let packet = browser
-            .packet(AgentPacketRequestDto {
-                question: question.into(),
-                budget: PacketBudgetModeDto::Compact,
-                probes: Vec::new(),
-                latency_budget_ms: Some(30_000),
-                parent_packet_id: None,
-                option_ids: Vec::new(),
-                core_generation_id: None,
-                retrieval_generation: None,
-            })
+        let request = AgentPacketRequestDto {
+            question: question.into(),
+            budget: PacketBudgetModeDto::Compact,
+            probes: Vec::new(),
+            latency_budget_ms: Some(30_000),
+            parent_packet_id: None,
+            option_ids: Vec::new(),
+            core_generation_id: None,
+            retrieval_generation: None,
+        };
+        let packet = browser.packet(request.clone())
             .unwrap_or_else(|error| {
                 panic!(
-                    "public packet must classify a real unindexed lexical artifact as an empty diagnostic result, got {}: {}",
+                    "public packet must deliver a real published lexical file while retaining diagnostic authority limits, got {}: {}",
                     error.code, error.message
                 )
             });
 
-        assert!(packet.support.is_empty());
+        assert_published_file_packet_available(&fixture, &request, &packet);
+        let source = packet
+            .support
+            .iter()
+            .find(|row| row.path.as_deref() == Some("LICENSE") && row.snippet.is_some())
+            .expect("small published LICENSE remains ordinary lexical file evidence");
+        assert!(source.symbol_id.is_none());
+        assert_eq!((source.start_line, source.end_line), (Some(1), Some(1)));
+        assert!(source.snippet.as_deref().unwrap().contains("The control plane assumes the control plane role, and worker nodes use the worker node role."));
+        assert!(
+            source
+                .source_delivery
+                .as_ref()
+                .is_some_and(|delivery| delivery.remaining_source_bytes == 0)
+        );
         assert!(packet.answer.citations.is_empty());
         assert!(
             packet
@@ -7016,16 +8968,23 @@ mod tests {
                 .retrieval_publication
                 .is_some()
         );
-        assert_eq!(
+        assert_ne!(
             packet.disposition.kind,
             PacketDispositionKindDto::NotEstablished
         );
-        assert_eq!(
+        assert_ne!(
             packet.disposition.reason.as_deref(),
             Some("no bounded repository evidence was retained")
         );
         assert!(packet.disposition.drill.is_none());
-        assert!(packet.disposition.omission_receipts.is_empty());
+        assert!(packet.answer.source_coverage.iter().any(|coverage| coverage.path == "LICENSE"
+            && coverage.status == codestory_contracts::api::SourceCoverageStatusDto::NotEstablished
+            && coverage.not_established_cause == Some(codestory_contracts::api::SourceCoverageNotEstablishedCauseDto::LookupUnavailable)));
+        assert_eq!(
+            packet.disposition.omission_receipts,
+            vec!["source coverage (lookup_unavailable) is unproven for LICENSE."],
+            "published source does not claim parser/Core coverage"
+        );
         let shadow = packet
             .answer
             .retrieval_trace
@@ -7807,6 +9766,26 @@ mod tests {
     }
 
     #[test]
+    fn free_query_batch_checks_later_policy_mismatch_before_any_hydration() {
+        let fixture = pinned_operation_fixture();
+        let first = query_result_with_stages(Vec::new());
+        let mut second = first.clone();
+        second.features.lexical_policy = LexicalAdmissionPolicy::BroadQuestionV1;
+        let query = first.query.clone();
+        let result = build_sidecar_packet_batch_outcome(
+            &fixture.controller,
+            &[(query.clone(), 4), (query, 4)],
+            vec![first, second],
+            0,
+            &HashSet::new(),
+            |_, _| {
+                panic!("no candidate may hydrate before all query/policy positions authenticate")
+            },
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn packet_batch_rejects_candidate_resolution_errors() {
         let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         use codestory_retrieval::CandidateSource;
@@ -8019,15 +9998,29 @@ mod tests {
     #[test]
     fn primary_env_override_rejects_zero() {
         let _lock = env_test_lock();
+        let fixture =
+            pinned_operation_fixture_with_profile(codestory_retrieval::SidecarProfile::Agent);
+        let pinned = Rc::new(
+            PinnedRetrievalRead::begin(&fixture.controller)
+                .expect("begin a validated Agent pin before opt-out"),
+        );
         // SAFETY: test-only env mutation; no concurrent tests rely on this variable.
         unsafe {
             std::env::set_var(RETRIEVAL_ENV, "0");
         }
         assert_eq!(retrieval_env_override(), Some(false));
+        let primary_enabled =
+            with_active_pinned_retrieval_read(&fixture.controller, pinned, || {
+                sidecar_retrieval_primary_enabled(&fixture.controller)
+            });
         // SAFETY: test-only env cleanup.
         unsafe {
             std::env::remove_var(RETRIEVAL_ENV);
         }
+        assert!(
+            !primary_enabled,
+            "explicit retrieval opt-out wins over an otherwise validated active pin"
+        );
         assert_eq!(retrieval_env_override(), None);
     }
 

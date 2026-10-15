@@ -1,7 +1,7 @@
 {
   "wireContract": {
-    "publicationStampSchemaVersion": 4,
-    "minimumCompatiblePublicationStampSchemaVersion": 3,
+    "publicationStampSchemaVersion": 5,
+    "minimumCompatiblePublicationStampSchemaVersion": 5,
     "supportedMcpProtocolVersions": [
       "2024-11-05",
       "2025-03-26",
@@ -10,15 +10,15 @@
     ],
     "preferredMcpProtocolVersion": "2025-11-25",
     "discoveryContracts": {
-      "2024-11-05": "6f3c26dc77b62728ac7ba402abafa5c97662bf5f57981ec638361726a0a71318",
-      "2025-03-26": "4735b1bcff7d44a07cd4aa6dde44b594fbf0b188703700e57dec30fcf0ecdef0",
-      "2025-06-18": "1494a59fc253ffe457c5a4c591a327354321a720f3daed93b481efaad38eb3b9",
-      "2025-11-25": "f9c390db818c3060628163beac29ff52ffd8dac44a123cb9bd0acc6771d3dfa3"
+      "2024-11-05": "f66f5345582da21a98b297b98d9f2e2dab054899746c1aa47a72c786bf1f9e69",
+      "2025-03-26": "dc0d3ed5d1ac887cb36dd65a2fbb5b4e9ae5eb32664522bed42b02830f375299",
+      "2025-06-18": "584297572e40cfb7f98c6e2446b15c2e7af4f01bbcf3a27456ec7e384fa554b8",
+      "2025-11-25": "18ce81099cb0cd0f03dd4050af9a45bbc195fdc4fd7002d7b8721cddb9582cbd"
     }
   },
   "revisionProfiles": {
     "2024-11-05": {
-      "discoveryContractSha256": "6f3c26dc77b62728ac7ba402abafa5c97662bf5f57981ec638361726a0a71318",
+      "discoveryContractSha256": "f66f5345582da21a98b297b98d9f2e2dab054899746c1aa47a72c786bf1f9e69",
       "tools": [
         {
           "description": "Inspect CodeStory readiness for the requested repository when diagnostics are needed. CodeStory effect: observational and does not activate managed state.",
@@ -76,12 +76,15 @@
                   "type": "string"
                 },
                 "maxItems": 8,
-                "minItems": 1,
+                "minItems": 0,
                 "type": "array"
               },
               "parent_packet_id": {
                 "description": "Parent packet id for a generation-bound continuation; repeat the original question unchanged.",
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "probes": {
                 "description": "Optional tagged exact-path, symbol-id, qualified-symbol, file-symbol, free-query, or generation-bound continuation probes.",
@@ -273,6 +276,29 @@
                               ],
                               "type": "string"
                             },
+                            "source_range": {
+                              "additionalProperties": false,
+                              "description": "Optional pinned complete-line source request.",
+                              "properties": {
+                                "end_line": {
+                                  "description": "Last requested line.",
+                                  "maximum": 4294967295,
+                                  "minimum": 1,
+                                  "type": "integer"
+                                },
+                                "start_line": {
+                                  "description": "First requested line.",
+                                  "maximum": 4294967295,
+                                  "minimum": 1,
+                                  "type": "integer"
+                                }
+                              },
+                              "required": [
+                                "start_line",
+                                "end_line"
+                              ],
+                              "type": "object"
+                            },
                             "stable_identity": {
                               "description": "Stable packet identity.",
                               "maxLength": 240,
@@ -305,7 +331,7 @@
                   ]
                 },
                 "maxItems": 16,
-                "minItems": 1,
+                "minItems": 0,
                 "type": "array"
               },
               "project": {
@@ -329,7 +355,10 @@
               },
               "retrieval_generation": {
                 "description": "Pinned retrieval generation for a continuation.",
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               }
             },
             "required": [
@@ -1591,13 +1620,19 @@
                     "minimum": 0,
                     "type": "integer"
                   },
+                  "max_tool_result_bytes": {
+                    "description": "Optional path-read allowance for UTF-8 serialized served MCP tool result, including revision text/structured mirroring and publication metadata. Excludes JSON-RPC and host framing; does not bound an investigation. Whole-line receipts may be partial; a receipt that cannot fit refuses.",
+                    "maximum": 524288,
+                    "minimum": 256,
+                    "type": "integer"
+                  },
                   "path": {
                     "description": "Single-file alias for `paths`: repository-relative path as returned in `file_path`. Combine with `line`.",
                     "minLength": 1,
                     "type": "string"
                   },
                   "paths": {
-                    "description": "File ranges to read in one call, instead of resolving a symbol. Line-numbered and bounded in total; use the paths and lines that search, trail, or packet already returned.",
+                    "description": "File ranges to read in one call, instead of resolving a symbol. Line-numbered and bounded in total; use exact paths from files, search, trail, or packet; filenames are paths, not symbol IDs.",
                     "items": {
                       "allOf": [
                         {
@@ -1845,7 +1880,7 @@
         {
           "mimeType": "application/json",
           "name": "Root symbols",
-          "uriTemplate": "codestory://symbols/root{?project}"
+          "uriTemplate": "codestory://symbols/root{?project,limit,cursor}"
         },
         {
           "mimeType": "application/json",
@@ -1884,7 +1919,7 @@
       ]
     },
     "2025-03-26": {
-      "discoveryContractSha256": "4735b1bcff7d44a07cd4aa6dde44b594fbf0b188703700e57dec30fcf0ecdef0",
+      "discoveryContractSha256": "dc0d3ed5d1ac887cb36dd65a2fbb5b4e9ae5eb32664522bed42b02830f375299",
       "tools": [
         {
           "annotations": {
@@ -1954,12 +1989,15 @@
                   "type": "string"
                 },
                 "maxItems": 8,
-                "minItems": 1,
+                "minItems": 0,
                 "type": "array"
               },
               "parent_packet_id": {
                 "description": "Parent packet id for a generation-bound continuation; repeat the original question unchanged.",
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "probes": {
                 "description": "Optional tagged exact-path, symbol-id, qualified-symbol, file-symbol, free-query, or generation-bound continuation probes.",
@@ -2151,6 +2189,29 @@
                               ],
                               "type": "string"
                             },
+                            "source_range": {
+                              "additionalProperties": false,
+                              "description": "Optional pinned complete-line source request.",
+                              "properties": {
+                                "end_line": {
+                                  "description": "Last requested line.",
+                                  "maximum": 4294967295,
+                                  "minimum": 1,
+                                  "type": "integer"
+                                },
+                                "start_line": {
+                                  "description": "First requested line.",
+                                  "maximum": 4294967295,
+                                  "minimum": 1,
+                                  "type": "integer"
+                                }
+                              },
+                              "required": [
+                                "start_line",
+                                "end_line"
+                              ],
+                              "type": "object"
+                            },
                             "stable_identity": {
                               "description": "Stable packet identity.",
                               "maxLength": 240,
@@ -2183,7 +2244,7 @@
                   ]
                 },
                 "maxItems": 16,
-                "minItems": 1,
+                "minItems": 0,
                 "type": "array"
               },
               "project": {
@@ -2207,7 +2268,10 @@
               },
               "retrieval_generation": {
                 "description": "Pinned retrieval generation for a continuation.",
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               }
             },
             "required": [
@@ -3571,13 +3635,19 @@
                     "minimum": 0,
                     "type": "integer"
                   },
+                  "max_tool_result_bytes": {
+                    "description": "Optional path-read allowance for UTF-8 serialized served MCP tool result, including revision text/structured mirroring and publication metadata. Excludes JSON-RPC and host framing; does not bound an investigation. Whole-line receipts may be partial; a receipt that cannot fit refuses.",
+                    "maximum": 524288,
+                    "minimum": 256,
+                    "type": "integer"
+                  },
                   "path": {
                     "description": "Single-file alias for `paths`: repository-relative path as returned in `file_path`. Combine with `line`.",
                     "minLength": 1,
                     "type": "string"
                   },
                   "paths": {
-                    "description": "File ranges to read in one call, instead of resolving a symbol. Line-numbered and bounded in total; use the paths and lines that search, trail, or packet already returned.",
+                    "description": "File ranges to read in one call, instead of resolving a symbol. Line-numbered and bounded in total; use exact paths from files, search, trail, or packet; filenames are paths, not symbol IDs.",
                     "items": {
                       "allOf": [
                         {
@@ -3831,7 +3901,7 @@
         {
           "mimeType": "application/json",
           "name": "Root symbols",
-          "uriTemplate": "codestory://symbols/root{?project}"
+          "uriTemplate": "codestory://symbols/root{?project,limit,cursor}"
         },
         {
           "mimeType": "application/json",
@@ -3870,7 +3940,7 @@
       ]
     },
     "2025-06-18": {
-      "discoveryContractSha256": "1494a59fc253ffe457c5a4c591a327354321a720f3daed93b481efaad38eb3b9",
+      "discoveryContractSha256": "584297572e40cfb7f98c6e2446b15c2e7af4f01bbcf3a27456ec7e384fa554b8",
       "tools": [
         {
           "_meta": {
@@ -4148,12 +4218,15 @@
                   "type": "string"
                 },
                 "maxItems": 8,
-                "minItems": 1,
+                "minItems": 0,
                 "type": "array"
               },
               "parent_packet_id": {
                 "description": "Parent packet id for a generation-bound continuation; repeat the original question unchanged.",
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "probes": {
                 "description": "Optional tagged exact-path, symbol-id, qualified-symbol, file-symbol, free-query, or generation-bound continuation probes.",
@@ -4345,6 +4418,29 @@
                               ],
                               "type": "string"
                             },
+                            "source_range": {
+                              "additionalProperties": false,
+                              "description": "Optional pinned complete-line source request.",
+                              "properties": {
+                                "end_line": {
+                                  "description": "Last requested line.",
+                                  "maximum": 4294967295,
+                                  "minimum": 1,
+                                  "type": "integer"
+                                },
+                                "start_line": {
+                                  "description": "First requested line.",
+                                  "maximum": 4294967295,
+                                  "minimum": 1,
+                                  "type": "integer"
+                                }
+                              },
+                              "required": [
+                                "start_line",
+                                "end_line"
+                              ],
+                              "type": "object"
+                            },
                             "stable_identity": {
                               "description": "Stable packet identity.",
                               "maxLength": 240,
@@ -4377,7 +4473,7 @@
                   ]
                 },
                 "maxItems": 16,
-                "minItems": 1,
+                "minItems": 0,
                 "type": "array"
               },
               "project": {
@@ -4401,7 +4497,10 @@
               },
               "retrieval_generation": {
                 "description": "Pinned retrieval generation for a continuation.",
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               }
             },
             "required": [
@@ -4449,6 +4548,172 @@
                                     },
                                     "maxItems": 256,
                                     "type": "array"
+                                  },
+                                  "packet_request_patch": {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "core_generation_id": {
+                                        "maxLength": 256,
+                                        "minLength": 1,
+                                        "type": "string"
+                                      },
+                                      "option_ids": {
+                                        "items": {
+                                          "maxLength": 256,
+                                          "minLength": 1,
+                                          "type": "string"
+                                        },
+                                        "maxItems": 8,
+                                        "type": "array"
+                                      },
+                                      "parent_packet_id": {
+                                        "anyOf": [
+                                          {
+                                            "maxLength": 256,
+                                            "minLength": 1,
+                                            "type": "string"
+                                          },
+                                          {
+                                            "type": "null"
+                                          }
+                                        ]
+                                      },
+                                      "probes": {
+                                        "items": {
+                                          "additionalProperties": false,
+                                          "description": "Project- and generation-bound continuation probe.",
+                                          "properties": {
+                                            "contract_version": {
+                                              "description": "Continuation probe contract version.",
+                                              "maximum": 1,
+                                              "minimum": 1,
+                                              "type": "integer"
+                                            },
+                                            "core_generation_id": {
+                                              "description": "Continuation core evidence generation.",
+                                              "maxLength": 240,
+                                              "minLength": 1,
+                                              "type": "string"
+                                            },
+                                            "kind": {
+                                              "description": "Probe kind.",
+                                              "enum": [
+                                                "continuation"
+                                              ],
+                                              "type": "string"
+                                            },
+                                            "project_id": {
+                                              "description": "Continuation project identity.",
+                                              "maxLength": 240,
+                                              "minLength": 1,
+                                              "type": "string"
+                                            },
+                                            "retrieval_generation": {
+                                              "description": "Optional continuation retrieval generation.",
+                                              "maxLength": 240,
+                                              "minLength": 1,
+                                              "type": [
+                                                "string",
+                                                "null"
+                                              ]
+                                            },
+                                            "selector": {
+                                              "additionalProperties": false,
+                                              "description": "Stable typed continuation selector.",
+                                              "properties": {
+                                                "path": {
+                                                  "description": "Optional exact project-relative path.",
+                                                  "maxLength": 240,
+                                                  "minLength": 1,
+                                                  "type": "string"
+                                                },
+                                                "reason": {
+                                                  "description": "Typed uncovered structural reason.",
+                                                  "enum": [
+                                                    "candidate_count_exceeded",
+                                                    "source_budget_exceeded",
+                                                    "source_unavailable",
+                                                    "ambiguous_selector",
+                                                    "disconnected_seed"
+                                                  ],
+                                                  "type": "string"
+                                                },
+                                                "source_range": {
+                                                  "additionalProperties": false,
+                                                  "description": "Optional pinned complete-line source request.",
+                                                  "properties": {
+                                                    "end_line": {
+                                                      "description": "Last requested line.",
+                                                      "maximum": 4294967295,
+                                                      "minimum": 1,
+                                                      "type": "integer"
+                                                    },
+                                                    "start_line": {
+                                                      "description": "First requested line.",
+                                                      "maximum": 4294967295,
+                                                      "minimum": 1,
+                                                      "type": "integer"
+                                                    }
+                                                  },
+                                                  "required": [
+                                                    "start_line",
+                                                    "end_line"
+                                                  ],
+                                                  "type": "object"
+                                                },
+                                                "stable_identity": {
+                                                  "description": "Stable packet identity.",
+                                                  "maxLength": 240,
+                                                  "minLength": 1,
+                                                  "type": "string"
+                                                },
+                                                "symbol_id": {
+                                                  "description": "Optional exact stable symbol id.",
+                                                  "maxLength": 240,
+                                                  "minLength": 1,
+                                                  "type": "string"
+                                                }
+                                              },
+                                              "required": [
+                                                "stable_identity",
+                                                "reason"
+                                              ],
+                                              "type": "object"
+                                            }
+                                          },
+                                          "required": [
+                                            "kind",
+                                            "contract_version",
+                                            "project_id",
+                                            "core_generation_id",
+                                            "selector"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        "maxItems": 1,
+                                        "type": "array"
+                                      },
+                                      "retrieval_generation": {
+                                        "anyOf": [
+                                          {
+                                            "maxLength": 256,
+                                            "minLength": 1,
+                                            "type": "string"
+                                          },
+                                          {
+                                            "type": "null"
+                                          }
+                                        ]
+                                      }
+                                    },
+                                    "required": [
+                                      "probes",
+                                      "parent_packet_id",
+                                      "option_ids",
+                                      "core_generation_id",
+                                      "retrieval_generation"
+                                    ],
+                                    "type": "object"
                                   },
                                   "remaining_rounds": {
                                     "maximum": 65535,
@@ -4573,6 +4838,172 @@
                                   ],
                                   "type": "string"
                                 },
+                                "packet_request_patch": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "core_generation_id": {
+                                      "maxLength": 256,
+                                      "minLength": 1,
+                                      "type": "string"
+                                    },
+                                    "option_ids": {
+                                      "items": {
+                                        "maxLength": 256,
+                                        "minLength": 1,
+                                        "type": "string"
+                                      },
+                                      "maxItems": 8,
+                                      "type": "array"
+                                    },
+                                    "parent_packet_id": {
+                                      "anyOf": [
+                                        {
+                                          "maxLength": 256,
+                                          "minLength": 1,
+                                          "type": "string"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
+                                    },
+                                    "probes": {
+                                      "items": {
+                                        "additionalProperties": false,
+                                        "description": "Project- and generation-bound continuation probe.",
+                                        "properties": {
+                                          "contract_version": {
+                                            "description": "Continuation probe contract version.",
+                                            "maximum": 1,
+                                            "minimum": 1,
+                                            "type": "integer"
+                                          },
+                                          "core_generation_id": {
+                                            "description": "Continuation core evidence generation.",
+                                            "maxLength": 240,
+                                            "minLength": 1,
+                                            "type": "string"
+                                          },
+                                          "kind": {
+                                            "description": "Probe kind.",
+                                            "enum": [
+                                              "continuation"
+                                            ],
+                                            "type": "string"
+                                          },
+                                          "project_id": {
+                                            "description": "Continuation project identity.",
+                                            "maxLength": 240,
+                                            "minLength": 1,
+                                            "type": "string"
+                                          },
+                                          "retrieval_generation": {
+                                            "description": "Optional continuation retrieval generation.",
+                                            "maxLength": 240,
+                                            "minLength": 1,
+                                            "type": [
+                                              "string",
+                                              "null"
+                                            ]
+                                          },
+                                          "selector": {
+                                            "additionalProperties": false,
+                                            "description": "Stable typed continuation selector.",
+                                            "properties": {
+                                              "path": {
+                                                "description": "Optional exact project-relative path.",
+                                                "maxLength": 240,
+                                                "minLength": 1,
+                                                "type": "string"
+                                              },
+                                              "reason": {
+                                                "description": "Typed uncovered structural reason.",
+                                                "enum": [
+                                                  "candidate_count_exceeded",
+                                                  "source_budget_exceeded",
+                                                  "source_unavailable",
+                                                  "ambiguous_selector",
+                                                  "disconnected_seed"
+                                                ],
+                                                "type": "string"
+                                              },
+                                              "source_range": {
+                                                "additionalProperties": false,
+                                                "description": "Optional pinned complete-line source request.",
+                                                "properties": {
+                                                  "end_line": {
+                                                    "description": "Last requested line.",
+                                                    "maximum": 4294967295,
+                                                    "minimum": 1,
+                                                    "type": "integer"
+                                                  },
+                                                  "start_line": {
+                                                    "description": "First requested line.",
+                                                    "maximum": 4294967295,
+                                                    "minimum": 1,
+                                                    "type": "integer"
+                                                  }
+                                                },
+                                                "required": [
+                                                  "start_line",
+                                                  "end_line"
+                                                ],
+                                                "type": "object"
+                                              },
+                                              "stable_identity": {
+                                                "description": "Stable packet identity.",
+                                                "maxLength": 240,
+                                                "minLength": 1,
+                                                "type": "string"
+                                              },
+                                              "symbol_id": {
+                                                "description": "Optional exact stable symbol id.",
+                                                "maxLength": 240,
+                                                "minLength": 1,
+                                                "type": "string"
+                                              }
+                                            },
+                                            "required": [
+                                              "stable_identity",
+                                              "reason"
+                                            ],
+                                            "type": "object"
+                                          }
+                                        },
+                                        "required": [
+                                          "kind",
+                                          "contract_version",
+                                          "project_id",
+                                          "core_generation_id",
+                                          "selector"
+                                        ],
+                                        "type": "object"
+                                      },
+                                      "maxItems": 1,
+                                      "type": "array"
+                                    },
+                                    "retrieval_generation": {
+                                      "anyOf": [
+                                        {
+                                          "maxLength": 256,
+                                          "minLength": 1,
+                                          "type": "string"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
+                                    }
+                                  },
+                                  "required": [
+                                    "probes",
+                                    "parent_packet_id",
+                                    "option_ids",
+                                    "core_generation_id",
+                                    "retrieval_generation"
+                                  ],
+                                  "type": "object"
+                                },
                                 "path": {
                                   "anyOf": [
                                     {
@@ -4582,6 +5013,73 @@
                                       "type": "null"
                                     }
                                   ]
+                                },
+                                "source_delivery": {
+                                  "additionalProperties": false,
+                                  "description": "Verified source delivery and unread byte receipt.",
+                                  "properties": {
+                                    "blocked_line_rendered_bytes": {
+                                      "description": "Required rendered bytes for an overlong line.",
+                                      "maximum": 18446744073709552000,
+                                      "minimum": 1,
+                                      "type": [
+                                        "integer",
+                                        "null"
+                                      ]
+                                    },
+                                    "next_start_line": {
+                                      "description": "Next complete line, when recoverable.",
+                                      "maximum": 4294967295,
+                                      "minimum": 1,
+                                      "type": [
+                                        "integer",
+                                        "null"
+                                      ]
+                                    },
+                                    "remaining_source_bytes": {
+                                      "description": "Raw bytes not delivered.",
+                                      "maximum": 18446744073709552000,
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "requested_range": {
+                                      "additionalProperties": false,
+                                      "description": "Requested inclusive source range.",
+                                      "properties": {
+                                        "end_line": {
+                                          "description": "Last requested line.",
+                                          "maximum": 4294967295,
+                                          "minimum": 1,
+                                          "type": "integer"
+                                        },
+                                        "start_line": {
+                                          "description": "First requested line.",
+                                          "maximum": 4294967295,
+                                          "minimum": 1,
+                                          "type": "integer"
+                                        }
+                                      },
+                                      "required": [
+                                        "start_line",
+                                        "end_line"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "source_sha256": {
+                                      "description": "Verified indexed source digest.",
+                                      "maxLength": 64,
+                                      "minLength": 64,
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "requested_range",
+                                    "source_sha256",
+                                    "remaining_source_bytes",
+                                    "next_start_line",
+                                    "blocked_line_rendered_bytes"
+                                  ],
+                                  "type": "object"
                                 },
                                 "start_line": {
                                   "anyOf": [
@@ -5326,6 +5824,172 @@
                                 "maxItems": 256,
                                 "type": "array"
                               },
+                              "packet_request_patch": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "core_generation_id": {
+                                    "maxLength": 256,
+                                    "minLength": 1,
+                                    "type": "string"
+                                  },
+                                  "option_ids": {
+                                    "items": {
+                                      "maxLength": 256,
+                                      "minLength": 1,
+                                      "type": "string"
+                                    },
+                                    "maxItems": 8,
+                                    "type": "array"
+                                  },
+                                  "parent_packet_id": {
+                                    "anyOf": [
+                                      {
+                                        "maxLength": 256,
+                                        "minLength": 1,
+                                        "type": "string"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  },
+                                  "probes": {
+                                    "items": {
+                                      "additionalProperties": false,
+                                      "description": "Project- and generation-bound continuation probe.",
+                                      "properties": {
+                                        "contract_version": {
+                                          "description": "Continuation probe contract version.",
+                                          "maximum": 1,
+                                          "minimum": 1,
+                                          "type": "integer"
+                                        },
+                                        "core_generation_id": {
+                                          "description": "Continuation core evidence generation.",
+                                          "maxLength": 240,
+                                          "minLength": 1,
+                                          "type": "string"
+                                        },
+                                        "kind": {
+                                          "description": "Probe kind.",
+                                          "enum": [
+                                            "continuation"
+                                          ],
+                                          "type": "string"
+                                        },
+                                        "project_id": {
+                                          "description": "Continuation project identity.",
+                                          "maxLength": 240,
+                                          "minLength": 1,
+                                          "type": "string"
+                                        },
+                                        "retrieval_generation": {
+                                          "description": "Optional continuation retrieval generation.",
+                                          "maxLength": 240,
+                                          "minLength": 1,
+                                          "type": [
+                                            "string",
+                                            "null"
+                                          ]
+                                        },
+                                        "selector": {
+                                          "additionalProperties": false,
+                                          "description": "Stable typed continuation selector.",
+                                          "properties": {
+                                            "path": {
+                                              "description": "Optional exact project-relative path.",
+                                              "maxLength": 240,
+                                              "minLength": 1,
+                                              "type": "string"
+                                            },
+                                            "reason": {
+                                              "description": "Typed uncovered structural reason.",
+                                              "enum": [
+                                                "candidate_count_exceeded",
+                                                "source_budget_exceeded",
+                                                "source_unavailable",
+                                                "ambiguous_selector",
+                                                "disconnected_seed"
+                                              ],
+                                              "type": "string"
+                                            },
+                                            "source_range": {
+                                              "additionalProperties": false,
+                                              "description": "Optional pinned complete-line source request.",
+                                              "properties": {
+                                                "end_line": {
+                                                  "description": "Last requested line.",
+                                                  "maximum": 4294967295,
+                                                  "minimum": 1,
+                                                  "type": "integer"
+                                                },
+                                                "start_line": {
+                                                  "description": "First requested line.",
+                                                  "maximum": 4294967295,
+                                                  "minimum": 1,
+                                                  "type": "integer"
+                                                }
+                                              },
+                                              "required": [
+                                                "start_line",
+                                                "end_line"
+                                              ],
+                                              "type": "object"
+                                            },
+                                            "stable_identity": {
+                                              "description": "Stable packet identity.",
+                                              "maxLength": 240,
+                                              "minLength": 1,
+                                              "type": "string"
+                                            },
+                                            "symbol_id": {
+                                              "description": "Optional exact stable symbol id.",
+                                              "maxLength": 240,
+                                              "minLength": 1,
+                                              "type": "string"
+                                            }
+                                          },
+                                          "required": [
+                                            "stable_identity",
+                                            "reason"
+                                          ],
+                                          "type": "object"
+                                        }
+                                      },
+                                      "required": [
+                                        "kind",
+                                        "contract_version",
+                                        "project_id",
+                                        "core_generation_id",
+                                        "selector"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "maxItems": 1,
+                                    "type": "array"
+                                  },
+                                  "retrieval_generation": {
+                                    "anyOf": [
+                                      {
+                                        "maxLength": 256,
+                                        "minLength": 1,
+                                        "type": "string"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  }
+                                },
+                                "required": [
+                                  "probes",
+                                  "parent_packet_id",
+                                  "option_ids",
+                                  "core_generation_id",
+                                  "retrieval_generation"
+                                ],
+                                "type": "object"
+                              },
                               "remaining_rounds": {
                                 "maximum": 65535,
                                 "minimum": 1,
@@ -5416,6 +6080,17 @@
                         "items": {
                           "additionalProperties": false,
                           "properties": {
+                            "display_name": {
+                              "anyOf": [
+                                {
+                                  "maxLength": 1024,
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            },
                             "end_line": {
                               "anyOf": [
                                 {
@@ -5478,6 +6153,7 @@
                             "identity",
                             "path",
                             "symbol_id",
+                            "display_name",
                             "start_line",
                             "end_line",
                             "excerpt"
@@ -12656,13 +13332,19 @@
                     "minimum": 0,
                     "type": "integer"
                   },
+                  "max_tool_result_bytes": {
+                    "description": "Optional path-read allowance for UTF-8 serialized served MCP tool result, including revision text/structured mirroring and publication metadata. Excludes JSON-RPC and host framing; does not bound an investigation. Whole-line receipts may be partial; a receipt that cannot fit refuses.",
+                    "maximum": 524288,
+                    "minimum": 256,
+                    "type": "integer"
+                  },
                   "path": {
                     "description": "Single-file alias for `paths`: repository-relative path as returned in `file_path`. Combine with `line`.",
                     "minLength": 1,
                     "type": "string"
                   },
                   "paths": {
-                    "description": "File ranges to read in one call, instead of resolving a symbol. Line-numbered and bounded in total; use the paths and lines that search, trail, or packet already returned.",
+                    "description": "File ranges to read in one call, instead of resolving a symbol. Line-numbered and bounded in total; use exact paths from files, search, trail, or packet; filenames are paths, not symbol IDs.",
                     "items": {
                       "allOf": [
                         {
@@ -12844,6 +13526,10 @@
                         "description": "Typed stdio retry or unavailable code.",
                         "type": "string"
                       },
+                      "complete": {
+                        "description": "Every requested window was delivered through its end or EOF.",
+                        "type": "boolean"
+                      },
                       "deadline_exceeded": {
                         "description": "Whether the request wait deadline expired.",
                         "type": "boolean"
@@ -12867,6 +13553,10 @@
                         "description": "One-based focused line.",
                         "type": "integer"
                       },
+                      "max_response_bytes": {
+                        "description": "Serialized structured result byte bound, including metadata.",
+                        "type": "integer"
+                      },
                       "max_snippet_bytes": {
                         "description": "Snippet byte cap.",
                         "type": [
@@ -12875,7 +13565,7 @@
                         ]
                       },
                       "max_total_bytes": {
-                        "description": "Total byte cap for a batched paths call.",
+                        "description": "Shared rendered-snippet byte cap for a batched paths call; metadata has a separate response bound.",
                         "type": "integer"
                       },
                       "message": {
@@ -12889,6 +13579,10 @@
                       "node": {
                         "description": "Node details DTO.",
                         "type": "object"
+                      },
+                      "omitted_count": {
+                        "description": "Number of windows with omitted source lines.",
+                        "type": "integer"
                       },
                       "operation": {
                         "description": "Current managed preparation operation.",
@@ -12909,11 +13603,55 @@
                         "description": "Requested source ranges from a batched paths call.",
                         "items": {
                           "additionalProperties": false,
-                          "description": "One requested source range from a batched snippet.paths call.",
+                          "description": "One requested window and its actual source delivery receipt from snippet.paths.",
                           "properties": {
+                            "complete": {
+                              "description": "Requested window complete, including natural EOF clipping; not complete-file coverage.",
+                              "type": "boolean"
+                            },
+                            "delivered_end_line": {
+                              "description": "Actual last delivered physical line, or null.",
+                              "type": [
+                                "integer",
+                                "null"
+                              ]
+                            },
+                            "delivered_start_line": {
+                              "description": "Actual first delivered physical line, or null.",
+                              "type": [
+                                "integer",
+                                "null"
+                              ]
+                            },
                             "end_line": {
                               "description": "1-based last line.",
                               "type": "integer"
+                            },
+                            "last_line_terminated": {
+                              "description": "Whether the last delivered source line ended in LF.",
+                              "type": [
+                                "boolean",
+                                "null"
+                              ]
+                            },
+                            "next_start_line": {
+                              "description": "First omitted line; retry this line or use a larger ordinary file read for an oversized line.",
+                              "type": [
+                                "integer",
+                                "null"
+                              ]
+                            },
+                            "omission_reason": {
+                              "description": "Why complete source lines were omitted.",
+                              "enum": [
+                                "byte_budget",
+                                "line_exceeds_byte_budget",
+                                null
+                              ],
+                              "type": [
+                                "string",
+                                "null"
+                              ]
                             },
                             "path": {
                               "description": "Project-relative file path.",
@@ -12926,6 +13664,27 @@
                             "snippet_truncated": {
                               "description": "Whether this range hit a byte cap.",
                               "type": "boolean"
+                            },
+                            "source_kind": {
+                              "description": "Source provenance.",
+                              "enum": [
+                                "workspace_read"
+                              ],
+                              "type": "string"
+                            },
+                            "source_range_sha256": {
+                              "description": "Digest of delivered raw source bytes, not an indexed file digest.",
+                              "type": [
+                                "string",
+                                "null"
+                              ]
+                            },
+                            "source_total_lines": {
+                              "description": "File line count only when the read observed EOF.",
+                              "type": [
+                                "integer",
+                                "null"
+                              ]
                             },
                             "start_line": {
                               "description": "1-based first line.",
@@ -12980,6 +13739,10 @@
                       },
                       "requested_context": {
                         "description": "Requested context line count.",
+                        "type": "integer"
+                      },
+                      "requested_count": {
+                        "description": "Number of requested ranges; all receive receipts.",
                         "type": "integer"
                       },
                       "resume_operation_attempt": {
@@ -13280,6 +14043,172 @@
                                 },
                                 "maxItems": 256,
                                 "type": "array"
+                              },
+                              "packet_request_patch": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "core_generation_id": {
+                                    "maxLength": 256,
+                                    "minLength": 1,
+                                    "type": "string"
+                                  },
+                                  "option_ids": {
+                                    "items": {
+                                      "maxLength": 256,
+                                      "minLength": 1,
+                                      "type": "string"
+                                    },
+                                    "maxItems": 8,
+                                    "type": "array"
+                                  },
+                                  "parent_packet_id": {
+                                    "anyOf": [
+                                      {
+                                        "maxLength": 256,
+                                        "minLength": 1,
+                                        "type": "string"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  },
+                                  "probes": {
+                                    "items": {
+                                      "additionalProperties": false,
+                                      "description": "Project- and generation-bound continuation probe.",
+                                      "properties": {
+                                        "contract_version": {
+                                          "description": "Continuation probe contract version.",
+                                          "maximum": 1,
+                                          "minimum": 1,
+                                          "type": "integer"
+                                        },
+                                        "core_generation_id": {
+                                          "description": "Continuation core evidence generation.",
+                                          "maxLength": 240,
+                                          "minLength": 1,
+                                          "type": "string"
+                                        },
+                                        "kind": {
+                                          "description": "Probe kind.",
+                                          "enum": [
+                                            "continuation"
+                                          ],
+                                          "type": "string"
+                                        },
+                                        "project_id": {
+                                          "description": "Continuation project identity.",
+                                          "maxLength": 240,
+                                          "minLength": 1,
+                                          "type": "string"
+                                        },
+                                        "retrieval_generation": {
+                                          "description": "Optional continuation retrieval generation.",
+                                          "maxLength": 240,
+                                          "minLength": 1,
+                                          "type": [
+                                            "string",
+                                            "null"
+                                          ]
+                                        },
+                                        "selector": {
+                                          "additionalProperties": false,
+                                          "description": "Stable typed continuation selector.",
+                                          "properties": {
+                                            "path": {
+                                              "description": "Optional exact project-relative path.",
+                                              "maxLength": 240,
+                                              "minLength": 1,
+                                              "type": "string"
+                                            },
+                                            "reason": {
+                                              "description": "Typed uncovered structural reason.",
+                                              "enum": [
+                                                "candidate_count_exceeded",
+                                                "source_budget_exceeded",
+                                                "source_unavailable",
+                                                "ambiguous_selector",
+                                                "disconnected_seed"
+                                              ],
+                                              "type": "string"
+                                            },
+                                            "source_range": {
+                                              "additionalProperties": false,
+                                              "description": "Optional pinned complete-line source request.",
+                                              "properties": {
+                                                "end_line": {
+                                                  "description": "Last requested line.",
+                                                  "maximum": 4294967295,
+                                                  "minimum": 1,
+                                                  "type": "integer"
+                                                },
+                                                "start_line": {
+                                                  "description": "First requested line.",
+                                                  "maximum": 4294967295,
+                                                  "minimum": 1,
+                                                  "type": "integer"
+                                                }
+                                              },
+                                              "required": [
+                                                "start_line",
+                                                "end_line"
+                                              ],
+                                              "type": "object"
+                                            },
+                                            "stable_identity": {
+                                              "description": "Stable packet identity.",
+                                              "maxLength": 240,
+                                              "minLength": 1,
+                                              "type": "string"
+                                            },
+                                            "symbol_id": {
+                                              "description": "Optional exact stable symbol id.",
+                                              "maxLength": 240,
+                                              "minLength": 1,
+                                              "type": "string"
+                                            }
+                                          },
+                                          "required": [
+                                            "stable_identity",
+                                            "reason"
+                                          ],
+                                          "type": "object"
+                                        }
+                                      },
+                                      "required": [
+                                        "kind",
+                                        "contract_version",
+                                        "project_id",
+                                        "core_generation_id",
+                                        "selector"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "maxItems": 1,
+                                    "type": "array"
+                                  },
+                                  "retrieval_generation": {
+                                    "anyOf": [
+                                      {
+                                        "maxLength": 256,
+                                        "minLength": 1,
+                                        "type": "string"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  }
+                                },
+                                "required": [
+                                  "probes",
+                                  "parent_packet_id",
+                                  "option_ids",
+                                  "core_generation_id",
+                                  "retrieval_generation"
+                                ],
+                                "type": "object"
                               },
                               "remaining_rounds": {
                                 "maximum": 65535,
@@ -13782,7 +14711,7 @@
         {
           "mimeType": "application/json",
           "name": "Root symbols",
-          "uriTemplate": "codestory://symbols/root{?project}"
+          "uriTemplate": "codestory://symbols/root{?project,limit,cursor}"
         },
         {
           "mimeType": "application/json",
@@ -13821,7 +14750,7 @@
       ]
     },
     "2025-11-25": {
-      "discoveryContractSha256": "f9c390db818c3060628163beac29ff52ffd8dac44a123cb9bd0acc6771d3dfa3",
+      "discoveryContractSha256": "18ce81099cb0cd0f03dd4050af9a45bbc195fdc4fd7002d7b8721cddb9582cbd",
       "tools": [
         {
           "_meta": {
@@ -14099,12 +15028,15 @@
                   "type": "string"
                 },
                 "maxItems": 8,
-                "minItems": 1,
+                "minItems": 0,
                 "type": "array"
               },
               "parent_packet_id": {
                 "description": "Parent packet id for a generation-bound continuation; repeat the original question unchanged.",
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "probes": {
                 "description": "Optional tagged exact-path, symbol-id, qualified-symbol, file-symbol, free-query, or generation-bound continuation probes.",
@@ -14296,6 +15228,29 @@
                               ],
                               "type": "string"
                             },
+                            "source_range": {
+                              "additionalProperties": false,
+                              "description": "Optional pinned complete-line source request.",
+                              "properties": {
+                                "end_line": {
+                                  "description": "Last requested line.",
+                                  "maximum": 4294967295,
+                                  "minimum": 1,
+                                  "type": "integer"
+                                },
+                                "start_line": {
+                                  "description": "First requested line.",
+                                  "maximum": 4294967295,
+                                  "minimum": 1,
+                                  "type": "integer"
+                                }
+                              },
+                              "required": [
+                                "start_line",
+                                "end_line"
+                              ],
+                              "type": "object"
+                            },
                             "stable_identity": {
                               "description": "Stable packet identity.",
                               "maxLength": 240,
@@ -14328,7 +15283,7 @@
                   ]
                 },
                 "maxItems": 16,
-                "minItems": 1,
+                "minItems": 0,
                 "type": "array"
               },
               "project": {
@@ -14352,7 +15307,10 @@
               },
               "retrieval_generation": {
                 "description": "Pinned retrieval generation for a continuation.",
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               }
             },
             "required": [
@@ -14400,6 +15358,172 @@
                                     },
                                     "maxItems": 256,
                                     "type": "array"
+                                  },
+                                  "packet_request_patch": {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "core_generation_id": {
+                                        "maxLength": 256,
+                                        "minLength": 1,
+                                        "type": "string"
+                                      },
+                                      "option_ids": {
+                                        "items": {
+                                          "maxLength": 256,
+                                          "minLength": 1,
+                                          "type": "string"
+                                        },
+                                        "maxItems": 8,
+                                        "type": "array"
+                                      },
+                                      "parent_packet_id": {
+                                        "anyOf": [
+                                          {
+                                            "maxLength": 256,
+                                            "minLength": 1,
+                                            "type": "string"
+                                          },
+                                          {
+                                            "type": "null"
+                                          }
+                                        ]
+                                      },
+                                      "probes": {
+                                        "items": {
+                                          "additionalProperties": false,
+                                          "description": "Project- and generation-bound continuation probe.",
+                                          "properties": {
+                                            "contract_version": {
+                                              "description": "Continuation probe contract version.",
+                                              "maximum": 1,
+                                              "minimum": 1,
+                                              "type": "integer"
+                                            },
+                                            "core_generation_id": {
+                                              "description": "Continuation core evidence generation.",
+                                              "maxLength": 240,
+                                              "minLength": 1,
+                                              "type": "string"
+                                            },
+                                            "kind": {
+                                              "description": "Probe kind.",
+                                              "enum": [
+                                                "continuation"
+                                              ],
+                                              "type": "string"
+                                            },
+                                            "project_id": {
+                                              "description": "Continuation project identity.",
+                                              "maxLength": 240,
+                                              "minLength": 1,
+                                              "type": "string"
+                                            },
+                                            "retrieval_generation": {
+                                              "description": "Optional continuation retrieval generation.",
+                                              "maxLength": 240,
+                                              "minLength": 1,
+                                              "type": [
+                                                "string",
+                                                "null"
+                                              ]
+                                            },
+                                            "selector": {
+                                              "additionalProperties": false,
+                                              "description": "Stable typed continuation selector.",
+                                              "properties": {
+                                                "path": {
+                                                  "description": "Optional exact project-relative path.",
+                                                  "maxLength": 240,
+                                                  "minLength": 1,
+                                                  "type": "string"
+                                                },
+                                                "reason": {
+                                                  "description": "Typed uncovered structural reason.",
+                                                  "enum": [
+                                                    "candidate_count_exceeded",
+                                                    "source_budget_exceeded",
+                                                    "source_unavailable",
+                                                    "ambiguous_selector",
+                                                    "disconnected_seed"
+                                                  ],
+                                                  "type": "string"
+                                                },
+                                                "source_range": {
+                                                  "additionalProperties": false,
+                                                  "description": "Optional pinned complete-line source request.",
+                                                  "properties": {
+                                                    "end_line": {
+                                                      "description": "Last requested line.",
+                                                      "maximum": 4294967295,
+                                                      "minimum": 1,
+                                                      "type": "integer"
+                                                    },
+                                                    "start_line": {
+                                                      "description": "First requested line.",
+                                                      "maximum": 4294967295,
+                                                      "minimum": 1,
+                                                      "type": "integer"
+                                                    }
+                                                  },
+                                                  "required": [
+                                                    "start_line",
+                                                    "end_line"
+                                                  ],
+                                                  "type": "object"
+                                                },
+                                                "stable_identity": {
+                                                  "description": "Stable packet identity.",
+                                                  "maxLength": 240,
+                                                  "minLength": 1,
+                                                  "type": "string"
+                                                },
+                                                "symbol_id": {
+                                                  "description": "Optional exact stable symbol id.",
+                                                  "maxLength": 240,
+                                                  "minLength": 1,
+                                                  "type": "string"
+                                                }
+                                              },
+                                              "required": [
+                                                "stable_identity",
+                                                "reason"
+                                              ],
+                                              "type": "object"
+                                            }
+                                          },
+                                          "required": [
+                                            "kind",
+                                            "contract_version",
+                                            "project_id",
+                                            "core_generation_id",
+                                            "selector"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        "maxItems": 1,
+                                        "type": "array"
+                                      },
+                                      "retrieval_generation": {
+                                        "anyOf": [
+                                          {
+                                            "maxLength": 256,
+                                            "minLength": 1,
+                                            "type": "string"
+                                          },
+                                          {
+                                            "type": "null"
+                                          }
+                                        ]
+                                      }
+                                    },
+                                    "required": [
+                                      "probes",
+                                      "parent_packet_id",
+                                      "option_ids",
+                                      "core_generation_id",
+                                      "retrieval_generation"
+                                    ],
+                                    "type": "object"
                                   },
                                   "remaining_rounds": {
                                     "maximum": 65535,
@@ -14524,6 +15648,172 @@
                                   ],
                                   "type": "string"
                                 },
+                                "packet_request_patch": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "core_generation_id": {
+                                      "maxLength": 256,
+                                      "minLength": 1,
+                                      "type": "string"
+                                    },
+                                    "option_ids": {
+                                      "items": {
+                                        "maxLength": 256,
+                                        "minLength": 1,
+                                        "type": "string"
+                                      },
+                                      "maxItems": 8,
+                                      "type": "array"
+                                    },
+                                    "parent_packet_id": {
+                                      "anyOf": [
+                                        {
+                                          "maxLength": 256,
+                                          "minLength": 1,
+                                          "type": "string"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
+                                    },
+                                    "probes": {
+                                      "items": {
+                                        "additionalProperties": false,
+                                        "description": "Project- and generation-bound continuation probe.",
+                                        "properties": {
+                                          "contract_version": {
+                                            "description": "Continuation probe contract version.",
+                                            "maximum": 1,
+                                            "minimum": 1,
+                                            "type": "integer"
+                                          },
+                                          "core_generation_id": {
+                                            "description": "Continuation core evidence generation.",
+                                            "maxLength": 240,
+                                            "minLength": 1,
+                                            "type": "string"
+                                          },
+                                          "kind": {
+                                            "description": "Probe kind.",
+                                            "enum": [
+                                              "continuation"
+                                            ],
+                                            "type": "string"
+                                          },
+                                          "project_id": {
+                                            "description": "Continuation project identity.",
+                                            "maxLength": 240,
+                                            "minLength": 1,
+                                            "type": "string"
+                                          },
+                                          "retrieval_generation": {
+                                            "description": "Optional continuation retrieval generation.",
+                                            "maxLength": 240,
+                                            "minLength": 1,
+                                            "type": [
+                                              "string",
+                                              "null"
+                                            ]
+                                          },
+                                          "selector": {
+                                            "additionalProperties": false,
+                                            "description": "Stable typed continuation selector.",
+                                            "properties": {
+                                              "path": {
+                                                "description": "Optional exact project-relative path.",
+                                                "maxLength": 240,
+                                                "minLength": 1,
+                                                "type": "string"
+                                              },
+                                              "reason": {
+                                                "description": "Typed uncovered structural reason.",
+                                                "enum": [
+                                                  "candidate_count_exceeded",
+                                                  "source_budget_exceeded",
+                                                  "source_unavailable",
+                                                  "ambiguous_selector",
+                                                  "disconnected_seed"
+                                                ],
+                                                "type": "string"
+                                              },
+                                              "source_range": {
+                                                "additionalProperties": false,
+                                                "description": "Optional pinned complete-line source request.",
+                                                "properties": {
+                                                  "end_line": {
+                                                    "description": "Last requested line.",
+                                                    "maximum": 4294967295,
+                                                    "minimum": 1,
+                                                    "type": "integer"
+                                                  },
+                                                  "start_line": {
+                                                    "description": "First requested line.",
+                                                    "maximum": 4294967295,
+                                                    "minimum": 1,
+                                                    "type": "integer"
+                                                  }
+                                                },
+                                                "required": [
+                                                  "start_line",
+                                                  "end_line"
+                                                ],
+                                                "type": "object"
+                                              },
+                                              "stable_identity": {
+                                                "description": "Stable packet identity.",
+                                                "maxLength": 240,
+                                                "minLength": 1,
+                                                "type": "string"
+                                              },
+                                              "symbol_id": {
+                                                "description": "Optional exact stable symbol id.",
+                                                "maxLength": 240,
+                                                "minLength": 1,
+                                                "type": "string"
+                                              }
+                                            },
+                                            "required": [
+                                              "stable_identity",
+                                              "reason"
+                                            ],
+                                            "type": "object"
+                                          }
+                                        },
+                                        "required": [
+                                          "kind",
+                                          "contract_version",
+                                          "project_id",
+                                          "core_generation_id",
+                                          "selector"
+                                        ],
+                                        "type": "object"
+                                      },
+                                      "maxItems": 1,
+                                      "type": "array"
+                                    },
+                                    "retrieval_generation": {
+                                      "anyOf": [
+                                        {
+                                          "maxLength": 256,
+                                          "minLength": 1,
+                                          "type": "string"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
+                                    }
+                                  },
+                                  "required": [
+                                    "probes",
+                                    "parent_packet_id",
+                                    "option_ids",
+                                    "core_generation_id",
+                                    "retrieval_generation"
+                                  ],
+                                  "type": "object"
+                                },
                                 "path": {
                                   "anyOf": [
                                     {
@@ -14533,6 +15823,73 @@
                                       "type": "null"
                                     }
                                   ]
+                                },
+                                "source_delivery": {
+                                  "additionalProperties": false,
+                                  "description": "Verified source delivery and unread byte receipt.",
+                                  "properties": {
+                                    "blocked_line_rendered_bytes": {
+                                      "description": "Required rendered bytes for an overlong line.",
+                                      "maximum": 18446744073709552000,
+                                      "minimum": 1,
+                                      "type": [
+                                        "integer",
+                                        "null"
+                                      ]
+                                    },
+                                    "next_start_line": {
+                                      "description": "Next complete line, when recoverable.",
+                                      "maximum": 4294967295,
+                                      "minimum": 1,
+                                      "type": [
+                                        "integer",
+                                        "null"
+                                      ]
+                                    },
+                                    "remaining_source_bytes": {
+                                      "description": "Raw bytes not delivered.",
+                                      "maximum": 18446744073709552000,
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "requested_range": {
+                                      "additionalProperties": false,
+                                      "description": "Requested inclusive source range.",
+                                      "properties": {
+                                        "end_line": {
+                                          "description": "Last requested line.",
+                                          "maximum": 4294967295,
+                                          "minimum": 1,
+                                          "type": "integer"
+                                        },
+                                        "start_line": {
+                                          "description": "First requested line.",
+                                          "maximum": 4294967295,
+                                          "minimum": 1,
+                                          "type": "integer"
+                                        }
+                                      },
+                                      "required": [
+                                        "start_line",
+                                        "end_line"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "source_sha256": {
+                                      "description": "Verified indexed source digest.",
+                                      "maxLength": 64,
+                                      "minLength": 64,
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "requested_range",
+                                    "source_sha256",
+                                    "remaining_source_bytes",
+                                    "next_start_line",
+                                    "blocked_line_rendered_bytes"
+                                  ],
+                                  "type": "object"
                                 },
                                 "start_line": {
                                   "anyOf": [
@@ -15277,6 +16634,172 @@
                                 "maxItems": 256,
                                 "type": "array"
                               },
+                              "packet_request_patch": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "core_generation_id": {
+                                    "maxLength": 256,
+                                    "minLength": 1,
+                                    "type": "string"
+                                  },
+                                  "option_ids": {
+                                    "items": {
+                                      "maxLength": 256,
+                                      "minLength": 1,
+                                      "type": "string"
+                                    },
+                                    "maxItems": 8,
+                                    "type": "array"
+                                  },
+                                  "parent_packet_id": {
+                                    "anyOf": [
+                                      {
+                                        "maxLength": 256,
+                                        "minLength": 1,
+                                        "type": "string"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  },
+                                  "probes": {
+                                    "items": {
+                                      "additionalProperties": false,
+                                      "description": "Project- and generation-bound continuation probe.",
+                                      "properties": {
+                                        "contract_version": {
+                                          "description": "Continuation probe contract version.",
+                                          "maximum": 1,
+                                          "minimum": 1,
+                                          "type": "integer"
+                                        },
+                                        "core_generation_id": {
+                                          "description": "Continuation core evidence generation.",
+                                          "maxLength": 240,
+                                          "minLength": 1,
+                                          "type": "string"
+                                        },
+                                        "kind": {
+                                          "description": "Probe kind.",
+                                          "enum": [
+                                            "continuation"
+                                          ],
+                                          "type": "string"
+                                        },
+                                        "project_id": {
+                                          "description": "Continuation project identity.",
+                                          "maxLength": 240,
+                                          "minLength": 1,
+                                          "type": "string"
+                                        },
+                                        "retrieval_generation": {
+                                          "description": "Optional continuation retrieval generation.",
+                                          "maxLength": 240,
+                                          "minLength": 1,
+                                          "type": [
+                                            "string",
+                                            "null"
+                                          ]
+                                        },
+                                        "selector": {
+                                          "additionalProperties": false,
+                                          "description": "Stable typed continuation selector.",
+                                          "properties": {
+                                            "path": {
+                                              "description": "Optional exact project-relative path.",
+                                              "maxLength": 240,
+                                              "minLength": 1,
+                                              "type": "string"
+                                            },
+                                            "reason": {
+                                              "description": "Typed uncovered structural reason.",
+                                              "enum": [
+                                                "candidate_count_exceeded",
+                                                "source_budget_exceeded",
+                                                "source_unavailable",
+                                                "ambiguous_selector",
+                                                "disconnected_seed"
+                                              ],
+                                              "type": "string"
+                                            },
+                                            "source_range": {
+                                              "additionalProperties": false,
+                                              "description": "Optional pinned complete-line source request.",
+                                              "properties": {
+                                                "end_line": {
+                                                  "description": "Last requested line.",
+                                                  "maximum": 4294967295,
+                                                  "minimum": 1,
+                                                  "type": "integer"
+                                                },
+                                                "start_line": {
+                                                  "description": "First requested line.",
+                                                  "maximum": 4294967295,
+                                                  "minimum": 1,
+                                                  "type": "integer"
+                                                }
+                                              },
+                                              "required": [
+                                                "start_line",
+                                                "end_line"
+                                              ],
+                                              "type": "object"
+                                            },
+                                            "stable_identity": {
+                                              "description": "Stable packet identity.",
+                                              "maxLength": 240,
+                                              "minLength": 1,
+                                              "type": "string"
+                                            },
+                                            "symbol_id": {
+                                              "description": "Optional exact stable symbol id.",
+                                              "maxLength": 240,
+                                              "minLength": 1,
+                                              "type": "string"
+                                            }
+                                          },
+                                          "required": [
+                                            "stable_identity",
+                                            "reason"
+                                          ],
+                                          "type": "object"
+                                        }
+                                      },
+                                      "required": [
+                                        "kind",
+                                        "contract_version",
+                                        "project_id",
+                                        "core_generation_id",
+                                        "selector"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "maxItems": 1,
+                                    "type": "array"
+                                  },
+                                  "retrieval_generation": {
+                                    "anyOf": [
+                                      {
+                                        "maxLength": 256,
+                                        "minLength": 1,
+                                        "type": "string"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  }
+                                },
+                                "required": [
+                                  "probes",
+                                  "parent_packet_id",
+                                  "option_ids",
+                                  "core_generation_id",
+                                  "retrieval_generation"
+                                ],
+                                "type": "object"
+                              },
                               "remaining_rounds": {
                                 "maximum": 65535,
                                 "minimum": 1,
@@ -15367,6 +16890,17 @@
                         "items": {
                           "additionalProperties": false,
                           "properties": {
+                            "display_name": {
+                              "anyOf": [
+                                {
+                                  "maxLength": 1024,
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            },
                             "end_line": {
                               "anyOf": [
                                 {
@@ -15429,6 +16963,7 @@
                             "identity",
                             "path",
                             "symbol_id",
+                            "display_name",
                             "start_line",
                             "end_line",
                             "excerpt"
@@ -22607,13 +24142,19 @@
                     "minimum": 0,
                     "type": "integer"
                   },
+                  "max_tool_result_bytes": {
+                    "description": "Optional path-read allowance for UTF-8 serialized served MCP tool result, including revision text/structured mirroring and publication metadata. Excludes JSON-RPC and host framing; does not bound an investigation. Whole-line receipts may be partial; a receipt that cannot fit refuses.",
+                    "maximum": 524288,
+                    "minimum": 256,
+                    "type": "integer"
+                  },
                   "path": {
                     "description": "Single-file alias for `paths`: repository-relative path as returned in `file_path`. Combine with `line`.",
                     "minLength": 1,
                     "type": "string"
                   },
                   "paths": {
-                    "description": "File ranges to read in one call, instead of resolving a symbol. Line-numbered and bounded in total; use the paths and lines that search, trail, or packet already returned.",
+                    "description": "File ranges to read in one call, instead of resolving a symbol. Line-numbered and bounded in total; use exact paths from files, search, trail, or packet; filenames are paths, not symbol IDs.",
                     "items": {
                       "allOf": [
                         {
@@ -22795,6 +24336,10 @@
                         "description": "Typed stdio retry or unavailable code.",
                         "type": "string"
                       },
+                      "complete": {
+                        "description": "Every requested window was delivered through its end or EOF.",
+                        "type": "boolean"
+                      },
                       "deadline_exceeded": {
                         "description": "Whether the request wait deadline expired.",
                         "type": "boolean"
@@ -22818,6 +24363,10 @@
                         "description": "One-based focused line.",
                         "type": "integer"
                       },
+                      "max_response_bytes": {
+                        "description": "Serialized structured result byte bound, including metadata.",
+                        "type": "integer"
+                      },
                       "max_snippet_bytes": {
                         "description": "Snippet byte cap.",
                         "type": [
@@ -22826,7 +24375,7 @@
                         ]
                       },
                       "max_total_bytes": {
-                        "description": "Total byte cap for a batched paths call.",
+                        "description": "Shared rendered-snippet byte cap for a batched paths call; metadata has a separate response bound.",
                         "type": "integer"
                       },
                       "message": {
@@ -22840,6 +24389,10 @@
                       "node": {
                         "description": "Node details DTO.",
                         "type": "object"
+                      },
+                      "omitted_count": {
+                        "description": "Number of windows with omitted source lines.",
+                        "type": "integer"
                       },
                       "operation": {
                         "description": "Current managed preparation operation.",
@@ -22860,11 +24413,55 @@
                         "description": "Requested source ranges from a batched paths call.",
                         "items": {
                           "additionalProperties": false,
-                          "description": "One requested source range from a batched snippet.paths call.",
+                          "description": "One requested window and its actual source delivery receipt from snippet.paths.",
                           "properties": {
+                            "complete": {
+                              "description": "Requested window complete, including natural EOF clipping; not complete-file coverage.",
+                              "type": "boolean"
+                            },
+                            "delivered_end_line": {
+                              "description": "Actual last delivered physical line, or null.",
+                              "type": [
+                                "integer",
+                                "null"
+                              ]
+                            },
+                            "delivered_start_line": {
+                              "description": "Actual first delivered physical line, or null.",
+                              "type": [
+                                "integer",
+                                "null"
+                              ]
+                            },
                             "end_line": {
                               "description": "1-based last line.",
                               "type": "integer"
+                            },
+                            "last_line_terminated": {
+                              "description": "Whether the last delivered source line ended in LF.",
+                              "type": [
+                                "boolean",
+                                "null"
+                              ]
+                            },
+                            "next_start_line": {
+                              "description": "First omitted line; retry this line or use a larger ordinary file read for an oversized line.",
+                              "type": [
+                                "integer",
+                                "null"
+                              ]
+                            },
+                            "omission_reason": {
+                              "description": "Why complete source lines were omitted.",
+                              "enum": [
+                                "byte_budget",
+                                "line_exceeds_byte_budget",
+                                null
+                              ],
+                              "type": [
+                                "string",
+                                "null"
+                              ]
                             },
                             "path": {
                               "description": "Project-relative file path.",
@@ -22877,6 +24474,27 @@
                             "snippet_truncated": {
                               "description": "Whether this range hit a byte cap.",
                               "type": "boolean"
+                            },
+                            "source_kind": {
+                              "description": "Source provenance.",
+                              "enum": [
+                                "workspace_read"
+                              ],
+                              "type": "string"
+                            },
+                            "source_range_sha256": {
+                              "description": "Digest of delivered raw source bytes, not an indexed file digest.",
+                              "type": [
+                                "string",
+                                "null"
+                              ]
+                            },
+                            "source_total_lines": {
+                              "description": "File line count only when the read observed EOF.",
+                              "type": [
+                                "integer",
+                                "null"
+                              ]
                             },
                             "start_line": {
                               "description": "1-based first line.",
@@ -22931,6 +24549,10 @@
                       },
                       "requested_context": {
                         "description": "Requested context line count.",
+                        "type": "integer"
+                      },
+                      "requested_count": {
+                        "description": "Number of requested ranges; all receive receipts.",
                         "type": "integer"
                       },
                       "resume_operation_attempt": {
@@ -23231,6 +24853,172 @@
                                 },
                                 "maxItems": 256,
                                 "type": "array"
+                              },
+                              "packet_request_patch": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "core_generation_id": {
+                                    "maxLength": 256,
+                                    "minLength": 1,
+                                    "type": "string"
+                                  },
+                                  "option_ids": {
+                                    "items": {
+                                      "maxLength": 256,
+                                      "minLength": 1,
+                                      "type": "string"
+                                    },
+                                    "maxItems": 8,
+                                    "type": "array"
+                                  },
+                                  "parent_packet_id": {
+                                    "anyOf": [
+                                      {
+                                        "maxLength": 256,
+                                        "minLength": 1,
+                                        "type": "string"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  },
+                                  "probes": {
+                                    "items": {
+                                      "additionalProperties": false,
+                                      "description": "Project- and generation-bound continuation probe.",
+                                      "properties": {
+                                        "contract_version": {
+                                          "description": "Continuation probe contract version.",
+                                          "maximum": 1,
+                                          "minimum": 1,
+                                          "type": "integer"
+                                        },
+                                        "core_generation_id": {
+                                          "description": "Continuation core evidence generation.",
+                                          "maxLength": 240,
+                                          "minLength": 1,
+                                          "type": "string"
+                                        },
+                                        "kind": {
+                                          "description": "Probe kind.",
+                                          "enum": [
+                                            "continuation"
+                                          ],
+                                          "type": "string"
+                                        },
+                                        "project_id": {
+                                          "description": "Continuation project identity.",
+                                          "maxLength": 240,
+                                          "minLength": 1,
+                                          "type": "string"
+                                        },
+                                        "retrieval_generation": {
+                                          "description": "Optional continuation retrieval generation.",
+                                          "maxLength": 240,
+                                          "minLength": 1,
+                                          "type": [
+                                            "string",
+                                            "null"
+                                          ]
+                                        },
+                                        "selector": {
+                                          "additionalProperties": false,
+                                          "description": "Stable typed continuation selector.",
+                                          "properties": {
+                                            "path": {
+                                              "description": "Optional exact project-relative path.",
+                                              "maxLength": 240,
+                                              "minLength": 1,
+                                              "type": "string"
+                                            },
+                                            "reason": {
+                                              "description": "Typed uncovered structural reason.",
+                                              "enum": [
+                                                "candidate_count_exceeded",
+                                                "source_budget_exceeded",
+                                                "source_unavailable",
+                                                "ambiguous_selector",
+                                                "disconnected_seed"
+                                              ],
+                                              "type": "string"
+                                            },
+                                            "source_range": {
+                                              "additionalProperties": false,
+                                              "description": "Optional pinned complete-line source request.",
+                                              "properties": {
+                                                "end_line": {
+                                                  "description": "Last requested line.",
+                                                  "maximum": 4294967295,
+                                                  "minimum": 1,
+                                                  "type": "integer"
+                                                },
+                                                "start_line": {
+                                                  "description": "First requested line.",
+                                                  "maximum": 4294967295,
+                                                  "minimum": 1,
+                                                  "type": "integer"
+                                                }
+                                              },
+                                              "required": [
+                                                "start_line",
+                                                "end_line"
+                                              ],
+                                              "type": "object"
+                                            },
+                                            "stable_identity": {
+                                              "description": "Stable packet identity.",
+                                              "maxLength": 240,
+                                              "minLength": 1,
+                                              "type": "string"
+                                            },
+                                            "symbol_id": {
+                                              "description": "Optional exact stable symbol id.",
+                                              "maxLength": 240,
+                                              "minLength": 1,
+                                              "type": "string"
+                                            }
+                                          },
+                                          "required": [
+                                            "stable_identity",
+                                            "reason"
+                                          ],
+                                          "type": "object"
+                                        }
+                                      },
+                                      "required": [
+                                        "kind",
+                                        "contract_version",
+                                        "project_id",
+                                        "core_generation_id",
+                                        "selector"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "maxItems": 1,
+                                    "type": "array"
+                                  },
+                                  "retrieval_generation": {
+                                    "anyOf": [
+                                      {
+                                        "maxLength": 256,
+                                        "minLength": 1,
+                                        "type": "string"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  }
+                                },
+                                "required": [
+                                  "probes",
+                                  "parent_packet_id",
+                                  "option_ids",
+                                  "core_generation_id",
+                                  "retrieval_generation"
+                                ],
+                                "type": "object"
                               },
                               "remaining_rounds": {
                                 "maximum": 65535,
@@ -23733,7 +25521,7 @@
         {
           "mimeType": "application/json",
           "name": "Root symbols",
-          "uriTemplate": "codestory://symbols/root{?project}"
+          "uriTemplate": "codestory://symbols/root{?project,limit,cursor}"
         },
         {
           "mimeType": "application/json",
@@ -24049,12 +25837,15 @@
               "type": "string"
             },
             "maxItems": 8,
-            "minItems": 1,
+            "minItems": 0,
             "type": "array"
           },
           "parent_packet_id": {
             "description": "Parent packet id for a generation-bound continuation; repeat the original question unchanged.",
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "probes": {
             "description": "Optional tagged exact-path, symbol-id, qualified-symbol, file-symbol, free-query, or generation-bound continuation probes.",
@@ -24246,6 +26037,29 @@
                           ],
                           "type": "string"
                         },
+                        "source_range": {
+                          "additionalProperties": false,
+                          "description": "Optional pinned complete-line source request.",
+                          "properties": {
+                            "end_line": {
+                              "description": "Last requested line.",
+                              "maximum": 4294967295,
+                              "minimum": 1,
+                              "type": "integer"
+                            },
+                            "start_line": {
+                              "description": "First requested line.",
+                              "maximum": 4294967295,
+                              "minimum": 1,
+                              "type": "integer"
+                            }
+                          },
+                          "required": [
+                            "start_line",
+                            "end_line"
+                          ],
+                          "type": "object"
+                        },
                         "stable_identity": {
                           "description": "Stable packet identity.",
                           "maxLength": 240,
@@ -24278,7 +26092,7 @@
               ]
             },
             "maxItems": 16,
-            "minItems": 1,
+            "minItems": 0,
             "type": "array"
           },
           "project": {
@@ -24302,7 +26116,10 @@
           },
           "retrieval_generation": {
             "description": "Pinned retrieval generation for a continuation.",
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -24350,6 +26167,172 @@
                                 },
                                 "maxItems": 256,
                                 "type": "array"
+                              },
+                              "packet_request_patch": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "core_generation_id": {
+                                    "maxLength": 256,
+                                    "minLength": 1,
+                                    "type": "string"
+                                  },
+                                  "option_ids": {
+                                    "items": {
+                                      "maxLength": 256,
+                                      "minLength": 1,
+                                      "type": "string"
+                                    },
+                                    "maxItems": 8,
+                                    "type": "array"
+                                  },
+                                  "parent_packet_id": {
+                                    "anyOf": [
+                                      {
+                                        "maxLength": 256,
+                                        "minLength": 1,
+                                        "type": "string"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  },
+                                  "probes": {
+                                    "items": {
+                                      "additionalProperties": false,
+                                      "description": "Project- and generation-bound continuation probe.",
+                                      "properties": {
+                                        "contract_version": {
+                                          "description": "Continuation probe contract version.",
+                                          "maximum": 1,
+                                          "minimum": 1,
+                                          "type": "integer"
+                                        },
+                                        "core_generation_id": {
+                                          "description": "Continuation core evidence generation.",
+                                          "maxLength": 240,
+                                          "minLength": 1,
+                                          "type": "string"
+                                        },
+                                        "kind": {
+                                          "description": "Probe kind.",
+                                          "enum": [
+                                            "continuation"
+                                          ],
+                                          "type": "string"
+                                        },
+                                        "project_id": {
+                                          "description": "Continuation project identity.",
+                                          "maxLength": 240,
+                                          "minLength": 1,
+                                          "type": "string"
+                                        },
+                                        "retrieval_generation": {
+                                          "description": "Optional continuation retrieval generation.",
+                                          "maxLength": 240,
+                                          "minLength": 1,
+                                          "type": [
+                                            "string",
+                                            "null"
+                                          ]
+                                        },
+                                        "selector": {
+                                          "additionalProperties": false,
+                                          "description": "Stable typed continuation selector.",
+                                          "properties": {
+                                            "path": {
+                                              "description": "Optional exact project-relative path.",
+                                              "maxLength": 240,
+                                              "minLength": 1,
+                                              "type": "string"
+                                            },
+                                            "reason": {
+                                              "description": "Typed uncovered structural reason.",
+                                              "enum": [
+                                                "candidate_count_exceeded",
+                                                "source_budget_exceeded",
+                                                "source_unavailable",
+                                                "ambiguous_selector",
+                                                "disconnected_seed"
+                                              ],
+                                              "type": "string"
+                                            },
+                                            "source_range": {
+                                              "additionalProperties": false,
+                                              "description": "Optional pinned complete-line source request.",
+                                              "properties": {
+                                                "end_line": {
+                                                  "description": "Last requested line.",
+                                                  "maximum": 4294967295,
+                                                  "minimum": 1,
+                                                  "type": "integer"
+                                                },
+                                                "start_line": {
+                                                  "description": "First requested line.",
+                                                  "maximum": 4294967295,
+                                                  "minimum": 1,
+                                                  "type": "integer"
+                                                }
+                                              },
+                                              "required": [
+                                                "start_line",
+                                                "end_line"
+                                              ],
+                                              "type": "object"
+                                            },
+                                            "stable_identity": {
+                                              "description": "Stable packet identity.",
+                                              "maxLength": 240,
+                                              "minLength": 1,
+                                              "type": "string"
+                                            },
+                                            "symbol_id": {
+                                              "description": "Optional exact stable symbol id.",
+                                              "maxLength": 240,
+                                              "minLength": 1,
+                                              "type": "string"
+                                            }
+                                          },
+                                          "required": [
+                                            "stable_identity",
+                                            "reason"
+                                          ],
+                                          "type": "object"
+                                        }
+                                      },
+                                      "required": [
+                                        "kind",
+                                        "contract_version",
+                                        "project_id",
+                                        "core_generation_id",
+                                        "selector"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "maxItems": 1,
+                                    "type": "array"
+                                  },
+                                  "retrieval_generation": {
+                                    "anyOf": [
+                                      {
+                                        "maxLength": 256,
+                                        "minLength": 1,
+                                        "type": "string"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  }
+                                },
+                                "required": [
+                                  "probes",
+                                  "parent_packet_id",
+                                  "option_ids",
+                                  "core_generation_id",
+                                  "retrieval_generation"
+                                ],
+                                "type": "object"
                               },
                               "remaining_rounds": {
                                 "maximum": 65535,
@@ -24474,6 +26457,172 @@
                               ],
                               "type": "string"
                             },
+                            "packet_request_patch": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "core_generation_id": {
+                                  "maxLength": 256,
+                                  "minLength": 1,
+                                  "type": "string"
+                                },
+                                "option_ids": {
+                                  "items": {
+                                    "maxLength": 256,
+                                    "minLength": 1,
+                                    "type": "string"
+                                  },
+                                  "maxItems": 8,
+                                  "type": "array"
+                                },
+                                "parent_packet_id": {
+                                  "anyOf": [
+                                    {
+                                      "maxLength": 256,
+                                      "minLength": 1,
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "probes": {
+                                  "items": {
+                                    "additionalProperties": false,
+                                    "description": "Project- and generation-bound continuation probe.",
+                                    "properties": {
+                                      "contract_version": {
+                                        "description": "Continuation probe contract version.",
+                                        "maximum": 1,
+                                        "minimum": 1,
+                                        "type": "integer"
+                                      },
+                                      "core_generation_id": {
+                                        "description": "Continuation core evidence generation.",
+                                        "maxLength": 240,
+                                        "minLength": 1,
+                                        "type": "string"
+                                      },
+                                      "kind": {
+                                        "description": "Probe kind.",
+                                        "enum": [
+                                          "continuation"
+                                        ],
+                                        "type": "string"
+                                      },
+                                      "project_id": {
+                                        "description": "Continuation project identity.",
+                                        "maxLength": 240,
+                                        "minLength": 1,
+                                        "type": "string"
+                                      },
+                                      "retrieval_generation": {
+                                        "description": "Optional continuation retrieval generation.",
+                                        "maxLength": 240,
+                                        "minLength": 1,
+                                        "type": [
+                                          "string",
+                                          "null"
+                                        ]
+                                      },
+                                      "selector": {
+                                        "additionalProperties": false,
+                                        "description": "Stable typed continuation selector.",
+                                        "properties": {
+                                          "path": {
+                                            "description": "Optional exact project-relative path.",
+                                            "maxLength": 240,
+                                            "minLength": 1,
+                                            "type": "string"
+                                          },
+                                          "reason": {
+                                            "description": "Typed uncovered structural reason.",
+                                            "enum": [
+                                              "candidate_count_exceeded",
+                                              "source_budget_exceeded",
+                                              "source_unavailable",
+                                              "ambiguous_selector",
+                                              "disconnected_seed"
+                                            ],
+                                            "type": "string"
+                                          },
+                                          "source_range": {
+                                            "additionalProperties": false,
+                                            "description": "Optional pinned complete-line source request.",
+                                            "properties": {
+                                              "end_line": {
+                                                "description": "Last requested line.",
+                                                "maximum": 4294967295,
+                                                "minimum": 1,
+                                                "type": "integer"
+                                              },
+                                              "start_line": {
+                                                "description": "First requested line.",
+                                                "maximum": 4294967295,
+                                                "minimum": 1,
+                                                "type": "integer"
+                                              }
+                                            },
+                                            "required": [
+                                              "start_line",
+                                              "end_line"
+                                            ],
+                                            "type": "object"
+                                          },
+                                          "stable_identity": {
+                                            "description": "Stable packet identity.",
+                                            "maxLength": 240,
+                                            "minLength": 1,
+                                            "type": "string"
+                                          },
+                                          "symbol_id": {
+                                            "description": "Optional exact stable symbol id.",
+                                            "maxLength": 240,
+                                            "minLength": 1,
+                                            "type": "string"
+                                          }
+                                        },
+                                        "required": [
+                                          "stable_identity",
+                                          "reason"
+                                        ],
+                                        "type": "object"
+                                      }
+                                    },
+                                    "required": [
+                                      "kind",
+                                      "contract_version",
+                                      "project_id",
+                                      "core_generation_id",
+                                      "selector"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  "maxItems": 1,
+                                  "type": "array"
+                                },
+                                "retrieval_generation": {
+                                  "anyOf": [
+                                    {
+                                      "maxLength": 256,
+                                      "minLength": 1,
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                }
+                              },
+                              "required": [
+                                "probes",
+                                "parent_packet_id",
+                                "option_ids",
+                                "core_generation_id",
+                                "retrieval_generation"
+                              ],
+                              "type": "object"
+                            },
                             "path": {
                               "anyOf": [
                                 {
@@ -24483,6 +26632,73 @@
                                   "type": "null"
                                 }
                               ]
+                            },
+                            "source_delivery": {
+                              "additionalProperties": false,
+                              "description": "Verified source delivery and unread byte receipt.",
+                              "properties": {
+                                "blocked_line_rendered_bytes": {
+                                  "description": "Required rendered bytes for an overlong line.",
+                                  "maximum": 18446744073709552000,
+                                  "minimum": 1,
+                                  "type": [
+                                    "integer",
+                                    "null"
+                                  ]
+                                },
+                                "next_start_line": {
+                                  "description": "Next complete line, when recoverable.",
+                                  "maximum": 4294967295,
+                                  "minimum": 1,
+                                  "type": [
+                                    "integer",
+                                    "null"
+                                  ]
+                                },
+                                "remaining_source_bytes": {
+                                  "description": "Raw bytes not delivered.",
+                                  "maximum": 18446744073709552000,
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "requested_range": {
+                                  "additionalProperties": false,
+                                  "description": "Requested inclusive source range.",
+                                  "properties": {
+                                    "end_line": {
+                                      "description": "Last requested line.",
+                                      "maximum": 4294967295,
+                                      "minimum": 1,
+                                      "type": "integer"
+                                    },
+                                    "start_line": {
+                                      "description": "First requested line.",
+                                      "maximum": 4294967295,
+                                      "minimum": 1,
+                                      "type": "integer"
+                                    }
+                                  },
+                                  "required": [
+                                    "start_line",
+                                    "end_line"
+                                  ],
+                                  "type": "object"
+                                },
+                                "source_sha256": {
+                                  "description": "Verified indexed source digest.",
+                                  "maxLength": 64,
+                                  "minLength": 64,
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "requested_range",
+                                "source_sha256",
+                                "remaining_source_bytes",
+                                "next_start_line",
+                                "blocked_line_rendered_bytes"
+                              ],
+                              "type": "object"
                             },
                             "start_line": {
                               "anyOf": [
@@ -25227,6 +27443,172 @@
                             "maxItems": 256,
                             "type": "array"
                           },
+                          "packet_request_patch": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "core_generation_id": {
+                                "maxLength": 256,
+                                "minLength": 1,
+                                "type": "string"
+                              },
+                              "option_ids": {
+                                "items": {
+                                  "maxLength": 256,
+                                  "minLength": 1,
+                                  "type": "string"
+                                },
+                                "maxItems": 8,
+                                "type": "array"
+                              },
+                              "parent_packet_id": {
+                                "anyOf": [
+                                  {
+                                    "maxLength": 256,
+                                    "minLength": 1,
+                                    "type": "string"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              },
+                              "probes": {
+                                "items": {
+                                  "additionalProperties": false,
+                                  "description": "Project- and generation-bound continuation probe.",
+                                  "properties": {
+                                    "contract_version": {
+                                      "description": "Continuation probe contract version.",
+                                      "maximum": 1,
+                                      "minimum": 1,
+                                      "type": "integer"
+                                    },
+                                    "core_generation_id": {
+                                      "description": "Continuation core evidence generation.",
+                                      "maxLength": 240,
+                                      "minLength": 1,
+                                      "type": "string"
+                                    },
+                                    "kind": {
+                                      "description": "Probe kind.",
+                                      "enum": [
+                                        "continuation"
+                                      ],
+                                      "type": "string"
+                                    },
+                                    "project_id": {
+                                      "description": "Continuation project identity.",
+                                      "maxLength": 240,
+                                      "minLength": 1,
+                                      "type": "string"
+                                    },
+                                    "retrieval_generation": {
+                                      "description": "Optional continuation retrieval generation.",
+                                      "maxLength": 240,
+                                      "minLength": 1,
+                                      "type": [
+                                        "string",
+                                        "null"
+                                      ]
+                                    },
+                                    "selector": {
+                                      "additionalProperties": false,
+                                      "description": "Stable typed continuation selector.",
+                                      "properties": {
+                                        "path": {
+                                          "description": "Optional exact project-relative path.",
+                                          "maxLength": 240,
+                                          "minLength": 1,
+                                          "type": "string"
+                                        },
+                                        "reason": {
+                                          "description": "Typed uncovered structural reason.",
+                                          "enum": [
+                                            "candidate_count_exceeded",
+                                            "source_budget_exceeded",
+                                            "source_unavailable",
+                                            "ambiguous_selector",
+                                            "disconnected_seed"
+                                          ],
+                                          "type": "string"
+                                        },
+                                        "source_range": {
+                                          "additionalProperties": false,
+                                          "description": "Optional pinned complete-line source request.",
+                                          "properties": {
+                                            "end_line": {
+                                              "description": "Last requested line.",
+                                              "maximum": 4294967295,
+                                              "minimum": 1,
+                                              "type": "integer"
+                                            },
+                                            "start_line": {
+                                              "description": "First requested line.",
+                                              "maximum": 4294967295,
+                                              "minimum": 1,
+                                              "type": "integer"
+                                            }
+                                          },
+                                          "required": [
+                                            "start_line",
+                                            "end_line"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        "stable_identity": {
+                                          "description": "Stable packet identity.",
+                                          "maxLength": 240,
+                                          "minLength": 1,
+                                          "type": "string"
+                                        },
+                                        "symbol_id": {
+                                          "description": "Optional exact stable symbol id.",
+                                          "maxLength": 240,
+                                          "minLength": 1,
+                                          "type": "string"
+                                        }
+                                      },
+                                      "required": [
+                                        "stable_identity",
+                                        "reason"
+                                      ],
+                                      "type": "object"
+                                    }
+                                  },
+                                  "required": [
+                                    "kind",
+                                    "contract_version",
+                                    "project_id",
+                                    "core_generation_id",
+                                    "selector"
+                                  ],
+                                  "type": "object"
+                                },
+                                "maxItems": 1,
+                                "type": "array"
+                              },
+                              "retrieval_generation": {
+                                "anyOf": [
+                                  {
+                                    "maxLength": 256,
+                                    "minLength": 1,
+                                    "type": "string"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              }
+                            },
+                            "required": [
+                              "probes",
+                              "parent_packet_id",
+                              "option_ids",
+                              "core_generation_id",
+                              "retrieval_generation"
+                            ],
+                            "type": "object"
+                          },
                           "remaining_rounds": {
                             "maximum": 65535,
                             "minimum": 1,
@@ -25317,6 +27699,17 @@
                     "items": {
                       "additionalProperties": false,
                       "properties": {
+                        "display_name": {
+                          "anyOf": [
+                            {
+                              "maxLength": 1024,
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
                         "end_line": {
                           "anyOf": [
                             {
@@ -25379,6 +27772,7 @@
                         "identity",
                         "path",
                         "symbol_id",
+                        "display_name",
                         "start_line",
                         "end_line",
                         "excerpt"
@@ -32557,13 +34951,19 @@
                 "minimum": 0,
                 "type": "integer"
               },
+              "max_tool_result_bytes": {
+                "description": "Optional path-read allowance for UTF-8 serialized served MCP tool result, including revision text/structured mirroring and publication metadata. Excludes JSON-RPC and host framing; does not bound an investigation. Whole-line receipts may be partial; a receipt that cannot fit refuses.",
+                "maximum": 524288,
+                "minimum": 256,
+                "type": "integer"
+              },
               "path": {
                 "description": "Single-file alias for `paths`: repository-relative path as returned in `file_path`. Combine with `line`.",
                 "minLength": 1,
                 "type": "string"
               },
               "paths": {
-                "description": "File ranges to read in one call, instead of resolving a symbol. Line-numbered and bounded in total; use the paths and lines that search, trail, or packet already returned.",
+                "description": "File ranges to read in one call, instead of resolving a symbol. Line-numbered and bounded in total; use exact paths from files, search, trail, or packet; filenames are paths, not symbol IDs.",
                 "items": {
                   "allOf": [
                     {
@@ -32745,6 +35145,10 @@
                     "description": "Typed stdio retry or unavailable code.",
                     "type": "string"
                   },
+                  "complete": {
+                    "description": "Every requested window was delivered through its end or EOF.",
+                    "type": "boolean"
+                  },
                   "deadline_exceeded": {
                     "description": "Whether the request wait deadline expired.",
                     "type": "boolean"
@@ -32768,6 +35172,10 @@
                     "description": "One-based focused line.",
                     "type": "integer"
                   },
+                  "max_response_bytes": {
+                    "description": "Serialized structured result byte bound, including metadata.",
+                    "type": "integer"
+                  },
                   "max_snippet_bytes": {
                     "description": "Snippet byte cap.",
                     "type": [
@@ -32776,7 +35184,7 @@
                     ]
                   },
                   "max_total_bytes": {
-                    "description": "Total byte cap for a batched paths call.",
+                    "description": "Shared rendered-snippet byte cap for a batched paths call; metadata has a separate response bound.",
                     "type": "integer"
                   },
                   "message": {
@@ -32790,6 +35198,10 @@
                   "node": {
                     "description": "Node details DTO.",
                     "type": "object"
+                  },
+                  "omitted_count": {
+                    "description": "Number of windows with omitted source lines.",
+                    "type": "integer"
                   },
                   "operation": {
                     "description": "Current managed preparation operation.",
@@ -32810,11 +35222,55 @@
                     "description": "Requested source ranges from a batched paths call.",
                     "items": {
                       "additionalProperties": false,
-                      "description": "One requested source range from a batched snippet.paths call.",
+                      "description": "One requested window and its actual source delivery receipt from snippet.paths.",
                       "properties": {
+                        "complete": {
+                          "description": "Requested window complete, including natural EOF clipping; not complete-file coverage.",
+                          "type": "boolean"
+                        },
+                        "delivered_end_line": {
+                          "description": "Actual last delivered physical line, or null.",
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
+                        },
+                        "delivered_start_line": {
+                          "description": "Actual first delivered physical line, or null.",
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
+                        },
                         "end_line": {
                           "description": "1-based last line.",
                           "type": "integer"
+                        },
+                        "last_line_terminated": {
+                          "description": "Whether the last delivered source line ended in LF.",
+                          "type": [
+                            "boolean",
+                            "null"
+                          ]
+                        },
+                        "next_start_line": {
+                          "description": "First omitted line; retry this line or use a larger ordinary file read for an oversized line.",
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
+                        },
+                        "omission_reason": {
+                          "description": "Why complete source lines were omitted.",
+                          "enum": [
+                            "byte_budget",
+                            "line_exceeds_byte_budget",
+                            null
+                          ],
+                          "type": [
+                            "string",
+                            "null"
+                          ]
                         },
                         "path": {
                           "description": "Project-relative file path.",
@@ -32827,6 +35283,27 @@
                         "snippet_truncated": {
                           "description": "Whether this range hit a byte cap.",
                           "type": "boolean"
+                        },
+                        "source_kind": {
+                          "description": "Source provenance.",
+                          "enum": [
+                            "workspace_read"
+                          ],
+                          "type": "string"
+                        },
+                        "source_range_sha256": {
+                          "description": "Digest of delivered raw source bytes, not an indexed file digest.",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "source_total_lines": {
+                          "description": "File line count only when the read observed EOF.",
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
                         },
                         "start_line": {
                           "description": "1-based first line.",
@@ -32881,6 +35358,10 @@
                   },
                   "requested_context": {
                     "description": "Requested context line count.",
+                    "type": "integer"
+                  },
+                  "requested_count": {
+                    "description": "Number of requested ranges; all receive receipts.",
                     "type": "integer"
                   },
                   "resume_operation_attempt": {
@@ -33181,6 +35662,172 @@
                             },
                             "maxItems": 256,
                             "type": "array"
+                          },
+                          "packet_request_patch": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "core_generation_id": {
+                                "maxLength": 256,
+                                "minLength": 1,
+                                "type": "string"
+                              },
+                              "option_ids": {
+                                "items": {
+                                  "maxLength": 256,
+                                  "minLength": 1,
+                                  "type": "string"
+                                },
+                                "maxItems": 8,
+                                "type": "array"
+                              },
+                              "parent_packet_id": {
+                                "anyOf": [
+                                  {
+                                    "maxLength": 256,
+                                    "minLength": 1,
+                                    "type": "string"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              },
+                              "probes": {
+                                "items": {
+                                  "additionalProperties": false,
+                                  "description": "Project- and generation-bound continuation probe.",
+                                  "properties": {
+                                    "contract_version": {
+                                      "description": "Continuation probe contract version.",
+                                      "maximum": 1,
+                                      "minimum": 1,
+                                      "type": "integer"
+                                    },
+                                    "core_generation_id": {
+                                      "description": "Continuation core evidence generation.",
+                                      "maxLength": 240,
+                                      "minLength": 1,
+                                      "type": "string"
+                                    },
+                                    "kind": {
+                                      "description": "Probe kind.",
+                                      "enum": [
+                                        "continuation"
+                                      ],
+                                      "type": "string"
+                                    },
+                                    "project_id": {
+                                      "description": "Continuation project identity.",
+                                      "maxLength": 240,
+                                      "minLength": 1,
+                                      "type": "string"
+                                    },
+                                    "retrieval_generation": {
+                                      "description": "Optional continuation retrieval generation.",
+                                      "maxLength": 240,
+                                      "minLength": 1,
+                                      "type": [
+                                        "string",
+                                        "null"
+                                      ]
+                                    },
+                                    "selector": {
+                                      "additionalProperties": false,
+                                      "description": "Stable typed continuation selector.",
+                                      "properties": {
+                                        "path": {
+                                          "description": "Optional exact project-relative path.",
+                                          "maxLength": 240,
+                                          "minLength": 1,
+                                          "type": "string"
+                                        },
+                                        "reason": {
+                                          "description": "Typed uncovered structural reason.",
+                                          "enum": [
+                                            "candidate_count_exceeded",
+                                            "source_budget_exceeded",
+                                            "source_unavailable",
+                                            "ambiguous_selector",
+                                            "disconnected_seed"
+                                          ],
+                                          "type": "string"
+                                        },
+                                        "source_range": {
+                                          "additionalProperties": false,
+                                          "description": "Optional pinned complete-line source request.",
+                                          "properties": {
+                                            "end_line": {
+                                              "description": "Last requested line.",
+                                              "maximum": 4294967295,
+                                              "minimum": 1,
+                                              "type": "integer"
+                                            },
+                                            "start_line": {
+                                              "description": "First requested line.",
+                                              "maximum": 4294967295,
+                                              "minimum": 1,
+                                              "type": "integer"
+                                            }
+                                          },
+                                          "required": [
+                                            "start_line",
+                                            "end_line"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        "stable_identity": {
+                                          "description": "Stable packet identity.",
+                                          "maxLength": 240,
+                                          "minLength": 1,
+                                          "type": "string"
+                                        },
+                                        "symbol_id": {
+                                          "description": "Optional exact stable symbol id.",
+                                          "maxLength": 240,
+                                          "minLength": 1,
+                                          "type": "string"
+                                        }
+                                      },
+                                      "required": [
+                                        "stable_identity",
+                                        "reason"
+                                      ],
+                                      "type": "object"
+                                    }
+                                  },
+                                  "required": [
+                                    "kind",
+                                    "contract_version",
+                                    "project_id",
+                                    "core_generation_id",
+                                    "selector"
+                                  ],
+                                  "type": "object"
+                                },
+                                "maxItems": 1,
+                                "type": "array"
+                              },
+                              "retrieval_generation": {
+                                "anyOf": [
+                                  {
+                                    "maxLength": 256,
+                                    "minLength": 1,
+                                    "type": "string"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              }
+                            },
+                            "required": [
+                              "probes",
+                              "parent_packet_id",
+                              "option_ids",
+                              "core_generation_id",
+                              "retrieval_generation"
+                            ],
+                            "type": "object"
                           },
                           "remaining_rounds": {
                             "maximum": 65535,
@@ -33683,7 +36330,7 @@
     {
       "mimeType": "application/json",
       "name": "Root symbols",
-      "uriTemplate": "codestory://symbols/root{?project}"
+      "uriTemplate": "codestory://symbols/root{?project,limit,cursor}"
     },
     {
       "mimeType": "application/json",

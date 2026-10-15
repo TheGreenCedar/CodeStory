@@ -1570,7 +1570,7 @@ function commandListRow(graph, name) {
 const cacheRunner = "${{ runner.os }}";
 const cacheRustVersion = "${{ steps.rust-cache-key.outputs.version }}";
 const cacheTarget = "${{ steps.rust-cache-key.outputs.target }}";
-const cacheManifests = "${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**/Cargo.toml') }}";
+const cacheManifests = "${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**/Cargo.toml', 'vendor/llama-cpp-sys-2-patches/**') }}";
 const cacheLock = "${{ hashFiles('Cargo.lock') }}";
 const cacheSaveCondition = "success() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''";
 const draftCompilerCachePath = "${{ runner.temp }}/codestory-draft-sccache";
@@ -1587,6 +1587,9 @@ const crateDurabilityDependencyTriggerPaths = [
   "vendor/**",
 ];
 const draftWorkflowPaths = [
+  ".github/actions/native-source/**",
+  "scripts/bootstrap-research-native-vendor.py",
+  "vendor/llama-cpp-sys-2-patches/**",
   "Cargo.lock",
   "Cargo.toml",
   "crates/**",
@@ -1636,8 +1639,14 @@ const windowsCachePrimary = [
   windowsInstallerHash,
   cacheLock,
 ].join("-");
+const nativeSourceStep = {
+  name: "Reconstruct pinned native source",
+  uses: "./.github/actions/native-source",
+  keys: ["name", "uses"],
+};
 const windowsStepSequence = [
   { uses: "actions/checkout@v5", keys: ["uses"] },
+  nativeSourceStep,
   { name: "Install Rust stable", keys: ["name", "shell", "run"] },
   {
     name: "Install checksum-pinned Windows Vulkan SDK",
@@ -1677,6 +1686,7 @@ const windowsRunCommands = new Map([
 ]);
 const draftStepSequence = [
   { uses: "actions/checkout@v5", keys: ["uses"] },
+  nativeSourceStep,
   { name: "Install Rust stable", keys: ["name", "run"] },
   { name: "Install Linux Vulkan build dependencies", keys: ["name", "run"] },
   { name: "Install pinned sccache", keys: ["name", "uses", "with"] },
@@ -1992,6 +2002,7 @@ export function proofFloorPolicyViolations(
 
   const expectedSteps = [
     { uses: "actions/checkout@v5", keys: ["uses"] },
+    nativeSourceStep,
     { name: "Install Rust stable", keys: ["name", "run"] },
     { name: "Capture Rust cache identity", keys: ["name", "id", "shell", "run"] },
     {
@@ -2042,7 +2053,7 @@ export function proofFloorPolicyViolations(
     durability.cache_namespace,
     "${{ steps.rust-cache-key.outputs.version }}",
     "${{ steps.rust-cache-key.outputs.target }}",
-    "${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**/Cargo.toml') }}",
+    "${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**/Cargo.toml', 'vendor/llama-cpp-sys-2-patches/**') }}",
     "${{ hashFiles('Cargo.lock') }}",
   ].join("-");
   add(
@@ -2802,7 +2813,6 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
       "crates/codestory-llama-sys/tests/model_staging.rs",
       "scripts/release-evidence/**",
       "scripts/release-evidence/serde-json-codestory-project.json",
-      "scripts/tests/release-evidence-runner-contract.test.mjs",
     ];
     for (const event of ["pull_request", "push"]) {
       add(violations, includesAll(at(plugin, "on", event, "paths"), requiredPaths), `${pluginFile} ${event} paths must cover policy and release surfaces`);
@@ -3005,11 +3015,11 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
     const windowsNativeSteps = list(windowsNative.steps).map(object);
     add(
       violations,
-      windowsNativeSteps.length === 9
+      windowsNativeSteps.length === 10
         && windowsNativeSteps[0]?.uses === "actions/checkout@v5"
         && object(windowsNativeSteps[0]?.with).ref === "${{ needs.resolve.outputs.ref }}"
         && windowsNativeSteps.every(step => step?.["continue-on-error"] === undefined),
-      `${sourceFile} Windows native source contracts must keep the exact blocking nine-step shape`,
+      `${sourceFile} Windows native source contracts must keep the exact blocking ten-step shape`,
     );
     // The qualification harness regression runs before the toolchain steps: it
     // needs no build, and a Windows-native reproduction of the control
@@ -3044,7 +3054,7 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
     );
     add(
       violations,
-      windowsNativeSteps[7]?.name === windowsNativeReceiptName
+      windowsNativeSteps[8]?.name === windowsNativeReceiptName
         && windowsNativeReceipt?.id === "windows-native-source-proof"
         && windowsNativeReceipt?.shell === "pwsh"
         && windowsNativeReceipt?.["continue-on-error"] === undefined
@@ -3087,7 +3097,7 @@ function validatePluginAndDraftWorkflows(workflows, violations, graph) {
     const windowsNativeUpload = namedStep(windowsNative, windowsNativeUploadName);
     add(
       violations,
-      windowsNativeSteps[8]?.name === windowsNativeUploadName
+      windowsNativeSteps[9]?.name === windowsNativeUploadName
         && windowsNativeUpload?.uses === "actions/upload-artifact@v7.0.1"
         && windowsNativeUpload?.["continue-on-error"] === undefined
         && hasExactKeys(windowsNativeUpload, ["name", "uses", "with"])

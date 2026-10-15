@@ -137,6 +137,7 @@ pub(super) fn sample_task_brief_packet() -> AgentPacketDto {
         },
         support: vec![
             SupportUnitDto {
+                source_delivery: None,
                 id: format!("symbol:{}", source.node_id.0),
                 kind: SupportUnitKindDto::SymbolLocation,
                 summary: format!(
@@ -156,6 +157,7 @@ pub(super) fn sample_task_brief_packet() -> AgentPacketDto {
                 query: None,
             },
             SupportUnitDto {
+                source_delivery: None,
                 id: format!("symbol:{}", test.node_id.0),
                 kind: SupportUnitKindDto::SymbolLocation,
                 summary: format!(

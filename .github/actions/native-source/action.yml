@@ -1,0 +1,10 @@
+name: Reconstruct pinned native source
+description: Verify or reconstruct the exact authored native source before workspace Cargo commands.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+        python_command="$(command -v python || command -v python3)"
+        "$python_command" scripts/bootstrap-research-native-vendor.py --ensure --download

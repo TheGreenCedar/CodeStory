@@ -12,7 +12,7 @@ members = [
     "crates/codestory-cli",
     "crates/codestory-bench",
 ]
-exclude = ["vendor/tree-sitter-graph"]
+exclude = ["vendor/tree-sitter-graph", "vendor/llama-cpp-sys-2"]
 
 [workspace.dependencies]
 # Internal crates
@@ -106,3 +106,7 @@ incremental = true
 [profile.dev.package."*"]
 opt-level = 3 # Optimize dependencies for faster execution
 debug = false # optional: reduces compile time + binary size for deps
+
+# Completion-bound execution and pre-submit CPU rejection at the native owner.
+[patch.crates-io]
+llama-cpp-sys-2 = { path = "vendor/llama-cpp-sys-2" }

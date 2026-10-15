@@ -660,58 +660,15 @@ pub(super) fn normalize_semantic_store_path(path: &Path) -> String {
     path
 }
 
-pub(super) fn semantic_path_is_absolute_like(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    path.starts_with('/')
-        || (bytes.len() > 2
-            && bytes[1] == b':'
-            && bytes[2] == b'/'
-            && bytes[0].is_ascii_alphabetic())
-}
-
-pub(super) fn semantic_path_parent(path: &str) -> Option<&str> {
-    path.rsplit_once('/')
-        .map(|(parent, _)| parent)
-        .filter(|parent| !parent.is_empty())
-}
-
-pub(super) fn common_semantic_path_prefix(left: &str, right: &str) -> String {
-    let left_parts = left.split('/').collect::<Vec<_>>();
-    let right_parts = right.split('/').collect::<Vec<_>>();
-    let mut common = Vec::new();
-    for (left, right) in left_parts.iter().zip(right_parts.iter()) {
-        if left != right {
-            break;
-        }
-        common.push(*left);
-    }
-    common.join("/")
-}
-
-pub(super) fn common_absolute_semantic_parent(paths: &[(GraphNodeId, String)]) -> Option<String> {
-    let mut parents = paths
-        .iter()
-        .map(|(_, path)| path.as_str())
-        .filter(|path| semantic_path_is_absolute_like(path))
-        .filter_map(semantic_path_parent);
-    let mut common = parents.next()?.to_string();
-    for parent in parents {
-        common = common_semantic_path_prefix(&common, parent);
-        if common.is_empty() {
-            return None;
-        }
-    }
-    Some(common).filter(|common| !common.is_empty())
-}
-
-pub(super) fn strip_semantic_common_parent(path: &str, common_parent: &str) -> Option<String> {
-    let rest = path.strip_prefix(common_parent)?;
+pub(super) fn strip_semantic_owning_root(path: &str, owning_root: &str) -> Option<String> {
+    let rest = path.strip_prefix(owning_root)?;
     let rest = rest.strip_prefix('/')?;
     (!rest.is_empty()).then(|| rest.to_string())
 }
 
 pub(super) fn semantic_file_table_path_maps(
     files: Vec<FileInfo>,
+    project_root: Option<&Path>,
 ) -> (HashMap<GraphNodeId, String>, HashMap<GraphNodeId, String>) {
     let rows = files
         .into_iter()
@@ -722,13 +679,14 @@ pub(super) fn semantic_file_table_path_maps(
             )
         })
         .collect::<Vec<_>>();
-    let common_parent = common_absolute_semantic_parent(&rows);
+    // File inventory must not redefine the owning root or erase source roles.
+    let owning_root = project_root.map(normalize_semantic_store_path);
     let mut display_paths = HashMap::new();
     let mut read_paths = HashMap::new();
     for (id, path) in rows {
-        let normalized = common_parent
+        let normalized = owning_root
             .as_deref()
-            .and_then(|common_parent| strip_semantic_common_parent(&path, common_parent))
+            .and_then(|root| strip_semantic_owning_root(&path, root.trim_end_matches('/')))
             .unwrap_or_else(|| path.clone());
         display_paths.insert(id, normalized);
         read_paths.insert(id, path);
@@ -736,8 +694,11 @@ pub(super) fn semantic_file_table_path_maps(
     (display_paths, read_paths)
 }
 
-pub(super) fn semantic_file_table_path_map(files: Vec<FileInfo>) -> HashMap<GraphNodeId, String> {
-    let (display_paths, _) = semantic_file_table_path_maps(files);
+pub(super) fn semantic_file_table_path_map(
+    files: Vec<FileInfo>,
+    project_root: Option<&Path>,
+) -> HashMap<GraphNodeId, String> {
+    let (display_paths, _) = semantic_file_table_path_maps(files, project_root);
     display_paths
 }
 
@@ -1299,7 +1260,7 @@ impl SemanticDocGraphContext {
         let files = storage
             .get_files()
             .map_err(|e| ApiError::internal(format!("Failed to load semantic doc files: {e}")))?;
-        let (file_paths, file_read_paths) = semantic_file_table_path_maps(files);
+        let (file_paths, file_read_paths) = semantic_file_table_path_maps(files, None);
         Self::build_for_scope(
             storage,
             semantic_nodes,
@@ -3985,6 +3946,7 @@ fn prune_incremental_semantic_docs(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn sync_llm_symbol_projection_for_runtime(
     storage: &mut Storage,
+    project_root: Option<&Path>,
     nodes: &[codestory_contracts::graph::Node],
     engine: &mut SearchEngine,
     refresh_scope: SemanticRefreshScope<'_>,
@@ -4011,7 +3973,7 @@ pub(super) fn sync_llm_symbol_projection_for_runtime(
     let files = storage
         .get_files()
         .map_err(|e| ApiError::internal(format!("Failed to load semantic doc files: {e}")))?;
-    let (file_paths, file_read_paths) = semantic_file_table_path_maps(files);
+    let (file_paths, file_read_paths) = semantic_file_table_path_maps(files, project_root);
     let (effective_file_scope, expand_for_contract_repair) =
         effective_incremental_file_scope(storage, refresh_scope.file_ids, &existing_docs)?;
     // Flow neighbors are selected globally. A changed seed may add or remove a
@@ -4360,6 +4322,7 @@ fn build_loaded_dense_selection_plan(
 
 fn prepare_full_semantic_stream(
     storage: &mut Storage,
+    project_root: Option<&Path>,
     policy: SemanticRuntimePolicy,
     document_source: SemanticProjectionDocumentSource,
 ) -> Result<(PreparedFullSemanticStream, SemanticProjectionStats), ApiError> {
@@ -4378,7 +4341,7 @@ fn prepare_full_semantic_stream(
     let files = storage
         .get_files()
         .map_err(|e| ApiError::internal(format!("Failed to load semantic doc files: {e}")))?;
-    let (mut file_paths, mut file_read_paths) = semantic_file_table_path_maps(files);
+    let (mut file_paths, mut file_read_paths) = semantic_file_table_path_maps(files, project_root);
     let semantic_file_id_set = semantic_file_ids.iter().copied().collect::<HashSet<_>>();
     file_paths.retain(|file_id, _| semantic_file_id_set.contains(file_id));
     file_read_paths.retain(|file_id, _| semantic_file_id_set.contains(file_id));
@@ -4664,6 +4627,7 @@ fn publish_full_component_reports(
 
 pub(super) fn sync_full_llm_symbol_projection_streaming_for_runtime(
     storage: &mut Storage,
+    project_root: Option<&Path>,
     source_identity: &str,
     cancel_token: Option<&CancellationToken>,
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
@@ -4679,7 +4643,8 @@ pub(super) fn sync_full_llm_symbol_projection_streaming_for_runtime(
         .into_iter()
         .map(|doc| (doc.node_id, doc))
         .collect::<HashMap<_, _>>();
-    let (prepared, mut stats) = prepare_full_semantic_stream(storage, policy, document_source)?;
+    let (prepared, mut stats) =
+        prepare_full_semantic_stream(storage, project_root, policy, document_source)?;
     let selection_plan =
         build_full_dense_selection_plan(storage, &prepared, policy, document_source, cancel_token)?;
     let publication = SemanticPublicationContext {
@@ -4717,8 +4682,11 @@ pub(super) fn sync_full_llm_symbol_projection_streaming_for_runtime(
     Ok(stats)
 }
 
+// Keep staged storage, refresh scopes, and immutable runtime inputs explicit.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn finalize_staged_semantic_docs_for_runtime(
     storage: &mut Storage,
+    project_root: Option<&Path>,
     llm_refresh_file_scope: Option<&HashSet<codestory_contracts::graph::NodeId>>,
     component_report_refresh: Option<&ComponentReportRefreshScope>,
     source_identity: &str,
@@ -4753,6 +4721,7 @@ pub(super) fn finalize_staged_semantic_docs_for_runtime(
     {
         sync_full_llm_symbol_projection_streaming_for_runtime(
             storage,
+            project_root,
             source_identity,
             cancel_token,
             runtime,
@@ -4770,6 +4739,7 @@ pub(super) fn finalize_staged_semantic_docs_for_runtime(
         })?;
         let mut stats = sync_llm_symbol_projection_for_runtime(
             storage,
+            project_root,
             &nodes,
             &mut engine,
             SemanticRefreshScope {
@@ -4827,4 +4797,89 @@ pub(super) fn load_persisted_semantic_docs_for_runtime(
     reload_llm_docs_from_storage(storage, engine, LLM_DOC_RELOAD_BATCH_SIZE)?;
     stats.reload_ms = clamp_u128_to_u32(reload_started.elapsed().as_millis());
     Ok(stats)
+}
+
+#[cfg(test)]
+mod owning_root_path_tests {
+    use super::*;
+
+    fn file(id: i64, path: &str) -> FileInfo {
+        FileInfo {
+            id,
+            path: path.into(),
+            language: "rust".into(),
+            modification_time: 1,
+            indexed: true,
+            complete: true,
+            line_count: 1,
+            file_role: codestory_store::FileRole::Source,
+        }
+    }
+
+    #[test]
+    fn semantic_paths_preserve_nested_roles_and_inventory_stability() {
+        let root = Path::new("/repo");
+        for relative in ["tests/nested/target.rs", "src/nested/target.rs"] {
+            let absolute = format!("/repo/{relative}");
+            let (single, reads) =
+                semantic_file_table_path_maps(vec![file(1, &absolute)], Some(root));
+            assert_eq!(single[&codestory_contracts::graph::NodeId(1)], relative);
+            let expected_role = if relative.starts_with("tests/") {
+                RetrievalFileRole::Test
+            } else {
+                RetrievalFileRole::Source
+            };
+            assert_eq!(
+                retrieval_file_role_from_path(&single[&codestory_contracts::graph::NodeId(1)]),
+                expected_role
+            );
+            assert_eq!(reads[&codestory_contracts::graph::NodeId(1)], absolute);
+            let (expanded, expanded_reads) = semantic_file_table_path_maps(
+                vec![file(1, &absolute), file(2, "/repo/other/sibling.rs")],
+                Some(root),
+            );
+            assert_eq!(
+                expanded[&codestory_contracts::graph::NodeId(1)],
+                single[&codestory_contracts::graph::NodeId(1)]
+            );
+            assert_eq!(
+                expanded_reads[&codestory_contracts::graph::NodeId(1)],
+                reads[&codestory_contracts::graph::NodeId(1)]
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_paths_preserve_unknown_and_outside_root_provenance() {
+        let files = || {
+            vec![
+                file(1, "/repo2/tests/target.rs"),
+                file(2, "/outside/src/target.rs"),
+                file(3, "tests/relative.rs"),
+            ]
+        };
+        let (known, reads) = semantic_file_table_path_maps(files(), Some(Path::new("/repo/")));
+        let (unknown, unknown_reads) = semantic_file_table_path_maps(files(), None);
+        assert_eq!(known, reads);
+        assert_eq!(unknown, reads);
+        assert_eq!(unknown_reads, reads);
+        let (root, _) =
+            semantic_file_table_path_maps(vec![file(1, "/tests/target.rs")], Some(Path::new("/")));
+        assert_eq!(
+            root[&codestory_contracts::graph::NodeId(1)],
+            "tests/target.rs"
+        );
+        let (windows, reads) = semantic_file_table_path_maps(
+            vec![file(1, r"\\?\C:\repo\tests\target.rs")],
+            Some(Path::new(r"C:\repo\")),
+        );
+        assert_eq!(
+            windows[&codestory_contracts::graph::NodeId(1)],
+            "tests/target.rs"
+        );
+        assert_eq!(
+            reads[&codestory_contracts::graph::NodeId(1)],
+            "C:/repo/tests/target.rs"
+        );
+    }
 }

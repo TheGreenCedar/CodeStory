@@ -2128,6 +2128,7 @@ jobs:
             .flush_projection_batch(ProjectionBatch {
                 files: &projected.files,
                 file_content_hashes: &[],
+                file_extraction_identities: &[],
                 nodes: &projected.nodes,
                 structural_text_units: &projected.structural_text_units,
                 structural_text_projections: &projected.structural_text_projections,
@@ -2206,6 +2207,7 @@ jobs:
             .flush_projection_batch(ProjectionBatch {
                 files: &projected.files,
                 file_content_hashes: &projected.file_content_hashes,
+                file_extraction_identities: &[],
                 nodes: &projected.nodes,
                 structural_text_units: &projected.structural_text_units,
                 structural_text_projections: &projected.structural_text_projections,

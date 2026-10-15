@@ -378,6 +378,7 @@ pub(super) fn validated_idle_epoch(
     event: &ControlEvent,
     snapshot: &EmbeddingServerSnapshot,
 ) -> Result<u64> {
+    let boot_id = snapshot.clock.qualification_boot_id()?;
     let details = event
         .details
         .as_ref()
@@ -392,10 +393,10 @@ pub(super) fn validated_idle_epoch(
     if details.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected
         || details.get("true_idle").map(String::as_str) != Some("true")
         || details.get("clock_domain") != Some(&snapshot.clock.domain)
-        || details.get("clock_boot_id") != Some(&snapshot.clock.boot_id)
+        || details.get("clock_boot_id").map(String::as_str) != Some(boot_id)
         || details.get("server_instance_id") != Some(&snapshot.process.server_instance_id)
         || event.clock.domain != snapshot.clock.domain
-        || event.clock.boot_id != snapshot.clock.boot_id
+        || event.clock.boot_id != boot_id
     {
         bail!("embedding_qualification_idle_epoch_invalid");
     }
@@ -414,6 +415,7 @@ pub(super) fn consume_watchdog_marker(
     nonce_sha256: &str,
     expected: &EmbeddingServerSnapshot,
 ) -> Result<(EmbeddingQualificationWatchdogMarker, String)> {
+    let boot_id = expected.clock.qualification_boot_id()?;
     let filename = codestory_retrieval::embedding_qualification_watchdog_marker_filename(
         nonce_sha256,
         &expected.process.server_instance_id,
@@ -433,7 +435,7 @@ pub(super) fn consume_watchdog_marker(
         || marker.executable_version != expected.process.executable_version
         || marker.reason != "embedding_engine_stalled"
         || marker.clock.domain != "awake_monotonic"
-        || marker.clock.boot_id != expected.clock.boot_id
+        || marker.clock.boot_id != boot_id
         || marker.last_progress_ns > marker.clock.observed_ns
         || marker.clock.observed_ns - marker.last_progress_ns
             < marker.hard_native_no_progress_ms.saturating_mul(1_000_000)

@@ -10,6 +10,8 @@ mod configuration;
 mod event_log;
 mod filesystem;
 
+pub use configuration::validate_qualification_clock_gate;
+
 pub(in crate::per_user_embedding) use command_io::poll_server_qualification_command;
 #[cfg(test)]
 pub(in crate::per_user_embedding) use command_io::{

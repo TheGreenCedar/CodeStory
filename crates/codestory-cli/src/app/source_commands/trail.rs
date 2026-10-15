@@ -1,4 +1,5 @@
 use super::super::artifacts::preflight_output_file;
+use super::super::lifecycle::open_target_surface;
 use super::super::rendering::build_query_resolution_output_with_runtime;
 use super::super::resolution::resolve_target_or_emit_ambiguity;
 use crate::args;
@@ -10,7 +11,7 @@ use crate::output::{
     RenderedPublicOutput, emit_public_operation, render_trail_dot, render_trail_markdown,
     render_trail_mermaid, render_trail_story_markdown,
 };
-use crate::runtime::{RuntimeContext, ensure_index_ready, map_api_error};
+use crate::runtime::map_api_error;
 use anyhow::{Result, bail};
 use codestory_contracts::api::TrailCallerScope;
 use std::fmt::Write as _;
@@ -23,9 +24,8 @@ pub(in crate::app) fn run_trail(cmd: TrailCommand) -> Result<()> {
     if cmd.story && cmd.format == args::OutputFormat::Dot {
         bail!("--story cannot be combined with --format dot; use markdown or json output");
     }
-    let runtime = RuntimeContext::new(&cmd.project)?;
-    let opened = runtime.ensure_open(cmd.refresh)?;
-    ensure_index_ready(&opened, "trail")?;
+    let selection = cmd.target.selection()?;
+    let (runtime, _) = open_target_surface(&cmd.project, cmd.refresh, &selection, "trail")?;
 
     let file_filter = cmd.target.file_filter();
     let operation = if cmd.target.query.is_some() {
@@ -36,7 +36,7 @@ pub(in crate::app) fn run_trail(cmd: TrailCommand) -> Result<()> {
     let operation = runtime.run_public_operation(operation, || {
         let target = resolve_target_or_emit_ambiguity(
             &runtime,
-            cmd.target.selection()?,
+            selection.clone(),
             file_filter.as_deref(),
             cmd.format,
             cmd.output_file.as_deref(),

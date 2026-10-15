@@ -47,6 +47,17 @@ engine residency, and final revalidation. Strict reader admission applies the
 same deep generation-evidence contract as writer reuse and promotion; admitted
 query execution then stays pinned to those verified files.
 
+After runtime seals a file's admission, that same pin can read its original
+whole-file lexical content. The newest logical component owns the document;
+tombstones and failed owners never fall back to an older copy. The reader
+checks document identity and current source bytes within a 1-MiB verification
+bound. It returns an authenticated source witness, without inventing a Core
+node or parser coverage. Runtime owns the smaller delivery reservation.
+The pin retains each successful read's accepted source identity, content hash
+and cancellation flag. The outer response owner verifies these again after
+selection and rendering, with publication checks before and after; the final
+bounded source read cannot adopt a new native identity.
+
 The embedding server is per-user, while manifests and artifacts are
 project-local. Its endpoint namespace is independent of project and cache
 roots. A compatible client joins the existing authority. An incompatible idle

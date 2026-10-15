@@ -3,12 +3,13 @@ use codestory_contracts::api::{
     AgentHybridWeightsDto, AgentPacketDto, AgentPacketRequestDto, ApiError, ApiErrorDetails,
     BookmarkCategoryDto, BookmarkDto, CreateBookmarkCategoryRequest, CreateBookmarkRequest,
     EmbeddingCapacityPressureDto, EmbeddingRetryStateDto, EmbeddingVectorPublicationIdentityDto,
-    GroundingBudgetDto, GroundingSnapshotDto, IncrementalPlanProbeOutcomeDto, IndexDryRunDto,
-    IndexFreshnessDto, IndexFreshnessNotCheckedCauseDto, IndexFreshnessStatusDto, IndexMode,
-    IndexPublicationDto, IndexedFilesDto, IndexedFilesRequest, IndexingPhaseTimings,
-    ListChildrenSymbolsRequest, ListRootSymbolsRequest, NodeDetailsDto, NodeDetailsRequest, NodeId,
-    OpenProjectRequest, ProjectSummary, RetrievalStateDto, SearchHit, SearchRepoTextMode,
-    SearchRequest, SearchResultsDto, SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest,
+    GroundingBudgetDto, GroundingSnapshotDto, IncrementalPlanProbeOutcomeDto,
+    IncrementalProbeUnavailableStageDto, IndexDryRunDto, IndexFreshnessDto,
+    IndexFreshnessNotCheckedCauseDto, IndexFreshnessStatusDto, IndexMode, IndexPublicationDto,
+    IndexedFilesDto, IndexedFilesRequest, IndexingPhaseTimings, ListChildrenSymbolsRequest,
+    ListRootSymbolsRequest, NodeDetailsDto, NodeDetailsRequest, NodeId, OpenProjectRequest,
+    ProjectSummary, RetrievalStateDto, SearchHit, SearchRepoTextMode, SearchRequest,
+    SearchResultsDto, SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest,
     SummaryGenerationDto, SymbolContextDto, SymbolSummaryDto, TrailConfigDto, TrailContextDto,
     UpdateBookmarkRequest,
 };
@@ -174,6 +175,9 @@ struct ActivePublicOperationOwner {
     operation: String,
     cancelled: Arc<AtomicBool>,
     publication: ActivePublicOperationPublication,
+    operation_id: String,
+    attempt: u32,
+    freshness: OperationFreshness,
 }
 
 struct ActivePublicOperationOwnerGuard {
@@ -215,10 +219,15 @@ fn with_public_operation_cancellation<T>(
     codestory_contracts::bounded_locks::with_thread_cancellation(cancelled, build)
 }
 
+// Bind owner identity, publication, freshness, and cancellation in one call.
+#[allow(clippy::too_many_arguments)]
 fn with_public_operation_owner<T>(
     controller_identity: usize,
     operation: &str,
     publication: ActivePublicOperationPublication,
+    operation_id: &str,
+    attempt: u32,
+    freshness: OperationFreshness,
     cancelled: Arc<AtomicBool>,
     build: impl FnOnce() -> T,
 ) -> T {
@@ -227,6 +236,9 @@ fn with_public_operation_owner<T>(
         operation: operation.to_owned(),
         cancelled: Arc::clone(&cancelled),
         publication,
+        operation_id: operation_id.to_owned(),
+        attempt,
+        freshness,
     };
     let previous = ACTIVE_PUBLIC_OPERATION_OWNER.with(|active| active.replace(Some(owner)));
     let _guard = ActivePublicOperationOwnerGuard {
@@ -478,6 +490,14 @@ struct ReadyLease {
     /// `None` on a host the observer cannot watch. The lease then means exactly what it meant
     /// before this package: EV-7's bounded scan, revalidated by the serving reads.
     source_observer: Option<ObservedSourceEpoch>,
+}
+
+/// A read-side identity, never a request to cancel a shared activation worker.
+#[derive(Clone)]
+struct SourceRepairIdentity {
+    target: ActivationTarget,
+    snapshot: ActivationSnapshot,
+    lease: Option<ReadyLease>,
 }
 
 #[derive(Debug, Clone)]
@@ -779,6 +799,35 @@ impl ActivationService {
             .flatten()
     }
 
+    fn has_running_replacement_for_publication(
+        &self,
+        project_root: &Path,
+        storage_path: &Path,
+        publication: &IndexPublicationDto,
+    ) -> bool {
+        let requested = ActivationTarget::new(project_root, storage_path);
+        let state = self
+            .coordinator
+            .state
+            .lock()
+            .expect("activation coordinator poisoned");
+        state.running
+            && state
+                .target
+                .as_ref()
+                .is_some_and(|current| current.matches(&requested))
+            && state.current.as_ref().is_some_and(|snapshot| {
+                matches!(
+                    snapshot.state,
+                    ActivationState::Preparing | ActivationState::Updating
+                ) && snapshot.retained_core_publication.as_ref() == Some(publication)
+                    && matches!(
+                        snapshot.capabilities.local_navigation,
+                        ActivationCapabilityState::Ready | ActivationCapabilityState::Retained
+                    )
+            })
+    }
+
     fn source_freshness_memo_for_target(
         &self,
         project_root: &Path,
@@ -861,6 +910,70 @@ impl ActivationService {
             not_checked_cause: lease.source.not_checked_cause,
             samples: Vec::new(),
         })
+    }
+
+    fn source_repair_identity(
+        &self,
+        project_root: &Path,
+        storage_path: &Path,
+    ) -> Option<SourceRepairIdentity> {
+        let target = ActivationTarget::new(project_root, storage_path);
+        let state = self
+            .coordinator
+            .state
+            .lock()
+            .expect("activation coordinator poisoned");
+        if state.running
+            || !state
+                .target
+                .as_ref()
+                .is_some_and(|current| current.matches(&target))
+        {
+            return None;
+        }
+        let snapshot = state.current.as_ref()?.clone();
+        // Core-only completion deliberately leaves aggregate state Updating:
+        // broad retrieval is not prepared, but local Ready still claims a
+        // fresh source admission that a later content fence must falsify.
+        if snapshot.capabilities.local_navigation != ActivationCapabilityState::Ready {
+            return None;
+        }
+        Some(SourceRepairIdentity {
+            target,
+            snapshot,
+            lease: state.ready_lease.clone(),
+        })
+    }
+
+    /// Invalidate only the exact ready admission whose pinned content fence
+    /// observed drift. A newer lease or an in-flight worker belongs to its own
+    /// owner and survives this read. Kept graph data becomes explicitly retained.
+    fn invalidate_source_admission_if_current(&self, expected: &SourceRepairIdentity) -> bool {
+        let mut state = self
+            .coordinator
+            .state
+            .lock()
+            .expect("activation coordinator poisoned");
+        if state.running
+            || !state
+                .target
+                .as_ref()
+                .is_some_and(|target| target.matches(&expected.target))
+            || state.current.as_ref() != Some(&expected.snapshot)
+            || state.ready_lease != expected.lease
+        {
+            return false;
+        }
+        state.ready_lease = None;
+        let snapshot = state.current.as_mut().expect("matched source admission");
+        snapshot.revision += 1;
+        snapshot.capabilities.local_navigation = if snapshot.retained_core_publication.is_some() {
+            ActivationCapabilityState::Retained
+        } else {
+            ActivationCapabilityState::Unavailable
+        };
+        snapshot.capabilities.broad_search = ActivationCapabilityState::Unavailable;
+        true
     }
 
     fn target_for_request(&self, project_root: &Path, storage_path: &Path) -> ActivationTarget {
@@ -1215,6 +1328,30 @@ impl ActivationService {
         Ok(retained)
     }
 
+    fn revalidate_content_current_core(
+        &self,
+        operation: &ActivationOperation,
+        storage_path: &Path,
+        expected: &IndexPublicationDto,
+    ) -> Result<(), ApiError> {
+        let freshness = self
+            .controller
+            .index_freshness_reverified(FreshnessObservationPolicy::ObserveSourceRoot)?;
+        if freshness.status != IndexFreshnessStatusDto::Fresh {
+            return Err(ApiError::new(
+                "publication_changed",
+                index_freshness_block_message("activation", &freshness),
+            ));
+        }
+        if self.retained_core_publication(storage_path)?.as_ref() != Some(expected) {
+            return Err(ApiError::new(
+                "publication_changed",
+                "the complete core publication changed during source-content validation",
+            ));
+        }
+        operation.ensure_not_cancelled("source-content validation")
+    }
+
     pub fn activate_project_with_foreground_budget(
         &self,
         project_root: &Path,
@@ -1259,15 +1396,35 @@ impl ActivationService {
         foreground_budget: Duration,
         goal: ActivationGoal,
     ) -> Result<ActivationRun, ApiError> {
+        let deadline = Instant::now()
+            .checked_add(foreground_budget)
+            .unwrap_or_else(Instant::now);
+        self.activate_with_goal_until(
+            project_root,
+            storage_path,
+            request_cancelled,
+            deadline,
+            goal,
+        )
+    }
+
+    // The managed redrive passes its original absolute deadline. Legacy sliced
+    // activation remains a duration adapter above, rather than resetting the
+    // managed request's clock between public attempts.
+    fn activate_with_goal_until(
+        &self,
+        project_root: &Path,
+        storage_path: &Path,
+        request_cancelled: Arc<AtomicBool>,
+        deadline: Instant,
+        goal: ActivationGoal,
+    ) -> Result<ActivationRun, ApiError> {
         if request_cancelled.load(Ordering::Acquire) {
             return Err(ApiError::new(
                 "cancelled",
                 "request cancelled before project activation",
             ));
         }
-        let deadline = Instant::now()
-            .checked_add(foreground_budget)
-            .unwrap_or_else(Instant::now);
         let target = self.target_for_request(project_root, storage_path);
         let (operation_id, activation_cancelled) = loop {
             let ready_candidate = {
@@ -1949,6 +2106,7 @@ impl ActivationService {
             has_complete_core,
             complete_incremental_source_inventory,
             search_repair_only,
+            content_validated_core,
             precomputed_core_probe,
             preflight_ms,
         ) = 'core_plan: loop {
@@ -2030,13 +2188,41 @@ impl ActivationService {
                                 == Some(&publication)
                         })
                 });
+            // Generic artifact seals deliberately refuse source aliases. An
+            // otherwise current, empty Core plan may use content validation
+            // without minting a seal or an observer-only freshness receipt.
+            let content_validated_core = has_complete_core
+                && precomputed_core_probe.as_ref().is_some_and(|probe| {
+                    probe.outcome == IncrementalPlanProbeOutcomeDto::ProbeUnavailable
+                        && probe.unavailable_stage
+                            == Some(IncrementalProbeUnavailableStageDto::SourceSeals)
+                        && probe.files_to_index == Some(0)
+                        && probe.files_to_remove == Some(0)
+                        && probe.publication.as_ref().is_some_and(|publication| {
+                            summary
+                                .as_ref()
+                                .and_then(|summary| summary.publication.as_ref())
+                                == Some(&crate::index_commit::index_publication_dto(
+                                    publication.clone(),
+                                ))
+                        })
+                });
+            if content_validated_core {
+                let candidate = summary
+                    .as_ref()
+                    .and_then(|summary| summary.publication.as_ref())
+                    .expect("complete Core candidate");
+                operation.set_retained_local_publication(candidate.clone());
+                self.revalidate_content_current_core(operation, &storage_path, candidate)?;
+            }
+
             let preflight_ms =
                 u64::try_from(activation_started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
             let core_stale = !has_complete_core
-                || precomputed_core_probe
-                    .as_ref()
-                    .is_none_or(|probe| !probe.short_circuited() && !search_repair_only);
+                || precomputed_core_probe.as_ref().is_none_or(|probe| {
+                    !probe.short_circuited() && !search_repair_only && !content_validated_core
+                });
             if !core_stale {
                 operation.set_stage(ActivationStage::CoreFreshness);
                 break 'core_plan (
@@ -2044,6 +2230,7 @@ impl ActivationService {
                     has_complete_core,
                     complete_incremental_source_inventory,
                     search_repair_only,
+                    content_validated_core,
                     precomputed_core_probe,
                     preflight_ms,
                 );
@@ -2135,6 +2322,7 @@ impl ActivationService {
                 has_complete_core,
                 complete_incremental_source_inventory,
                 search_repair_only,
+                content_validated_core,
                 precomputed_core_probe,
                 preflight_ms,
             );
@@ -2148,9 +2336,9 @@ impl ActivationService {
             None => summary.as_ref().is_some_and(|summary| {
                 has_complete_core
                     && summary.stats.fatal_error_count == 0
-                    && precomputed_core_probe
-                        .as_ref()
-                        .is_some_and(|probe| probe.short_circuited() || search_repair_only)
+                    && precomputed_core_probe.as_ref().is_some_and(|probe| {
+                        probe.short_circuited() || search_repair_only || content_validated_core
+                    })
             }),
         };
         let core_refresh_ms =
@@ -2177,8 +2365,17 @@ impl ActivationService {
                     .and_then(|summary| summary.publication.clone())
             })
             .expect("fresh complete core has a publication identity");
-        operation.set_local_publication(local_publication.clone());
+        if content_validated_core {
+            operation.set_retained_local_publication(local_publication.clone());
+        } else {
+            operation.set_local_publication(local_publication.clone());
+        }
         run_after_activation_core_refresh_test_hook();
+
+        if content_validated_core {
+            self.revalidate_content_current_core(operation, &storage_path, &local_publication)?;
+            operation.set_local_publication(local_publication.clone());
+        }
 
         if goal == ActivationGoal::CoreOnly {
             operation.set_capability(false, ActivationCapabilityState::Ready);
@@ -2273,6 +2470,11 @@ impl ActivationService {
                 "retrieval publication is not live-ready after activation",
             ));
         }
+        if content_validated_core {
+            // A later fence refusal must not escape as fresh local readiness
+            // through a CoreOnly waiter joining this Full activation.
+            operation.set_retained_local_publication(local_publication.clone());
+        }
         run_before_activation_endpoint_observer_test_hook();
         let observer_after_publication = self
             .controller
@@ -2300,11 +2502,16 @@ impl ActivationService {
             .and_then(|_| observer_after_publication.clone());
         let source_freshness = if let Some(freshness) = observed_source_freshness {
             freshness
+        } else if content_validated_core {
+            self.controller
+                .index_freshness_reverified(FreshnessObservationPolicy::ObserveSourceRoot)?
         } else {
             self.controller
                 .index_freshness_uncached(FreshnessObservationPolicy::ObserveSourceRoot)?
         };
-        if !index_freshness_admits_operation(&source_freshness) {
+        if (content_validated_core && source_freshness.status != IndexFreshnessStatusDto::Fresh)
+            || !index_freshness_admits_operation(&source_freshness)
+        {
             return Err(ApiError::new(
                 "publication_changed",
                 index_freshness_block_message("activation", &source_freshness),
@@ -2357,14 +2564,19 @@ impl ActivationService {
                 "source or repository tracking changed before ready-lease publication",
             ));
         }
-        operation.set_ready_lease(ReadyLease {
+        let ready_lease = ReadyLease {
             configuration_id: self.controller.runtime_configuration_id()?,
             core_publication: revalidated_core,
             retrieval,
             source: ReadySourceIdentity::from(&source_freshness),
             source_freshness_memo,
             source_observer,
-        });
+        };
+        if content_validated_core {
+            operation.ensure_not_cancelled("source-content ready-lease validation")?;
+            operation.set_local_publication(ready_lease.core_publication.clone());
+        }
+        operation.set_ready_lease(ready_lease);
         operation.set_capability(true, ActivationCapabilityState::Ready);
         let validation_ms =
             u64::try_from(validation_started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -2424,6 +2636,17 @@ pub enum OperationReadClass {
     Retrieval,
 }
 
+impl OperationReadClass {
+    /// Request only the publication capability this class can read.
+    /// Core-only operations may still refresh Core, but cannot start retrieval.
+    pub fn activation_goal(self) -> ActivationGoal {
+        match self {
+            Self::Retrieval => ActivationGoal::Full,
+            Self::GraphOnly | Self::SourceBacked | Self::PinnedObserver => ActivationGoal::CoreOnly,
+        }
+    }
+}
+
 /// The read class of one public operation name.
 ///
 /// Operation names here are the runtime-visible names: `stdio` maps tool
@@ -2449,6 +2672,37 @@ pub fn operation_read_class(operation: &str) -> OperationReadClass {
 /// whose admission also requires `broad_search` readiness.
 fn operation_requires_retrieval(operation: &str) -> bool {
     operation_read_class(operation) == OperationReadClass::Retrieval
+}
+
+/// Only explicit source differences discovered by the existing content fence
+/// authorize managed redrive. Unknown checks and observer-only escalation do not.
+fn content_fence_observed_drift(freshness: &IndexFreshnessDto) -> bool {
+    freshness.status == IndexFreshnessStatusDto::Stale
+        && freshness.reason.is_none()
+        && (freshness.changed_file_count > 0
+            || freshness.new_file_count > 0
+            || freshness.removed_file_count > 0)
+}
+
+fn source_repair_budget_at(
+    deadline: Instant,
+    now: Instant,
+    packet_remaining: Option<Option<u32>>,
+) -> Result<Duration, ApiError> {
+    let remaining = deadline.saturating_duration_since(now);
+    let remaining = match packet_remaining {
+        Some(Some(ms)) => remaining.min(Duration::from_millis(u64::from(ms))),
+        Some(None) => Duration::ZERO,
+        None => remaining,
+    };
+    if remaining.is_zero() {
+        Err(ApiError::new(
+            "activation_preparing",
+            "the original foreground or packet deadline ended before source repair",
+        ))
+    } else {
+        Ok(remaining)
+    }
 }
 
 /// Whether a freshness observation permits serving an operation from the current publication.
@@ -2613,6 +2867,22 @@ fn activation_preparing_error(snapshot: &ActivationSnapshot) -> ApiError {
     )
 }
 
+/// Preserve activation failure context and its actionable underlying cause.
+/// The wire diagnostic remains bounded and truncates only at a UTF-8 boundary.
+fn bounded_activation_error_message(error: &anyhow::Error) -> String {
+    const MAX_BYTES: usize = 8 * 1024;
+    let mut message = format!("{error:#}");
+    if message.len() > MAX_BYTES {
+        let mut end = MAX_BYTES - "…".len();
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        message.truncate(end);
+        message.push('…');
+    }
+    message
+}
+
 fn map_activation_error(error: anyhow::Error) -> ApiError {
     if let Some(refusal) = crate::insufficient_space_api_error(&error) {
         return refusal;
@@ -2634,7 +2904,10 @@ fn map_activation_error(error: anyhow::Error) -> ApiError {
             error.to_string(),
         ));
     }
-    classify_activation_api_error(ApiError::new("project_unavailable", error.to_string()))
+    classify_activation_api_error(ApiError::new(
+        "project_unavailable",
+        bounded_activation_error_message(&error),
+    ))
 }
 
 fn classify_activation_api_error(mut error: ApiError) -> ApiError {
@@ -2815,6 +3088,15 @@ pub struct ActivePublicOperationPublication {
     pub retrieval_publication: Option<EmbeddingVectorPublicationIdentityDto>,
 }
 
+/// Read-only identities already captured by the current pinned attempt.
+#[derive(Debug, Clone)]
+pub struct ActivePacketRepresentationContextV3 {
+    pub publication: ActivePublicOperationPublication,
+    pub operation_id: String,
+    pub attempt: u32,
+    pub freshness: OperationFreshness,
+}
+
 #[derive(Clone)]
 pub struct PublicOperationService {
     controller: AppController,
@@ -2823,6 +3105,16 @@ pub struct PublicOperationService {
 }
 
 impl PublicOperationService {
+    /// Commit the source inventory of the adapter's finalized Complete product.
+    /// Preview projection APIs never issue a historical-source record.
+    pub fn commit_packet_served_sources_v3(
+        &self,
+        caller: &str,
+        product: &crate::PacketEvidenceProductV3,
+    ) -> Result<(), ApiError> {
+        crate::agent::packet_served_sources::commit(&self.controller, caller, product)
+    }
+
     pub(crate) fn new(controller: AppController) -> Self {
         Self {
             controller,
@@ -2898,6 +3190,36 @@ impl PublicOperationService {
         Some(reason)
     }
 
+    fn redrive_source_with_deadline(
+        &self,
+        operation: &str,
+        cancelled: Arc<AtomicBool>,
+        deadline: Instant,
+    ) -> Result<(), ApiError> {
+        let packet_remaining = if operation == "packet" {
+            crate::agent::packet_batch::active_packet_latency_budget()
+                .map(|budget| budget.remaining_for_handoff())
+        } else {
+            None
+        };
+        let now = Instant::now();
+        let budget = source_repair_budget_at(deadline, now, packet_remaining)?;
+        let repair_deadline = now.checked_add(budget).unwrap_or(deadline).min(deadline);
+        let activation = self.activation.as_ref().ok_or_else(|| {
+            ApiError::internal("managed source repair requires an activation owner")
+        })?;
+        let goal = operation_read_class(operation).activation_goal();
+        activation
+            .activate_with_goal_until(
+                &self.controller.require_project_root()?,
+                &self.controller.require_storage_path()?,
+                cancelled,
+                repair_deadline,
+                goal,
+            )
+            .map(|_| ())
+    }
+
     fn ensure_packet_latency_remaining(
         &self,
         operation: &str,
@@ -2911,8 +3233,9 @@ impl PublicOperationService {
             return Ok(());
         };
         packet_latency.remaining_for_handoff().ok_or_else(|| {
-            crate::agent::retrieval_primary::sidecar_retrieval_unavailable_error(
+            crate::agent::retrieval_primary::sidecar_request_stop_error(
                 &self.controller,
+                "deadline",
                 format!("packet latency budget exhausted before {phase}"),
             )
         })?;
@@ -2938,6 +3261,26 @@ impl PublicOperationService {
         Some(ActivePublicOperationPublication {
             core_publication,
             retrieval_publication,
+        })
+    }
+
+    pub fn active_packet_representation_context_v3(
+        &self,
+    ) -> Option<ActivePacketRepresentationContextV3> {
+        let owner = ACTIVE_PUBLIC_OPERATION_OWNER.with(|active| active.borrow().clone())?;
+        // Source-backed packets cannot be served from historical admission.
+        if owner.operation != "packet"
+            || owner.controller_identity != self.controller.identity()
+            || owner.freshness != OperationFreshness::Fresh
+            || self.active_publication().as_ref() != Some(&owner.publication)
+        {
+            return None;
+        }
+        Some(ActivePacketRepresentationContextV3 {
+            publication: owner.publication,
+            operation_id: owner.operation_id,
+            attempt: owner.attempt,
+            freshness: owner.freshness,
         })
     }
 
@@ -2990,8 +3333,9 @@ impl PublicOperationService {
         }
         if active_budget.remaining_for_handoff().is_none() {
             return Some(Err(
-                crate::agent::retrieval_primary::sidecar_retrieval_unavailable_error(
+                crate::agent::retrieval_primary::sidecar_request_stop_error(
                     &self.controller,
+                    "deadline",
                     "packet latency budget exhausted before public packet admission",
                 ),
             ));
@@ -3029,6 +3373,35 @@ impl PublicOperationService {
         &self,
         operation: &str,
         cancelled: Arc<AtomicBool>,
+        build: impl FnMut() -> Result<T, ApiError>,
+    ) -> Result<PublicOperation<T>, ApiError> {
+        self.run_with_source_policy(operation, cancelled, None, build)
+    }
+
+    /// Managed tools may use the existing second attempt to activate after an
+    /// actual content fence falsifies their source admission. The absolute
+    /// foreground deadline and any active packet budget are inherited unchanged.
+    /// Raw browser/resource reads continue to use `run_with_cancel`.
+    pub fn run_managed_with_cancel<T>(
+        &self,
+        operation: &str,
+        cancelled: Arc<AtomicBool>,
+        deadline: Instant,
+        build: impl FnMut() -> Result<T, ApiError>,
+    ) -> Result<PublicOperation<T>, ApiError> {
+        if self.controller.active_core_publication().is_some() {
+            return Err(ApiError::invalid_argument(
+                "managed source repair requires the outer public-operation owner",
+            ));
+        }
+        self.run_with_source_policy(operation, cancelled, Some(deadline), build)
+    }
+
+    fn run_with_source_policy<T>(
+        &self,
+        operation: &str,
+        cancelled: Arc<AtomicBool>,
+        managed_deadline: Option<Instant>,
         mut build: impl FnMut() -> Result<T, ApiError>,
     ) -> Result<PublicOperation<T>, ApiError> {
         if cancelled.load(Ordering::Acquire) {
@@ -3061,6 +3434,12 @@ impl PublicOperationService {
                     format!("request cancelled before {operation}"),
                 ));
             }
+            if managed_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(ApiError::new(
+                    "activation_preparing",
+                    "the original foreground deadline ended before the public attempt",
+                ));
+            }
             crate::agent::packet_batch::observe_packet_entry_phase(
                 crate::agent::packet_batch::PacketEntryObservationPhase::PublicAdmissionCheck,
             );
@@ -3079,6 +3458,15 @@ impl PublicOperationService {
                 crate::agent::packet_batch::PacketOperationObservationSpan::CompleteCoreSnapshot,
             );
             let mut historical_reason = None;
+            let mut content_drift = false;
+            let source_identity = managed_deadline.and_then(|_| {
+                let activation = self.activation.as_ref()?;
+                activation.source_repair_identity(
+                    &self.controller.require_project_root().ok()?,
+                    &self.controller.require_storage_path().ok()?,
+                )
+            });
+            let mut drifted_admission = None;
             let result = self.controller.with_complete_core_snapshot(|publication| {
                 let mut freshness_span =
                     crate::agent::packet_batch::observe_packet_operation_span(
@@ -3088,7 +3476,14 @@ impl PublicOperationService {
                 // receipt, the lease probe already falsifies source drift without
                 // another content walk. Re-scanning here burned ~4s on Keycloak
                 // after validation@90 and blew the remaining 18s packet floor.
-                let freshness = if let Some(lease_freshness) =
+                let freshness = if attempt > 1 {
+                    // A prior content fence can observe drift before the OS
+                    // observer advances. A retry must re-derive content truth
+                    // rather than re-admit through that still-coherent lease.
+                    self.controller.index_freshness_reverified(
+                        FreshnessObservationPolicy::ObserveSourceRoot,
+                    )
+                } else if let Some(lease_freshness) =
                     self.activation.as_ref().and_then(|activation| {
                         let project_root = self.controller.require_project_root().ok()?;
                         let storage_path = self.controller.require_storage_path().ok()?;
@@ -3106,6 +3501,13 @@ impl PublicOperationService {
                     freshness_span.finish_success();
                 }
                 let freshness = freshness?;
+                if content_fence_observed_drift(&freshness) {
+                    content_drift = true;
+                    drifted_admission = source_identity.as_ref().filter(|identity| {
+                        identity.snapshot.retained_core_publication.as_ref()
+                            == Some(&crate::index_publication_dto(publication.clone()))
+                    }).cloned();
+                }
                 if !index_freshness_admits_operation(&freshness) {
                     codestory_workspace::invalidate_lease_memoized_values();
                     match self.retained_core_admission(operation, publication) {
@@ -3138,13 +3540,23 @@ impl PublicOperationService {
                         self.controller.identity(),
                         operation,
                         active_publication,
+                        &operation_id,
+                        attempt,
+                        match historical_reason { Some(reason) => OperationFreshness::Historical(reason), None => OperationFreshness::Fresh },
                         Arc::clone(&cancelled),
                         &mut build,
                     );
                     if value.is_ok() {
                         build_span.finish_success();
                     }
-                    let value = value?;
+                    // A source reader can detect drift before the response-level
+                    // fence. Only the managed path defers that typed refusal to
+                    // the existing fence; no extra scan is added to a warm call.
+                    let value = match value {
+                        Ok(value) => Ok(value),
+                        Err(error) if managed_deadline.is_some() && matches!(error.code.as_str(), "source_stale" | "source_unavailable") => Err(error),
+                        Err(error) => return Err(error),
+                    };
                     if cancelled.load(Ordering::Acquire) {
                         return Err(ApiError::new(
                             "cancelled",
@@ -3171,6 +3583,13 @@ impl PublicOperationService {
                         freshness_span.finish_success();
                     }
                     let after = after?;
+                    if content_fence_observed_drift(&after) {
+                        content_drift = true;
+                        drifted_admission = source_identity.as_ref().filter(|identity| {
+                            identity.snapshot.retained_core_publication.as_ref()
+                                == Some(&crate::index_publication_dto(publication.clone()))
+                        }).cloned();
+                    }
                     if !index_freshness_admits_operation(&after) {
                         codestory_workspace::invalidate_lease_memoized_values();
                         match self.retained_core_admission(operation, publication) {
@@ -3183,7 +3602,7 @@ impl PublicOperationService {
                             }
                         }
                     }
-                    Ok(value)
+                    value
                 };
                 let (value, retrieval_publication) = if operation_requires_retrieval(operation) {
                     run_before_retrieval_pin_test_hook();
@@ -3219,6 +3638,132 @@ impl PublicOperationService {
             });
             if result.is_ok() {
                 complete_core_span.finish_success();
+            }
+            // Every core/retrieval/read pin has unwound before managed
+            // activation can wait for a writer or publish a replacement.
+            // An already-admitted historical graph value must not wait on
+            // the replacement that made it historical. That writer may be
+            // waiting on its caller, and source-backed reads still need it.
+            // Aggregate Updating alone is insufficient: a completed CoreOnly
+            // run can be quiescent in that state and must still repair drift.
+            let serving_running_historical = operation_read_class(operation)
+                == OperationReadClass::GraphOnly
+                && matches!(
+                    historical_reason,
+                    Some(
+                        HistoricalServedReason::PeerWriter
+                            | HistoricalServedReason::RefreshInProgress
+                    )
+                )
+                && result.as_ref().is_ok_and(|(_, publication, _)| {
+                    let Some(activation) = self.activation.as_ref() else {
+                        return false;
+                    };
+                    let Ok(project_root) = self.controller.require_project_root() else {
+                        return false;
+                    };
+                    let Ok(storage_path) = self.controller.require_storage_path() else {
+                        return false;
+                    };
+                    activation.has_running_replacement_for_publication(
+                        &project_root,
+                        &storage_path,
+                        publication,
+                    )
+                });
+            if content_drift
+                && let Some(deadline) = managed_deadline
+                && !serving_running_historical
+            {
+                if let (Some(activation), Some(identity)) = (&self.activation, &drifted_admission) {
+                    activation.invalidate_source_admission_if_current(identity);
+                }
+                let repairable_result = result.as_ref().err().is_none_or(|error| {
+                    matches!(
+                        error.code.as_str(),
+                        "project_unavailable"
+                            | "publication_changed"
+                            | "source_stale"
+                            | "source_unavailable"
+                    )
+                });
+                if attempt == 1 && repairable_result {
+                    if cancelled.load(Ordering::Acquire) {
+                        return Err(ApiError::new(
+                            "cancelled",
+                            "request cancelled before source repair",
+                        ));
+                    }
+                    let repair = self.redrive_source_with_deadline(
+                        operation,
+                        Arc::clone(&cancelled),
+                        deadline,
+                    );
+                    if cancelled.load(Ordering::Acquire) {
+                        return Err(ApiError::new(
+                            "cancelled",
+                            "request cancelled during source repair",
+                        ));
+                    }
+                    match repair {
+                        Ok(()) => {
+                            crate::agent::packet_batch::observe_packet_retry_cause(
+                                "publication_changed",
+                            );
+                            continue;
+                        }
+                        Err(error) => {
+                            // Graph-only reads may retain the already-built,
+                            // pinned value. Never invent fresh source or re-run
+                            // the body after its original deadline expired.
+                            if operation_read_class(operation) == OperationReadClass::GraphOnly
+                                && let Ok((value, core_publication, retrieval_publication)) = result
+                            {
+                                let reason = self
+                                    .activation
+                                    .as_ref()
+                                    .and_then(|activation| {
+                                        activation.snapshot_for_target(
+                                            &self.controller.require_project_root().ok()?,
+                                            &self.controller.require_storage_path().ok()?,
+                                        )
+                                    })
+                                    .filter(|snapshot| {
+                                        snapshot.retained_core_publication.as_ref()
+                                            == Some(&core_publication)
+                                    })
+                                    .map(|snapshot| {
+                                        if snapshot.stage == ActivationStage::WaitingForPeerWriter {
+                                            HistoricalServedReason::PeerWriter
+                                        } else if matches!(
+                                            snapshot.state,
+                                            ActivationState::Preparing | ActivationState::Updating
+                                        ) {
+                                            HistoricalServedReason::RefreshInProgress
+                                        } else if matches!(
+                                            snapshot.state,
+                                            ActivationState::Retryable
+                                                | ActivationState::Unavailable
+                                        ) {
+                                            HistoricalServedReason::ReplacementFailed
+                                        } else {
+                                            HistoricalServedReason::StaleSource
+                                        }
+                                    })
+                                    .unwrap_or(HistoricalServedReason::StaleSource);
+                                return Ok(PublicOperation {
+                                    value,
+                                    core_publication: Some(core_publication),
+                                    retrieval_publication,
+                                    operation_id,
+                                    attempt,
+                                    freshness: OperationFreshness::Historical(reason),
+                                });
+                            }
+                            return Err(error);
+                        }
+                    }
+                }
             }
             match result {
                 Ok((value, core_publication, retrieval_publication)) => {
@@ -3754,6 +4299,30 @@ impl IndexService {
             .bind_project_paths_for_refresh(root, storage_path)
     }
 
+    /// Refresh and summarize the Core without observing optional retrieval transport.
+    /// A read without refresh still requires an existing complete Core publication.
+    pub fn refresh_core_index_blocking(
+        &self,
+        root: PathBuf,
+        storage_path: PathBuf,
+        mode: Option<IndexMode>,
+    ) -> Result<(ProjectSummary, Option<IndexingPhaseTimings>), ApiError> {
+        let timings = if let Some(mode) = mode {
+            self.controller
+                .bind_project_paths_for_refresh(root.clone(), storage_path.clone())?;
+            Some(
+                self.controller
+                    .run_indexing_blocking_without_runtime_refresh(mode)?,
+            )
+        } else {
+            None
+        };
+        let summary = self
+            .controller
+            .open_core_read_only_with_storage_path(root, storage_path)?;
+        Ok((summary, timings))
+    }
+
     pub fn run_indexing_blocking_without_runtime_refresh_with_cancel(
         &self,
         mode: IndexMode,
@@ -4141,6 +4710,39 @@ mod freshness_gate_tests {
     }
 
     #[test]
+    fn graph_and_source_reads_activate_only_core() {
+        for operation in [
+            "symbols",
+            "files",
+            "graph",
+            "exact_search",
+            "source_snippet",
+            "affected",
+            crate::call_path_kernel::PROOF_DOMAIN,
+        ] {
+            assert_eq!(
+                operation_read_class(operation).activation_goal(),
+                ActivationGoal::CoreOnly,
+                "{operation}"
+            );
+        }
+        for operation in [
+            "packet",
+            "search",
+            "context",
+            "drill",
+            "resolution",
+            "graph_assisted",
+        ] {
+            assert_eq!(
+                operation_read_class(operation).activation_goal(),
+                ActivationGoal::Full,
+                "{operation}"
+            );
+        }
+    }
+
+    #[test]
     fn dark_indexed_call_path_builder_remains_core_only() {
         assert!(!operation_requires_retrieval(
             crate::call_path_kernel::PROOF_DOMAIN
@@ -4325,7 +4927,7 @@ pub(crate) mod activation_tests {
         ready_activation_fixture_with_observer_setup(|_, _| {})
     }
 
-    fn ready_activation_fixture_with_observer_setup(
+    pub(crate) fn ready_activation_fixture_with_observer_setup(
         setup_observer: impl FnOnce(&Path, &AppController),
     ) -> ReadyActivationFixture {
         let project = tempfile::tempdir().expect("project");
@@ -5106,6 +5708,84 @@ pub(crate) mod activation_tests {
     }
 
     #[test]
+    fn packet_public_admission_refuses_missing_retrieval_before_response_building() {
+        let (project, _cache, storage_path, _) = complete_core_without_retrieval_pointer_fixture();
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
+        runtime
+            .project_service()
+            .open_core_read_only_with_storage_path(project.path().to_path_buf(), storage_path)
+            .expect("attach complete Core without retrieval");
+        let service = runtime.public_operation_service();
+        let request = warm_packet_request();
+        let _latency_scope = crate::enter_packet_latency_scope(request.latency_budget_ms);
+
+        for observational in [false, true] {
+            let mut body_calls = 0;
+            let mut build = || {
+                body_calls += 1;
+                Ok(())
+            };
+            let error = if observational {
+                service.run_observational_with_cancel(
+                    "packet",
+                    Arc::new(AtomicBool::new(false)),
+                    &mut build,
+                )
+            } else {
+                service.run_with_cancel("packet", Arc::new(AtomicBool::new(false)), &mut build)
+            }
+            .expect_err("missing retrieval must refuse before the response builder");
+            assert_eq!(error.code, "retrieval_unavailable", "{error:?}");
+            assert!(
+                error.message.contains("expected profile=agent mode=full"),
+                "{error:?}"
+            );
+            assert_eq!(
+                body_calls, 0,
+                "unavailable retrieval must not invoke the body"
+            );
+            assert!(service.active_packet_representation_context_v3().is_none());
+            assert!(active_public_operation_cancellation().is_none());
+        }
+        let graph = service
+            .run_with_cancel("symbols", Arc::new(AtomicBool::new(false)), || Ok(()))
+            .expect("complete Core remains available for graph-only reads");
+        assert!(graph.core_publication.is_some());
+        assert!(graph.retrieval_publication.is_none());
+    }
+
+    #[test]
+    fn packet_public_admission_preserves_ready_representation_owner() {
+        let fixture = ready_activation_fixture();
+        let service = fixture.runtime.public_operation_service();
+        let browser = fixture.runtime.browser_service();
+        let request = warm_packet_request();
+        let _latency_scope = crate::enter_packet_latency_scope(request.latency_budget_ms);
+        let operation = service
+            .run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
+                let context = service
+                    .active_packet_representation_context_v3()
+                    .expect("fresh representation context");
+                assert!(context.publication.retrieval_publication.is_some());
+                let represented = browser.packet_for_representation_v3(
+                    request.clone(),
+                    "test",
+                    &mut |candidate| {
+                        serde_json::to_vec(candidate)
+                            .map(|bytes| bytes.len())
+                            .map_err(|_| ())
+                    },
+                )?;
+                assert_eq!(service.active_publication(), Some(context.publication));
+                Ok(represented.product)
+            })
+            .expect("ready packet representation retains the actual owner");
+        assert!(operation.retrieval_publication.is_some());
+        assert!(service.active_packet_representation_context_v3().is_none());
+    }
+
+    #[test]
     fn packet_public_owner_reuses_outer_for_browser_and_projection() {
         let fixture = ready_activation_fixture();
         let service = fixture.runtime.public_operation_service();
@@ -5300,16 +5980,15 @@ pub(crate) mod activation_tests {
 
         let outer = service
             .run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
-                let packet = browser
+                let reads = crate::search_evidence::verified_source_read_count();
+                let error = browser
                     .packet(request.clone())
-                    .expect("independent packet reaches the existing projection guard");
-                let error =
-                    crate::project_packet_v3(&service, "test", &request, &packet, |_| Ok(0))
-                        .expect_err("mismatched core generation must not produce a projection");
-                assert_eq!(error.code, "internal");
-                assert!(
-                    error.message.contains("RequestedCoreGenerationMismatch"),
-                    "unexpected existing core-generation error: {error:?}"
+                    .expect_err("mismatched core generation must fail before hydration");
+                assert_eq!(error.code, "invalid_argument");
+                assert_eq!(
+                    crate::search_evidence::verified_source_read_count(),
+                    reads,
+                    "a stale core request must not read source"
                 );
                 Ok(())
             })
@@ -5335,20 +6014,15 @@ pub(crate) mod activation_tests {
 
         let outer = service
             .run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
-                let packet = browser
+                let reads = crate::search_evidence::verified_source_read_count();
+                let error = browser
                     .packet(request.clone())
-                    .expect("independent packet reaches the existing projection guard");
-                let error =
-                    crate::project_packet_v3(&service, "test", &request, &packet, |_| Ok(0))
-                        .expect_err(
-                            "mismatched retrieval generation must not produce a projection",
-                        );
-                assert_eq!(error.code, "internal");
-                assert!(
-                    error
-                        .message
-                        .contains("RequestedRetrievalGenerationMismatch"),
-                    "unexpected existing retrieval-generation error: {error:?}"
+                    .expect_err("mismatched retrieval generation must fail before hydration");
+                assert_eq!(error.code, "invalid_argument");
+                assert_eq!(
+                    crate::search_evidence::verified_source_read_count(),
+                    reads,
+                    "a stale retrieval request must not read source"
                 );
                 Ok(())
             })
@@ -5451,6 +6125,19 @@ pub(crate) mod activation_tests {
             .expect("outer packet completes after the test releases cancellation");
     }
 
+    fn assert_packet_budget_refusal_has_no_index_repair(error: &ApiError) {
+        assert_eq!(error.code, "retrieval_unavailable");
+        let details = error.details.as_ref().expect("typed packet budget cause");
+        assert!(
+            details.next_commands.is_empty()
+                && details.minimum_next.is_empty()
+                && details.full_repair.is_empty(),
+            "an exhausted packet allowance must not prescribe index repair: {error:?}"
+        );
+        assert_eq!(details.cause_code.as_deref(), Some("deadline"));
+        assert_eq!(details.failed_layer.as_deref(), Some("retrieval_query"));
+    }
+
     #[test]
     fn packet_public_owner_refuses_an_expired_inherited_allowance() {
         let fixture = ready_activation_fixture();
@@ -5473,9 +6160,67 @@ pub(crate) mod activation_tests {
                         .contains("packet latency budget exhausted before public packet admission"),
                     "unexpected expired-allowance error: {error:?}"
                 );
+                assert_packet_budget_refusal_has_no_index_repair(&error);
                 Ok(())
             })
             .expect("outer owner retains its post-build checks");
+    }
+
+    #[test]
+    fn packet_representation_context_tracks_actual_retry_and_rejects_historical_owner() {
+        let fixture = ready_activation_fixture();
+        let service = fixture.runtime.public_operation_service();
+        let request = warm_packet_request();
+        let _latency_scope = crate::enter_packet_latency_scope(request.latency_budget_ms);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut snapshots = Vec::new();
+        let operation = service
+            .run_with_cancel("packet", Arc::clone(&cancelled), || {
+                let context = service
+                    .active_packet_representation_context_v3()
+                    .expect("actual fresh packet owner context");
+                assert_eq!(
+                    Some(context.publication.clone()),
+                    service.active_publication()
+                );
+                assert_eq!(context.freshness, OperationFreshness::Fresh);
+                with_public_operation_owner(
+                    service.controller.identity(),
+                    "packet",
+                    context.publication.clone(),
+                    &context.operation_id,
+                    context.attempt,
+                    OperationFreshness::Historical(HistoricalServedReason::RefreshInProgress),
+                    Arc::clone(&cancelled),
+                    || {
+                        assert!(service.active_packet_representation_context_v3().is_none());
+                    },
+                );
+                assert_eq!(
+                    service
+                        .active_packet_representation_context_v3()
+                        .unwrap()
+                        .attempt,
+                    context.attempt
+                );
+                snapshots.push(context);
+                if snapshots.len() == 1 {
+                    Err(ApiError::new(
+                        "publication_changed",
+                        "exercise existing outer retry",
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+            .expect("one original outer retry");
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].attempt, 1);
+        assert_eq!(snapshots[1].attempt, 2);
+        assert_eq!(snapshots[0].operation_id, operation.operation_id);
+        assert_eq!(snapshots[1].operation_id, operation.operation_id);
+        assert_eq!(operation.attempt, 2);
+        assert!(service.active_packet_representation_context_v3().is_none());
     }
 
     #[test]
@@ -5582,6 +6327,7 @@ pub(crate) mod activation_tests {
                 .contains("packet latency budget exhausted before public packet admission"),
             "retry must consume the original allowance: {error:?}"
         );
+        assert_packet_budget_refusal_has_no_index_repair(&error);
         let observation = crate::agent::packet_batch::packet_operation_observation_for_test()
             .expect("active packet operation observation");
         assert_eq!(observation.public_admission_reached_count, 2);
@@ -5630,6 +6376,7 @@ pub(crate) mod activation_tests {
                 .contains("packet latency budget exhausted before public packet admission"),
             "retry must preserve the existing admission error: {error:?}"
         );
+        assert_packet_budget_refusal_has_no_index_repair(&error);
         let observation = crate::agent::packet_batch::packet_operation_observation_for_test()
             .expect("active packet operation observation");
         assert_eq!(observation.public_admission_reached_count, 2);
@@ -5662,6 +6409,7 @@ pub(crate) mod activation_tests {
                 .contains("packet latency budget exhausted before public packet admission"),
             "first refusal must preserve the existing admission error: {error:?}"
         );
+        assert_packet_budget_refusal_has_no_index_repair(&error);
         let observation = crate::agent::packet_batch::packet_operation_observation_for_test()
             .expect("active packet operation observation");
         assert_eq!(observation.public_admission_reached_count, 1);
@@ -5782,6 +6530,638 @@ pub(crate) mod activation_tests {
             1,
             "a new ready lease must compute its own fingerprint"
         );
+    }
+
+    fn delayed_managed_fixture() -> ReadyActivationFixture {
+        ready_activation_fixture_with_observer_setup(|root, controller| {
+            let session =
+                crate::tests::freshness_observer_tests::scripted_session(root, |_| Vec::new());
+            controller.install_source_observer_for_test(root, Arc::new(session));
+        })
+    }
+
+    fn managed_fixture_files(
+        fixture: &ReadyActivationFixture,
+    ) -> Result<IndexedFilesDto, ApiError> {
+        fixture
+            .runtime
+            .activation_service()
+            .controller
+            .indexed_files(IndexedFilesRequest {
+                include_framework_coverage: false,
+                path_contains: None,
+                language: None,
+                role: None,
+                limit: Some(100),
+            })
+    }
+
+    #[test]
+    fn managed_delayed_new_file_redrives_once_and_serves_the_new_core() {
+        let fixture = delayed_managed_fixture();
+        let activation = fixture.runtime.activation_service();
+        let original_epoch = fixture.lease.source_observer.clone();
+        let old_publication = fixture.lease.core_publication.clone();
+        let mut builds = 0;
+        let response = fixture
+            .runtime
+            .public_operation_service()
+            .run_managed_with_cancel(
+                "files",
+                Arc::new(AtomicBool::new(false)),
+                Instant::now() + Duration::from_secs(10),
+                || {
+                    builds += 1;
+                    if builds == 1 {
+                        fs::write(
+                            fixture.project.path().join("new_admitted.rs"),
+                            "// NEW_FILE_ANCHOR\n",
+                        )
+                        .unwrap();
+                    }
+                    managed_fixture_files(&fixture)
+                },
+            )
+            .expect("one managed refresh covers the delayed new file");
+        assert_eq!(builds, 2);
+        assert_eq!(response.attempt, 2);
+        assert_eq!(response.freshness, OperationFreshness::Fresh);
+        assert_ne!(response.core_publication.as_ref(), Some(&old_publication));
+        assert!(
+            response
+                .value
+                .files
+                .iter()
+                .any(|file| file.path.ends_with("new_admitted.rs"))
+        );
+        assert_eq!(activation.worker_start_count_for_test(), 1);
+        assert_eq!(
+            activation.coordinator.state.lock().unwrap().goal,
+            ActivationGoal::CoreOnly
+        );
+        assert_eq!(
+            activation
+                .controller
+                .observed_source_epoch_if_armed(fixture.project.path()),
+            original_epoch,
+            "the repair is justified by content, without an OS event"
+        );
+    }
+
+    #[test]
+    fn managed_same_length_same_mtime_drift_replaces_the_falsified_lease() {
+        let fixture = delayed_managed_fixture();
+        let activation = fixture.runtime.activation_service();
+        let source = fixture.project.path().join("metadata.rs");
+        let original = fs::read(&source).unwrap();
+        let mtime = fs::metadata(&source).unwrap().modified().unwrap();
+        let mut changed = original.clone();
+        let at = changed.len() - 2;
+        changed[at] = b'X';
+        fs::write(&source, &changed).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        assert_eq!(fs::metadata(&source).unwrap().len(), original.len() as u64);
+        assert_eq!(fs::metadata(&source).unwrap().modified().unwrap(), mtime);
+        let old_id = {
+            let storage = Store::open_read_only(&fixture.storage_path).unwrap();
+            let nodes = storage.get_nodes().unwrap();
+            let node = nodes
+                .iter()
+                .find(|node| node.kind == codestory_contracts::graph::NodeKind::FILE)
+                .unwrap();
+            NodeId(node.id.0.to_string())
+        };
+        let response = fixture
+            .runtime
+            .public_operation_service()
+            .run_managed_with_cancel(
+                "source_snippet",
+                Arc::new(AtomicBool::new(false)),
+                Instant::now() + Duration::from_secs(10),
+                || activation.controller.snippet_context(old_id.clone(), 1),
+            )
+            .expect("content change, not timestamp, authorizes managed core replacement");
+        assert!(
+            response
+                .value
+                .snippet
+                .contains(std::str::from_utf8(&changed).unwrap().trim_end())
+        );
+        assert_eq!(response.attempt, 2);
+        assert_eq!(response.freshness, OperationFreshness::Fresh);
+        assert_ne!(
+            response.core_publication.as_ref(),
+            Some(&fixture.lease.core_publication)
+        );
+        assert_eq!(activation.worker_start_count_for_test(), 1);
+        assert!(
+            activation
+                .coordinator
+                .state
+                .lock()
+                .unwrap()
+                .ready_lease
+                .is_none(),
+            "CoreOnly never presents the old Full lease as ready"
+        );
+        assert_eq!(
+            activation
+                .controller
+                .index_freshness_reverified(FreshnessObservationPolicy::ObserveSourceRoot)
+                .unwrap()
+                .status,
+            IndexFreshnessStatusDto::Fresh
+        );
+    }
+
+    #[test]
+    fn managed_removed_stable_id_is_not_rebound_to_replacement_bytes() {
+        let fixture = delayed_managed_fixture();
+        let activation = fixture.runtime.activation_service();
+        let old_id = {
+            let storage = Store::open_read_only(&fixture.storage_path).unwrap();
+            let nodes = storage.get_nodes().unwrap();
+            let node = nodes
+                .iter()
+                .find(|node| node.kind == codestory_contracts::graph::NodeKind::FILE)
+                .unwrap();
+            NodeId(node.id.0.to_string())
+        };
+        let mut builds = 0;
+        let refusal = fixture
+            .runtime
+            .public_operation_service()
+            .run_managed_with_cancel(
+                "source_snippet",
+                Arc::new(AtomicBool::new(false)),
+                Instant::now() + Duration::from_secs(10),
+                || {
+                    builds += 1;
+                    let value = activation.controller.snippet_context(old_id.clone(), 1);
+                    if builds == 1 {
+                        fs::rename(
+                            fixture.project.path().join("metadata.rs"),
+                            fixture.project.path().join("replacement.rs"),
+                        )
+                        .unwrap();
+                    }
+                    value
+                },
+            )
+            .expect_err("a retired ID must not silently resolve to another file");
+        assert_eq!(refusal.code, "not_found");
+        assert_eq!(builds, 2);
+        assert_eq!(activation.worker_start_count_for_test(), 1);
+        assert!(
+            managed_fixture_files(&fixture)
+                .unwrap()
+                .files
+                .iter()
+                .any(|file| file.path.ends_with("replacement.rs"))
+        );
+        assert!(!refusal.message.contains("READY_LEASE_SOURCE_ANCHOR"));
+    }
+
+    #[test]
+    fn managed_second_mutation_exhausts_the_same_two_attempt_owner() {
+        let fixture = delayed_managed_fixture();
+        let activation = fixture.runtime.activation_service();
+        let mut builds = 0;
+        let refusal = fixture
+            .runtime
+            .public_operation_service()
+            .run_managed_with_cancel(
+                "source_snippet",
+                Arc::new(AtomicBool::new(false)),
+                Instant::now() + Duration::from_secs(10),
+                || {
+                    builds += 1;
+                    fs::write(
+                        fixture.project.path().join("metadata.rs"),
+                        format!("// MUTATION_{builds}\n"),
+                    )
+                    .unwrap();
+                    Ok(())
+                },
+            )
+            .expect_err("a second torn response cannot start another replacement");
+        assert_eq!(refusal.code, "publication_changed");
+        assert_eq!(builds, 2);
+        assert_eq!(activation.worker_start_count_for_test(), 1);
+        assert!(
+            activation
+                .coordinator
+                .state
+                .lock()
+                .unwrap()
+                .ready_lease
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn managed_mutation_before_second_admission_refuses_without_another_repair() {
+        let armed = Arc::new(AtomicBool::new(false));
+        let fired = Arc::new(AtomicBool::new(false));
+        let armed_observer = Arc::clone(&armed);
+        let fired_observer = Arc::clone(&fired);
+        let fixture = ready_activation_fixture_with_observer_setup(move |root, controller| {
+            let source = root.join("metadata.rs");
+            let storage = controller.require_storage_path().unwrap();
+            let old_generation = Store::database_complete_index_publication(&storage)
+                .unwrap()
+                .unwrap()
+                .generation_id;
+            let session =
+                crate::tests::freshness_observer_tests::scripted_session(root, move |_| {
+                    let replacement_committed = Store::database_complete_index_publication(
+                        &storage,
+                    )
+                    .is_ok_and(|publication| {
+                        publication.is_some_and(|value| value.generation_id != old_generation)
+                    });
+                    if armed_observer.load(Ordering::Acquire)
+                        && replacement_committed
+                        && !fired_observer.swap(true, Ordering::AcqRel)
+                    {
+                        fs::write(&source, "// SECOND_MUTATION_BEFORE_ADMISSION\n").unwrap();
+                    }
+                    Vec::new()
+                });
+            controller.install_source_observer_for_test(root, Arc::new(session));
+        });
+        let activation = fixture.runtime.activation_service();
+        let mut builds = 0;
+        let refusal = fixture
+            .runtime
+            .public_operation_service()
+            .run_managed_with_cancel(
+                "source_snippet",
+                Arc::new(AtomicBool::new(false)),
+                Instant::now() + Duration::from_secs(10),
+                || {
+                    builds += 1;
+                    fs::write(
+                        fixture.project.path().join("metadata.rs"),
+                        "// FIRST_MUTATION\n",
+                    )
+                    .unwrap();
+                    armed.store(true, Ordering::Release);
+                    Ok(())
+                },
+            )
+            .expect_err("attempt two must see content that moved after the replacement committed");
+        assert!(fired.load(Ordering::Acquire));
+        assert_eq!(refusal.code, "project_unavailable");
+        assert_eq!(builds, 1, "attempt two refuses before reusing the body");
+        assert_eq!(
+            activation.worker_start_count_for_test(),
+            1,
+            "no third attempt or second repair"
+        );
+        assert_eq!(
+            activation.snapshot().unwrap().capabilities.local_navigation,
+            ActivationCapabilityState::Retained
+        );
+    }
+
+    #[test]
+    fn source_invalidation_cannot_clear_a_newer_ready_identity() {
+        let fixture = delayed_managed_fixture();
+        let activation = fixture.runtime.activation_service();
+        let old = activation
+            .source_repair_identity(fixture.project.path(), &fixture.storage_path)
+            .unwrap();
+        {
+            let mut state = activation.coordinator.state.lock().unwrap();
+            state.current.as_mut().unwrap().revision += 1;
+            state.ready_lease.as_mut().unwrap().source_freshness_memo =
+                codestory_workspace::SourceFreshnessMemo::default();
+        }
+        let newer = activation
+            .source_repair_identity(fixture.project.path(), &fixture.storage_path)
+            .unwrap();
+        assert!(!activation.invalidate_source_admission_if_current(&old));
+        let unchanged = activation
+            .source_repair_identity(fixture.project.path(), &fixture.storage_path)
+            .unwrap();
+        assert_eq!(unchanged.snapshot, newer.snapshot);
+        assert_eq!(unchanged.lease, newer.lease);
+        assert!(activation.invalidate_source_admission_if_current(&newer));
+        let state = activation.coordinator.state.lock().unwrap();
+        assert!(state.ready_lease.is_none());
+        assert_eq!(
+            state
+                .current
+                .as_ref()
+                .unwrap()
+                .capabilities
+                .local_navigation,
+            ActivationCapabilityState::Retained
+        );
+        assert_eq!(
+            state.current.as_ref().unwrap().capabilities.broad_search,
+            ActivationCapabilityState::Unavailable
+        );
+    }
+
+    #[test]
+    fn managed_source_repair_never_resets_foreground_or_packet_deadlines() {
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(10);
+        assert_eq!(
+            source_repair_budget_at(deadline, started + Duration::from_secs(7), None).unwrap(),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            source_repair_budget_at(deadline, started + Duration::from_secs(7), Some(Some(700)))
+                .unwrap(),
+            Duration::from_millis(700)
+        );
+        assert_eq!(
+            source_repair_budget_at(deadline, started + Duration::from_secs(7), Some(None))
+                .unwrap_err()
+                .code,
+            "activation_preparing"
+        );
+        assert_eq!(
+            source_repair_budget_at(deadline, deadline, None)
+                .unwrap_err()
+                .code,
+            "activation_preparing"
+        );
+        let fixture = delayed_managed_fixture();
+        let mut builds = 0;
+        let refusal = fixture
+            .runtime
+            .public_operation_service()
+            .run_managed_with_cancel(
+                "source_snippet",
+                Arc::new(AtomicBool::new(false)),
+                started,
+                || {
+                    builds += 1;
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+        assert_eq!(refusal.code, "activation_preparing");
+        assert_eq!(builds, 0);
+        assert_eq!(
+            fixture
+                .runtime
+                .activation_service()
+                .worker_start_count_for_test(),
+            0
+        );
+    }
+
+    #[test]
+    fn managed_cancellation_during_first_body_does_not_launch_source_repair() {
+        let fixture = delayed_managed_fixture();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut builds = 0;
+        let refusal = fixture
+            .runtime
+            .public_operation_service()
+            .run_managed_with_cancel(
+                "source_snippet",
+                Arc::clone(&cancelled),
+                Instant::now() + Duration::from_secs(10),
+                || {
+                    builds += 1;
+                    fs::write(
+                        fixture.project.path().join("metadata.rs"),
+                        "// CANCELLED_DRIFT\n",
+                    )
+                    .unwrap();
+                    cancelled.store(true, Ordering::Release);
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+        assert_eq!(refusal.code, "cancelled");
+        assert_eq!(builds, 1);
+        assert_eq!(
+            fixture
+                .runtime
+                .activation_service()
+                .worker_start_count_for_test(),
+            0
+        );
+    }
+
+    #[test]
+    fn managed_warm_nested_reads_keep_the_existing_content_scan_cost() {
+        let fixture = delayed_managed_fixture();
+        let service = fixture.runtime.public_operation_service();
+        let indexed = u64::from(fixture.lease.source.indexed_file_count);
+        let mut before = None;
+        let mut after = None;
+        let response = service
+            .run_managed_with_cancel(
+                "ground",
+                Arc::new(AtomicBool::new(false)),
+                Instant::now() + Duration::from_secs(10),
+                || {
+                    service.run_with_cancel("ground", Arc::new(AtomicBool::new(false)), || {
+                        before = codestory_workspace::source_freshness_counts();
+                        Ok(())
+                    })?;
+                    after = codestory_workspace::source_freshness_counts();
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(before.unwrap().content_hash_reads, 0);
+        assert_eq!(after.unwrap().content_hash_reads, indexed);
+        assert_eq!(response.attempt, 1);
+        assert_eq!(response.freshness, OperationFreshness::Fresh);
+        assert_eq!(
+            fixture
+                .runtime
+                .activation_service()
+                .worker_start_count_for_test(),
+            0
+        );
+        assert_eq!(codestory_workspace::source_freshness_counts(), None);
+    }
+
+    #[test]
+    fn managed_graph_retains_historical_answer_while_shared_repair_waits() {
+        let fixture = delayed_managed_fixture();
+        let activation = fixture.runtime.activation_service();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        activation.set_worker_start_gate_for_test(Some(Arc::clone(&gate)));
+        let mut builds = 0;
+        let response = fixture
+            .runtime
+            .public_operation_service()
+            .run_managed_with_cancel(
+                "files",
+                Arc::new(AtomicBool::new(false)),
+                Instant::now() + Duration::from_millis(100),
+                || {
+                    builds += 1;
+                    fs::write(
+                        fixture.project.path().join("metadata.rs"),
+                        "// WAITING_DRIFT\n",
+                    )
+                    .unwrap();
+                    Ok(())
+                },
+            );
+        // Always release the test worker, even if an assertion below fails.
+        activation.set_worker_start_gate_for_test(None);
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        let response =
+            response.expect("a graph-only value may retain its pinned historical publication");
+        assert_eq!(builds, 1);
+        assert_eq!(response.attempt, 1);
+        assert_eq!(
+            response.freshness,
+            OperationFreshness::Historical(HistoricalServedReason::RefreshInProgress)
+        );
+        let before = activation.snapshot().unwrap();
+        activation
+            .wait_for_existing_operation(
+                fixture.project.path(),
+                &fixture.storage_path,
+                (&before.operation_id, before.attempt),
+                &AtomicBool::new(false),
+                Duration::from_secs(10),
+                ActivationGoal::CoreOnly,
+            )
+            .expect("finish the same shared worker before fixture directories are dropped");
+        assert_eq!(activation.worker_start_count_for_test(), 1);
+    }
+
+    #[test]
+    fn managed_historical_graph_returns_before_its_running_replacement_is_released() {
+        let fixture = delayed_managed_fixture();
+        let activation = fixture.runtime.activation_service();
+        let old_publication = fixture.lease.core_publication.clone();
+        fs::write(
+            fixture.project.path().join("metadata.rs"),
+            "// RUNNING_REPLACEMENT_DRIFT\n",
+        )
+        .unwrap();
+        let identity = activation
+            .source_repair_identity(fixture.project.path(), &fixture.storage_path)
+            .unwrap();
+        assert!(activation.invalidate_source_admission_if_current(&identity));
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        activation.set_worker_start_gate_for_test(Some(Arc::clone(&gate)));
+        let pending = activation.activate_project_with_foreground_budget_and_goal(
+            fixture.project.path(),
+            &fixture.storage_path,
+            Arc::new(AtomicBool::new(false)),
+            Duration::ZERO,
+            ActivationGoal::CoreOnly,
+        );
+        let service = fixture.runtime.public_operation_service();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let caller = std::thread::spawn(move || {
+            let mut builds = 0;
+            let response = service.run_managed_with_cancel(
+                "ground",
+                Arc::new(AtomicBool::new(false)),
+                Instant::now() + Duration::from_secs(60),
+                || {
+                    builds += 1;
+                    Ok(())
+                },
+            );
+            tx.send((response, builds)).unwrap();
+        });
+        // This receive must complete while the writer is still gated, not
+        // when the request spends its foreground deadline. Always release
+        // and join before asserting, including the old blocking behavior.
+        let before_release = rx.recv_timeout(Duration::from_secs(10));
+        let snapshot_before_release = activation.snapshot().unwrap();
+        activation.set_worker_start_gate_for_test(None);
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        caller.join().unwrap();
+        let joined = activation.wait_for_existing_operation(
+            fixture.project.path(),
+            &fixture.storage_path,
+            (
+                &snapshot_before_release.operation_id,
+                snapshot_before_release.attempt,
+            ),
+            &AtomicBool::new(false),
+            Duration::from_secs(10),
+            ActivationGoal::CoreOnly,
+        );
+        assert_eq!(pending.unwrap_err().code, "activation_preparing");
+        let (response, builds) = before_release
+            .expect("historical graph must return before its replacement is released");
+        let response = response.unwrap();
+        assert_eq!(builds, 1);
+        assert_eq!(response.attempt, 1);
+        assert_eq!(response.core_publication.as_ref(), Some(&old_publication));
+        assert_eq!(
+            response.freshness,
+            OperationFreshness::Historical(HistoricalServedReason::RefreshInProgress)
+        );
+        joined.expect("join the same replacement before dropping fixture roots");
+        assert_eq!(activation.worker_start_count_for_test(), 1);
+    }
+
+    #[test]
+    fn nested_managed_owner_cannot_redrive_under_an_existing_pin() {
+        let fixture = delayed_managed_fixture();
+        let service = fixture.runtime.public_operation_service();
+        let mut inner_builds = 0;
+        service
+            .run_with_cancel("ground", Arc::new(AtomicBool::new(false)), || {
+                let refusal = service
+                    .run_managed_with_cancel(
+                        "files",
+                        Arc::new(AtomicBool::new(false)),
+                        Instant::now() + Duration::from_secs(10),
+                        || {
+                            inner_builds += 1;
+                            Ok(())
+                        },
+                    )
+                    .unwrap_err();
+                assert_eq!(refusal.code, "invalid_argument");
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(inner_builds, 0);
+        assert_eq!(
+            fixture
+                .runtime
+                .activation_service()
+                .worker_start_count_for_test(),
+            0
+        );
+    }
+
+    #[test]
+    fn unknown_and_observer_only_freshness_do_not_authorize_content_repair() {
+        let fixture = delayed_managed_fixture();
+        let mut observed = fixture
+            .runtime
+            .activation_service()
+            .controller
+            .index_freshness_uncached(FreshnessObservationPolicy::ObserveSourceRoot)
+            .unwrap();
+        observed.status = IndexFreshnessStatusDto::NotChecked;
+        observed.changed_file_count = 1;
+        assert!(!content_fence_observed_drift(&observed));
+        observed.status = IndexFreshnessStatusDto::Stale;
+        observed.reason = Some("observer escalation".into());
+        assert!(!content_fence_observed_drift(&observed));
     }
 
     #[test]
@@ -5919,10 +7299,10 @@ pub(crate) mod activation_tests {
             })
             .expect_err("post-build content rehash must refuse stale source");
         assert_eq!(
-            builds, 2,
-            "the same ready lease admits both bounded attempts while its event is delayed"
+            builds, 1,
+            "retry content revalidation must refuse before reusing the delayed-event lease"
         );
-        assert_eq!(refusal.code, "publication_changed");
+        assert_eq!(refusal.code, "project_unavailable");
 
         fs::write(&source, original).expect("restore source after refusal");
         let _lease_scope = codestory_workspace::SourceFreshnessScope::enter_with_memo(
@@ -7857,6 +9237,58 @@ pub(crate) mod activation_tests {
         );
     }
 
+    fn finish_search_repair_for_test(
+        runtime: &crate::Runtime,
+        project_root: &Path,
+        storage_path: &Path,
+    ) -> Result<ActivationRun, ApiError> {
+        finish_activation_for_goal_for_test(
+            runtime,
+            project_root,
+            storage_path,
+            ActivationGoal::Full,
+        )
+    }
+
+    fn finish_activation_for_goal_for_test(
+        runtime: &crate::Runtime,
+        project_root: &Path,
+        storage_path: &Path,
+        goal: ActivationGoal,
+    ) -> Result<ActivationRun, ApiError> {
+        let activation = runtime.activation_service();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let initial = activation.activate_project_with_foreground_budget_and_goal(
+            project_root,
+            storage_path,
+            Arc::clone(&cancelled),
+            DEFAULT_ACTIVATION_FOREGROUND_BUDGET,
+            goal,
+        );
+        // Parallel fixture work may outlast a foreground slice. Join the same
+        // operation rather than assuming the first response is terminal.
+        if initial
+            .as_ref()
+            .is_err_and(|error| error.code == "activation_preparing")
+        {
+            let pending = activation.snapshot().expect("pending search repair");
+            let terminal = activation.wait_for_existing_operation(
+                project_root,
+                storage_path,
+                (&pending.operation_id, pending.attempt),
+                &cancelled,
+                Duration::from_secs(30),
+                goal,
+            );
+            let completed = activation.snapshot().expect("completed search repair");
+            assert_eq!(completed.operation_id, pending.operation_id);
+            assert_eq!(completed.attempt, pending.attempt);
+            terminal
+        } else {
+            initial
+        }
+    }
+
     #[test]
     fn activation_repairs_complete_core_without_a_search_generation() {
         let project = tempfile::tempdir().expect("project");
@@ -7889,13 +9321,7 @@ pub(crate) mod activation_tests {
         fs::remove_dir_all(&previous_search).expect("remove completed search generation");
 
         let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
-        let error = runtime
-            .activation_service()
-            .activate_project(
-                project.path(),
-                &storage_path,
-                Arc::new(AtomicBool::new(false)),
-            )
+        let error = finish_search_repair_for_test(&runtime, project.path(), &storage_path)
             .expect_err("the unit-test runtime has no managed embedding server");
 
         assert_eq!(error.code, "project_unavailable");
@@ -7935,20 +9361,498 @@ pub(crate) mod activation_tests {
     #[test]
     fn activation_repairs_missing_search_for_unchanged_core_with_source_alias_without_republishing_core()
      {
+        assert_unchanged_source_alias_activation_preserves_core(ActivationGoal::Full, true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn activation_adopts_unchanged_core_with_source_alias_without_republishing_core() {
+        assert_unchanged_source_alias_activation_preserves_core(ActivationGoal::Full, false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn core_only_activation_adopts_unchanged_core_with_source_alias_without_republishing_core() {
+        assert_unchanged_source_alias_activation_preserves_core(ActivationGoal::CoreOnly, false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_alias_core_only_fence_refusal_reaches_the_public_waiter() {
+        for fault in ["source", "publication", "cancelled"] {
+            let fixture = source_alias_core_fixture();
+            let runtime = crate::test_runtime_with_owned_cache_root(fixture.process_cache.path());
+            let service = runtime.activation_service();
+            let previous = service
+                .retained_core_publication(&fixture.storage_path)
+                .unwrap()
+                .unwrap();
+            let target = ActivationTarget::new(fixture.project.path(), &fixture.storage_path);
+            let (operation_id, cancelled) = {
+                let mut state = service.coordinator.state.lock().unwrap();
+                service.begin_activation_locked(
+                    &mut state,
+                    &target,
+                    Some(previous.clone()),
+                    ActivationGoal::CoreOnly,
+                )
+            };
+            let operation = ActivationOperation {
+                service: service.clone(),
+                operation_id: operation_id.clone(),
+                cancelled: Arc::clone(&cancelled),
+            };
+            let hook_ran = Arc::new(AtomicBool::new(false));
+            let hook_receipt = Arc::clone(&hook_ran);
+            let root = fixture.project.path().to_path_buf();
+            let storage = fixture.storage_path.clone();
+            let process_cache = fixture.process_cache.path().to_path_buf();
+            arm_after_activation_core_refresh_test_hook(move || {
+                match fault {
+                    "source" => {
+                        let source = root.join("source.rs");
+                        let mtime = fs::metadata(&source).unwrap().modified().unwrap();
+                        let original = fs::read_to_string(&source).unwrap();
+                        let changed = original.replace("{ 1 }", "{ 2 }");
+                        assert_ne!(changed, original);
+                        assert_eq!(changed.len(), original.len());
+                        fs::write(&source, changed).unwrap();
+                        fs::File::options()
+                            .write(true)
+                            .open(&source)
+                            .unwrap()
+                            .set_modified(mtime)
+                            .unwrap();
+                        assert_eq!(fs::metadata(&source).unwrap().modified().unwrap(), mtime);
+                    }
+                    "publication" => {
+                        let peer = crate::test_runtime_with_owned_cache_root(&process_cache);
+                        peer.project_service()
+                            .open_project_summary_with_storage_path(root, storage.clone())
+                            .unwrap();
+                        let before = Store::database_index_publication(&storage)
+                            .unwrap()
+                            .unwrap();
+                        peer.index_service()
+                            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+                            .unwrap();
+                        assert_ne!(
+                            Store::database_index_publication(&storage)
+                                .unwrap()
+                                .unwrap(),
+                            before
+                        );
+                    }
+                    "cancelled" => cancelled.store(true, Ordering::Release),
+                    _ => unreachable!(),
+                }
+                hook_receipt.store(true, Ordering::Release);
+            });
+            // Execute the actual activation and completion on the hook-owning
+            // thread; the public waiter then observes that exact issued run.
+            let error = service
+                .activate_once(
+                    &operation,
+                    fixture.project.path().to_path_buf(),
+                    fixture.storage_path.clone(),
+                    ActivationGoal::CoreOnly,
+                )
+                .expect_err("the adoption fence must refuse the injected fault");
+            assert!(
+                hook_ran.load(Ordering::Acquire),
+                "{fault}: fault hook did not run"
+            );
+            assert_eq!(
+                error.code,
+                if fault == "cancelled" {
+                    "cancelled"
+                } else {
+                    "publication_changed"
+                }
+            );
+            let finished = operation.finish(Some(&error)).unwrap();
+            let waiter = service.wait_for_existing_operation(
+                fixture.project.path(),
+                &fixture.storage_path,
+                (&operation_id, finished.attempt),
+                &AtomicBool::new(false),
+                Duration::from_secs(1),
+                ActivationGoal::CoreOnly,
+            );
+            assert!(
+                waiter.is_err(),
+                "{fault}: a terminal refusal must reach the public caller"
+            );
+            let snapshot = service.snapshot().unwrap();
+            assert!(!snapshot.allows_operation("affected"), "{fault}");
+            assert!(!snapshot.allows_operation("source_snippet"), "{fault}");
+            assert!(
+                service
+                    .coordinator
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ready_lease
+                    .is_none()
+            );
+            if fault != "publication" {
+                assert_eq!(
+                    service
+                        .retained_core_publication(&fixture.storage_path)
+                        .unwrap(),
+                    Some(previous)
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_alias_target_changes_cannot_adopt_the_previous_core() {
+        use std::os::unix::fs::symlink;
+        for fault in [
+            "source",
+            "retarget",
+            "escape",
+            "dangling",
+            "directory",
+            "loop",
+        ] {
+            let fixture = source_alias_core_fixture();
+            let previous = Store::database_index_publication(&fixture.storage_path)
+                .unwrap()
+                .unwrap();
+            let root = fixture.project.path();
+            let outside = tempfile::tempdir().unwrap();
+            if fault == "source" {
+                let target = root.join("source.rs");
+                let mtime = fs::metadata(&target).unwrap().modified().unwrap();
+                let original = fs::read_to_string(&target).unwrap();
+                let changed = original.replace("{ 1 }", "{ 2 }");
+                assert_ne!(changed, original);
+                assert_eq!(changed.len(), original.len());
+                fs::write(&target, changed).unwrap();
+                fs::File::options()
+                    .write(true)
+                    .open(&target)
+                    .unwrap()
+                    .set_modified(mtime)
+                    .unwrap();
+                assert_eq!(fs::metadata(&target).unwrap().modified().unwrap(), mtime);
+            } else {
+                fs::remove_file(root.join("linked.rs")).unwrap();
+                let target = match fault {
+                    "retarget" => {
+                        let path = root.join("replacement.rs");
+                        fs::write(&path, "pub fn replacement_source() -> i32 { 2 }\n").unwrap();
+                        path
+                    }
+                    "escape" => {
+                        let path = outside.path().join("outside.rs");
+                        fs::write(&path, "pub fn outside_sentinel() {}\n").unwrap();
+                        path
+                    }
+                    "dangling" => root.join("missing.rs"),
+                    "directory" => {
+                        let path = root.join("not_a_file");
+                        fs::create_dir(&path).unwrap();
+                        path
+                    }
+                    "loop" => root.join("linked.rs"),
+                    _ => unreachable!(),
+                };
+                symlink(target, root.join("linked.rs")).unwrap();
+            }
+            let runtime = crate::test_runtime_with_owned_cache_root(fixture.process_cache.path());
+            let result = finish_activation_for_goal_for_test(
+                &runtime,
+                root,
+                &fixture.storage_path,
+                ActivationGoal::CoreOnly,
+            );
+            let current = Store::database_index_publication(&fixture.storage_path)
+                .unwrap()
+                .unwrap();
+            if result.is_ok() {
+                assert_ne!(
+                    current, previous,
+                    "{fault}: changed source cannot reuse the old Core"
+                );
+            }
+            if fault == "escape" {
+                assert!(
+                    runtime
+                        .browser_service()
+                        .source_ranges(
+                            &[crate::browser::SourceRangeRequest {
+                                path: "linked.rs".to_string(),
+                                start_line: 1,
+                                end_line: 1,
+                            }],
+                            4096,
+                        )
+                        .is_err(),
+                    "an outside-root source alias cannot serve its target bytes"
+                );
+                assert_eq!(
+                    fs::read_to_string(outside.path().join("outside.rs")).unwrap(),
+                    "pub fn outside_sentinel() {}\n",
+                    "activation must preserve the outside-root sentinel"
+                );
+            }
+            if fault == "loop" {
+                assert!(result.is_err(), "incomplete alias discovery must refuse");
+                assert_eq!(
+                    current, previous,
+                    "partial discovery cannot republish or delete old data"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_alias_full_endpoint_fence_refusal_reaches_the_public_waiter() {
         use std::os::unix::fs::symlink;
 
-        let project = tempfile::tempdir().expect("project");
-        let cache = tempfile::tempdir().expect("cache");
-        let storage_path = cache.path().join("codestory.db");
+        let fixture = ready_activation_fixture_with_observer_setup(|root, controller| {
+            symlink("metadata.rs", root.join("linked.rs")).unwrap();
+            write_source_alias_manifest(root);
+            controller
+                .open_project_summary_with_storage_path(
+                    root.to_path_buf(),
+                    controller.require_storage_path().unwrap(),
+                )
+                .unwrap();
+            controller
+                .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+                .unwrap();
+            codestory_retrieval::test_support::publish_zero_dense_pinned_query_fixture(
+                root,
+                &controller.require_storage_path().unwrap(),
+                &controller.runtime_config,
+            )
+            .unwrap();
+            let session =
+                crate::tests::freshness_observer_tests::scripted_session(root, |_| vec![]);
+            controller.install_source_observer_for_test(root, Arc::new(session));
+        });
+        let service = fixture.runtime.activation_service();
+        service.use_published_retrieval_fixture_for_test();
+        let previous = fixture.lease.core_publication.clone();
+        assert_unsealed_zero_delta_alias_probe(&service.controller, &previous);
+        let target = ActivationTarget::new(fixture.project.path(), &fixture.storage_path);
+        let (operation_id, cancelled) = {
+            let mut state = service.coordinator.state.lock().unwrap();
+            service.begin_activation_locked(
+                &mut state,
+                &target,
+                Some(previous.clone()),
+                ActivationGoal::Full,
+            )
+        };
+        let operation = ActivationOperation {
+            service: service.clone(),
+            operation_id: operation_id.clone(),
+            cancelled,
+        };
+        let hook_ran = Arc::new(AtomicBool::new(false));
+        let hook_receipt = Arc::clone(&hook_ran);
+        let source = fixture.project.path().join("metadata.rs");
+        arm_before_activation_endpoint_observer_test_hook(move || {
+            let mtime = fs::metadata(&source).unwrap().modified().unwrap();
+            let original = fs::read_to_string(&source).unwrap();
+            let changed = original.replace("ANCHOR", "CHANGE");
+            assert_ne!(changed, original);
+            assert_eq!(changed.len(), original.len());
+            fs::write(&source, changed).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&source)
+                .unwrap()
+                .set_modified(mtime)
+                .unwrap();
+            assert_eq!(fs::metadata(&source).unwrap().modified().unwrap(), mtime);
+            hook_receipt.store(true, Ordering::Release);
+        });
+        let result = service.activate_once(
+            &operation,
+            fixture.project.path().to_path_buf(),
+            fixture.storage_path.clone(),
+            ActivationGoal::Full,
+        );
+        assert!(
+            hook_ran.load(Ordering::Acquire),
+            "endpoint fault did not run"
+        );
+        let error = result.expect_err("a quiet observer cannot hide endpoint target-content drift");
+        assert_eq!(error.code, "publication_changed");
+        let finished = operation.finish(Some(&error)).unwrap();
+        assert!(
+            service
+                .wait_for_existing_operation(
+                    fixture.project.path(),
+                    &fixture.storage_path,
+                    (&operation_id, finished.attempt),
+                    &AtomicBool::new(false),
+                    Duration::from_secs(1),
+                    ActivationGoal::CoreOnly,
+                )
+                .is_err(),
+            "a CoreOnly caller joining the refused Full operation must receive the refusal"
+        );
+        let snapshot = service.snapshot().unwrap();
+        assert!(!snapshot.allows_operation("affected"));
+        assert!(!snapshot.allows_operation("source_snippet"));
+        assert!(
+            service
+                .coordinator
+                .state
+                .lock()
+                .unwrap()
+                .ready_lease
+                .is_none()
+        );
+        assert_eq!(
+            service
+                .retained_core_publication(&fixture.storage_path)
+                .unwrap(),
+            Some(previous)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_alias_adoption_rejects_a_bounded_content_verdict() {
+        let fixture = source_alias_core_fixture();
+        let runtime = crate::test_runtime_with_owned_cache_root(fixture.process_cache.path());
+        runtime
+            .project_service()
+            .open_project_summary_with_storage_path(
+                fixture.project.path().to_path_buf(),
+                fixture.storage_path.clone(),
+            )
+            .unwrap();
+        let service = runtime.activation_service();
+        let session = crate::tests::freshness_observer_tests::scripted_session(
+            fixture.project.path(),
+            |_| {
+                vec![codestory_workspace::filesystem_observer::ObservedFilesystemEvent::CoverageLost {
+                detail: "bounded alias adoption control".to_string(),
+            }]
+            },
+        );
+        service
+            .controller
+            .install_source_observer_for_test(fixture.project.path(), Arc::new(session));
+        let previous = service
+            .retained_core_publication(&fixture.storage_path)
+            .unwrap()
+            .unwrap();
+        let target = ActivationTarget::new(fixture.project.path(), &fixture.storage_path);
+        let (operation_id, cancelled) = {
+            let mut state = service.coordinator.state.lock().unwrap();
+            service.begin_activation_locked(
+                &mut state,
+                &target,
+                Some(previous.clone()),
+                ActivationGoal::CoreOnly,
+            )
+        };
+        let operation = ActivationOperation {
+            service: service.clone(),
+            operation_id,
+            cancelled,
+        };
+        crate::index_freshness::with_index_freshness_caps_for_test(0, 0, || {
+            let freshness = service
+                .controller
+                .index_freshness_reverified(FreshnessObservationPolicy::ObserveSourceRoot)
+                .unwrap();
+            assert_eq!(freshness.status, IndexFreshnessStatusDto::NotChecked);
+            assert_eq!(
+                freshness.not_checked_cause,
+                Some(IndexFreshnessNotCheckedCauseDto::BoundedInventory)
+            );
+            let error = service
+                .activate_once(
+                    &operation,
+                    fixture.project.path().to_path_buf(),
+                    fixture.storage_path.clone(),
+                    ActivationGoal::CoreOnly,
+                )
+                .expect_err("a bounded scan cannot validate unsealed Core adoption");
+            assert_eq!(error.code, "publication_changed");
+            operation.finish(Some(&error)).unwrap();
+        });
+        let snapshot = service.snapshot().unwrap();
+        assert!(!snapshot.allows_operation("affected"));
+        assert!(!snapshot.allows_operation("source_snippet"));
+        assert!(
+            service
+                .coordinator
+                .state
+                .lock()
+                .unwrap()
+                .ready_lease
+                .is_none()
+        );
+        assert_eq!(
+            service
+                .retained_core_publication(&fixture.storage_path)
+                .unwrap(),
+            Some(previous)
+        );
+    }
+
+    #[cfg(unix)]
+    struct SourceAliasCoreFixture {
+        project: tempfile::TempDir,
+        _cache: tempfile::TempDir,
+        process_cache: tempfile::TempDir,
+        storage_path: PathBuf,
+    }
+
+    #[cfg(unix)]
+    fn assert_unsealed_zero_delta_alias_probe(
+        controller: &AppController,
+        expected: &IndexPublicationDto,
+    ) {
+        assert!(
+            codestory_contracts::validation_receipts::ArtifactSeal::observe(
+                &controller.require_project_root().unwrap().join("linked.rs")
+            )
+            .is_err(),
+            "generic artifact seals must continue to refuse source symlinks"
+        );
+        let probe = controller.probe_incremental_plan_for_activation().unwrap();
+        assert_eq!(
+            probe.outcome,
+            IncrementalPlanProbeOutcomeDto::ProbeUnavailable
+        );
+        assert_eq!(
+            probe.unavailable_stage,
+            Some(IncrementalProbeUnavailableStageDto::SourceSeals)
+        );
+        assert_eq!(probe.files_to_index, Some(0));
+        assert_eq!(probe.files_to_remove, Some(0));
+        assert!(!probe.short_circuited());
+        assert!(
+            !probe.has_complete_source_inventory(),
+            "an unsealed inventory cannot mint observer-only freshness"
+        );
+        assert_eq!(
+            probe
+                .publication
+                .map(crate::index_commit::index_publication_dto),
+            Some(expected.clone())
+        );
+    }
+
+    #[cfg(unix)]
+    fn write_source_alias_manifest(root: &Path) {
         fs::write(
-            project.path().join("source.rs"),
-            "pub fn linked_source() -> i32 { 1 }\n",
-        )
-        .expect("write alias target");
-        symlink("source.rs", project.path().join("linked.rs"))
-            .expect("create in-project source alias");
-        fs::write(
-            project.path().join("codestory_project.json"),
+            root.join("codestory_project.json"),
             serde_json::to_vec(&serde_json::json!({
                 "name": "same-core search repair",
                 "version": 1,
@@ -7966,6 +9870,23 @@ pub(crate) mod activation_tests {
             .expect("serialize project manifest"),
         )
         .expect("write project manifest");
+    }
+
+    #[cfg(unix)]
+    fn source_alias_core_fixture() -> SourceAliasCoreFixture {
+        use std::os::unix::fs::symlink;
+
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("cache");
+        let storage_path = cache.path().join("codestory.db");
+        fs::write(
+            project.path().join("source.rs"),
+            "pub fn linked_source() -> i32 { 1 }\n",
+        )
+        .expect("write alias target");
+        symlink("source.rs", project.path().join("linked.rs"))
+            .expect("create in-project source alias");
+        write_source_alias_manifest(project.path());
 
         let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let seeding_runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
@@ -7980,6 +9901,25 @@ pub(crate) mod activation_tests {
             .index_service()
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
             .expect("publish complete core");
+        SourceAliasCoreFixture {
+            project,
+            _cache: cache,
+            process_cache,
+            storage_path,
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_unchanged_source_alias_activation_preserves_core(
+        goal: ActivationGoal,
+        repair_missing_search: bool,
+    ) {
+        let SourceAliasCoreFixture {
+            project,
+            _cache,
+            process_cache,
+            storage_path,
+        } = source_alias_core_fixture();
         let previous = Store::database_index_publication(&storage_path)
             .expect("read core publication")
             .expect("complete core publication");
@@ -7993,19 +9933,33 @@ pub(crate) mod activation_tests {
             fs::read(layout.publication_path()).expect("read core publication pointer");
         let previous_search = search_index_path_for_publication(&storage_path, Some(&previous))
             .expect("search generation path");
-        fs::remove_dir_all(&previous_search).expect("remove completed search generation");
-
         let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
-        let error = runtime
-            .activation_service()
-            .activate_project(
-                project.path(),
-                &storage_path,
-                Arc::new(AtomicBool::new(false)),
+        runtime
+            .project_service()
+            .open_project_summary_with_storage_path(
+                project.path().to_path_buf(),
+                storage_path.clone(),
             )
-            .expect_err("the unit-test runtime has no managed embedding server");
+            .expect("bind unchanged alias publication observationally");
+        assert_unsealed_zero_delta_alias_probe(
+            &runtime.activation_service().controller,
+            &crate::index_publication_dto(previous.clone()),
+        );
+        if repair_missing_search {
+            fs::remove_dir_all(&previous_search).expect("remove completed search generation");
+        }
 
-        assert_eq!(error.code, "project_unavailable", "{error:?}");
+        let result =
+            finish_activation_for_goal_for_test(&runtime, project.path(), &storage_path, goal);
+        if goal == ActivationGoal::Full {
+            let error = result.expect_err("the unit-test runtime has no managed embedding server");
+            assert_eq!(error.code, "project_unavailable", "{error:?}");
+        } else {
+            result.expect(
+                "CoreOnly must adopt the unchanged source alias without native preparation",
+            );
+        }
+
         let snapshot = runtime.activation_service().snapshot().expect("snapshot");
         assert_eq!(
             snapshot.capabilities.local_navigation,
@@ -8016,17 +9970,21 @@ pub(crate) mod activation_tests {
             .expect("complete core publication after search repair");
         assert_eq!(
             current, previous,
-            "search repair must not republish the core"
+            "activation must not republish an unchanged core"
         );
         assert_eq!(
             fs::read(&previous_database).expect("reread immutable core"),
             previous_database_bytes,
-            "search repair must not mutate the immutable core database"
+            "activation must not mutate the immutable core database"
         );
         assert_eq!(
             fs::read(layout.publication_path()).expect("reread core publication pointer"),
             previous_pointer_bytes,
-            "search repair must not rewrite the core publication pointer"
+            "activation must not rewrite the core publication pointer"
+        );
+        assert_unsealed_zero_delta_alias_probe(
+            &runtime.activation_service().controller,
+            &crate::index_publication_dto(current),
         );
         assert!(
             read_search_generation_completion(&previous_search, &previous.generation_id).is_some(),
@@ -8405,6 +10363,84 @@ pub(crate) mod activation_tests {
             .expect_err("a source-backed read must never serve the retained core");
         assert_eq!(source.code, "project_unavailable");
         assert!(!entered_source_response);
+    }
+
+    #[test]
+    fn outdated_python_extraction_refuses_source_reads_without_mutating_publication() {
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("owned runtime cache");
+        let storage_path = project.path().join("cache/codestory.db");
+        fs::write(
+            project.path().join("fixture.py"),
+            "@trace\ndef fixture():\n    return 1\n",
+        )
+        .expect("write Python fixture");
+        let runtime = crate::test_runtime_with_owned_cache_root(cache.path());
+        runtime
+            .project_service()
+            .open_project_summary_with_storage_path(
+                project.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+        runtime
+            .index_service()
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish current extraction");
+        let summary = runtime
+            .project_service()
+            .inspect_project_summary_with_storage_path(
+                project.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            summary.freshness.as_ref().unwrap().status,
+            IndexFreshnessStatusDto::Fresh
+        );
+        let publication = summary.publication.expect("complete publication");
+
+        for mutation in [
+            "UPDATE file_extraction_identity SET extraction_revision = 'previous-python-producer';",
+            "DELETE FROM file_extraction_identity;",
+        ] {
+            mutate_active_generation_sql(&storage_path, mutation);
+            let database = codestory_store::resolve_core_database_path(&storage_path).unwrap();
+            let before = fs::read(&database).unwrap();
+            let observed = runtime
+                .project_service()
+                .inspect_project_summary_with_storage_path(
+                    project.path().to_path_buf(),
+                    storage_path.clone(),
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(observed.publication.as_ref(), Some(&publication));
+            assert_eq!(
+                observed.freshness.as_ref().unwrap().status,
+                IndexFreshnessStatusDto::Stale
+            );
+            assert_eq!(observed.freshness.as_ref().unwrap().changed_file_count, 1);
+            for operation in ["exact_search", "source_snippet"] {
+                let mut entered = false;
+                let error = runtime
+                    .public_operation_service()
+                    .run_with_cancel(operation, Arc::new(AtomicBool::new(false)), || {
+                        entered = true;
+                        Ok(())
+                    })
+                    .expect_err("outdated extraction cannot admit current source evidence");
+                assert_eq!(error.code, "project_unavailable", "{error:?}");
+                assert!(!entered, "the source response builder must not run");
+            }
+            assert_eq!(fs::read(&database).unwrap(), before);
+            assert_eq!(
+                Store::database_schema_version(&storage_path).unwrap(),
+                codestory_store::CURRENT_SCHEMA_VERSION
+            );
+            assert!(runtime.activation_service().snapshot().is_none());
+        }
     }
 
     #[test]
@@ -9328,5 +11364,74 @@ mod bounded_runtime_tests {
         });
 
         assert_eq!(error.code, "cancelled");
+    }
+
+    #[test]
+    fn path_window_chunk_loop_honors_cancellation_inside_wanted_and_skipped_long_lines() {
+        struct CancellingReader {
+            inner: std::io::BufReader<std::io::Cursor<Vec<u8>>>,
+            flag: Arc<AtomicBool>,
+            consumed: usize,
+        }
+        impl std::io::Read for CancellingReader {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                std::io::Read::read(&mut self.inner, bytes)
+            }
+        }
+        impl std::io::BufRead for CancellingReader {
+            fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+                std::io::BufRead::fill_buf(&mut self.inner)
+            }
+            fn consume(&mut self, count: usize) {
+                std::io::BufRead::consume(&mut self.inner, count);
+                self.consumed += count;
+                self.flag.store(true, Ordering::Relaxed);
+            }
+        }
+        for request in [(1, 1), (2, 2)] {
+            let flag = Arc::new(AtomicBool::new(false));
+            let mut reader = CancellingReader {
+                inner: std::io::BufReader::with_capacity(1, std::io::Cursor::new(vec![b'x'; 4096])),
+                flag: Arc::clone(&flag),
+                consumed: 0,
+            };
+            let result = with_public_operation_cancellation(flag, || {
+                crate::snippets::read_path_source_windows(&mut reader, &[request], 1024)
+            });
+            assert!(
+                matches!(result, Err(error) if error.kind() == std::io::ErrorKind::Interrupted)
+            );
+            assert_eq!(
+                reader.consumed, 1,
+                "cancellation must stop inside both wanted and skipped LF-free physical lines"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod activation_error_diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn unclassified_activation_failure_preserves_vector_validation_cause() {
+        let error = anyhow::anyhow!("vector producer does not match the complete core run")
+            .context("deep-validate vector generation at retrieval publication fence");
+        let mapped = map_activation_error(error);
+        assert_eq!(mapped.code, "project_unavailable");
+        assert_eq!(
+            mapped.message,
+            "deep-validate vector generation at retrieval publication fence: vector producer does not match the complete core run"
+        );
+    }
+
+    #[test]
+    fn activation_failure_chain_is_bounded_at_a_utf8_boundary() {
+        let error = anyhow::anyhow!("界".repeat(4096)).context("vector validation");
+        let mapped = map_activation_error(error);
+        assert_eq!(mapped.code, "project_unavailable");
+        assert!(mapped.message.len() <= 8 * 1024);
+        assert!(mapped.message.starts_with("vector validation: "));
+        assert!(mapped.message.ends_with('…'));
     }
 }

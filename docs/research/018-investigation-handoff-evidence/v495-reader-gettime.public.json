@@ -1,0 +1,150 @@
+{
+  "_meta": {
+    "codestory_publication": {
+      "contract_runtime": {
+        "cli_sha256": null,
+        "cli_source": "direct_cli_launch",
+        "cli_version": "0.17.7",
+        "known_override_skew_channel": false,
+        "pinned_pair_matches": null,
+        "plugin_cli_version": null,
+        "plugin_version": null
+      },
+      "core_publication": {
+        "generation": 1,
+        "generation_id": "1731ee82-b30e-4c5f-8ced-9d87c6a809c5",
+        "mode": "full",
+        "published_at_epoch_ms": 1791502992064,
+        "run_id": "b5714e8a-1fa0-4acc-a69d-0d6d4baa390c"
+      },
+      "freshness": {
+        "served_generation": "1731ee82-b30e-4c5f-8ced-9d87c6a809c5",
+        "state": "fresh"
+      },
+      "minimum_compatible_schema_version": 3,
+      "operation": {
+        "attempt": 1,
+        "operation_id": "public-1"
+      },
+      "publication": {
+        "generation": 1,
+        "generation_id": "1731ee82-b30e-4c5f-8ced-9d87c6a809c5",
+        "mode": "full",
+        "published_at_epoch_ms": 1791502992064,
+        "run_id": "b5714e8a-1fa0-4acc-a69d-0d6d4baa390c"
+      },
+      "retrieval_publication": null,
+      "schema_version": 4,
+      "served_from": "complete_publication"
+    }
+  },
+  "resolution": {
+    "alternatives": [
+      {
+        "display_name": "getTimeTZ",
+        "evidence_producer": "lexical_source",
+        "evidence_tier": "lexical_source",
+        "file_path": "spec_test.go",
+        "kind": "FUNCTION",
+        "line": 275,
+        "match_quality": "prefix",
+        "node_id": "-3786221121319633211",
+        "node_ref": "spec_test.go:275:getTimeTZ",
+        "origin": "indexed_symbol",
+        "primary_occurrence_kind": "definition",
+        "resolution_status": "resolved",
+        "resolvable": true,
+        "score": 192.0,
+        "score_breakdown": {
+          "graph": 0.0,
+          "lexical": 192.0,
+          "provenance": [
+            "lexical_source"
+          ],
+          "semantic": 0.0,
+          "total": 192.0
+        },
+        "symbol_role": "definition",
+        "verification_targets": [
+          {
+            "line": 275,
+            "node_ref": "spec_test.go:275:getTimeTZ",
+            "path": "spec_test.go",
+            "reason": "primary source occurrence selected for this symbol",
+            "role": "definition"
+          }
+        ]
+      }
+    ],
+    "requested": "getTime",
+    "resolved": {
+      "display_name": "getTime",
+      "evidence_producer": "lexical_source",
+      "evidence_tier": "lexical_source",
+      "file_path": "spec_test.go",
+      "kind": "FUNCTION",
+      "line": 217,
+      "match_quality": "exact",
+      "node_id": "1582420003958081855",
+      "node_ref": "spec_test.go:217:getTime",
+      "origin": "indexed_symbol",
+      "primary_occurrence_kind": "definition",
+      "resolution_status": "resolved",
+      "resolvable": true,
+      "score": 192.0,
+      "score_breakdown": {
+        "graph": 0.0,
+        "lexical": 192.0,
+        "provenance": [
+          "lexical_source"
+        ],
+        "semantic": 0.0,
+        "total": 192.0
+      },
+      "symbol_role": "definition",
+      "verification_targets": [
+        {
+          "line": 217,
+          "node_ref": "spec_test.go:217:getTime",
+          "path": "spec_test.go",
+          "reason": "primary source occurrence selected for this symbol",
+          "role": "definition"
+        }
+      ]
+    },
+    "selector": "query"
+  },
+  "snippet": {
+    "line": 217,
+    "max_snippet_bytes": 65536,
+    "node": {
+      "canonical_id": "<CRON_ROOT>/spec_test.go:getTime#0",
+      "display_name": "getTime",
+      "end_col": 2,
+      "end_line": 246,
+      "file_path": "<CRON_ROOT>/spec_test.go",
+      "id": "1582420003958081855",
+      "kind": "FUNCTION",
+      "member_access": null,
+      "qualified_name": "getTime",
+      "serialized_name": "getTime",
+      "start_col": 1,
+      "start_line": 217
+    },
+    "path": "<CRON_ROOT>/spec_test.go",
+    "range_source": "indexed_symbol_range",
+    "requested_context": 0,
+    "scope": "function_body",
+    "snippet": "```text\n>  217 | func getTime(value string) time.Time {\n   218 | \tif value == \"\" {\n   219 | \t\treturn time.Time{}\n   220 | \t}\n   221 | \n   222 | \tvar location = time.Local\n   223 | \tif strings.HasPrefix(value, \"TZ=\") {\n   224 | \t\tparts := strings.Fields(value)\n   225 | \t\tloc, err := time.LoadLocation(parts[0][len(\"TZ=\"):])\n   226 | \t\tif err != nil {\n   227 | \t\t\tpanic(\"could not parse location:\" + err.Error())\n   228 | \t\t}\n   229 | \t\tlocation = loc\n   230 | \t\tvalue = parts[1]\n   231 | \t}\n   232 | \n   233 | \tvar layouts = []string{\n   234 | \t\t\"Mon Jan 2 15:04 2006\",\n   235 | \t\t\"Mon Jan 2 15:04:05 2006\",\n   236 | \t}\n   237 | \tfor _, layout := range layouts {\n   238 | \t\tif t, err := time.ParseInLocation(layout, value, location); err == nil {\n   239 | \t\t\treturn t\n   240 | \t\t}\n   241 | \t}\n   242 | \tif t, err := time.ParseInLocation(\"2006-01-02T15:04:05-0700\", value, location); err == nil {\n   243 | \t\treturn t\n   244 | \t}\n   245 | \tpanic(\"could not parse time value \" + value)\n   246 | }\n```",
+    "snippet_truncated": false
+  },
+  "verification_targets": [
+    {
+      "line": 217,
+      "node_ref": "spec_test.go:217:getTime",
+      "path": "spec_test.go",
+      "reason": "primary source occurrence selected for this symbol",
+      "role": "definition"
+    }
+  ]
+}

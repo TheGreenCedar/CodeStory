@@ -31,12 +31,14 @@ fn source(
     end_line: u32,
 ) -> PacketHydratedSourceRangeV1 {
     PacketHydratedSourceRangeV1 {
+        callable_body: None,
         stable_identity: identity.to_string(),
         path: path.to_string(),
         symbol: Some(identity.to_string()),
         start_line,
         end_line,
         source: format!("fn {}() {{}}", identity.replace([':', '-'], "_")),
+        delivery: None,
         parser_completeness: PacketParserCompletenessV1::Complete,
     }
 }
@@ -445,10 +447,12 @@ fn self_loops_never_spend_bounded_public_rows() {
 #[test]
 fn exact_continuations_follow_selector_order_not_identity_spelling() {
     let mut compiler_input = input(Vec::new(), Vec::new(), Vec::new());
+    // Exact selectors without descriptor allocation bounds remain recoverable before hydration.
     compiler_input.admission_gaps = (0..10)
         .map(
             |ordinal| codestory_contracts::compilation::PacketAdmissionGapV1 {
-                kind: codestory_contracts::compilation::PacketAdmissionGapKindV1::SourceUnavailable,
+                kind:
+                    codestory_contracts::compilation::PacketAdmissionGapKindV1::SourceBoundMissing,
                 stable_identity: Some(format!("node:{}", 100 - ordinal)),
                 exact_selector_ordinal: Some(ordinal),
             },

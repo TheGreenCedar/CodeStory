@@ -48,7 +48,6 @@ readiness leases, hook installation, and the confined workspace reader cannot
 regress between dispatch-gated workspace proofs:
 
 ```bash
-cargo test --locked -p codestory-runtime --lib agent::packet_evidence::
 cargo test --locked -p codestory-runtime --lib agent::packet_compiler::tests
 cargo test --locked -p codestory-runtime --lib agent::packet_batch::
 cargo test --locked -p codestory-runtime --lib tests::search_scoring_tests::
@@ -57,6 +56,9 @@ cargo test --locked -p codestory-cli --lib
 cargo test --locked -p codestory-workspace
 cargo test --locked -p codestory-agent
 ```
+
+Evidence classification now lives in `codestory-agent` and is covered by its
+full suite above. The former runtime module filter selects no tests.
 
 The workspace crate additionally owns one external-fixture lane,
 `helm-u08-fixture`. Its only test,
@@ -79,13 +81,36 @@ adds only real-tree scale and incidental shapes no synthetic fixture
 reproduces.
 
 The CLI crate owns one live-sidecar lane, `cli-live-sidecar-contracts`. The
-four `#[ignore]`d contracts in `tests/search_json_output.rs` exercise live
+`#[ignore]`d live-sidecar contracts in `tests/search_json_output.rs` exercise live
 full-sidecar behavior: `retrieval index --profile agent` must spawn the
 managed per-user embedding runtime, so the lane requires a prepared embedded
-model and an admissible embedding device:
+model and an admissible embedding device.
+
+The automatic CLI preparation case clears the test CPU opt-in and requires an
+accelerated device. It also requires `CODESTORY_CLI` to select a separately
+built normal executable: Cargo's integration-test build enables retrieval
+test support, whose synthetic engine identity cannot certify a real retrieval
+publication. On macOS, build and copy the normal binary before compiling the
+test harness so Cargo cannot overwrite the supplied executable:
 
 ```bash
 export CODESTORY_EMBED_MODEL_SOURCE="$(node scripts/prepare-embedded-model.mjs)"
+normal_target_dir="${CARGO_TARGET_DIR:-target}"
+cargo build --locked -p codestory-cli --bin codestory-cli --target-dir "$normal_target_dir"
+normal_cli_dir="$(mktemp -d)"
+cp "$normal_target_dir/debug/codestory-cli" "$normal_cli_dir/codestory-cli"
+CODESTORY_CLI="$normal_cli_dir/codestory-cli" \
+    cargo test --locked -p codestory-cli --test search_json_output \
+    search_json_auto_and_full_prepare_missing_retrieval -- --ignored --exact --nocapture
+```
+
+Older fixture cases may use the test opt-in shown below; the automatic
+preparation case still needs the normal executable supplied through
+`CODESTORY_CLI`:
+
+```bash
+export CODESTORY_EMBED_MODEL_SOURCE="$(node scripts/prepare-embedded-model.mjs)"
+CODESTORY_CLI=/path/to/copied/normal/codestory-cli \
 CODESTORY_TEST_EMBED_ALLOW_CPU=1 \
     cargo test --locked -p codestory-cli --test search_json_output -- --ignored --nocapture
 ```

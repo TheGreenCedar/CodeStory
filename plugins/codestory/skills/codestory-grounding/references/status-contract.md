@@ -35,6 +35,14 @@ When no complete publication exists yet, `ground`, `packet`, `search`, and
 while managed search is coming up. Retry that same tool. Do not ask the user to
 enable, repair, approve, or configure an internal service.
 
+A terminal tool or transport failure before evidence delivery does not establish
+that matching repository evidence is absent. Preserve the returned failure code,
+causal message and stage when available; do not turn an error into an empty
+successful result or repeat the unchanged failed call. Continue bounded,
+task-authorized source inspection when useful. A later source read can support
+the answer while the earlier retrieval call remains failed. Attribute citations
+to the delivered source and retain any unresolved runtime or coverage gap.
+
 While the plugin launcher is still provisioning the managed runtime itself,
 `retry_after_ms` derives from the observed runtime-download progress: the
 estimated remaining transfer time at the observed throughput, clamped between

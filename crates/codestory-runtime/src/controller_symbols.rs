@@ -455,7 +455,7 @@ impl AppController {
         let mut roots = storage
             .get_root_symbols()
             .map_err(|e| ApiError::internal(format!("Failed to load root symbols: {e}")))?;
-        roots.sort_by_cached_key(node_display_name);
+        roots.sort_by_cached_key(|node| (node_display_name(node), node.id));
 
         let labels_by_id = self.cached_labels(roots.iter().map(|node| node.id));
         roots = Self::dedupe_symbol_nodes(roots, &labels_by_id);
@@ -466,6 +466,33 @@ impl AppController {
         }
 
         Self::symbol_summaries_for_nodes(&storage, &labels_by_id, roots)
+    }
+
+    /// Complete deterministic inventory for publication-bound resource pages.
+    /// The ordinary symbols tool retains its count limit; pages must not silently
+    /// inherit that limit. Fingerprint all rendered rows, including cached labels
+    /// and child flags, so same-publication content drift invalidates a cursor.
+    pub fn list_root_symbols_page(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<SymbolSummaryDto>, usize, String), ApiError> {
+        use sha2::{Digest, Sha256};
+        self.ensure_search_state()?;
+        let storage = self.open_storage_read_only()?;
+        let mut roots = storage
+            .get_root_symbols()
+            .map_err(|e| ApiError::internal(format!("Failed to load root symbols: {e}")))?;
+        roots.sort_by_cached_key(|node| (node_display_name(node), node.id));
+        let labels = self.cached_labels(roots.iter().map(|node| node.id));
+        let roots = Self::dedupe_symbol_nodes(roots, &labels);
+        let symbols = Self::symbol_summaries_for_nodes(&storage, &labels, roots)?;
+        let total = symbols.len();
+        let bytes = serde_json::to_vec(&symbols)
+            .map_err(|e| ApiError::internal(format!("Failed to fingerprint root symbols: {e}")))?;
+        let fingerprint = format!("{:x}", Sha256::digest(bytes));
+        let page = symbols.into_iter().skip(offset).take(limit).collect();
+        Ok((page, total, fingerprint))
     }
 
     pub fn list_children_symbols(
@@ -514,6 +541,23 @@ impl AppController {
                 &publication.generation_id,
                 &publication.run_id,
                 || agent::agent_packet(self, req.clone()),
+            )
+        })
+    }
+
+    pub(crate) fn agent_packet_for_representation(
+        &self,
+        req: AgentPacketRequestDto,
+        caller: &str,
+        measure: agent::orchestrator::PacketRepresentationMeasure<'_>,
+    ) -> Result<AgentPacketDto, ApiError> {
+        self.with_complete_core_snapshot(|publication| {
+            agent::retrieval_primary::with_stable_packet_retrieval_publication(
+                self,
+                "packet output",
+                &publication.generation_id,
+                &publication.run_id,
+                || agent::agent_packet_for_representation(self, req.clone(), caller, &mut *measure),
             )
         })
     }
@@ -589,7 +633,7 @@ impl AppController {
                     .unwrap_or_else(|| node.serialized_name.clone())
             });
 
-        let file_path = match node.file_node_id {
+        let file_path = match crate::controller_files::source_file_id(&node) {
             Some(file_id) => match storage.get_node(file_id) {
                 Ok(Some(file_node)) => Some(file_node.serialized_name),
                 _ => None,

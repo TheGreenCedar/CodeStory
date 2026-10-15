@@ -1,0 +1,6 @@
+{
+  "question": "Our Go service uses robfig/cron with five-field schedules and asks for the next activation from a UTC timestamp. The schedules \"0 0 29 Feb ?\", \"0 0 30 Feb ?\", and \"0 0 31 Apr ?\" all pass parsing, but the last two give us no next activation. Is that a parser bug, or is parsing allowed to accept a date that never occurs? Explain what each schedule returns when the starting time is 2012-07-09T23:35:00Z. For the February 29 schedule, also explain the result if we ask again starting exactly at 2016-02-29T00:00:00Z. Trace how the library searches the calendar, why it does not loop forever on the impossible dates, and what value signals that it found no activation. Identify the existing tests and their actual assertions that support the leap-year and impossible-date behavior, and distinguish what those tests establish from what you infer from the implementation. Keep the library unchanged.",
+  "source_root": "<CRON_ROOT>",
+  "source_commit": "bc59245fe10efaed9d51b56900192527ed733435",
+  "case_id": "v495-question-2"
+}

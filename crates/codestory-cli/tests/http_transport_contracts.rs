@@ -201,7 +201,9 @@ fn indexed_zero_dense_fixture() -> HttpFixture {
     }
 }
 
-fn publish_zero_dense_agent_fixture(fixture: &HttpFixture) {
+fn agent_fixture_runtime(
+    fixture: &HttpFixture,
+) -> (PathBuf, codestory_retrieval::SidecarRuntimeConfig) {
     let project = fs::canonicalize(fixture.workspace.path()).expect("canonical project fixture");
     let process_cache = test_support::test_state_root().join("stdio-cache");
     fs::create_dir_all(&process_cache).expect("create process cache root");
@@ -214,12 +216,27 @@ fn publish_zero_dense_agent_fixture(fixture: &HttpFixture) {
         runtime.embedding.allow_cpu = true;
         runtime
     });
+    (project, runtime)
+}
+
+fn publish_zero_dense_agent_fixture(fixture: &HttpFixture) {
+    let (project, runtime) = agent_fixture_runtime(fixture);
     codestory_retrieval::test_support::publish_zero_dense_pinned_query_fixture(
         &project,
         &fixture.cache_dir.path().join("codestory.db"),
         &runtime,
     )
     .expect("publish strict zero-dense HTTP fixture");
+}
+
+fn publish_deterministic_dense_agent_fixture(fixture: &HttpFixture) {
+    let (project, runtime) = agent_fixture_runtime(fixture);
+    codestory_retrieval::test_support::publish_deterministic_dense_pinned_query_fixture(
+        &project,
+        &fixture.cache_dir.path().join("codestory.db"),
+        &runtime,
+    )
+    .expect("publish deterministic dense HTTP fixture");
 }
 
 fn free_local_addr() -> String {
@@ -777,6 +794,18 @@ fn http_routes_and_stdio_tools_keep_aligned_default_contracts() {
 #[test]
 fn http_target_ambiguity_returns_json_error_and_choose_resolves() {
     let fixture = indexed_fixture();
+    let (project, runtime) = agent_fixture_runtime(&fixture);
+    assert_eq!(
+        codestory_retrieval::test_support::publish_zero_dense_pinned_query_fixture(
+            &project,
+            &fixture.cache_dir.path().join("codestory.db"),
+            &runtime,
+        )
+        .expect_err("zero-dense fixture must reject the indexed dense anchors")
+        .to_string(),
+        "zero-dense pinned query fixture received dense anchors",
+    );
+    publish_deterministic_dense_agent_fixture(&fixture);
     let (_server, addr) = spawn_http_server(&fixture);
 
     let ambiguous = http_get(&addr, "/definition?q=configure").expect("ambiguous definition");
@@ -834,6 +863,7 @@ fn http_target_ambiguity_returns_json_error_and_choose_resolves() {
 #[test]
 fn http_smoke_keeps_existing_routes_and_default_semantics_against_indexed_repo() {
     let fixture = indexed_fixture();
+    publish_deterministic_dense_agent_fixture(&fixture);
     let (_server, addr) = spawn_http_server(&fixture);
 
     let search = http_get(&addr, "/search?q=AppController&repo_text=off")
@@ -899,11 +929,12 @@ fn http_smoke_keeps_existing_routes_and_default_semantics_against_indexed_repo()
             .as_array()
             .is_some_and(|evidence| evidence.iter().any(|row| {
                 row["path"] == "metadata.rs"
+                    && row.get("display_name").is_some_and(Value::is_null)
                     && row["excerpt"]
                         .as_str()
                         .is_some_and(|excerpt| excerpt.contains("HTTP_METADATA_ANCHOR"))
             })),
-        "/search evidence must retain the matched source path and anchor: {search}"
+        "/search text evidence must retain the matched path and anchor with an explicit null symbol name: {search}"
     );
     assert!(
         search["gaps"].as_array().is_some_and(Vec::is_empty) && search["continuation"].is_null(),
@@ -923,14 +954,14 @@ fn http_smoke_keeps_existing_routes_and_default_semantics_against_indexed_repo()
         );
     }
     assert!(
-        search["_meta"]["codestory_publication"]["schema_version"] == 4
-            && search["_meta"]["codestory_publication"]["minimum_compatible_schema_version"] == 3
+        search["_meta"]["codestory_publication"]["schema_version"] == 5
+            && search["_meta"]["codestory_publication"]["minimum_compatible_schema_version"] == 5
             && search["_meta"]["codestory_publication"]["served_from"] == "complete_publication"
             && search["_meta"]["codestory_publication"]["core_publication"]["mode"] == "full"
             && search["_meta"]["codestory_publication"]["core_publication"].is_object()
             && search["_meta"]["codestory_publication"]["retrieval_publication"].is_object()
             && search["_meta"]["codestory_publication"]["operation"]["operation_id"].is_string(),
-        "/search success metadata must retain schema 4 and the complete core and retrieval publications plus operation identity: {search}"
+        "/search success metadata must retain schema 5 and the complete core and retrieval publications plus operation identity: {search}"
     );
     required_nonempty_string(&search, "/publication/core/project_id");
     let public_core_generation_id =

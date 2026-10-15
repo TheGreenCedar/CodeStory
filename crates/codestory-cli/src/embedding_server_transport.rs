@@ -201,6 +201,21 @@ impl NativeEmbeddingClientTransport {
     }
 
     pub(crate) fn capture_with_mode(mode: ClientTransportMode) -> Result<Self> {
+        Self::capture_with_clock_provenance(mode, ClockProvenance::Operational)
+    }
+
+    // Called only after the qualification worker has validated its gate/request.
+    pub(crate) fn capture_for_qualification() -> Result<Self> {
+        Self::capture_with_clock_provenance(
+            ClientTransportMode::SpawnCapable,
+            ClockProvenance::Qualification,
+        )
+    }
+
+    fn capture_with_clock_provenance(
+        mode: ClientTransportMode,
+        provenance: ClockProvenance,
+    ) -> Result<Self> {
         let launch_policy = capture_server_launch_policy()?;
         let executable = ExactExecutable::capture_for_client(mode)?;
         let executable_identity = executable_identity(&executable)?;
@@ -209,7 +224,9 @@ impl NativeEmbeddingClientTransport {
             executable_identity,
             mode,
             launch_policy,
-            clock: Arc::new(NativeAwakeClock::capture()?),
+            clock: Arc::new(NativeAwakeClock::capture_with_provenance(
+                provenance, boot_id,
+            )?),
             next_spawn_generation: Arc::new(AtomicU64::new(1)),
         })
     }
@@ -533,9 +550,16 @@ fn run_retrieval_server(
 ) -> Result<()> {
     std::hint::black_box(codestory_retrieval::PER_USER_EMBEDDING_SERVER_PROOF_MARKER);
     let defaults = crate::sidecar_runtime::process_defaults();
+    let provenance = if codestory_retrieval::validate_qualification_clock_gate()? {
+        ClockProvenance::Qualification
+    } else {
+        ClockProvenance::Operational
+    };
     let transport = Arc::new(NativeEmbeddingServerTransport {
         listener: std::sync::Mutex::new(Some(listener)),
-        clock: Arc::new(NativeAwakeClock::capture()?),
+        clock: Arc::new(NativeAwakeClock::capture_with_provenance(
+            provenance, boot_id,
+        )?),
     });
     let executable = executable_identity(&executable)?;
     codestory_retrieval::run_per_user_embedding_server(
@@ -586,16 +610,31 @@ struct NativeAwakeClock {
     snapshot: codestory_retrieval::EmbeddingServerClockSnapshot,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ClockProvenance {
+    Operational,
+    Qualification,
+}
+
 impl NativeAwakeClock {
-    fn capture() -> Result<Self> {
-        Ok(Self {
-            snapshot: codestory_retrieval::EmbeddingServerClockSnapshot {
-                domain: clock_domain().into(),
-                api: clock_api().into(),
-                boot_id: boot_id()?,
-                resolution_ns: platform::clock_resolution_ns()?,
-            },
-        })
+    fn capture_with_provenance(
+        provenance: ClockProvenance,
+        read_boot_id: impl FnOnce() -> Result<String>,
+    ) -> Result<Self> {
+        let boot_id = match provenance {
+            ClockProvenance::Operational => None,
+            ClockProvenance::Qualification => Some(read_boot_id()?),
+        };
+        let snapshot = codestory_retrieval::EmbeddingServerClockSnapshot {
+            domain: clock_domain().into(),
+            api: clock_api().into(),
+            boot_id,
+            resolution_ns: platform::clock_resolution_ns()?,
+        };
+        if matches!(provenance, ClockProvenance::Qualification) {
+            snapshot.qualification_boot_id()?;
+        }
+        Ok(Self { snapshot })
     }
 }
 
@@ -2329,10 +2368,14 @@ mod platform {
     fn open_authority(runtime: &RuntimeDirectory, create: bool) -> Result<Option<File>> {
         ensure_runtime_directory_matches(runtime)?;
         let name = UnixCString::new(LOCK_NAME).expect("static authority name");
-        let flags = libc::O_RDWR
-            | libc::O_CLOEXEC
-            | libc::O_NOFOLLOW
-            | if create { libc::O_CREAT } else { 0 };
+        // Existing-authority observation only validates identity and probes flock;
+        // it never creates or writes the file. Keep creation a separate capability.
+        let access = if create {
+            libc::O_RDWR | libc::O_CREAT
+        } else {
+            libc::O_RDONLY
+        };
+        let flags = access | libc::O_CLOEXEC | libc::O_NOFOLLOW;
         let fd = unsafe {
             libc::openat(
                 runtime.handle.as_raw_fd(),
@@ -2346,7 +2389,7 @@ mod platform {
             if !create && error.kind() == ErrorKind::NotFound {
                 return Ok(None);
             }
-            return Err(error).context("open handle-relative embedding authority");
+            return Err(authority_open_error(error));
         }
         let file = unsafe { File::from_raw_fd(fd) };
         let metadata = file.metadata()?;
@@ -2379,6 +2422,15 @@ mod platform {
         }
         ensure_runtime_directory_matches(runtime)?;
         Ok(Some(file))
+    }
+
+    fn authority_open_error(error: std::io::Error) -> anyhow::Error {
+        let context = if error.kind() == ErrorKind::PermissionDenied {
+            "embedding_runtime_authority_access_denied: OS denied open handle-relative embedding authority"
+        } else {
+            "open handle-relative embedding authority"
+        };
+        anyhow::Error::new(error).context(context)
     }
 
     fn try_lock(fd: RawFd) -> Result<bool> {
@@ -2800,6 +2852,43 @@ mod platform {
         }
 
         #[test]
+        fn authority_open_permission_denial_retains_os_cause() {
+            for code in [libc::EPERM, libc::EACCES] {
+                let error = authority_open_error(std::io::Error::from_raw_os_error(code));
+                assert!(
+                    error
+                        .to_string()
+                        .starts_with("embedding_runtime_authority_access_denied:")
+                );
+                assert_eq!(
+                    error
+                        .downcast_ref::<std::io::Error>()
+                        .expect("retain the original OS error")
+                        .raw_os_error(),
+                    Some(code)
+                );
+            }
+        }
+
+        #[test]
+        fn authority_open_other_failures_keep_existing_context() {
+            for code in [libc::ENOENT, libc::EIO, libc::ELOOP] {
+                let error = authority_open_error(std::io::Error::from_raw_os_error(code));
+                assert_eq!(
+                    error.to_string(),
+                    "open handle-relative embedding authority"
+                );
+                assert_eq!(
+                    error
+                        .downcast_ref::<std::io::Error>()
+                        .expect("retain the original OS error")
+                        .raw_os_error(),
+                    Some(code)
+                );
+            }
+        }
+
+        #[test]
         fn qualification_endpoint_stays_short_and_shared_for_long_unicode_control_path() {
             let control_parent = tempfile::tempdir().expect("create qualification parent");
             fs::set_permissions(
@@ -2935,6 +3024,90 @@ mod platform {
             let link_error = validate_private_directory(&link, false)
                 .expect_err("symlink runtime directory must fail closed");
             assert!(link_error.to_string().contains("is not a real directory"));
+        }
+
+        #[test]
+        fn embedding_existing_authority_reader_is_read_only_and_preserves_election() {
+            let root = tempfile::tempdir().expect("create fixture authority directory");
+            fs::set_permissions(root.path(), fs::Permissions::from_mode(PRIVATE_DIR_MODE))
+                .expect("make fixture authority directory private");
+            let runtime = validate_private_directory(root.path(), false)
+                .expect("validate fixture authority directory")
+                .expect("fixture directory exists");
+            assert!(
+                open_authority(&runtime, false)
+                    .expect("observe missing authority")
+                    .is_none()
+            );
+            assert!(!root.path().join(LOCK_NAME).exists());
+
+            let owner = open_authority(&runtime, true)
+                .expect("create fixture authority")
+                .expect("created authority exists");
+            let reader = open_authority(&runtime, false)
+                .expect("open existing authority reader")
+                .expect("existing authority exists");
+            assert_eq!(
+                unsafe { libc::fcntl(owner.as_raw_fd(), libc::F_GETFL) } & libc::O_ACCMODE,
+                libc::O_RDWR
+            );
+            assert_eq!(
+                unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) } & libc::O_ACCMODE,
+                libc::O_RDONLY
+            );
+            assert_eq!(
+                authority_id(&owner).unwrap(),
+                authority_id(&reader).unwrap()
+            );
+            let before = reader.metadata().expect("capture authority identity");
+            let byte = [1_u8];
+            let written =
+                unsafe { libc::write(reader.as_raw_fd(), byte.as_ptr().cast(), byte.len()) };
+            let write_error = std::io::Error::last_os_error();
+            assert_eq!(written, -1);
+            assert_eq!(write_error.raw_os_error(), Some(libc::EBADF));
+            assert!(try_lock(owner.as_raw_fd()).expect("owner wins lifetime election"));
+            assert!(!try_lock(reader.as_raw_fd()).expect("reader contends on same inode"));
+            unlock(owner.as_raw_fd()).expect("release owner lifetime lock");
+            assert!(try_lock(reader.as_raw_fd()).expect("reader observes released authority"));
+            unlock(reader.as_raw_fd()).expect("release reader probe");
+            let after = reader.metadata().expect("reinspect authority identity");
+            assert_eq!(
+                (before.dev(), before.ino(), before.len()),
+                (after.dev(), after.ino(), after.len())
+            );
+            assert_eq!(after.len(), 0);
+        }
+
+        #[test]
+        fn embedding_existing_authority_reader_rejects_untrusted_files() {
+            let root = tempfile::tempdir().expect("create fixture authority directory");
+            fs::set_permissions(root.path(), fs::Permissions::from_mode(PRIVATE_DIR_MODE))
+                .expect("make fixture authority directory private");
+            let runtime = validate_private_directory(root.path(), false)
+                .expect("validate fixture authority directory")
+                .expect("fixture directory exists");
+            let owner = open_authority(&runtime, true)
+                .expect("create fixture authority")
+                .expect("created authority exists");
+            let path = root.path().join(LOCK_NAME);
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o640))
+                .expect("make fixture file nonprivate");
+            assert!(open_authority(&runtime, false).is_err());
+            fs::set_permissions(&path, fs::Permissions::from_mode(PRIVATE_FILE_MODE))
+                .expect("restore fixture private mode");
+            let extra_link = root.path().join("authority-hardlink");
+            fs::hard_link(&path, &extra_link).expect("add fixture hardlink");
+            assert!(open_authority(&runtime, false).is_err());
+            fs::remove_file(&extra_link).expect("remove fixture hardlink");
+            let moved = root.path().join("original-authority");
+            fs::rename(&path, &moved).expect("move fixture authority");
+            symlink(&moved, &path).expect("substitute fixture symlink");
+            assert!(open_authority(&runtime, false).is_err());
+            fs::remove_file(&path).expect("remove fixture symlink");
+            fs::create_dir(&path).expect("substitute fixture directory");
+            assert!(open_authority(&runtime, false).is_err());
+            assert_eq!(owner.metadata().unwrap().len(), 0);
         }
 
         #[test]
@@ -5525,5 +5698,53 @@ mod tests {
             executable_file_identity(&file).expect("capture executable metadata identity");
         assert_eq!(identity, executable.file_identity);
         assert!(identity.file_size > 0);
+    }
+}
+
+#[cfg(test)]
+mod clock_provenance_tests {
+    use super::*;
+    use codestory_retrieval::AwakeMonotonicClock;
+
+    #[test]
+    fn operational_clock_never_requests_boot_provenance_and_keeps_real_time() {
+        let clock = NativeAwakeClock::capture_with_provenance(ClockProvenance::Operational, || {
+            panic!("ordinary operational clock must not read boot provenance")
+        })
+        .expect("operational clock");
+        assert!(clock.snapshot().boot_id.is_none());
+        assert!(clock.snapshot().qualification_boot_id().is_err());
+        let before = clock.now_ns();
+        clock.sleep(Duration::from_millis(1));
+        assert!(clock.now_ns() >= before);
+        let encoded = serde_json::to_value(clock.snapshot()).expect("snapshot JSON");
+        assert_eq!(encoded.get("boot_id"), Some(&serde_json::Value::Null));
+    }
+
+    #[test]
+    fn qualification_clock_requires_a_collected_nonempty_fixture_witness() {
+        let denied =
+            NativeAwakeClock::capture_with_provenance(ClockProvenance::Qualification, || {
+                bail!("synthetic boot-reader refusal")
+            })
+            .expect_err("collection refusal must propagate");
+        assert!(denied.to_string().contains("synthetic boot-reader refusal"));
+        for empty in ["", " "] {
+            assert!(
+                NativeAwakeClock::capture_with_provenance(ClockProvenance::Qualification, || Ok(
+                    empty.into()
+                ))
+                .is_err()
+            );
+        }
+        let clock =
+            NativeAwakeClock::capture_with_provenance(ClockProvenance::Qualification, || {
+                Ok("synthetic-fixture-boot".into())
+            })
+            .expect("synthetic witness");
+        assert_eq!(
+            clock.snapshot().qualification_boot_id().expect("witness"),
+            "synthetic-fixture-boot"
+        );
     }
 }

@@ -36,13 +36,19 @@ project's immutable config and never rereads or mutates process environment.
 - `src/stdio_transport.rs`: project routing, activation, resources, and tools
 - `src/output.rs`: rendering
 
+An exact CLI `--cache-dir` override belongs to single-project serve. Multi-project
+serve rejects that combination before transport startup, instead of silently
+selecting a different cache. Bind single-project stdio with `--project` and
+`--cache-dir` when using a retained cache. Stdio tool calls still own managed
+preparation; `serve --refresh none` is not an existing-publication fence.
+
 Multi-project stdio retains at most four hot contexts. A context key combines
 native workspace identity with a non-secret fingerprint of the immutable cache,
 retrieval, embedding, and summary configuration captured at process start.
 Equivalent path spellings converge on one context; configuration changes do
 not silently reuse another context. Project selection requires an absolute,
 existing repository root. Every repository-reading resource advertises a
-`{?project}` URI template and binds the canonical percent-encoded native root
+project-selector URI template and binds the canonical percent-encoded native root
 before dispatch. Missing, relative, unavailable, duplicate, malformed, or
 conflicting selectors fail closed. `codestory://agent-guide` is the static,
 project-free exception. A legacy `params.project` resource selector remains an
@@ -70,6 +76,14 @@ the shared activation remains owned by its other callers.
 Generated `--help` owns option syntax. User guides own workflows. This page owns
 the adapter boundary.
 
+CLI query targets in symbol, trail, impact, test-map, explore and bookmark-add
+commands use the existing Agent-profile opener and backend preflight. Their
+runtime operations still require a complete Full retrieval publication. The
+query DSL uses that same opening and graph-assisted operation class. Exact-ID
+navigation and source snippets retain their Core read path. Format, output-file
+and target-selector validation precede opening; runtime owns later resolution,
+freshness, admission and retry decisions.
+
 The canonical packet probe is a tagged JSON object. CLI `--probe` and stdio
 `probes[]` accept the same typed probe kinds. The retired free-string
 `--extra-probe` and `extra_probes[]` inputs are rejected; callers that need a
@@ -79,6 +93,19 @@ MCP schema is a strict tagged union, so fields from another probe kind are
 rejected.
 Search and definition links bind continuations to the selected project, stable
 node ID, contract version, and evidence generation.
+
+Root-symbol resources advertise `codestory://symbols/root{?project,limit,cursor}`.
+They return a versioned page object with `symbols`, explicit offset/remaining
+counts, and `continuation_uri`. Each successful individual JSON-RPC value is
+limited to 8,192 serialized bytes, including its actual request ID and escaped
+resource text. The newline terminator, error frames and batch aggregates are
+outside that page bound. Only complete rows are returned; an oversized row or
+metadata receives a typed refusal without advancing the cursor. Continuations
+bind the logical project, complete Core publication identity and deterministic
+full inventory fingerprint. Changed bindings require restarting the inventory.
+Paging reads an existing pinned Core without activation; it does not relax
+freshness or publication admission. The inventory is rendered and fingerprinted
+in full on each page, so this wire bound does not imply bounded-memory paging.
 
 MCP `snippet` accepts `scope=line_context|function_body`, bounded `context`,
 the `lines` compatibility alias, and the CLI-compatible `function_body`

@@ -1481,7 +1481,7 @@ fn app_controller_opens_project() {
     assert_files_and_affected_read_existing_cache(workspace.path(), cache_dir.path());
     search_dir_snapshot.assert_unchanged("files and affected");
 
-    assert_query_search_uses_core_without_full_sidecars(workspace.path(), cache_dir.path());
+    assert_query_search_fails_closed_without_full_sidecars(workspace.path(), cache_dir.path());
     search_dir_snapshot.assert_unchanged("query search");
     assert_packet_builds_broad_task_contract(workspace.path(), cache_dir.path());
     search_dir_snapshot.assert_unchanged("packet");
@@ -1500,6 +1500,80 @@ fn app_controller_opens_project() {
         cache_dir.path(),
         &node_id,
     );
+}
+
+#[test]
+fn python_function_body_id_snippet_retains_attached_test_cases() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    fs::write(
+        workspace.path().join("test_cases.py"),
+        r#"import pytest
+
+def unrelated_before():
+    return "UNRELATED_BEFORE"
+
+# UNRELATED_COMMENT_BEFORE
+@pytest.mark.parametrize(
+    "mode, expected",
+    [
+        ("first", "FIRST"),
+        ("second", "SECOND"),
+    ],
+)
+def test_checked_modes(mode, expected):
+    assert mode.upper() == expected
+
+# UNRELATED_COMMENT_AFTER
+def unrelated_after():
+    return "UNRELATED_AFTER"
+"#,
+    )
+    .expect("write decorated Python test");
+    run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &["index", "--refresh", "full", "--format", "json"],
+    );
+    let node_id = ground_symbol_node_id_from_existing_cache(
+        workspace.path(),
+        cache_dir.path(),
+        "test_checked_modes",
+        Some("test_cases.py"),
+    );
+    let snippet = run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "snippet",
+            "--id",
+            &node_id,
+            "--function-body",
+            "--context",
+            "0",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(snippet["resolution"]["resolved"]["node_id"], node_id);
+    assert_eq!(snippet["snippet"]["scope"], "function_body");
+    assert_eq!(snippet["snippet"]["requested_context"], 0);
+    assert_eq!(snippet["snippet"]["snippet_truncated"], false);
+    let source = string_field(&snippet, &["snippet", "snippet"]);
+    assert!(source.contains("def test_checked_modes(mode, expected):"));
+    assert!(source.contains("assert mode.upper() == expected"));
+    assert!(
+        source.contains("@pytest.mark.parametrize("),
+        "function-body source must include its attached test cases: {snippet:#}"
+    );
+    assert!(source.contains("\"mode, expected\""));
+    assert!(source.contains("(\"first\", \"FIRST\")"));
+    assert!(source.contains("(\"second\", \"SECOND\")"));
+    assert!(!source.contains("unrelated_before"));
+    assert!(!source.contains("unrelated_after"));
+    assert!(!source.contains("UNRELATED_COMMENT"));
 }
 
 #[test]
@@ -2745,7 +2819,7 @@ fn run_git(workspace: &Path, args: &[&str]) {
     );
 }
 
-fn assert_query_search_uses_core_without_full_sidecars(workspace: &Path, cache_dir: &Path) {
+fn assert_query_search_fails_closed_without_full_sidecars(workspace: &Path, cache_dir: &Path) {
     let output = run_cli(
         workspace,
         cache_dir,
@@ -2759,22 +2833,18 @@ fn assert_query_search_uses_core_without_full_sidecars(workspace: &Path, cache_d
         ],
     );
     assert!(
-        output.status.success(),
-        "query search DSL should use the complete core without sidecars: {}",
+        !output.status.success(),
+        "query search DSL must fail closed without full sidecars\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let query: Value = serde_json::from_slice(&output.stdout)
-        .unwrap_or_else(|error| panic!("parse query-search output: {error}; output={output:#?}"));
-    assert!(
-        query["items"].as_array().is_some_and(|items| {
-            items.iter().any(|item| {
-                item["display_name"] == "AppController"
-                    && item["source"] == "search"
-                    && item["file_path"] == "src/lib.rs"
-            })
-        }),
-        "query search DSL should return the exact core symbol: {query:#}"
+    let failure: Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("parse query-search refusal: {error}; output={output:#?}"));
+    assert_eq!(
+        failure["error"]["code"], "retrieval_unavailable",
+        "query search DSL must report the retrieval gate: {failure:#}"
     );
+    assert_retrieval_failure_output(output);
 }
 
 fn assert_context_id_fails_closed_without_full_sidecars(

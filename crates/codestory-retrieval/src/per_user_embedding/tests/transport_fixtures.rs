@@ -44,7 +44,7 @@ impl AwakeMonotonicClock for TestClock {
         EmbeddingServerClockSnapshot {
             domain: "awake_monotonic".into(),
             api: "test_clock".into(),
-            boot_id: "test-boot".into(),
+            boot_id: Some("test-boot".into()),
             resolution_ns: 1,
         }
     }
@@ -103,7 +103,7 @@ impl AwakeMonotonicClock for GatedSleepClock {
         EmbeddingServerClockSnapshot {
             domain: "awake_monotonic".into(),
             api: "gated_sleep_clock".into(),
-            boot_id: "test-boot".into(),
+            boot_id: Some("test-boot".into()),
             resolution_ns: 1,
         }
     }

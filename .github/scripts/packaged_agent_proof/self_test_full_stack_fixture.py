@@ -128,7 +128,7 @@ def _build_native_contract(
     constant_set_sha256 = sha256(constant_set)
     measurement_protocol_sha256 = sha256(measurement_protocol)
     server_proof_identity = (
-        "codestory-embedding-server-proof-v1|bootstrap=1|protocol_schema=1|"
+        "codestory-embedding-server-proof-v1|bootstrap=1|protocol_schema=2|"
         f"protocol_sha256={protocol_sha256}|"
         f"constant_set_sha256={constant_set_sha256}|"
         f"measurement_protocol_sha256={measurement_protocol_sha256}|"

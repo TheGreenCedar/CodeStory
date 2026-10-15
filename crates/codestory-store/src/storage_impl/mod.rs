@@ -87,7 +87,11 @@ const PROOF_RESOLUTION_PROVENANCE_SCHEMA_VERSION: u32 = 33;
 const CANONICAL_SUFFIX_SCHEMA_VERSION: u32 = 34;
 const ATTACHED_COMMENT_SCHEMA_VERSION: u32 = 35;
 const PROOF_RESOLUTION_FK_INDEX_SCHEMA_VERSION: u32 = 36;
-const SCHEMA_VERSION: u32 = PROOF_RESOLUTION_FK_INDEX_SCHEMA_VERSION;
+const FILE_EXTRACTION_IDENTITY_SCHEMA_VERSION: u32 = 37;
+const SCHEMA_VERSION: u32 = FILE_EXTRACTION_IDENTITY_SCHEMA_VERSION;
+// v37 only adds file extraction identity; retention's manifest/pointer
+// projection is unchanged. Keep this ceiling explicit across future bumps.
+const RETENTION_PUBLICATION_MAX_CORE_SCHEMA_VERSION: u32 = FILE_EXTRACTION_IDENTITY_SCHEMA_VERSION;
 // Reserved outside the sequential migration range so a future real schema version cannot
 // accidentally be treated as an interrupted run from this release.
 /// The `user_version` sentinel stamped while an incremental index run is
@@ -2911,6 +2915,7 @@ impl ProjectionPersistenceStats {
 pub struct ProjectionBatch<'a> {
     pub files: &'a [FileInfo],
     pub file_content_hashes: &'a [FileContentHash],
+    pub file_extraction_identities: &'a [FileExtractionIdentity],
     pub nodes: &'a [Node],
     pub structural_text_units: &'a [StructuralTextUnit],
     pub structural_text_projections: &'a [StructuralTextProjection],
@@ -3117,6 +3122,15 @@ pub struct FileInfo {
 pub struct FileContentHash {
     pub file_id: i64,
     pub content_hash: String,
+}
+
+/// Successful extraction identity, committed with the exact file projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileExtractionIdentity {
+    pub file_id: i64,
+    pub language: String,
+    pub source_content_hash: String,
+    pub extraction_revision: String,
 }
 
 /// Opaque parser-cache payload retained for one source path.
@@ -3820,6 +3834,7 @@ impl NormalizedRolePath {
             || marked.contains("_test_client/")
             || marked.contains(".test.")
             || marked.contains(".spec.")
+            || file_name.ends_with("_test.go")
             || file_name.ends_with("_test.rs")
             || file_name.ends_with("_tests.rs")
             || file_name.ends_with("_test.py")
@@ -5065,6 +5080,8 @@ impl std::ops::Deref for PinnedCoreConnection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NonmutatingOpenPolicy {
     StrictCurrentSchema,
+    RetentionPublications,
+    RetentionPointer,
     FreshnessFence,
     ProofValidation,
     SchemaVersion,
@@ -5212,6 +5229,118 @@ impl Storage {
     /// activating writer; an observer reports those states instead.
     pub fn open_observational<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
         Self::open_nonmutating(path.as_ref(), NonmutatingOpenPolicy::StrictCurrentSchema)
+    }
+
+    /// Observe only a complete publication identity from known historical Core schemas.
+    ///
+    /// This shares the closed retention-publication compatibility set and
+    /// nonmutating schema/row snapshot. It does not admit graph or source reads,
+    /// migrate the image, or expose a historical Store to the caller.
+    pub fn observe_complete_index_publication<P: AsRef<Path>>(
+        path: P,
+    ) -> Result<Option<IndexPublicationRecord>, StorageError> {
+        let path = path.as_ref();
+        let _exact_lease = pin_exact_core(path)?;
+        let storage = Self::open_nonmutating(path, NonmutatingOpenPolicy::RetentionPublications)?;
+        storage.get_complete_index_publication()
+    }
+
+    /// Observe only retrieval protection pointers without migrating the owning Core.
+    ///
+    /// The enumerated legacy schemas share this projection, not the general Store
+    /// contract. Unknown schemas or incomplete pointer rows remain unavailable
+    /// protection evidence. No old-schema Store escapes this narrow operation.
+    pub fn observe_retrieval_index_publications<P: AsRef<Path>>(
+        path: P,
+    ) -> Result<Vec<(RetrievalIndexManifest, Option<RetrievalIndexRollbackRecord>)>, StorageError>
+    {
+        let storage =
+            Self::open_nonmutating(path.as_ref(), NonmutatingOpenPolicy::RetentionPublications)?;
+        // Keep the pinned Core lease alive while reading its separately mutable
+        // pointer. Reuse the nonmutating journal/WAL fences rather than reopening
+        // that pointer through the ordinary publication connection helper.
+        let pointer;
+        let reader = if let Some(path) = storage.retrieval_publication_path.as_deref() {
+            // Preserve the ordinary external pointer reader's direct-file fence:
+            // the generic Core observer's is_file check follows symbolic links.
+            let metadata = fs::symlink_metadata(path).map_err(|error| {
+                StorageError::Other(format!(
+                    "Retrieval publication pointer is unavailable at {}: {error}",
+                    path.display()
+                ))
+            })?;
+            if !metadata.file_type().is_file() {
+                return Err(StorageError::Other(format!(
+                    "Retrieval publication pointer is not a regular file: {}",
+                    path.display()
+                )));
+            }
+            pointer = Self::open_nonmutating(path, NonmutatingOpenPolicy::RetentionPointer)?;
+            if pointer.retrieval_publication_path.is_some() {
+                return Err(StorageError::Other(
+                    "Retention pointer unexpectedly selects a Core publication".into(),
+                ));
+            }
+            let mut bindings = pointer.conn.prepare(
+                "SELECT core_generation_id, core_run_id, rollback_core_generation_id,
+                  rollback_core_run_id, rollback_record_json FROM retrieval_index_manifest",
+            )?;
+            let mut rows = bindings.query([])?;
+            while let Some(row) = rows.next()? {
+                let generation: String = row.get(0)?;
+                let run: String = row.get(1)?;
+                crate::core_generation::validate_generation_id(&generation)?;
+                if run.trim().is_empty() || run.len() > 128 {
+                    return Err(StorageError::Other(
+                        "Retention pointer has invalid Core run identity".into(),
+                    ));
+                }
+                let rollback_generation: Option<String> = row.get(2)?;
+                let rollback_run: Option<String> = row.get(3)?;
+                let rollback_record: Option<String> = row.get(4)?;
+                if rollback_generation.is_some() != rollback_run.is_some()
+                    || rollback_generation.is_some() != rollback_record.is_some()
+                {
+                    return Err(StorageError::Other(
+                        "Retention pointer has incomplete rollback Core binding".into(),
+                    ));
+                }
+                if let (Some(generation), Some(run)) = (rollback_generation, rollback_run) {
+                    crate::core_generation::validate_generation_id(&generation)?;
+                    if run.trim().is_empty() || run.len() > 128 {
+                        return Err(StorageError::Other(
+                            "Retention pointer has invalid rollback Core run identity".into(),
+                        ));
+                    }
+                }
+            }
+            &pointer
+        } else {
+            &storage
+        };
+        // The shared parser requires the mandatory manifest columns and validates
+        // scopes/rollback records. Missing tables or columns are errors, never an
+        // inferred empty protection set.
+        let publications = reader.list_retrieval_index_publications()?;
+        for (current, rollback) in &publications {
+            for manifest in
+                std::iter::once(current).chain(rollback.as_ref().map(|record| &record.manifest))
+            {
+                if manifest.project_id.trim().is_empty()
+                    || manifest.lexical_version.trim().is_empty()
+                    || manifest.semantic_generation.trim().is_empty()
+                    || manifest
+                        .sidecar_generation
+                        .as_deref()
+                        .is_none_or(|id| id.trim().is_empty())
+                {
+                    return Err(StorageError::Other(
+                        "Retention publication has an incomplete generation identity".into(),
+                    ));
+                }
+            }
+        }
+        Ok(publications)
     }
 
     /// Open the current database for one persistent proof-validation observer.
@@ -5367,7 +5496,12 @@ impl Storage {
                 OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
             )?
         };
-        if policy == NonmutatingOpenPolicy::FreshnessFence {
+        if matches!(
+            policy,
+            NonmutatingOpenPolicy::FreshnessFence
+                | NonmutatingOpenPolicy::RetentionPublications
+                | NonmutatingOpenPolicy::RetentionPointer
+        ) {
             // The freshness decision combines the schema sentinel, durable
             // fence, stored inventory, and workspace comparison. Pin one
             // SQLite snapshot before the first read so a concurrent writer
@@ -5378,6 +5512,20 @@ impl Storage {
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         let version = version.max(0) as u32;
         match policy {
+            // Closed schema set: a future Core schema bump must prove this
+            // projection's compatibility before it can enter a retention scan.
+            NonmutatingOpenPolicy::RetentionPublications
+                if !matches!(version, 32..=RETENTION_PUBLICATION_MAX_CORE_SCHEMA_VERSION) =>
+            {
+                return Err(StorageError::Other(format!(
+                    "Retention publication observation supports Core schemas 32–{RETENTION_PUBLICATION_MAX_CORE_SCHEMA_VERSION}, found {version}"
+                )));
+            }
+            NonmutatingOpenPolicy::RetentionPointer if version != 1 => {
+                return Err(StorageError::Other(format!(
+                    "Retention publication pointer requires schema 1, found {version}"
+                )));
+            }
             NonmutatingOpenPolicy::StrictCurrentSchema if version != SCHEMA_VERSION => {
                 return Err(schema_version_mismatch_error(
                     "Observational storage",
@@ -5707,6 +5855,42 @@ impl Storage {
         cache_key: &str,
     ) -> Result<Option<Vec<u8>>, StorageError> {
         get_index_artifact_cache_from_connection(&self.conn, path, cache_key)
+    }
+
+    pub fn file_extraction_identity_matches(
+        &self,
+        file_id: i64,
+        language: &str,
+        extraction_revision: &str,
+    ) -> Result<bool, StorageError> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM file_extraction_identity e JOIN file f ON f.id = e.file_id
+                WHERE e.file_id = ?1 AND e.language = ?2 AND e.extraction_revision = ?3
+                  AND e.language = f.language AND e.source_content_hash = f.content_hash
+                  AND f.indexed = 1 AND f.complete = 1
+             )",
+            params![file_id, language, extraction_revision],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn files_with_extraction_revision_mismatch(
+        &self,
+        language: &str,
+        extraction_revision: &str,
+    ) -> Result<Vec<i64>, StorageError> {
+        let mut statement = self.conn.prepare(
+            "SELECT f.id FROM file f LEFT JOIN file_extraction_identity e ON e.file_id = f.id
+             WHERE f.language = ?1 AND (
+                e.file_id IS NULL OR e.language != f.language
+                OR e.extraction_revision != ?2 OR e.source_content_hash != f.content_hash
+                OR f.content_hash IS NULL
+             ) ORDER BY f.id",
+        )?;
+        let rows = statement.query_map(params![language, extraction_revision], |row| row.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
     }
 
     pub fn get_index_artifact_cache_entries(
@@ -8461,6 +8645,9 @@ impl Storage {
         Ok(edges)
     }
 
+    /// Returns normalized incident edges for each requested node in edge-ID order.
+    /// Resolution filtering matches [`Self::get_edges_for_node_id`], whose trail
+    /// resolution priority can produce a different order.
     pub fn get_edges_for_node_ids(
         &self,
         node_ids: &[NodeId],
@@ -8779,6 +8966,7 @@ impl Storage {
         let mut breakdown = ProjectionFlushBreakdown::default();
         if batch.files.is_empty()
             && batch.file_content_hashes.is_empty()
+            && batch.file_extraction_identities.is_empty()
             && batch.nodes.is_empty()
             && batch.structural_text_units.is_empty()
             && batch.structural_text_projections.is_empty()
@@ -8835,6 +9023,28 @@ impl Storage {
         }
         let prepared_structural =
             prepare_structural_projection_batch(&batch, &file_content_hashes)?;
+        let mut extraction_file_ids = HashSet::new();
+        for identity in batch.file_extraction_identities {
+            let file = batch.files.iter().find(|file| file.id == identity.file_id);
+            if !extraction_file_ids.insert(identity.file_id)
+                || !file.is_some_and(|file| {
+                    file.indexed && file.complete && file.language == identity.language
+                })
+                || file_content_hashes.get(&identity.file_id).copied()
+                    != Some(identity.source_content_hash.as_str())
+                || identity.source_content_hash.len() != 64
+                || !identity
+                    .source_content_hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+                || identity.extraction_revision.trim().is_empty()
+            {
+                return Err(StorageError::Other(format!(
+                    "extraction identity {} does not describe a complete verified file projection",
+                    identity.file_id
+                )));
+            }
+        }
         let transaction_started = std::time::Instant::now();
         let transaction_setup_started = std::time::Instant::now();
         let tx = self.conn.transaction()?;
@@ -8899,6 +9109,40 @@ impl Storage {
             }
             breakdown.files_ms = clamp_i64_to_u32(started.elapsed().as_millis() as i64);
             breakdown.persistence.files.wall_ms = breakdown.files_ms;
+        }
+
+        if !batch.files.is_empty() {
+            let placeholders = question_placeholders(batch.files.len());
+            let removed = tx.execute(
+                &format!("DELETE FROM file_extraction_identity WHERE file_id IN ({placeholders})"),
+                params_from_iter(batch.files.iter().map(|file| file.id)),
+            )?;
+            record_projection_statement(
+                &mut breakdown.persistence.files,
+                removed as u64,
+                projection_scalar_binds(batch.files.len()),
+            );
+            let mut statement = tx.prepare(
+                "INSERT INTO file_extraction_identity
+                 (file_id, language, source_content_hash, extraction_revision)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for identity in batch.file_extraction_identities {
+                statement.execute(params![
+                    identity.file_id,
+                    identity.language,
+                    identity.source_content_hash,
+                    identity.extraction_revision,
+                ])?;
+                record_projection_statement(
+                    &mut breakdown.persistence.files,
+                    1,
+                    projection_scalar_binds(1)
+                        .saturating_add(projection_text_bind_bytes(&identity.language))
+                        .saturating_add(projection_text_bind_bytes(&identity.source_content_hash))
+                        .saturating_add(projection_text_bind_bytes(&identity.extraction_revision)),
+                );
+            }
         }
 
         if !prepared_nodes.is_empty() {
@@ -14698,7 +14942,8 @@ impl Storage {
         )
     }
 
-    /// Get all edges connected to a node (both directions)
+    /// Get all edges connected to a node (both directions).
+    /// Uses trail resolution priority, with edge-ID order within each priority.
     pub fn get_edges_for_node_id(&self, node_id: NodeId) -> Result<Vec<Edge>, StorageError> {
         trail::get_edges_for_node_id(self, node_id)
     }
@@ -15416,8 +15661,8 @@ mod grounding_snapshot_fast_path_tests {
 }
 
 pub use retrieval_manifest::{
-    BoundRetrievalIndexManifest, RetrievalCoreGenerationBinding, RetrievalIndexManifest,
-    RetrievalIndexRollbackRecord, RetrievalPublicationTransaction,
+    BoundRetrievalIndexManifest, RetrievalArtifactScope, RetrievalCoreGenerationBinding,
+    RetrievalIndexManifest, RetrievalIndexRollbackRecord, RetrievalPublicationTransaction,
 };
 
 #[cfg(test)]

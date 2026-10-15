@@ -23,6 +23,27 @@ pub(crate) fn callable_names(
             .child_by_field_name("declarator")
             .and_then(declarator_name)
             .and_then(|node| node.utf8_text(source.as_bytes()).ok())
+            // Recovery around conditional directives can alias a statement
+            // keyword to an identifier inside a function-shaped declarator.
+            // These spellings cannot name a function in either C or C++.
+            // Leave contextual/language-specific keywords and body errors
+            // alone so genuine surrounding definitions remain available.
+            .filter(|name| {
+                !matches!(
+                    *name,
+                    "if" | "else"
+                        | "for"
+                        | "while"
+                        | "do"
+                        | "switch"
+                        | "case"
+                        | "default"
+                        | "return"
+                        | "break"
+                        | "continue"
+                        | "goto"
+                )
+            })
             .map(str::to_string);
         names.insert(ts_node_graph_span(definition), name);
     });

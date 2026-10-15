@@ -368,6 +368,31 @@ impl RuntimeContext {
         self.ensure_open_from_decision(refresh, None, decision)
     }
 
+    /// Refresh or attach the complete Core without inspecting retrieval readiness.
+    pub(crate) fn ensure_core_open(&self, refresh: RefreshMode) -> Result<OpenedProject> {
+        let decision = self.resolve_refresh_decision_with_preflight(refresh)?;
+        let (summary, phase_timings) = self
+            .index
+            .refresh_core_index_blocking(
+                self.project_root.clone(),
+                self.storage_path.clone(),
+                decision.effective_mode,
+            )
+            .map_err(|error| {
+                let error = match decision.effective_mode {
+                    Some(mode) => annotate_refresh_error(error, refresh, mode),
+                    None => error,
+                };
+                map_api_error_for_project(error, &self.project_root)
+            })?;
+        Ok(OpenedProject {
+            summary,
+            refresh_mode: decision.effective_mode,
+            refresh_reason: decision.reason,
+            phase_timings,
+        })
+    }
+
     /// Open an agent surface while retaining a safe before/after summary for
     /// report telemetry. Compatibility is decided before any mutable project
     /// open. When that decision requires full recovery, no trustworthy
@@ -1434,11 +1459,11 @@ mod tests {
         // must see the bump rather than a self-referential comparison.
         assert_eq!(
             value.pointer("/_meta/codestory_publication/schema_version"),
-            Some(&serde_json::json!(4))
+            Some(&serde_json::json!(5))
         );
         assert_eq!(
             value.pointer("/_meta/codestory_publication/minimum_compatible_schema_version"),
-            Some(&serde_json::json!(3))
+            Some(&serde_json::json!(5))
         );
         assert_eq!(
             value.pointer("/_meta/codestory_publication/contract_runtime/cli_version"),

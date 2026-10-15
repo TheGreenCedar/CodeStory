@@ -909,6 +909,7 @@ fn plan_incremental_semantics(
             .store_mut()
             .get_files()
             .map_err(|error| ApiError::internal(format!("Failed to load files: {error}")))?,
+        Some(root),
     );
     let mut removed_component_keys = HashSet::new();
     for file_id in &execution_plan.files_to_remove {
@@ -1469,6 +1470,7 @@ fn prepare_incremental_refresh(
     } else {
         finalize_staged_semantic_docs_for_runtime(
             preparation.staged_mut().store_mut(),
+            Some(root),
             (!rebuild_complete_dense_anchor_set).then_some(&semantic_refresh_scope),
             (!rebuild_complete_dense_anchor_set).then_some(&semantic_plan.component_reports),
             &source_identity,

@@ -37,6 +37,7 @@ pub struct ProductEmbeddingIdentity {
     pub execution_observation_source: &'static str,
     pub encode_count: u64,
     pub execution_node_count: u64,
+    pub completed_operator_counts: std::collections::BTreeMap<String, u64>,
     pub resident_accelerator_tensor_count: u64,
     pub resident_accelerator_tensor_bytes: u64,
     pub model_layer_count: u32,
@@ -185,7 +186,9 @@ pub fn embed_prepared_queries_via_server_with_control(
     )
 }
 
-fn compatibility_identity(identity: EmbeddingEngineIdentity) -> Result<ProductEmbeddingIdentity> {
+pub(crate) fn compatibility_identity(
+    identity: EmbeddingEngineIdentity,
+) -> Result<ProductEmbeddingIdentity> {
     let residency = stable_name(&identity.residency)?;
     let policy = stable_name(&identity.policy)?;
     let execution_observation_source = stable_name(&identity.execution_observation_source)?;
@@ -218,6 +221,7 @@ fn compatibility_identity(identity: EmbeddingEngineIdentity) -> Result<ProductEm
         execution_observation_source,
         encode_count: identity.encode_count,
         execution_node_count: identity.execution_node_count,
+        completed_operator_counts: identity.completed_operator_counts,
         resident_accelerator_tensor_count: identity.resident_accelerator_tensor_count,
         resident_accelerator_tensor_bytes: identity.resident_accelerator_tensor_bytes,
         model_layer_count: identity.model_layer_count,
