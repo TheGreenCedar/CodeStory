@@ -956,15 +956,13 @@ fn public_exact_verifier_compiles_without_qualification_support() {
             "the inert launcher discovery session lost Rust's {revision} revision"
         );
     }
-    // LIVE-L2 bumped the publication stamp to schema 4 (the launcher exposes
-    // it as `publicationSchemaVersion`; minimum-compatible stays 3).
     assert!(
-        launcher.contains("publicationStampSchemaVersion = 4"),
+        launcher.contains("publicationStampSchemaVersion = 5"),
         "the inert launcher discovery session must preserve the Rust discovery schema"
     );
     assert!(
-        launcher.contains("minimumCompatiblePublicationStampSchemaVersion = 3"),
-        "the inert launcher must keep schema-3 producers readable"
+        launcher.contains("minimumCompatiblePublicationStampSchemaVersion = 5"),
+        "the inert launcher must reject producers missing the current search evidence contract"
     );
 }
 
@@ -1003,8 +1001,7 @@ process.stdout.write(JSON.stringify(
         session["discoveryContractSha256"], contracts["2025-06-18"],
         "the launcher must retain Rust's discovery digest without substituting one"
     );
-    // LIVE-L2 bumped the publication stamp to schema 4.
-    assert_eq!(session["publicationSchemaVersion"], 4);
+    assert_eq!(session["publicationSchemaVersion"], 5);
 }
 
 #[test]
