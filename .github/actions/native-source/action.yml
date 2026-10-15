@@ -3,6 +3,11 @@ description: Verify or reconstruct the exact authored native source before works
 runs:
   using: composite
   steps:
+    - uses: actions/setup-python@v7.0.0
+      env:
+        PSExecutionPolicyPreference: Bypass
+      with:
+        python-version: "3.13"
     - shell: bash
       run: |
         set -euo pipefail
