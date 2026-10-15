@@ -12,7 +12,7 @@ const consumers = {
   'crate-durability.yml': ['linux-durability'],
   'retrieval-engine-smoke.yml': ['linux-contracts', 'windows-manifest-missing'],
   'rustdoc.yml': ['warnings'],
-  'source-proof.yml': ['full-source-gate', 'windows-native-contracts'],
+  'source-proof.yml': ['full-source-gate', 'windows-native-contracts', 'freeze-hostile-mutations', 'freeze-windows-native-probe'],
   'packaged-platform-proof.yml': ['build', 'frozen-linux-qualification'],
   'macos-metal-proof.yml': ['packaged-metal'],
   'windows-vulkan-proof.yml': ['packaged-vulkan'],
@@ -38,7 +38,7 @@ test('every workspace Cargo job prepares pinned native source before its first C
       assert.ok(steps, `${file}:${name} consumer must still exist`);
       const prepare = steps.findIndex(step => step.uses === action);
       assert.ok(prepare >= 0, `${file}:${name} is missing native source reconstruction`);
-      const cargo = steps.findIndex(step => /\bcargo(?:\s|\s*@)/u.test(step.run ?? ''));
+      const cargo = steps.findIndex(step => /\bcargo(?:\s|\s*@)|cargo-build-artifacts\.test\.mjs/u.test(step.run ?? ''));
       assert.ok(cargo > prepare, `${file}:${name} invokes Cargo before native source reconstruction`);
       const condition = ['macos-metal-proof.yml', 'windows-vulkan-proof.yml'].includes(file)
         ? '${{ !inputs.use_packaged_cli_artifact }}' : undefined;

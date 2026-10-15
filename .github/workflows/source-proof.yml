@@ -441,6 +441,9 @@ jobs:
         with:
           ref: ${{ needs.resolve.outputs.ref }}
 
+      - name: Reconstruct pinned native source
+        uses: ./.github/actions/native-source
+
       - uses: actions/setup-node@v5
         with:
           node-version: "24"
@@ -468,9 +471,8 @@ jobs:
         with:
           ref: ${{ needs.resolve.outputs.ref }}
 
-      - uses: actions/setup-python@v7.0.0
-        with:
-          python-version: "3.13"
+      - name: Reconstruct pinned native source
+        uses: ./.github/actions/native-source
 
       - name: Run packaged proof self-test
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
