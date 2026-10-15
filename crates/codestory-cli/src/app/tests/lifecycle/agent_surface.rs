@@ -1,4 +1,5 @@
 use super::transport::EnvVarSnapshot;
+use crate::app::lifecycle::new_agent_surface_runtime;
 use crate::app::{open_agent_surface, open_search_surface};
 use crate::args;
 use crate::args::ProjectArgs;
@@ -147,15 +148,20 @@ fn agent_surface_preflights_precurrent_schema_before_summary_open() {
         .expect("resolve active immutable generation");
     assert_eq!(sqlite_schema_version(&generation_path), old_schema);
 
-    let opened = open_agent_surface(&project_args, None, None, args::RefreshMode::Auto, "packet")
+    // Exercise the shared Core-opening step without requiring the live
+    // retrieval activation covered by search_json_auto_and_full_prepare_missing_retrieval.
+    let runtime =
+        new_agent_surface_runtime(&project_args, None, None).expect("create agent surface runtime");
+    let (before, opened) = runtime
+        .ensure_open_with_before(args::RefreshMode::Auto)
         .expect("auto may select full recovery");
     assert!(
-        opened.before.is_none(),
+        before.is_none(),
         "compatibility recovery has no safe pre-refresh summary"
     );
-    assert_eq!(opened.opened.refresh_mode, Some(IndexMode::Full));
+    assert_eq!(opened.refresh_mode, Some(IndexMode::Full));
     assert_eq!(
-        opened.opened.refresh_reason.as_deref(),
+        opened.refresh_reason.as_deref(),
         Some("core_schema_upgrade_required")
     );
     let recovered_path = codestory_runtime::resolve_core_database_path(&storage_path)

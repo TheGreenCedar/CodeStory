@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- CLI search, packets and query-based navigation prepare missing retrieval data during automatic or full refresh, so a fresh index can be used without a separate retrieval command.
+
 - Search honors the requested result limit across symbol and repository-text matches and reports when additional matches are omitted.
 
 - Packets can include complete small configuration and text files found by lexical search even when the symbol index has no file entry. Delivered text is checked against the published and current file, stays within the existing source limit, and remains protected during CLI source continuation.
