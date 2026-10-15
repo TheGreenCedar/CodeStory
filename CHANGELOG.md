@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.18.0
+
 - Packets retain already found evidence when optional call metadata reaches its deadline, with the incomplete retrieval recorded instead of discarding the results.
 
 - ID-based navigation reports exact matches instead of labelling correctly selected IDs as fuzzy.
