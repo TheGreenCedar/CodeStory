@@ -20,6 +20,16 @@ const consumers = {
   'notifier-parity.yml': ['parity-macos-fsevents', 'parity-windows-rdcw', 'parity-linux-wsl-inotify'],
 };
 
+test('native source reconstruction provisions Python before interpreter discovery', () => {
+  const { runs } = parse(fs.readFileSync(path.join(root, action, 'action.yml'), 'utf8'));
+  const setup = runs.steps.findIndex(step => step.uses?.startsWith('actions/setup-python@'));
+  const bootstrap = runs.steps.findIndex(step => step.run?.includes('bootstrap-research-native-vendor.py'));
+  assert.ok(setup >= 0 && setup < bootstrap, 'Python must be available before the bootstrap shell starts');
+  assert.equal(runs.steps[setup].with['python-version'], '3.13');
+  assert.equal(runs.steps[setup].if, undefined);
+  assert.equal(runs.steps[setup]['continue-on-error'], undefined);
+});
+
 test('every workspace Cargo job prepares pinned native source before its first Cargo consumer', () => {
   for (const [file, jobs] of Object.entries(consumers)) {
     const workflow = parse(fs.readFileSync(path.join(root, '.github/workflows', file), 'utf8'));
