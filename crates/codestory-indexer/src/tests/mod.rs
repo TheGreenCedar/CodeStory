@@ -17,6 +17,7 @@ use std::collections::HashSet;
 use tempfile::tempdir;
 
 mod python_declaration_envelopes;
+mod rust_declaration_envelopes;
 mod walk_tree_nodes;
 
 #[test]

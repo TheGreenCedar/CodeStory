@@ -70,16 +70,18 @@ pub(super) fn mark_extraction_revision_mismatches(
     store: &Store,
     stored_files: &mut [codestory_contracts::workspace::StoredFileState],
 ) -> Result<(), ApiError> {
-    if let Some(revision) = codestory_indexer::current_file_extraction_revision("python") {
-        let outdated = store
-            .files_with_extraction_revision_mismatch("python", revision)
-            .map_err(|error| {
-                ApiError::internal(format!("Failed to read extraction identities: {error}"))
-            })?
-            .into_iter()
-            .collect::<std::collections::HashSet<_>>();
-        for file in stored_files.iter_mut() {
-            file.retry_required |= outdated.contains(&file.id);
+    for language in ["python", "rust"] {
+        if let Some(revision) = codestory_indexer::current_file_extraction_revision(language) {
+            let outdated = store
+                .files_with_extraction_revision_mismatch(language, revision)
+                .map_err(|error| {
+                    ApiError::internal(format!("Failed to read extraction identities: {error}"))
+                })?
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>();
+            for file in stored_files.iter_mut() {
+                file.retry_required |= outdated.contains(&file.id);
+            }
         }
     }
     Ok(())
@@ -491,6 +493,16 @@ mod extraction_identity_tests {
                 line_count: 1,
                 file_role: FileRole::Source,
             },
+            FileInfo {
+                id: 3,
+                path: PathBuf::from("plain.go"),
+                language: "go".into(),
+                modification_time: 0,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: FileRole::Source,
+            },
         ];
         let hashes = [
             FileContentHash {
@@ -500,6 +512,10 @@ mod extraction_identity_tests {
             FileContentHash {
                 file_id: 2,
                 content_hash: "b".repeat(64),
+            },
+            FileContentHash {
+                file_id: 3,
+                content_hash: "c".repeat(64),
             },
         ];
         let flush = |store: &mut Store, identities: &[FileExtractionIdentity]| {
@@ -521,62 +537,53 @@ mod extraction_identity_tests {
                 })
                 .unwrap();
         };
-        flush(&mut store, &[]);
-        let inputs = workspace_refresh_inputs(&store).unwrap();
-        assert!(
-            inputs
-                .stored_files
-                .iter()
-                .find(|file| file.id == 1)
+        let retry_ids = |store: &Store| {
+            workspace_refresh_inputs(store)
                 .unwrap()
-                .retry_required
-        );
-        assert!(
-            !inputs
                 .stored_files
-                .iter()
-                .find(|file| file.id == 2)
-                .unwrap()
-                .retry_required
-        );
-        let revision = codestory_indexer::current_file_extraction_revision("python").unwrap();
-        let identity = FileExtractionIdentity {
-            file_id: 1,
-            language: "python".into(),
-            source_content_hash: hashes[0].content_hash.clone(),
-            extraction_revision: revision.to_string(),
+                .into_iter()
+                .filter(|file| file.retry_required)
+                .map(|file| file.id)
+                .collect::<HashSet<_>>()
         };
-        flush(&mut store, &[identity]);
-        assert!(
-            workspace_refresh_inputs(&store)
-                .unwrap()
-                .stored_files
-                .iter()
-                .all(|file| !file.retry_required)
-        );
+        flush(&mut store, &[]);
+        assert_eq!(retry_ids(&store), HashSet::from([1, 2]));
+        let identities = [
+            FileExtractionIdentity {
+                file_id: 1,
+                language: "python".into(),
+                source_content_hash: hashes[0].content_hash.clone(),
+                extraction_revision: codestory_indexer::current_file_extraction_revision("python")
+                    .unwrap()
+                    .to_string(),
+            },
+            FileExtractionIdentity {
+                file_id: 2,
+                language: "rust".into(),
+                source_content_hash: hashes[1].content_hash.clone(),
+                extraction_revision: codestory_indexer::current_file_extraction_revision("rust")
+                    .unwrap()
+                    .to_string(),
+            },
+        ];
+        flush(&mut store, &identities);
+        assert!(retry_ids(&store).is_empty());
         store
             .get_connection()
             .execute(
                 "UPDATE file SET content_hash = ?1 WHERE id = 1",
-                ["c".repeat(64)],
+                ["d".repeat(64)],
             )
             .unwrap();
-        let inputs = workspace_refresh_inputs(&store).unwrap();
-        assert!(
-            inputs
-                .stored_files
-                .iter()
-                .find(|file| file.id == 1)
-                .unwrap()
-                .retry_required
-        );
-        assert!(
-            !inputs
-                .stored_files
-                .iter()
-                .find(|file| file.id == 2)
-                .unwrap()
-                .retry_required
-        );
+        assert_eq!(retry_ids(&store), HashSet::from([1]));
+        flush(&mut store, &identities);
+        store
+            .get_connection()
+            .execute(
+                "UPDATE file SET content_hash = ?1 WHERE id = 2",
+                ["e".repeat(64)],
+            )
+            .unwrap();
+        assert_eq!(retry_ids(&store), HashSet::from([2]));
     }
 }

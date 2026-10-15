@@ -6,6 +6,8 @@
 
 - Python function and method source includes directly attached decorators, so test parameterization and other declaration settings stay with the inspected callable. Calls in decorator arguments are attributed to their enclosing function. Existing indexes rebuild once on their next refresh.
 
+- Rust function and method source includes attached attributes, keeping test cases and platform conditions with the inspected declaration. Existing Rust indexes rebuild once on their next refresh.
+
 - CLI query-based symbol, call-graph, exploration and bookmark commands initialize the required retrieval runtime, avoiding failures caused by the default local profile. ID-based navigation remains available from the Core index.
 
 - Retrieval refreshes account for incremental vector work followed by a full rebuild, avoiding a timing-report error after fallback completes.

@@ -3349,14 +3349,16 @@ impl WorkspaceIndexer {
         };
         let content_hash = source_content_hash(&bytes);
         let source_utf8_exact = std::str::from_utf8(&bytes).is_ok();
-        let existing_projection_id = if language_config.language_name == "python" {
+        let existing_projection_id = if let Some(revision) =
+            current_file_extraction_revision(language_config.language_name)
+        {
             existing_projection_id.filter(|file_id| {
                 cache_access.storage_mut().is_some_and(|storage| {
                     storage
                         .file_extraction_identity_matches(
                             *file_id,
-                            "python",
-                            languages::python::CALLABLE_DECLARATION_REVISION,
+                            language_config.language_name,
+                            revision,
                         )
                         .unwrap_or(false)
                         && storage
@@ -4320,7 +4322,11 @@ fn source_content_hash(bytes: &[u8]) -> String {
 
 /// Current extraction revisions requiring durable per-file compatibility checks.
 pub fn current_file_extraction_revision(language: &str) -> Option<&'static str> {
-    (language == "python").then_some(languages::python::CALLABLE_DECLARATION_REVISION)
+    match language {
+        "python" => Some(languages::python::CALLABLE_DECLARATION_REVISION),
+        "rust" => Some(languages::rust::CALLABLE_DECLARATION_REVISION),
+        _ => None,
+    }
 }
 
 fn add_current_file_extraction_identities(storage: &mut IntermediateStorage) {
@@ -17043,6 +17049,8 @@ fn index_file_with_resolution_inputs(
 
     if language_config.language_name == "python" {
         languages::python::apply_callable_declaration_envelopes(&tree, &mut final_nodes);
+    } else if language_config.language_name == "rust" {
+        languages::rust::apply_callable_declaration_envelopes(&tree, &mut final_nodes);
     }
     let callable_projection_states =
         build_callable_projection_states(&final_nodes, &result_edges, &result_occurrences);
