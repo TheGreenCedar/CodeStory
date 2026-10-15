@@ -1,8 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { execute } from '../codestory-release.mjs';
-import { MARKER, recordBody } from '../lib/release-coordinator-contract.mjs';
-import { githubFixture, C, D, F, M, P } from './fixtures/release-github.mjs';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { execute, createDefaultHost } from '../codestory-release.mjs';
+import { MARKER, CONSTANT_SET, recordBody } from '../lib/release-coordinator-contract.mjs';
+import { githubFixture, ROOT, C, D, F, M, P } from './fixtures/release-github.mjs';
 
 async function started() {
   const f = githubFixture();
@@ -342,15 +346,20 @@ test('three real calibration records retain their shared Actions producer and di
   assert.equal(new Set(rows.map(row => row.member_sha256)).size, 3);
   assert.ok(f.data.lineageChecks >= 1);
   assert.equal(f.data.next, C);
+  assert.equal(f.data.calls.some(call => call.program === 'git' && call.args.includes('worktree')), false,
+    'freezing must reuse the existing checkout without creating another worktree');
 });
 
 test('generated source and canonical lineage failures cannot publish a freeze branch', async t => {
-  for (const [name, key, pattern] of [['extra file', 'wrongFreezePath', /only the generated/u], ['lineage owner', 'lineageFailure', /lineage owner rejected/u]]) {
+  for (const [name, key, pattern] of [['extra file', 'wrongFreezePath', /exact constant-only child/u], ['lineage owner', 'lineageFailure', /lineage owner rejected/u]]) {
     await t.test(name, async () => {
       const f = await calibrated(); f.data[key] = true;
       assert.match((await run(f)).blocker, pattern);
       assert.equal(f.data.branches.size, 0);
       assert.equal(f.data.next, C);
+      assert.equal(f.data.localHead, C);
+      assert.equal(f.data.localBranch, 'dev/codestory-next');
+      assert.equal(f.data.localBranches.get('dev/codestory-next'), C);
       assert.equal(f.record().heads.F, undefined);
     });
   }
@@ -433,4 +442,116 @@ test('a rehearsal ends at pre-publish proof without main or catalog claims', asy
   assert.equal(f.data.main, M);
   assert.equal(f.record().receipt.groups.publication, undefined);
   assert.equal(f.record().receipt.groups['catalog-delivery'], undefined);
+});
+
+test('freeze uses real Git without another checkout and preserves operator state on failure', async t => {
+  for (const scenario of ['attached', 'detached', 'commit failure', 'lineage failure', 'push failure',
+    'adopt existing', 'concurrent staged files', 'concurrent constant edit']) await t.test(scenario, () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'codestory-freeze-git-test-'));
+    try {
+      const repo = path.join(root, 'repo'), remote = path.join(root, 'remote.git');
+      mkdirSync(repo);
+      const git = args => execFileSync('git', ['-C', repo, ...args], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+      git(['init', '-b', 'candidate']);
+      git(['config', 'user.name', 'Fixture']); git(['config', 'user.email', 'fixture@example.invalid']);
+      git(['config', 'commit.gpgsign', 'false']);
+      git(['config', 'core.hooksPath', os.devNull]);
+      mkdirSync(path.join(repo, path.dirname(CONSTANT_SET)), { recursive: true });
+      writeFileSync(path.join(repo, CONSTANT_SET), '{"status":"unfrozen"}\n');
+      writeFileSync(path.join(repo, 'other.txt'), 'original\n');
+      git(['add', '.']); git(['commit', '-m', 'source']);
+      const C = { commit: git(['rev-parse', 'HEAD']), tree: git(['rev-parse', 'HEAD^{tree}']) };
+      git(['init', '--bare', remote]); git(['remote', 'add', 'origin', remote]);
+      if (scenario === 'detached') git(['switch', '--detach', C.commit]);
+      const originalBranch = git(['branch', '--show-current']);
+      const originalIndex = git(['ls-files', '--stage']);
+      const bytes = JSON.stringify({ status: 'frozen', source: C.commit }) + '\n';
+      const calibration = { documents: { 'per-user-embedding-server-constant-set.json': bytes,
+        'calibration-bundle.json': '{}' }, rows: [{ run_id: 123, attempt: 1 }], artifact: { name: 'calibration' } };
+      let F, commits = 0, pushes = 0;
+      const host = createDefaultHost({ projectRoot: ROOT, runCommand(program, args, options = {}) {
+        if (program === 'git') {
+          assert.equal(args[0], '-C'); assert.equal(args[1], ROOT);
+          assert.equal(args.includes('worktree'), false);
+          if (args.includes('commit-tree') && scenario === 'commit failure') throw new Error('fixture commit failure');
+          if (args.includes('push')) {
+            pushes++;
+            if (scenario === 'push failure') throw new Error('fixture push failure');
+          }
+          const result = execFileSync(program, ['-C', repo, ...args.slice(2)], {
+            encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], ...options,
+          });
+          if (args.includes('commit-tree')) {
+            F = result.trim(); commits++;
+            if (scenario === 'concurrent staged files') {
+              writeFileSync(path.join(repo, 'other.txt'), 'operator edit\n'); git(['add', 'other.txt']);
+              writeFileSync(path.join(repo, 'untracked.txt'), 'operator file\n');
+            }
+          }
+          return result;
+        }
+        if (program === 'gh') {
+          assert.ok(args[1].includes('/pulls') || args.includes('--method'));
+          if (!options.input) return '[]';
+          const body = JSON.parse(options.input);
+          return JSON.stringify({ number: 42, head: { sha: F }, base: { ref: body.base } });
+        }
+        assert.ok(args[0].endsWith('check-calibration-release-lineage.py'));
+        assert.equal(args[args.indexOf('--repo') + 1], ROOT);
+        assert.equal(git(['rev-parse', 'HEAD']), F);
+        assert.equal(readFileSync(path.join(repo, CONSTANT_SET), 'utf8'), bytes);
+        if (scenario === 'concurrent constant edit') {
+          writeFileSync(path.join(repo, CONSTANT_SET), 'operator constant edit\n');
+          throw new Error('fixture lineage failure after operator edit');
+        }
+        if (scenario === 'lineage failure') throw new Error('fixture lineage failure');
+        return '{"status":"passed"}';
+      } });
+      Object.defineProperty(host, 'heads', { value: { next: C } });
+      host.findIssue = () => ({ number: 41 });
+      const record = { heads: { C: C.commit, C_tree: C.tree }, receipt: { version: '0.18.0' }, issue_number: 40 };
+      if (scenario.includes('failure') || scenario.startsWith('concurrent')) {
+        const refusal = scenario === 'concurrent staged files' ? /clean existing checkout/u
+          : scenario === 'concurrent constant edit' ? /would be overwritten by checkout/u
+            : new RegExp(`fixture ${scenario}`, 'u');
+        assert.throws(() => host.freeze(record, calibration), error => {
+          assert.match(error.message, refusal);
+          if (scenario === 'concurrent constant edit') {
+            assert.ok(error instanceof AggregateError);
+            assert.match(error.errors[0].message, /fixture lineage failure after operator edit/u);
+            assert.match(error.errors[1].message, /would be overwritten by checkout/u);
+            assert.match(error.message, /fixture lineage failure after operator edit/u);
+          }
+          return true;
+        });
+        assert.equal(pushes, scenario === 'push failure' ? 1 : 0);
+      } else {
+        assert.equal(host.freeze(record, calibration).commit, F);
+        if (scenario === 'adopt existing') {
+          assert.equal(host.freeze(record, calibration).commit, F);
+          assert.equal(commits, 1); assert.equal(pushes, 1);
+        }
+      }
+      assert.equal(git(['rev-parse', 'refs/heads/candidate']), C.commit);
+      if (F) {
+        assert.equal(git(['rev-list', '--parents', '-n', '1', F]), `${F} ${C.commit}`);
+        assert.equal(git(['diff', '--name-only', C.commit, F]), CONSTANT_SET);
+      }
+      if (scenario === 'concurrent constant edit') {
+        assert.equal(git(['rev-parse', 'HEAD']), F);
+        assert.equal(readFileSync(path.join(repo, CONSTANT_SET), 'utf8'), 'operator constant edit\n');
+      } else {
+        assert.equal(git(['rev-parse', 'HEAD']), C.commit);
+        assert.equal(git(['branch', '--show-current']), originalBranch);
+        if (scenario === 'concurrent staged files') {
+          assert.equal(git(['diff', '--cached', '--name-only']), 'other.txt');
+          assert.equal(readFileSync(path.join(repo, 'other.txt'), 'utf8'), 'operator edit\n');
+          assert.equal(readFileSync(path.join(repo, 'untracked.txt'), 'utf8'), 'operator file\n');
+        } else {
+          assert.equal(git(['status', '--porcelain']), '');
+          assert.equal(git(['ls-files', '--stage']), originalIndex);
+        }
+      }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
 });
