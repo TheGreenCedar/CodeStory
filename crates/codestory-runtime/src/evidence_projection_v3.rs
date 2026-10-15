@@ -890,6 +890,8 @@ struct SearchEvidenceSelectionV3 {
 }
 
 fn search_evidence_selection(results: &SearchResultsDto) -> SearchEvidenceSelectionV3 {
+    let row_limit = (results.limit_per_source as usize)
+        .min(codestory_contracts::packet_projection_v3::EVIDENCE_ROWS_MAX_V3);
     let mut rows = Vec::new();
     let mut seen = HashSet::new();
     let mut missing_source = false;
@@ -909,7 +911,7 @@ fn search_evidence_selection(results: &SearchResultsDto) -> SearchEvidenceSelect
         if !seen.insert((hit.node_id.0.as_str(), path, hit.line)) {
             continue;
         }
-        if rows.len() == codestory_contracts::packet_projection_v3::EVIDENCE_ROWS_MAX_V3 {
+        if rows.len() == row_limit {
             was_bounded = true;
             continue;
         }
@@ -2869,6 +2871,76 @@ mod tests {
     }
 
     #[test]
+    fn search_projection_limits_combined_unique_hits_without_changing_source_order() {
+        let (_project, _state, _process_cache, controller, service) = indexed_search_fixture();
+        service
+            .run_observational_with_cancel(
+                crate::services::search_operation_name(SearchRepoTextMode::Off),
+                Arc::new(AtomicBool::new(false)),
+                || {
+                    for limit in [1, 2, 10, 15] {
+                        let mut request = core_search_request("layout.css");
+                        request.limit_per_source = limit;
+                        let mut results = controller.search_results(request)?;
+                        assert_eq!(results.limit_per_source, limit);
+                        let mut first = results.hits[0].clone();
+                        first.node_id.0 = "indexed-first".into();
+                        first.file_path = Some("src/indexed-first.css".into());
+                        let mut second = first.clone();
+                        second.node_id.0 = "indexed-second".into();
+                        second.file_path = Some("src/indexed-second.css".into());
+                        results.hits = vec![first.clone()];
+                        if limit > 1 {
+                            results.hits.push(second);
+                        }
+                        results.repo_text_hits = (0..limit)
+                            .map(|index| {
+                                if limit > 1 && index == 0 {
+                                    return first.clone();
+                                }
+                                let mut hit = first.clone();
+                                hit.node_id.0 = format!("text-{index}");
+                                hit.file_path = Some(format!("src/text-{index}.css"));
+                                hit
+                            })
+                            .collect();
+                        let projected = project_search_v3(&service, "test", &results)?;
+                        let rows = projected.evidence.as_slice();
+                        assert_eq!(rows.len(), limit as usize, "combined limit {limit}");
+                        assert_eq!(rows[0].path.as_str(), "src/indexed-first.css");
+                        if limit > 1 {
+                            assert_eq!(rows[1].path.as_str(), "src/indexed-second.css");
+                        }
+                        for (index, row) in rows.iter().skip(2).enumerate() {
+                            assert_eq!(row.path.as_str(), format!("src/text-{}.css", index + 1));
+                        }
+                        assert!(
+                            projected
+                                .gaps
+                                .as_slice()
+                                .iter()
+                                .any(|gap| { gap.kind == GapKindV3Dto::OutputBudgetExceeded })
+                        );
+
+                        // A duplicate-only tail does not mean another source row was omitted.
+                        results.repo_text_hits = vec![first];
+                        let projected = project_search_v3(&service, "test", &results)?;
+                        assert_eq!(projected.evidence.as_slice().len(), limit.min(2) as usize);
+                        assert!(
+                            !projected
+                                .gaps
+                                .as_slice()
+                                .iter()
+                                .any(|gap| { gap.kind == GapKindV3Dto::OutputBudgetExceeded })
+                        );
+                    }
+                    Ok(())
+                },
+            )
+            .expect("mixed search sources obey one public limit");
+    }
+
+    #[test]
     fn search_projection_deduplicates_mixed_hits_and_accounts_for_missing_or_bounded_rows() {
         let (_project, _state, _process_cache, controller, service) = indexed_search_fixture();
         let results = service
@@ -2918,7 +2990,7 @@ mod tests {
         );
 
         let mut bounded = duplicate;
-        bounded.hits = (0..=codestory_contracts::packet_projection_v3::EVIDENCE_ROWS_MAX_V3)
+        bounded.hits = (0..=bounded.limit_per_source)
             .map(|index| {
                 let mut hit = file_hit.clone();
                 hit.node_id.0 = format!("file-{index}");
@@ -2935,10 +3007,7 @@ mod tests {
             )
             .expect("bounded projection")
             .value;
-        assert_eq!(
-            bounded_projection.evidence.as_slice().len(),
-            codestory_contracts::packet_projection_v3::EVIDENCE_ROWS_MAX_V3
-        );
+        assert_eq!(bounded_projection.evidence.as_slice().len(), 10);
         assert!(
             bounded_projection
                 .gaps

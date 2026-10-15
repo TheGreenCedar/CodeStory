@@ -1047,11 +1047,7 @@ pub(crate) struct SearchCommand {
     pub(crate) project: ProjectArgs,
     #[arg(long)]
     pub(crate) query: String,
-    #[arg(
-        long,
-        default_value_t = 10,
-        help = "Maximum results per provenance group (`indexed_symbol` and `text_match`)."
-    )]
+    #[arg(long, default_value_t = 10, help = "Maximum search hits returned.")]
     pub(crate) limit: u32,
     #[arg(
         long,
