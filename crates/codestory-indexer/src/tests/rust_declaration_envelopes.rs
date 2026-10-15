@@ -238,13 +238,14 @@ fn rust_callable_declarations_keep_attached_metadata_and_execution_ownership() -
 }
 
 #[test]
-fn stale_rust_extraction_replaces_old_bounds_even_with_current_cached_projection() -> Result<()> {
+fn stale_rust_extraction_replaces_old_macro_duplicates_even_with_current_cached_projection()
+-> Result<()> {
     let dir = tempdir()?;
     let path = dir.path().join("worker.rs");
     let empty_path = dir.path().join("empty.rs");
     std::fs::write(
         &path,
-        "// before\n#[test]\nfn worker() {\n    let _value = 1;\n}\n",
+        "// before\n#[test]\nfn worker() {\n    println!(\"Hello\");\n}\n",
     )?;
     std::fs::write(&empty_path, "const VALUE: u8 = 1;\n")?;
     let indexer = WorkspaceIndexer::new(dir.path().to_path_buf());
@@ -281,24 +282,60 @@ fn stale_rust_extraction_replaces_old_bounds_even_with_current_cached_projection
     };
     assert_eq!(stored_span(&store)?, (2, 1, 5, 2));
     let source_hash = store.get_file_content_hash(file.id)?.unwrap();
+    let legacy_key = format!("{}:worker#0", WorkspaceIndexer::file_identity_path(&path));
+    let phantom_key = format!("{}:worker#1", WorkspaceIndexer::file_identity_path(&path));
     store.get_connection().execute(
-        "UPDATE node SET start_line = 3, start_col = 1 WHERE id = ?1",
-        [worker.id.0],
+        "UPDATE node SET canonical_id = ?1 WHERE id = ?2",
+        (&legacy_key, worker.id.0),
     )?;
+    store.insert_node(&Node {
+        id: NodeId(generate_id(&phantom_key)),
+        kind: NodeKind::FUNCTION,
+        serialized_name: "worker".to_string(),
+        qualified_name: Some("worker".to_string()),
+        canonical_id: Some(phantom_key),
+        file_node_id: Some(NodeId(file.id)),
+        start_line: Some(3),
+        start_col: Some(4),
+        end_line: Some(3),
+        end_col: Some(10),
+        ..Node::default()
+    })?;
+    let legacy_revision = "rust-callable-declaration-v1";
+    assert_ne!(
+        revision, legacy_revision,
+        "the duplicate producer must be retired"
+    );
     store.get_connection().execute(
-        "UPDATE file_extraction_identity SET extraction_revision = 'old' WHERE file_id = ?1",
-        [file.id],
+        "UPDATE file_extraction_identity SET extraction_revision = ?1 WHERE file_id = ?2",
+        (legacy_revision, file.id),
     )?;
-    assert_eq!(stored_span(&store)?, (3, 1, 5, 2), "actual old graph");
+    let workers = |store: &Storage| -> Result<Vec<Node>> {
+        Ok(store
+            .get_nodes()?
+            .into_iter()
+            .filter(|node| node.kind == NodeKind::FUNCTION && node.serialized_name == "worker")
+            .collect())
+    };
+    assert_eq!(
+        workers(&store)?.len(),
+        2,
+        "actual stale full and name-only graph"
+    );
     assert!(!store.file_extraction_identity_matches(file.id, "rust", revision)?);
     let cancelled = CancellationToken::new();
     cancelled.cancel();
     let cancelled_stats =
         indexer.run_incremental(&mut store, &plan, &EventBus::new(), Some(&cancelled))?;
     assert!(!cancelled_stats.graph_projection_changed);
-    assert_eq!(stored_span(&store)?, (3, 1, 5, 2));
+    assert_eq!(stored_span(&store)?, (2, 1, 5, 2));
+    assert_eq!(
+        workers(&store)?.len(),
+        2,
+        "cancelled refresh preserves the old graph"
+    );
     assert!(
-        store.file_extraction_identity_matches(file.id, "rust", "old")?,
+        store.file_extraction_identity_matches(file.id, "rust", legacy_revision)?,
         "cancelled extraction never advances the producer"
     );
     let repaired = indexer.run_incremental(&mut store, &plan, &EventBus::new(), None)?;
@@ -308,6 +345,19 @@ fn stale_rust_extraction_replaces_old_bounds_even_with_current_cached_projection
     );
     assert!(repaired.graph_projection_changed);
     assert_eq!(stored_span(&store)?, (2, 1, 5, 2));
+    let repaired_workers = workers(&store)?;
+    assert_eq!(
+        repaired_workers.len(),
+        1,
+        "refresh removes the phantom definition"
+    );
+    assert!(
+        repaired_workers[0]
+            .canonical_id
+            .as_deref()
+            .unwrap()
+            .starts_with(RUST_ORDINAL_CANONICAL_ID_PREFIX)
+    );
     assert_eq!(
         store.get_file_content_hash(file.id)?.as_deref(),
         Some(source_hash.as_str())

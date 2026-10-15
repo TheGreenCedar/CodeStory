@@ -748,11 +748,8 @@ pub(crate) fn build_index_artifact_cache_key(
     mix_str(&mut state, language_config.language_name);
     mix_str(&mut state, language_config.graph_query);
     mix_optional_str(&mut state, language_config.tags_query);
-    if language_config.language_name == "python" {
-        mix_str(
-            &mut state,
-            crate::languages::python::CALLABLE_DECLARATION_REVISION,
-        );
+    if let Some(revision) = crate::current_file_extraction_revision(language_config.language_name) {
+        mix_str(&mut state, revision);
     }
     // Rust-side callable identity/scope extraction changed independently of the
     // graph rules. Invalidate affected languages without discarding unrelated
@@ -1127,7 +1124,7 @@ mod tests {
     }
 
     #[test]
-    fn python_declaration_cache_revision_leaves_other_languages_reusable() {
+    fn callable_declaration_cache_revision_leaves_other_languages_reusable() {
         for extension in ["py", "rs", "go", "c", "cpp", "js", "ts", "tsx"] {
             let config = crate::get_language_for_ext(extension).expect("parser config");
             let root = Path::new("project");
@@ -1164,7 +1161,11 @@ mod tests {
             let current =
                 build_index_artifact_cache_key(root, path, source, &config, None, false, true)
                     .expect("cache key");
-            assert_eq!(current != previous, extension == "py", "{extension}");
+            assert_eq!(
+                current != previous,
+                matches!(extension, "py" | "rs"),
+                "{extension}"
+            );
         }
     }
 
@@ -1185,11 +1186,8 @@ mod tests {
             mix_str(&mut previous, config.language_name);
             mix_str(&mut previous, config.graph_query);
             mix_optional_str(&mut previous, config.tags_query);
-            if config.language_name == "python" {
-                mix_str(
-                    &mut previous,
-                    crate::languages::python::CALLABLE_DECLARATION_REVISION,
-                );
+            if let Some(revision) = crate::current_file_extraction_revision(config.language_name) {
+                mix_str(&mut previous, revision);
             }
             if matches!(
                 config.language_name,
@@ -1236,11 +1234,8 @@ mod tests {
             mix_str(&mut previous, config.language_name);
             mix_str(&mut previous, config.graph_query);
             mix_optional_str(&mut previous, config.tags_query);
-            if config.language_name == "python" {
-                mix_str(
-                    &mut previous,
-                    crate::languages::python::CALLABLE_DECLARATION_REVISION,
-                );
+            if let Some(revision) = crate::current_file_extraction_revision(config.language_name) {
+                mix_str(&mut previous, revision);
             }
             if matches!(config.language_name, "c" | "cpp") {
                 mix_str(&mut previous, "native-control-flow-declarator-v1");
@@ -1281,11 +1276,8 @@ mod tests {
             mix_str(&mut previous, config.language_name);
             mix_str(&mut previous, config.graph_query);
             mix_optional_str(&mut previous, config.tags_query);
-            if config.language_name == "python" {
-                mix_str(
-                    &mut previous,
-                    crate::languages::python::CALLABLE_DECLARATION_REVISION,
-                );
+            if let Some(revision) = crate::current_file_extraction_revision(config.language_name) {
+                mix_str(&mut previous, revision);
             }
             if config.language_name == "go" {
                 mix_str(&mut previous, "go-member-export-access-v1");
@@ -1330,11 +1322,8 @@ mod tests {
             mix_str(&mut previous, config.language_name);
             mix_str(&mut previous, config.graph_query);
             mix_optional_str(&mut previous, config.tags_query);
-            if config.language_name == "python" {
-                mix_str(
-                    &mut previous,
-                    crate::languages::python::CALLABLE_DECLARATION_REVISION,
-                );
+            if let Some(revision) = crate::current_file_extraction_revision(config.language_name) {
+                mix_str(&mut previous, revision);
             }
             if matches!(
                 config.language_name,
@@ -1383,11 +1372,8 @@ mod tests {
             mix_str(&mut previous, config.language_name);
             mix_str(&mut previous, config.graph_query);
             mix_optional_str(&mut previous, config.tags_query);
-            if config.language_name == "python" {
-                mix_str(
-                    &mut previous,
-                    crate::languages::python::CALLABLE_DECLARATION_REVISION,
-                );
+            if let Some(revision) = crate::current_file_extraction_revision(config.language_name) {
+                mix_str(&mut previous, revision);
             }
             if matches!(
                 config.language_name,

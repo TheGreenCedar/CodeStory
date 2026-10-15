@@ -603,6 +603,7 @@ const OUTLINE_SIGNATURE: &str = "outline:111";
 
 fn discriminating() -> AnchorDiscrimination {
     AnchorDiscrimination {
+        anchor_tuple_unique: true,
         signature_unique_in_file: true,
         qualified_name_unique: true,
     }
@@ -692,6 +693,7 @@ fn a_bind_records_how_well_its_evidence_separated_the_symbol() {
     assert_eq!(
         evidence.discrimination,
         Some(AnchorDiscrimination {
+            anchor_tuple_unique: true,
             signature_unique_in_file: false,
             qualified_name_unique: false,
         })
@@ -711,6 +713,29 @@ fn a_bind_records_how_well_its_evidence_separated_the_symbol() {
         panic!("the exact anchor tuple still binds");
     };
     assert_eq!(evidence.discrimination, Some(discriminating()));
+
+    let repeated_name = FakeCore::at_generation(4)
+        .with(candidate(99, "/repo/src/lib.rs", "alpha"))
+        .with(candidate_with_signature(
+            100,
+            "/repo/src/lib.rs",
+            "alpha",
+            OTHER_SIGNATURE,
+        ));
+    let evidence = anchor_evidence(
+        &candidate(99, "/repo/src/lib.rs", "alpha"),
+        Some(4),
+        &repeated_name,
+    )
+    .expect("record old Core discrimination before replacement");
+    assert_eq!(
+        evidence.discrimination,
+        Some(AnchorDiscrimination {
+            anchor_tuple_unique: false,
+            signature_unique_in_file: true,
+            qualified_name_unique: false,
+        })
+    );
 }
 
 #[test]
@@ -772,6 +797,7 @@ fn a_rename_is_never_inferred_from_evidence_that_already_matched_a_sibling() {
         &store,
         Some(4),
         Some(AnchorDiscrimination {
+            anchor_tuple_unique: true,
             signature_unique_in_file: false,
             qualified_name_unique: true,
         }),
@@ -893,6 +919,7 @@ fn a_move_is_never_inferred_from_a_name_that_already_named_two_symbols() {
         &store,
         Some(4),
         Some(AnchorDiscrimination {
+            anchor_tuple_unique: true,
             signature_unique_in_file: true,
             qualified_name_unique: false,
         }),
@@ -977,6 +1004,310 @@ fn a_canonical_id_resolves_before_the_anchor_tuple() {
             .node_id(),
         Some(11)
     );
+}
+
+#[test]
+fn rust_ordinal_epoch_does_not_promote_historically_ambiguous_or_missing_evidence() {
+    for canonical_id in [Some("/repo/src/lib.rs:alpha#2"), None] {
+        for (label, discrimination) in [
+            ("no discrimination", None),
+            (
+                "historical evidence without tuple discrimination",
+                Some(serde_json::json!({
+                    "signature_unique_in_file": false,
+                    "qualified_name_unique": false,
+                })),
+            ),
+            (
+                "known ambiguous tuple",
+                Some(serde_json::json!({
+                    "signature_unique_in_file": false,
+                    "qualified_name_unique": false,
+                    "anchor_tuple_unique": false,
+                })),
+            ),
+        ] {
+            let dir = TempDir::new().expect("temp dir");
+            let store = open_store(&dir, "unix:1:1");
+            let bookmark = rust_ordinal_bookmark(&store, canonical_id, discrimination);
+            let core = FakeCore::at_generation(5).with(CoreAnchorCandidate {
+                kind: Some(13),
+                canonical_id: Some("rust-ordinal-v2:/repo/src/lib.rs:alpha#0".to_string()),
+                ..candidate(99, "/repo/src/lib.rs", "alpha")
+            });
+
+            let resolution = resolve_bookmark(&bookmark, &core).expect("resolve Rust epoch");
+            assert_eq!(resolution.status(), ResolutionStatus::Orphaned, "{label}");
+            assert_eq!(
+                resolution.orphan_reason(),
+                Some(OrphanReason::AmbiguousMatch),
+                "{label}: a tuple shrinking to one must not invent historical uniqueness"
+            );
+            store
+                .apply_resolution(&bookmark.uuid, &resolution)
+                .expect("persist visible orphan");
+            let stored = store
+                .bookmark(&bookmark.uuid)
+                .expect("reload orphan")
+                .expect("bookmark remains visible");
+            assert_eq!(stored.resolution_status, ResolutionStatus::Orphaned);
+            assert_eq!(stored.orphan_reason, Some(OrphanReason::AmbiguousMatch));
+            assert_eq!(stored.comment.as_deref(), Some("keep Rust bookmark"));
+            assert_eq!(stored.canonical_id, bookmark.canonical_id);
+            assert_eq!(stored.file_identity, bookmark.file_identity);
+            assert_eq!(stored.qualified_name, bookmark.qualified_name);
+            assert_eq!(stored.kind, bookmark.kind);
+            assert_eq!(stored.normalized_signature, bookmark.normalized_signature);
+            assert_eq!(stored.start_line, bookmark.start_line);
+            assert_eq!(stored.last_known_evidence, bookmark.last_known_evidence);
+            assert!(
+                store
+                    .bookmarks(None)
+                    .expect("list visible bookmarks")
+                    .iter()
+                    .any(|item| item.uuid == stored.uuid)
+            );
+            let repeated = resolve_bookmark(&stored, &core).expect("resolve orphan again");
+            assert_eq!(repeated.orphan_reason(), Some(OrphanReason::AmbiguousMatch));
+            store
+                .apply_resolution(&stored.uuid, &repeated)
+                .expect("persist repeated orphan");
+            let repeated = store.bookmark(&stored.uuid).unwrap().unwrap();
+            assert_eq!(repeated.comment, stored.comment);
+            assert_eq!(repeated.canonical_id, stored.canonical_id);
+            assert_eq!(repeated.last_known_evidence, stored.last_known_evidence);
+        }
+    }
+}
+
+#[test]
+fn rust_ordinal_epoch_migrates_a_previously_unique_file_tuple_after_body_edits() {
+    let dir = TempDir::new().expect("temp dir");
+    let store = open_store(&dir, "unix:1:1");
+    let bookmark = rust_ordinal_bookmark(
+        &store,
+        Some("/repo/src/lib.rs:alpha#0"),
+        Some(serde_json::json!({
+            "signature_unique_in_file": false,
+            "qualified_name_unique": false,
+            "anchor_tuple_unique": true,
+        })),
+    );
+    let new_key = "rust-ordinal-v2:/repo/src/lib.rs:alpha#0";
+    let core = FakeCore::at_generation(5)
+        .with(CoreAnchorCandidate {
+            kind: Some(13),
+            canonical_id: Some(new_key.to_string()),
+            start_line: Some(90),
+            ..candidate_with_signature(99, "/repo/src/lib.rs", "alpha", OTHER_SIGNATURE)
+        })
+        .with(CoreAnchorCandidate {
+            kind: Some(13),
+            canonical_id: Some("rust-ordinal-v2:/repo/src/other.rs:alpha#0".to_string()),
+            ..candidate(100, "/repo/src/other.rs", "alpha")
+        });
+
+    let resolution = resolve_bookmark(&bookmark, &core).expect("resolve unique Rust tuple");
+    assert_eq!(resolution.node_id(), Some(99));
+    store
+        .apply_resolution(&bookmark.uuid, &resolution)
+        .expect("persist epoch migration");
+    let stored = store
+        .bookmark(&bookmark.uuid)
+        .expect("reload migrated bookmark")
+        .expect("bookmark remains visible");
+    assert_eq!(stored.canonical_id.as_deref(), Some(new_key));
+    assert_eq!(
+        stored.normalized_signature.as_deref(),
+        Some(OTHER_SIGNATURE)
+    );
+    assert_eq!(stored.start_line, Some(90));
+    assert_eq!(stored.comment.as_deref(), Some("keep Rust bookmark"));
+}
+
+#[test]
+fn rust_ordinal_epoch_migrates_a_previously_unique_strong_shape() {
+    let dir = TempDir::new().expect("temp dir");
+    let store = open_store(&dir, "unix:1:1");
+    let bookmark = rust_ordinal_bookmark(
+        &store,
+        Some("/repo/src/lib.rs:alpha#0"),
+        Some(serde_json::json!({
+            "signature_unique_in_file": true,
+            "qualified_name_unique": false,
+            "anchor_tuple_unique": false,
+        })),
+    );
+    let new_key = "rust-ordinal-v2:/repo/src/lib.rs:alpha#0";
+    let core = FakeCore::at_generation(5)
+        .with(CoreAnchorCandidate {
+            kind: Some(13),
+            canonical_id: Some(new_key.to_string()),
+            ..candidate(99, "/repo/src/lib.rs", "alpha")
+        })
+        .with(CoreAnchorCandidate {
+            kind: Some(13),
+            ..candidate_with_signature(100, "/repo/src/lib.rs", "sibling", OTHER_SIGNATURE)
+        });
+
+    let resolution = resolve_bookmark(&bookmark, &core).expect("resolve strong Rust shape");
+    assert_eq!(resolution.node_id(), Some(99));
+    let AnnotationResolution::Bound { evidence, .. } = resolution else {
+        panic!("old phantom tuple ambiguity must not discard unique strong evidence");
+    };
+    assert_eq!(evidence.canonical_id.as_deref(), Some(new_key));
+    assert_eq!(
+        evidence.normalized_signature.as_deref(),
+        Some(ALPHA_SIGNATURE)
+    );
+}
+
+#[test]
+fn rust_ordinal_epoch_rejects_unproven_shapes_and_current_tuple_ambiguity() {
+    for (label, previous_signature, current_signature, unique_shape, ambiguous_tuple) in [
+        (
+            "weak outline",
+            Some(OUTLINE_SIGNATURE),
+            Some(OUTLINE_SIGNATURE),
+            true,
+            false,
+        ),
+        (
+            "changed shape",
+            Some(ALPHA_SIGNATURE),
+            Some(OTHER_SIGNATURE),
+            true,
+            false,
+        ),
+        (
+            "missing previous shape",
+            None,
+            Some(ALPHA_SIGNATURE),
+            true,
+            false,
+        ),
+        (
+            "missing current shape",
+            Some(ALPHA_SIGNATURE),
+            None,
+            true,
+            false,
+        ),
+        (
+            "historically nonunique shape",
+            Some(ALPHA_SIGNATURE),
+            Some(ALPHA_SIGNATURE),
+            false,
+            false,
+        ),
+        (
+            "ambiguous current tuple",
+            Some(ALPHA_SIGNATURE),
+            Some(ALPHA_SIGNATURE),
+            true,
+            true,
+        ),
+    ] {
+        let dir = TempDir::new().expect("temp dir");
+        let store = open_store(&dir, "unix:1:1");
+        let bookmark = rust_ordinal_bookmark(
+            &store,
+            Some("/repo/src/lib.rs:alpha#0"),
+            Some(serde_json::json!({
+                "anchor_tuple_unique": false,
+                "signature_unique_in_file": unique_shape,
+                "qualified_name_unique": false,
+            })),
+        );
+        let mut evidence = bookmark.last_known_evidence.clone().unwrap();
+        evidence.normalized_signature = previous_signature.map(str::to_string);
+        store
+            .apply_resolution(
+                &bookmark.uuid,
+                &AnnotationResolution::Bound {
+                    node_id: 7,
+                    evidence,
+                },
+            )
+            .expect("persist historical shape");
+        let bookmark = store.bookmark(&bookmark.uuid).unwrap().unwrap();
+        let mut core = FakeCore::at_generation(5).with(CoreAnchorCandidate {
+            kind: Some(13),
+            canonical_id: Some("rust-ordinal-v2:/repo/src/lib.rs:alpha#0".to_string()),
+            normalized_signature: current_signature.map(str::to_string),
+            ..candidate(99, "/repo/src/lib.rs", "alpha")
+        });
+        if ambiguous_tuple {
+            core = core.with(CoreAnchorCandidate {
+                kind: Some(13),
+                canonical_id: Some("rust-ordinal-v2:/repo/src/lib.rs:alpha#1".to_string()),
+                ..candidate_with_signature(100, "/repo/src/lib.rs", "alpha", OTHER_SIGNATURE)
+            });
+        }
+        let resolution = resolve_bookmark(&bookmark, &core).expect("resolve Rust shape boundary");
+        assert_eq!(
+            resolution.orphan_reason(),
+            Some(OrphanReason::AmbiguousMatch),
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn rust_ordinal_epoch_preserves_canonical_lookup_within_the_epoch() {
+    let dir = TempDir::new().expect("temp dir");
+    let store = open_store(&dir, "unix:1:1");
+    let key = "rust-ordinal-v2:/repo/src/lib.rs:alpha#0";
+    let bookmark = rust_ordinal_bookmark(&store, Some(key), None);
+    let core = FakeCore::at_generation(5)
+        .with(CoreAnchorCandidate {
+            kind: Some(13),
+            canonical_id: Some(key.to_string()),
+            start_line: Some(90),
+            ..candidate_with_signature(99, "/repo/src/lib.rs", "alpha", OTHER_SIGNATURE)
+        })
+        .with(CoreAnchorCandidate {
+            kind: Some(13),
+            canonical_id: Some("rust-ordinal-v2:/repo/src/lib.rs:alpha#1".to_string()),
+            ..candidate(100, "/repo/src/lib.rs", "alpha")
+        });
+
+    let resolution = resolve_bookmark(&bookmark, &core).expect("resolve same Rust epoch");
+    assert_eq!(
+        resolution.node_id(),
+        Some(99),
+        "same-epoch canonical identity must survive a body edit and line shift"
+    );
+}
+
+fn rust_ordinal_bookmark(
+    store: &AnnotationStore,
+    canonical_id: Option<&str>,
+    discrimination: Option<serde_json::Value>,
+) -> AnnotationBookmark {
+    let bookmark = anchored_bookmark_with_discrimination(store, Some(4), None);
+    let mut evidence = serde_json::to_value(
+        bookmark
+            .last_known_evidence
+            .as_ref()
+            .expect("initial anchor evidence"),
+    )
+    .expect("serialize historical evidence");
+    evidence["canonical_id"] = serde_json::json!(canonical_id);
+    evidence["kind"] = serde_json::json!(13);
+    evidence["discrimination"] = discrimination.unwrap_or(serde_json::Value::Null);
+    store
+        .apply_resolution(
+            &bookmark.uuid,
+            &AnnotationResolution::Bound {
+                node_id: 7,
+                evidence: serde_json::from_value(evidence).expect("decode historical evidence"),
+            },
+        )
+        .expect("persist historical Rust anchor");
+    store
+        .update_bookmark(&bookmark.uuid, None, Some(Some("keep Rust bookmark")))
+        .expect("retain user comment")
 }
 
 #[test]

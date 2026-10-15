@@ -14,7 +14,8 @@
 use anyhow::{Result, anyhow};
 use codestory_contracts::graph::{
     AccessKind, CallableProjectionState, Edge, EdgeId, EdgeKind, FileCoverageReason, Node, NodeId,
-    NodeKind, Occurrence, OccurrenceKind, ResolutionCertainty, SourceLocation,
+    NodeKind, Occurrence, OccurrenceKind, RUST_ORDINAL_CANONICAL_ID_PREFIX, ResolutionCertainty,
+    SourceLocation,
 };
 use codestory_contracts::language_support::normalize_extension;
 use codestory_contracts::workspace::{OversizedSourceExclusionCandidate, SourceIndexPolicy};
@@ -4679,7 +4680,12 @@ fn rebase_cached_index_artifact(
     }
 
     let old_file_id = artifact.files.first().map(|file| NodeId(file.id));
-    let (nodes, id_remap) = canonicalize_nodes(&file_identity, artifact.nodes, &HashMap::new());
+    let (nodes, id_remap) = canonicalize_nodes(
+        &file_identity,
+        artifact.nodes,
+        &HashMap::new(),
+        language_name,
+    );
     let new_file_id = old_file_id
         .and_then(|file_id| id_remap.get(&file_id).copied())
         .unwrap_or(rebased_file_id);
@@ -5724,7 +5730,21 @@ fn graph_capture_span_policy(
     name: &str,
     has_token_surface_edge: bool,
 ) -> NodeSpanPolicy {
-    if rust_impl_expr || has_token_surface_edge {
+    if rust_impl_expr {
+        return NodeSpanPolicy::Token;
+    }
+    if language_name == "rust"
+        && matches!(kind, NodeKind::FUNCTION | NodeKind::METHOD)
+        && matches!(
+            canonical_role,
+            CanonicalNodeRole::Definition
+                | CanonicalNodeRole::Declaration
+                | CanonicalNodeRole::ForwardDeclaration
+        )
+    {
+        return NodeSpanPolicy::Definition;
+    }
+    if has_token_surface_edge {
         return NodeSpanPolicy::Token;
     }
 
@@ -11516,8 +11536,15 @@ fn canonicalize_nodes(
     file_name: &str,
     final_nodes: Vec<Node>,
     canonical_roles: &HashMap<NodeId, CanonicalNodeRole>,
+    language_name: &str,
 ) -> (Vec<Node>, HashMap<NodeId, NodeId>) {
-    canonicalize_nodes_with_file_identity(file_name, file_name, final_nodes, canonical_roles)
+    canonicalize_nodes_with_file_identity(
+        file_name,
+        file_name,
+        final_nodes,
+        canonical_roles,
+        language_name,
+    )
 }
 
 /// Separator between a qualified name and its declaration ordinal.
@@ -11605,6 +11632,7 @@ fn canonicalize_nodes_with_file_identity(
     file_identity: &str,
     final_nodes: Vec<Node>,
     canonical_roles: &HashMap<NodeId, CanonicalNodeRole>,
+    language_name: &str,
 ) -> (Vec<Node>, HashMap<NodeId, NodeId>) {
     let mut id_remap = HashMap::<NodeId, NodeId>::new();
     let mut grouped_nodes = BTreeMap::<String, Vec<Node>>::new();
@@ -11625,8 +11653,23 @@ fn canonicalize_nodes_with_file_identity(
                 } else if node.kind == NodeKind::FILE {
                     format!("{file_identity}:{file_identity}:1")
                 } else {
-                    let ordinal = ordinals_by_node.get(&node.id).copied().unwrap_or(0);
-                    format!("{file_name}:{qualified_name}{DECLARATION_ORDINAL_SEPARATOR}{ordinal}")
+                    // Cached nodes retain their role-ordered ordinal even though
+                    // the cache does not retain the extraction role map.
+                    let cached_rust_ordinal = (language_name == "rust"
+                        && node.canonical_id.as_deref().is_some_and(|id| {
+                            id.starts_with(RUST_ORDINAL_CANONICAL_ID_PREFIX)
+                        }))
+                    .then(|| canonical_declaration_ordinal(&node))
+                    .flatten();
+                    let ordinal = cached_rust_ordinal
+                        .or_else(|| ordinals_by_node.get(&node.id).copied())
+                        .unwrap_or(0);
+                    let prefix = if language_name == "rust" {
+                        RUST_ORDINAL_CANONICAL_ID_PREFIX
+                    } else {
+                        ""
+                    };
+                    format!("{prefix}{file_name}:{qualified_name}{DECLARATION_ORDINAL_SEPARATOR}{ordinal}")
                 }
             });
         grouped_nodes.entry(canonical_id).or_default().push(node);
@@ -11999,8 +12042,12 @@ fn post_process_index_results(
         );
     }
     // Stage 2: canonicalize nodes and capture the remap used by later repair stages.
-    let (mut final_nodes, id_remap) =
-        canonicalize_nodes(file_name, final_nodes, canonical_role_by_node_id);
+    let (mut final_nodes, id_remap) = canonicalize_nodes(
+        file_name,
+        final_nodes,
+        canonical_role_by_node_id,
+        language_name,
+    );
     let new_file_id = id_remap.get(&file_id).copied().unwrap_or(file_id);
 
     // Stage 3: remap nodes, edges, and occurrences to the canonical IDs.
@@ -12687,6 +12734,7 @@ fn index_template_file(
         &file_identity,
         local_storage.nodes,
         &HashMap::new(),
+        surface_language,
     );
     let new_file_id = id_remap.get(&file_id).copied().unwrap_or(file_id);
     local_storage.nodes = final_nodes;
@@ -17597,6 +17645,78 @@ mod proof_resolution_cache_tests {
         assert_eq!(file.direct_exports[0].declaration, new_owner);
         assert!(!file.export_poison_all);
         assert_eq!(file.poisoned_export_names, ["unrelated"]);
+    }
+
+    #[test]
+    fn rebases_rust_ordinal_epoch_like_fresh_extraction() -> Result<()> {
+        let source = "fn caller() { target(); println!(\"Hello\"); }\nfn target() {}\n";
+        let config = get_language_for_ext("rs").expect("Rust config");
+        let indexed = index_file(
+            Path::new("/tmp/original/source.rs"),
+            source,
+            &config,
+            None,
+            None,
+        )?;
+        let artifact = CachedIndexArtifact {
+            resolution_input_schema_version: 28,
+            files: indexed.files,
+            nodes: indexed.nodes,
+            edges: indexed.edges,
+            occurrences: indexed.occurrences,
+            component_access: indexed.component_access,
+            callable_projection_states: indexed.callable_projection_states,
+            impl_anchor_node_ids: indexed.impl_anchor_node_ids,
+            call_resolution_inputs: Vec::new(),
+            resolution_file: None,
+        };
+        let destination = Path::new("/tmp/rebased/source.payload");
+        let rebased = rebase_cached_index_artifact(
+            artifact,
+            destination,
+            source,
+            "rust",
+            index_feature_flags(),
+        );
+        let fresh = index_file(destination, source, &config, None, None)?;
+        let identities = |nodes: &[Node]| {
+            nodes
+                .iter()
+                .map(|node| {
+                    (
+                        node.canonical_id.clone().expect("canonical key"),
+                        (
+                            node.id,
+                            node.kind,
+                            node.start_line,
+                            node.start_col,
+                            node.end_line,
+                            node.end_col,
+                        ),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        assert_eq!(identities(&rebased.nodes), identities(&fresh.nodes));
+        let calls = |edges: &[Edge]| {
+            edges
+                .iter()
+                .filter(|edge| edge.kind == EdgeKind::CALL)
+                .map(|edge| (edge.effective_source(), edge.effective_target(), edge.line))
+                .collect::<HashSet<_>>()
+        };
+        assert_eq!(calls(&rebased.edges), calls(&fresh.edges));
+        assert!(
+            fresh.nodes.iter().any(|node| {
+                node.kind == NodeKind::UNKNOWN
+                    && node
+                        .canonical_id
+                        .as_deref()
+                        .is_some_and(|id| id.starts_with(RUST_ORDINAL_CANONICAL_ID_PREFIX))
+            }),
+            "the reference-before-declaration cache control must be present"
+        );
+        Ok(())
     }
 
     #[test]

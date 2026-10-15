@@ -18,6 +18,10 @@ use thiserror::Error;
 /// not in retrieval ranking.
 pub const STRUCTURAL_COLLECTION_CANONICAL_ID_PREFIXES: &[&str] = &["payload:collection:"];
 
+/// Permanent namespace for generated Rust ordinal identities after retiring
+/// duplicate declaration captures. Legacy ordinals must never alias these keys.
+pub const RUST_ORDINAL_CANONICAL_ID_PREFIX: &str = "rust-ordinal-v2:";
+
 pub mod access;
 pub mod definition;
 pub mod error;

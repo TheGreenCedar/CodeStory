@@ -8,6 +8,8 @@
 
 - Rust function and method source includes attached attributes, keeping test cases and platform conditions with the inspected declaration. Existing Rust indexes rebuild once on their next refresh.
 
+- Rust functions that call macros no longer appear as duplicate definitions. Refreshing existing Rust indexes also updates affected symbol IDs; bookmarks migrate with sufficient prior evidence, and unresolved bookmarks retain their comments and previous anchors.
+
 - CLI query-based symbol, call-graph, exploration and bookmark commands initialize the required retrieval runtime, avoiding failures caused by the default local profile. ID-based navigation remains available from the Core index.
 
 - Retrieval refreshes account for incremental vector work followed by a full rebuild, avoiding a timing-report error after fallback completes.
