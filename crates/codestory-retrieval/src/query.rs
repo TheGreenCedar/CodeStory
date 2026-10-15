@@ -487,6 +487,34 @@ impl PinnedQuerySession {
         self.validate_full_readiness_with_context(&context)
     }
 
+    /// Reuse completed admission without repeating the repository fingerprint.
+    /// Descriptor-only pins still require their ordinary deferred validation;
+    /// admitted pins must retain live engine and component health.
+    pub fn validate_primary_readiness_reuse(&self) -> Option<Result<()>> {
+        if !self.full_readiness_validated.get() {
+            return None;
+        }
+        Some((|| {
+            self.validate_full_readiness()?;
+            #[cfg(not(feature = "test-support"))]
+            self._embedding_residency.revalidate()?;
+            let (mode, degraded_reason) = resolve_batch_mode(
+                self.sidecars.as_ref(),
+                Some(&self.manifest),
+                &self.embedding_device,
+                &self.runtime,
+            );
+            if mode != RetrievalDegradedMode::Full {
+                bail!(
+                    "retrieval sidecar is mandatory; project is not in full mode (mode={}, reason={})",
+                    mode.as_str(),
+                    degraded_reason.as_deref().unwrap_or("unknown")
+                );
+            }
+            Ok(())
+        })())
+    }
+
     fn validate_full_readiness_with_identity(
         &self,
         producer_compatibility_identity: &str,
@@ -2710,6 +2738,33 @@ mod tests {
             "ordinary validation did not preserve the strict failure: {ordinary_error:#}"
         );
         assert!(!session.full_readiness_validated.get());
+
+        drop(session);
+        let writer = Store::open(&storage_path).expect("restore the owned fixture");
+        writer
+            .get_connection()
+            .execute("UPDATE file SET language = 'rust' WHERE id = 1", [])
+            .expect("restore the original file projection");
+        drop(writer);
+        let validated = PinnedQuerySession::begin(project.path(), &storage_path, &runtime)
+            .expect("the restored fixture admits full readiness");
+        assert!(validated.full_readiness_validated.get());
+        for (context, expected) in [
+            (
+                &expired,
+                "retrieval stopped: reason=deadline stage=deferred_full_readiness_entry",
+            ),
+            (
+                &cancelled,
+                "retrieval stopped: reason=request_cancelled stage=deferred_full_readiness_entry",
+            ),
+        ] {
+            let error = validated
+                .validate_full_readiness_with_context(context)
+                .expect_err("cached readiness must still honor deadline and cancellation");
+            assert_eq!(error.to_string(), expected);
+            assert!(validated.full_readiness_validated.get());
+        }
     }
 
     #[test]

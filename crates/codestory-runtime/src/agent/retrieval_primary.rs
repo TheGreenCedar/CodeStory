@@ -629,18 +629,24 @@ fn shadow_env_enabled() -> Option<bool> {
 /// - Unset: retrieval is available when the manifest exists and the shared
 ///   per-user embedding server is healthy.
 pub(crate) fn sidecar_retrieval_primary_enabled(controller: &AppController) -> bool {
+    let eligible = || {
+        if controller.runtime_config.profile == SidecarProfile::Agent
+            && let Some(pinned) = active_pinned_retrieval_read(controller)
+            && let Some(readiness) = pinned.session.validate_primary_readiness_reuse()
+        {
+            return readiness.is_ok();
+        }
+        sidecar_retrieval_eligible(controller) && sidecar_mode_is_required_full(controller)
+    };
     match retrieval_env_override() {
         Some(false) => {
             tracing::error!("CODESTORY_RETRIEVAL=0 is unsupported; full retrieval is mandatory");
             false
         }
-        Some(true) => {
-            sidecar_retrieval_eligible(controller) && sidecar_mode_is_required_full(controller)
-        }
+        Some(true) => eligible(),
         None => {
             // Default product path: serve only from full agent-scoped retrieval.
-            let auto_on =
-                sidecar_retrieval_eligible(controller) && sidecar_mode_is_required_full(controller);
+            let auto_on = eligible();
             if auto_on {
                 tracing::info!(
                     "retrieval primary auto-on (unset CODESTORY_RETRIEVAL; agent retrieval full)"
@@ -3594,6 +3600,12 @@ mod tests {
     }
 
     fn pinned_operation_fixture() -> PinnedOperationFixture {
+        pinned_operation_fixture_with_profile(codestory_retrieval::SidecarProfile::Local)
+    }
+
+    fn pinned_operation_fixture_with_profile(
+        profile: codestory_retrieval::SidecarProfile,
+    ) -> PinnedOperationFixture {
         use codestory_store::{IndexPublicationMode, IndexPublicationRecord};
 
         let project = tempfile::tempdir().expect("project");
@@ -3611,10 +3623,7 @@ mod tests {
         publish_test_complete_core(&mut store, project.path(), &publication);
         drop(store);
         let runtime = codestory_retrieval::with_test_cache_root(retrieval_cache.path(), || {
-            SidecarRuntimeConfig::for_project_profile(
-                Some(project.path()),
-                codestory_retrieval::SidecarProfile::Local,
-            )
+            SidecarRuntimeConfig::for_project_profile(Some(project.path()), profile)
         });
         publish_zero_dense_pinned_query_fixture(project.path(), &storage_path, &runtime)
             .expect("publish strict retrieval fixture");
@@ -4105,6 +4114,94 @@ mod tests {
             after_pin,
             "borrowing the active pin must not buy another readiness fingerprint pass"
         );
+    }
+
+    #[test]
+    fn primary_eligibility_reuses_only_a_healthy_validated_agent_pin() {
+        let _lock = env_test_lock();
+        let fixture =
+            pinned_operation_fixture_with_profile(codestory_retrieval::SidecarProfile::Agent);
+        let _scope = codestory_workspace::SourceFreshnessScope::enter();
+        let pinned = Rc::new(
+            PinnedRetrievalRead::begin(&fixture.controller).expect("begin validated Agent pin"),
+        );
+        let after_pin = codestory_workspace::source_freshness_counts()
+            .expect("armed scope")
+            .readiness_fingerprint_passes;
+
+        with_active_pinned_retrieval_read(&fixture.controller, Rc::clone(&pinned), || {
+            assert!(
+                sidecar_retrieval_primary_enabled(&fixture.controller),
+                "the validated Agent pin remains eligible for primary retrieval"
+            );
+        });
+        assert_eq!(
+            codestory_workspace::source_freshness_counts()
+                .expect("armed scope")
+                .readiness_fingerprint_passes,
+            after_pin,
+            "primary eligibility must not re-fingerprint an already validated operation pin"
+        );
+
+        let foreign_controller =
+            AppController::new_with_config(fixture.controller.runtime_config.as_ref().clone());
+        {
+            let mut state = foreign_controller.state.lock();
+            state.project_root = Some(fixture._project.path().to_owned());
+            state.storage_path = Some(fixture.storage_path.clone());
+        }
+        with_active_pinned_retrieval_read(&fixture.controller, Rc::clone(&pinned), || {
+            assert!(sidecar_retrieval_primary_enabled(&foreign_controller));
+        });
+        let after_foreign = codestory_workspace::source_freshness_counts()
+            .expect("armed scope")
+            .readiness_fingerprint_passes;
+        assert!(
+            after_foreign > after_pin,
+            "a different controller must obtain its own ordinary readiness proof"
+        );
+
+        let descriptor = Rc::new(
+            PinnedRetrievalRead::begin_packet_descriptor(&fixture.controller)
+                .expect("begin an unvalidated descriptor pin"),
+        );
+        let before_descriptor_gate = codestory_workspace::source_freshness_counts()
+            .expect("armed scope")
+            .readiness_fingerprint_passes;
+        with_active_pinned_retrieval_read(&fixture.controller, descriptor, || {
+            assert!(sidecar_retrieval_primary_enabled(&fixture.controller));
+        });
+        assert!(
+            codestory_workspace::source_freshness_counts()
+                .expect("armed scope")
+                .readiness_fingerprint_passes
+                > before_descriptor_gate,
+            "a descriptor pin without full validation must retain ordinary readiness"
+        );
+
+        let local_fixture = pinned_operation_fixture();
+        let local_pin = Rc::new(
+            PinnedRetrievalRead::begin(&local_fixture.controller)
+                .expect("begin a validated Local-profile pin"),
+        );
+        with_active_pinned_retrieval_read(&local_fixture.controller, local_pin, || {
+            assert!(
+                !sidecar_retrieval_primary_enabled(&local_fixture.controller),
+                "a validated Local pin must not become Agent primary retrieval"
+            );
+        });
+
+        std::fs::rename(
+            &fixture.controller.runtime_config.layout.lexical_data_dir,
+            fixture._retrieval_cache.path().join("unavailable-lexical"),
+        )
+        .expect("withdraw only this owned fixture's lexical component");
+        with_active_pinned_retrieval_read(&fixture.controller, pinned, || {
+            assert!(
+                !sidecar_retrieval_primary_enabled(&fixture.controller),
+                "a validated pin must not hide a component that became unavailable"
+            );
+        });
     }
 
     /// The counters are scoped to the operation, never to the process.
@@ -9901,15 +9998,29 @@ mod tests {
     #[test]
     fn primary_env_override_rejects_zero() {
         let _lock = env_test_lock();
+        let fixture =
+            pinned_operation_fixture_with_profile(codestory_retrieval::SidecarProfile::Agent);
+        let pinned = Rc::new(
+            PinnedRetrievalRead::begin(&fixture.controller)
+                .expect("begin a validated Agent pin before opt-out"),
+        );
         // SAFETY: test-only env mutation; no concurrent tests rely on this variable.
         unsafe {
             std::env::set_var(RETRIEVAL_ENV, "0");
         }
         assert_eq!(retrieval_env_override(), Some(false));
+        let primary_enabled =
+            with_active_pinned_retrieval_read(&fixture.controller, pinned, || {
+                sidecar_retrieval_primary_enabled(&fixture.controller)
+            });
         // SAFETY: test-only env cleanup.
         unsafe {
             std::env::remove_var(RETRIEVAL_ENV);
         }
+        assert!(
+            !primary_enabled,
+            "explicit retrieval opt-out wins over an otherwise validated active pin"
+        );
         assert_eq!(retrieval_env_override(), None);
     }
 
