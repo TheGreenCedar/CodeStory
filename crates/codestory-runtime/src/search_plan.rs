@@ -1924,12 +1924,12 @@ impl AppController {
                 &indexed_symbol_hits,
                 5,
             );
-            return Err(
-                agent::retrieval_primary::sidecar_retrieval_unavailable_error(
-                    self,
-                    format!("sidecar search rejected query: {reason}; {diagnostic}"),
-                ),
-            );
+            return Err(agent::retrieval_primary::sidecar_query_rejection_error(
+                self,
+                &query_result.trace.retrieval_mode,
+                query_result.trace.cancel_reason.as_deref(),
+                format!("sidecar search rejected query: {reason}; {diagnostic}"),
+            ));
         }
         let initial_sidecar_hits = indexed_symbol_hits.clone();
 

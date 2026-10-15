@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Search deadlines and cancellations no longer recommend rebuilding retrieval data; deadline failures suggest retrying or narrowing the query.
+
 - CLI search, packets and query-based navigation prepare missing retrieval data during automatic or full refresh, so a fresh index can be used without a separate retrieval command.
 
 - Search honors the requested result limit across symbol and repository-text matches and reports when additional matches are omitted.

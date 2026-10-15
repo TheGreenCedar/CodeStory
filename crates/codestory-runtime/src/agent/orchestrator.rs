@@ -29,9 +29,9 @@ use crate::agent::packet_trace::merge_packet_initial_search_hits;
 use crate::agent::profiles::{ResolvedProfile, TrailPlan, resolve_profile};
 use crate::agent::retrieval_primary::{
     RETRIEVAL_VERSION_SIDECAR, SidecarPrimarySearchOutcome, maybe_run_retrieval_shadow,
-    preadmit_packet_descriptor_queries_with_policy, sidecar_retrieval_blocks_nucleo_supplement,
-    sidecar_retrieval_primary_enabled, sidecar_retrieval_unavailable_error,
-    try_sidecar_primary_search_with_policy,
+    preadmit_packet_descriptor_queries_with_policy, sidecar_query_rejection_error,
+    sidecar_retrieval_blocks_nucleo_supplement, sidecar_retrieval_primary_enabled,
+    sidecar_retrieval_unavailable_error, try_sidecar_primary_search_with_policy,
 };
 use crate::agent::trace::{TraceRecorder, field};
 use crate::agent::trace_export;
@@ -1187,14 +1187,17 @@ fn execute_retrieval(
             (scored_hits, hits, packet_hits)
         }
         Some(SidecarPrimarySearchOutcome::Rejected { shadow, reason }) => {
+            let error = sidecar_query_rejection_error(
+                controller,
+                &shadow.retrieval_mode,
+                shadow.cancel_reason.as_deref(),
+                format!("retrieval rejected query: {reason}"),
+            );
             trace.set_retrieval_shadow(shadow);
             trace.annotate_gap(format!(
                 "retrieval_primary rejected=true fail_closed=true reason={reason}"
             ));
-            return Err(sidecar_retrieval_unavailable_error(
-                controller,
-                format!("retrieval rejected query: {reason}"),
-            ));
+            return Err(error);
         }
         Some(SidecarPrimarySearchOutcome::Unavailable { reason }) => {
             trace.annotate_gap(format!(

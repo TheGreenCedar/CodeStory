@@ -17,10 +17,11 @@ use crate::{
 use anyhow::Error as AnyhowError;
 use codestory_contracts::api::NodeKind as ApiNodeKind;
 use codestory_contracts::api::{
-    AgentAnswerDto, AgentPacketDto, ApiError, EmbeddingVectorPublicationIdentityDto, GraphNodeDto,
-    GraphResponse, PacketQueryCompletionDto, PacketSidecarQueryDiagnosticDto,
-    RetrievalCandidateResolutionCountDto, RetrievalCandidateSummaryDto, RetrievalScoreBreakdownDto,
-    RetrievalShadowDto, RetrievalStageTimingDto, SearchHit, SearchHitOrigin, SearchResultsDto,
+    AgentAnswerDto, AgentPacketDto, ApiError, ApiErrorDetails,
+    EmbeddingVectorPublicationIdentityDto, GraphNodeDto, GraphResponse, PacketQueryCompletionDto,
+    PacketSidecarQueryDiagnosticDto, RetrievalCandidateResolutionCountDto,
+    RetrievalCandidateSummaryDto, RetrievalScoreBreakdownDto, RetrievalShadowDto,
+    RetrievalStageTimingDto, SearchHit, SearchHitOrigin, SearchResultsDto,
 };
 use codestory_contracts::compilation::PacketAdmissionGapKindV1;
 use codestory_contracts::graph::{
@@ -722,6 +723,37 @@ pub(crate) fn sidecar_retrieval_unavailable_error(
         })
         .unwrap_or_else(|| sidecar_retrieval_recovery_commands_for_project(&project, None));
     ApiError::retrieval_unavailable(reason, project.clone(), recovery_commands)
+}
+
+pub(crate) fn sidecar_query_rejection_error(
+    controller: &AppController,
+    retrieval_mode: &str,
+    cancel_reason: Option<&str>,
+    reason: impl Into<String>,
+) -> ApiError {
+    if sidecar_mode_can_serve_primary(retrieval_mode)
+        && let Some(stop @ ("deadline" | "stage_deadline" | "cancelled")) = cancel_reason
+    {
+        let mut details = ApiErrorDetails::cause(stop);
+        details.failed_layer = Some("retrieval_query".into());
+        details.project = Some(
+            controller
+                .require_project_root()
+                .map(|path| path.to_string_lossy().to_string())
+                .unwrap_or_else(|_| "<project>".into()),
+        );
+        let action = if stop == "cancelled" {
+            "The query was cancelled; no index repair is required."
+        } else {
+            "Retry the query or narrow it to a more specific target."
+        };
+        return ApiError::with_details(
+            "retrieval_unavailable",
+            format!("{}; {action}", reason.into()),
+            details,
+        );
+    }
+    sidecar_retrieval_unavailable_error(controller, reason)
 }
 
 fn sidecar_retrieval_recovery_commands_for_runtime(
@@ -7501,6 +7533,108 @@ mod tests {
         )
         .expect_err("retained cancellation must not be converted to a deadline omission");
         assert_eq!(retained_cancelled.code, "cancelled");
+    }
+
+    #[test]
+    fn query_rejection_recovery_uses_trace_cause_without_prescribing_index_repair() {
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let project = tempfile::tempdir().expect("project root");
+        let defaults = codestory_retrieval::SidecarProcessDefaults::new(
+            process_cache.path().to_path_buf(),
+            codestory_retrieval::SidecarRuntimeDefaults::from_process_env(),
+        );
+        let config = SidecarRuntimeConfig::for_project_profile_with_process_defaults(
+            Some(project.path()),
+            SidecarProfile::Agent,
+            Some("query-recovery-fixture"),
+            &defaults,
+            &codestory_retrieval::SidecarRuntimeOverrides::default(),
+        );
+        let controller = AppController::new_with_config(config);
+        controller
+            .bind_project_paths_for_refresh(
+                project.path().to_path_buf(),
+                process_cache.path().join("codestory.db"),
+            )
+            .expect("bind project without opening retrieval");
+
+        for (mode, stop, query_stop) in [
+            ("full", Some("deadline"), true),
+            ("full", Some("stage_deadline"), true),
+            ("full", Some("cancelled"), true),
+            ("unavailable", Some("stage_deadline"), false),
+            ("unavailable", None, false),
+            ("no_semantic", Some("deadline"), false),
+            ("full", None, false),
+            ("full", Some("unrecognized_stop"), false),
+        ] {
+            let trace = QueryTrace {
+                retrieval_mode: mode.into(),
+                degraded_reason: (mode != "full").then(|| "retrieval_manifest_missing".into()),
+                total_budget_ms: 1_500,
+                elapsed_ms: 1_412,
+                cancel_reason: stop.map(str::to_string),
+                cache_hit: false,
+                stages: Vec::new(),
+            };
+            // Diagnostic prose must not decide whether the publication needs repair.
+            let diagnostic = if query_stop {
+                "opaque lookup diagnostic with retrieval_manifest_missing as a label"
+            } else {
+                "opaque stage_deadline diagnostic"
+            };
+            let error = sidecar_query_rejection_error(
+                &controller,
+                &trace.retrieval_mode,
+                trace.cancel_reason.as_deref(),
+                diagnostic,
+            );
+            assert_eq!(error.code, "retrieval_unavailable");
+            assert!(
+                error.message.contains(diagnostic),
+                "retain bounded diagnostic"
+            );
+            let details = error.details.as_ref().expect("typed recovery details");
+            assert_eq!(
+                details.project.as_deref(),
+                Some(project.path().to_str().expect("fixture project path"))
+            );
+            if query_stop {
+                assert!(
+                    details.next_commands.is_empty()
+                        && details.minimum_next.is_empty()
+                        && details.full_repair.is_empty(),
+                    "{stop:?} in full mode must not prescribe index repair: {error:?}"
+                );
+                assert_eq!(details.cause_code.as_deref(), stop);
+                assert_eq!(details.failed_layer.as_deref(), Some("retrieval_query"));
+                let message = error.message.to_ascii_lowercase();
+                if stop == Some("cancelled") {
+                    assert!(message.contains("cancelled"));
+                    assert!(
+                        !message.contains("retry"),
+                        "cancellation must not request retry"
+                    );
+                } else {
+                    assert!(
+                        message.contains("retry") && message.contains("narrow"),
+                        "a query deadline needs a useful query action: {error:?}"
+                    );
+                }
+            } else {
+                assert_eq!(details.failed_layer.as_deref(), Some("retrieval_engine"));
+                assert!(details.cause_code.is_none());
+                assert_eq!(details.next_commands.len(), 3);
+                assert!(details.next_commands[0].starts_with("codestory-cli retrieval index "));
+                assert!(details.next_commands[1].starts_with("codestory-cli retrieval status "));
+                assert!(details.next_commands[2].starts_with("codestory-cli doctor "));
+                for command in &details.next_commands[..2] {
+                    assert!(command.contains("--run-id query-recovery-fixture"));
+                }
+                assert_eq!(details.minimum_next, details.next_commands[..1]);
+                assert_eq!(details.full_repair, details.next_commands);
+            }
+        }
     }
 
     #[test]
