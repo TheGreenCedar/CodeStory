@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- ID-based navigation reports exact matches instead of labelling correctly selected IDs as fuzzy.
+
 - Rust call navigation preserves explicit local module paths, so a same-named wrapper is not mistaken for the called function. Unsupported or ambiguous qualified paths remain unresolved. Existing Rust indexes rebuild on their next refresh.
 
 - Change-impact results show typed symbols before unknown occurrences within the result limit, keeping identifiable downstream impacts visible. Direct evidence describes indexed symbols or occurrences without claiming each is a declaration.

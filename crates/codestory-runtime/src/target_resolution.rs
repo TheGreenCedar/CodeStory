@@ -938,7 +938,7 @@ fn search_hit_from_node(node: &NodeDetailsDto) -> SearchHit {
         score: 0.0,
         origin: SearchHitOrigin::IndexedSymbol,
         target: None,
-        match_quality: None,
+        match_quality: Some(SearchMatchQualityDto::Exact),
         resolvable: true,
         evidence_tier: Some(
             node.evidence_tier
@@ -1364,6 +1364,10 @@ mod tests {
         };
         assert_eq!(source_target.selected.node_id, details.id);
         assert_eq!(
+            source_target.selected.match_quality,
+            Some(SearchMatchQualityDto::Exact)
+        );
+        assert_eq!(
             source_target.selected.resolution_status,
             Some(PacketEvidenceResolutionDto::SourceRangeOnly)
         );
@@ -1414,6 +1418,10 @@ mod tests {
             panic!("an exact OpenAPI id should remain source-navigable");
         };
         assert_eq!(source_target.selected.node_id, details.id);
+        assert_eq!(
+            source_target.selected.match_quality,
+            Some(SearchMatchQualityDto::Exact)
+        );
         assert_eq!(
             source_target.selected.evidence_tier,
             Some(PacketEvidenceTierDto::ExactSource)

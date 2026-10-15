@@ -20,6 +20,7 @@ use super::{
     test_index_publication, test_retrieval_manifest, test_sidecar_runtime_from_env, unbounded,
     write_search_generation_completion, write_semantic_fixture,
 };
+use codestory_contracts::api::SearchMatchQualityDto;
 use codestory_contracts::bounded_locks::{self, FileLockKind};
 
 #[test]
@@ -1119,8 +1120,15 @@ fn dotted_owner_method_query_resolves_with_file_constraint() {
             Some("MissingParser.java"),
         )
         .expect("resolve exact id");
-    assert!(matches!(exact_id, TargetResolution::Resolved(target)
-        if target.selected.node_id == NodeId("11".to_string())));
+    let TargetResolution::Resolved(exact_id) = exact_id else {
+        panic!("an explicit id must select its stored node: {exact_id:?}");
+    };
+    assert_eq!(exact_id.selected.node_id, NodeId("11".to_string()));
+    assert_eq!(
+        exact_id.selected.match_quality,
+        Some(SearchMatchQualityDto::Exact),
+        "ID selection is exact even when the requested ID differs from the symbol name"
+    );
 
     let mut rust_method = target.selected.clone();
     rust_method.display_name = "crate::RustType::parseCode".to_string();
