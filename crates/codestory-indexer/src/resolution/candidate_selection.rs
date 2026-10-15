@@ -622,7 +622,10 @@ pub(super) fn compute_import_resolution(
     let has_alias = import_alias_mismatch(source_name, target_name);
     let has_relative_import_binding =
         is_import_binding_name(source_name) && is_relative_import_module_name(target_name);
-    let is_go_import = semantic_language_bucket(caller_file_path.as_deref()) == Some("go");
+    let require_unambiguous_semantic_import = matches!(
+        semantic_language_bucket(caller_file_path.as_deref()),
+        Some("go" | "rust")
+    );
     let caller_prefix = caller_qualified.as_deref().and_then(module_prefix);
     let name_candidates = import_name_candidates(target_name, pass.flags.legacy_mode)
         .into_iter()
@@ -636,7 +639,7 @@ pub(super) fn compute_import_resolution(
         if pass.flags.store_candidates {
             candidate_ids.push(candidate.target_node_id);
         }
-        if is_go_import {
+        if require_unambiguous_semantic_import {
             semantic_fallback.consider(candidate.target_node_id, candidate.confidence);
         } else {
             consider_selected(
@@ -785,7 +788,16 @@ pub(super) fn compute_import_resolution(
         selected = None;
     }
 
-    let semantic_fallback = if is_go_import {
+    // Rust semantic evidence precedes generic module substring matches. A tied
+    // semantic result must not fall back to one of those weaker matches.
+    if semantic_language_bucket(caller_file_path.as_deref()) == Some("rust")
+        && !semantic_candidates.is_empty()
+        && matches!(selected, Some((_, _, ResolutionStrategy::ImportFuzzy)))
+    {
+        selected = None;
+    }
+
+    let semantic_fallback = if require_unambiguous_semantic_import {
         semantic_fallback.selected()
     } else {
         first_best_semantic_fallback

@@ -301,10 +301,10 @@ fn stale_rust_extraction_replaces_old_macro_duplicates_even_with_current_cached_
         end_col: Some(10),
         ..Node::default()
     })?;
-    let legacy_revision = "rust-callable-declaration-v1";
+    let legacy_revision = "rust-callable-declaration-v2";
     assert_ne!(
         revision, legacy_revision,
-        "the duplicate producer must be retired"
+        "the previous Rust producer must be retired"
     );
     store.get_connection().execute(
         "UPDATE file_extraction_identity SET extraction_revision = ?1 WHERE file_id = ?2",

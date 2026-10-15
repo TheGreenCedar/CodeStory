@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Rust import navigation reaches declarations when several files import the same symbol, rather than another import occurrence or a weaker partial-name module match. Tied matches in Rust semantic resolution remain unresolved. Existing Rust indexes rebuild once on their next refresh.
+
 - Search results retain indexed display names beside their source locations, including matches without captured excerpts. Custom strict clients must support publication stamp schema 5; the evidence payload family remains schema 3.
 
 - Search and packet requests reuse completed readiness checks within the same pinned operation while continuing to check retrieval health and source freshness.

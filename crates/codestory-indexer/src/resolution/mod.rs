@@ -82,9 +82,9 @@ const REFERENCE_SINK_EDGE_KINDS: [EdgeKind; 11] = [
 ];
 /// Version for cached resolution-support snapshots.
 ///
-/// Bumped when import-candidate snapshots began excluding Go import occurrence
-/// placeholders from declaration-target indexes.
-pub const RESOLUTION_SUPPORT_SNAPSHOT_VERSION: i64 = 9;
+/// Bumped when import-candidate snapshots began excluding Go and Rust import
+/// occurrence placeholders from declaration-target indexes.
+pub const RESOLUTION_SUPPORT_SNAPSHOT_VERSION: i64 = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SemanticResolutionRequestKey {
@@ -2178,8 +2178,7 @@ impl PreparedResolutionState {
         telemetry.support_snapshot_load_ms = duration_ms_u64(snapshot_load_started.elapsed());
 
         let conn = storage.get_connection();
-        let go_import_occurrence_node_ids =
-            CandidateIndex::load_go_import_occurrence_node_ids(conn)?;
+        let import_occurrence_node_ids = CandidateIndex::load_import_occurrence_node_ids(conn)?;
         let call_candidate_started = Instant::now();
         let call_candidate_index = CandidateIndex::load_with_import_bindings(
             conn,
@@ -2200,7 +2199,7 @@ impl PreparedResolutionState {
                 NodeKind::PACKAGE as i32,
             ],
             semantic_candidate_kinds(EdgeKind::IMPORT),
-            &go_import_occurrence_node_ids,
+            &import_occurrence_node_ids,
         )?;
         telemetry.import_candidate_index_ms = duration_ms_u64(import_candidate_started.elapsed());
 
@@ -2214,7 +2213,7 @@ impl PreparedResolutionState {
             let import_semantic_index = SemanticCandidateIndex::load_excluding(
                 conn,
                 semantic_candidate_kinds(EdgeKind::IMPORT),
-                &go_import_occurrence_node_ids,
+                &import_occurrence_node_ids,
             )?;
             telemetry.import_semantic_index_ms = duration_ms_u64(import_semantic_started.elapsed());
             (call_semantic_index, import_semantic_index)
@@ -2353,7 +2352,7 @@ impl CandidateIndex {
         ))
     }
 
-    fn load_go_import_occurrence_node_ids(conn: &rusqlite::Connection) -> Result<HashSet<i64>> {
+    fn load_import_occurrence_node_ids(conn: &rusqlite::Connection) -> Result<HashSet<i64>> {
         let mut stmt = conn.prepare(
             "SELECT DISTINCT target.id, file_node.serialized_name
              FROM edge AS import_edge
@@ -2370,7 +2369,10 @@ impl CandidateIndex {
         let mut ids = HashSet::new();
         for row in rows {
             let (node_id, file_path) = row?;
-            if semantic_language_bucket(Some(&file_path)) == Some("go") {
+            if matches!(
+                semantic_language_bucket(Some(&file_path)),
+                Some("go" | "rust")
+            ) {
                 ids.insert(node_id);
             }
         }
@@ -4363,7 +4365,8 @@ mod tests {
     }
 
     #[test]
-    fn test_prepared_resolution_state_rebuilds_snapshot_when_semantic_mode_changes() -> Result<()> {
+    fn test_prepared_resolution_state_rebuilds_snapshot_when_version_or_semantic_mode_changes()
+    -> Result<()> {
         let mut storage = Storage::new_in_memory()?;
         storage.insert_nodes_batch(&[
             codestory_contracts::graph::Node {
@@ -4380,38 +4383,116 @@ mod tests {
                 file_node_id: Some(codestory_contracts::graph::NodeId(1)),
                 ..Default::default()
             },
+            codestory_contracts::graph::Node {
+                id: codestory_contracts::graph::NodeId(3),
+                kind: NodeKind::MODULE,
+                serialized_name: "Action".to_string(),
+                file_node_id: Some(codestory_contracts::graph::NodeId(1)),
+                ..Default::default()
+            },
+            codestory_contracts::graph::Node {
+                id: codestory_contracts::graph::NodeId(4),
+                kind: NodeKind::MODULE,
+                serialized_name: "actions".to_string(),
+                file_node_id: Some(codestory_contracts::graph::NodeId(1)),
+                ..Default::default()
+            },
+            codestory_contracts::graph::Node {
+                id: codestory_contracts::graph::NodeId(5),
+                kind: NodeKind::ENUM,
+                serialized_name: "Action".to_string(),
+                file_node_id: Some(codestory_contracts::graph::NodeId(1)),
+                ..Default::default()
+            },
         ])?;
-
-        let stale_snapshot = empty_resolution_support_snapshot();
-        storage.put_resolution_support_snapshot(
-            RESOLUTION_SUPPORT_SNAPSHOT_VERSION,
-            &serde_json::to_vec(&stale_snapshot)?,
+        storage.get_connection().execute(
+            "INSERT INTO edge (id, source_node_id, target_node_id, kind) VALUES (10, 3, 3, ?1)",
+            [EdgeKind::IMPORT as i32],
         )?;
 
-        let flags = ResolutionFlags {
-            legacy_mode: false,
-            enable_semantic: true,
-            store_candidates: false,
-            parallel_compute: false,
-        };
-        let mut telemetry = ResolutionPhaseTelemetry::default();
-        let prepared = PreparedResolutionState::load(&storage, flags, &mut telemetry)?;
+        // Version 9 admitted Rust import occurrences as declaration candidates.
+        // The same-mode case must reject that cache even when its JSON is valid.
+        for (snapshot_version, enable_semantic) in
+            [(9, false), (RESOLUTION_SUPPORT_SNAPSHOT_VERSION, true)]
+        {
+            let mut stale_snapshot = empty_resolution_support_snapshot();
+            stale_snapshot.import_candidates =
+                CandidateIndex::load(storage.get_connection(), &[NodeKind::MODULE as i32])?
+                    .snapshot_nodes();
+            stale_snapshot.relative_import_candidates = CandidateIndex::load(
+                storage.get_connection(),
+                semantic_candidate_kinds(EdgeKind::IMPORT),
+            )?
+            .snapshot_nodes();
+            storage.put_resolution_support_snapshot(
+                snapshot_version,
+                &serde_json::to_vec(&stale_snapshot)?,
+            )?;
 
-        assert!(
-            !telemetry.support_snapshot_hit,
-            "semantic mode mismatch should force a snapshot rebuild"
-        );
-        assert!(
-            !prepared.call_semantic_index.snapshot_nodes().is_empty(),
-            "rebuilt state should include semantic candidates from storage"
-        );
+            let flags = ResolutionFlags {
+                legacy_mode: false,
+                enable_semantic,
+                store_candidates: false,
+                parallel_compute: false,
+            };
+            let mut telemetry = ResolutionPhaseTelemetry::default();
+            PreparedResolutionState::load(&storage, flags, &mut telemetry)?;
+            assert!(
+                !telemetry.support_snapshot_hit,
+                "version or semantic mode mismatch must rebuild the snapshot"
+            );
 
-        let rebuilt_blob = storage
-            .get_resolution_support_snapshot(RESOLUTION_SUPPORT_SNAPSHOT_VERSION)?
-            .expect("rebuilt snapshot");
-        let rebuilt: ResolutionSupportSnapshot = serde_json::from_slice(&rebuilt_blob)?;
-        assert!(rebuilt.enable_semantic);
-        assert!(!rebuilt.call_semantic_nodes.is_empty());
+            let rebuilt_blob = storage
+                .get_resolution_support_snapshot(RESOLUTION_SUPPORT_SNAPSHOT_VERSION)?
+                .expect("rebuilt snapshot");
+            let rebuilt: ResolutionSupportSnapshot = serde_json::from_slice(&rebuilt_blob)?;
+            assert_eq!(rebuilt.enable_semantic, enable_semantic);
+            assert_eq!(
+                rebuilt
+                    .import_candidates
+                    .iter()
+                    .map(|node| node.id)
+                    .collect::<Vec<_>>(),
+                vec![4],
+                "real module declarations survive; the raw self-import is excluded"
+            );
+            let relative_ids = rebuilt
+                .relative_import_candidates
+                .iter()
+                .map(|node| node.id)
+                .collect::<HashSet<_>>();
+            assert!(relative_ids.contains(&4));
+            assert!(relative_ids.contains(&5));
+            assert!(!relative_ids.contains(&3));
+            if enable_semantic {
+                assert!(!rebuilt.call_semantic_nodes.is_empty());
+                let semantic_ids = rebuilt
+                    .import_semantic_nodes
+                    .iter()
+                    .map(|node| node.id)
+                    .collect::<HashSet<_>>();
+                assert!(semantic_ids.contains(&4));
+                assert!(semantic_ids.contains(&5));
+                assert!(!semantic_ids.contains(&3));
+            }
+            let mut reuse_telemetry = ResolutionPhaseTelemetry::default();
+            let reused = PreparedResolutionState::load(&storage, flags, &mut reuse_telemetry)?;
+            assert!(reuse_telemetry.support_snapshot_hit);
+            let reused = reused.snapshot(flags);
+            assert_eq!(
+                serde_json::to_value((
+                    reused.import_candidates,
+                    reused.relative_import_candidates,
+                    reused.import_semantic_nodes,
+                ))?,
+                serde_json::to_value((
+                    rebuilt.import_candidates,
+                    rebuilt.relative_import_candidates,
+                    rebuilt.import_semantic_nodes,
+                ))?,
+                "current snapshots retain the filtered declaration indexes on reuse"
+            );
+        }
 
         Ok(())
     }
