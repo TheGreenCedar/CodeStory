@@ -53,7 +53,16 @@ fn render_search_projection_markdown(
         let line = row
             .start_line
             .map_or(String::new(), |line| format!(":{line}"));
-        let _ = writeln!(markdown, "- {}{line}", row.path.as_str());
+        if let Some(name) = &row.display_name {
+            let _ = writeln!(
+                markdown,
+                "- {} — {}{line}",
+                name.as_str(),
+                row.path.as_str()
+            );
+        } else {
+            let _ = writeln!(markdown, "- {}{line}", row.path.as_str());
+        }
     }
     if !search.gaps.as_slice().is_empty() {
         let _ = writeln!(markdown, "\n## Gaps");
@@ -127,5 +136,28 @@ mod tests {
         let without_message = projection_with_gap_message(None);
         let rendered = render_search_projection_markdown(&without_message);
         assert_eq!(rendered.lines().last(), Some("- EvidenceMissing"));
+    }
+
+    #[test]
+    fn search_markdown_includes_labels_without_inventing_source_text() {
+        let mut value = serde_json::to_value(projection_with_gap_message(None)).unwrap();
+        value["evidence"] = json!([
+            {
+                "identity": {"evidence_id": "named-hit"},
+                "path": "src/refresh.rs", "symbol_id": "42",
+                "display_name": "preserve_previous_publication",
+                "start_line": 12, "end_line": 12, "excerpt": null
+            },
+            {
+                "identity": {"evidence_id": "text-hit"},
+                "path": "README.md", "symbol_id": null, "display_name": null,
+                "start_line": null, "end_line": null, "excerpt": null
+            }
+        ]);
+        let projection = serde_json::from_value(value).expect("closed search rows");
+        let rendered = render_search_projection_markdown(&projection);
+        assert!(rendered.contains("\n- preserve_previous_publication — src/refresh.rs:12\n"));
+        assert!(rendered.contains("\n- README.md\n"));
+        assert!(!rendered.contains("null"));
     }
 }

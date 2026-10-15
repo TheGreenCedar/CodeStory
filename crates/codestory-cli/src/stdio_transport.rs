@@ -9461,8 +9461,8 @@ mod tests {
         let candidate: codestory_contracts::packet_projection_v3::PacketProjectionV3Dto =
             serde_json::from_value(root).expect("packet projection fixture");
         let publication_meta = json!({
-            "schema_version":3,
-            "minimum_compatible_schema_version":3,
+            "schema_version":5,
+            "minimum_compatible_schema_version":5,
             "core_publication":{
                 "generation_id":"core-generation-with-escaped-\"-metadata",
                 "run_id":"core-run-1"
@@ -9548,8 +9548,8 @@ mod tests {
             }
         });
         let publication_meta = json!({
-            "schema_version":3,
-            "minimum_compatible_schema_version":3,
+            "schema_version":5,
+            "minimum_compatible_schema_version":5,
             "core_publication":{
                 "generation_id":"core-generation-with-escaped-\"-metadata",
                 "run_id":"core-run-1"
@@ -9695,8 +9695,8 @@ mod tests {
         }
 
         let publication_meta = json!({
-            "schema_version":3,
-            "minimum_compatible_schema_version":3,
+            "schema_version":5,
+            "minimum_compatible_schema_version":5,
             "core_publication":{
                 "generation_id":"core-generation-with-escaped-\"-metadata",
                 "run_id":"core-run-1"
@@ -13898,7 +13898,7 @@ version = "0.11.20"
         );
         assert_eq!(
             response.pointer("/result/_meta/codestory_publication/schema_version"),
-            Some(&json!(4))
+            Some(&json!(5))
         );
         assert_eq!(
             response.pointer("/result/_meta/codestory_publication/contract_runtime/cli_version"),
@@ -13947,12 +13947,12 @@ version = "0.11.20"
         // an older schema.
         assert_eq!(
             response.pointer("/result/_meta/codestory_publication/schema_version"),
-            Some(&json!(4))
+            Some(&json!(5))
         );
         assert_eq!(
             response
                 .pointer("/result/_meta/codestory_publication/minimum_compatible_schema_version"),
-            Some(&json!(3))
+            Some(&json!(5))
         );
         assert_eq!(
             response.pointer("/result/_meta/codestory_publication/core_publication"),
@@ -14053,8 +14053,8 @@ version = "0.11.20"
         // The launcher reads this stamp out of the frame it suppresses, so it
         // must be the same contract-only stamp every other adapter publishes.
         let stamp = &agreed["_meta"]["codestory_publication"];
-        assert_eq!(stamp["schema_version"], json!(4));
-        assert_eq!(stamp["minimum_compatible_schema_version"], json!(3));
+        assert_eq!(stamp["schema_version"], json!(5));
+        assert_eq!(stamp["minimum_compatible_schema_version"], json!(5));
         assert_eq!(stamp["served_from"], json!("contract_only"));
         assert_eq!(
             stamp["contract_runtime"]["cli_version"],

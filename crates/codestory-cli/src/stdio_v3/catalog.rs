@@ -374,6 +374,13 @@ fn search_evidence_schema_v3() -> Value {
         ("path", string_schema_v3()),
         ("symbol_id", nullable_schema_v3(string_schema_v3())),
         (
+            "display_name",
+            nullable_schema_v3(json!({
+                "type":"string",
+                "maxLength":codestory_contracts::packet_projection_v3::SYMBOL_ID_MAX_BYTES_V3
+            })),
+        ),
+        (
             "start_line",
             nullable_schema_v3(unsigned_integer_schema_v3()),
         ),
@@ -1057,12 +1064,38 @@ mod tests {
             "kind":"complete","schema_version":3,"identity":identity,"publication":publication,
             "status":"no_useful_evidence","evidence":[{
                 "identity":{"evidence_id":"evidence-1"},"path":"src/lib.rs","symbol_id":null,
-                "start_line":null,"end_line":null,"excerpt":null
+                "display_name":null,"start_line":null,"end_line":null,"excerpt":null
             }],
             "gaps":[],"continuation":null,"retrieval":{"state":"unavailable","generation_id":null},
             "diagnostics":diagnostics
         });
         let tools = tools_for_revision_v3(McpRevisionV3::June2025);
+        let search_schema = &tool(&tools, "search")["outputSchema"];
+        let mut labelled_search = search.clone();
+        labelled_search["evidence"][0]["display_name"] = json!("entry");
+        assert!(
+            crate::stdio_arguments::validate_structured_content(search_schema, &labelled_search)
+                .is_ok()
+        );
+        for invalid in [json!(false), json!("x".repeat(1_025))] {
+            let mut malformed = labelled_search.clone();
+            malformed["evidence"][0]["display_name"] = invalid;
+            assert!(
+                crate::stdio_arguments::validate_structured_content(search_schema, &malformed)
+                    .is_err(),
+                "accepted an invalid display label: {malformed}"
+            );
+        }
+        let mut missing_label = labelled_search;
+        missing_label["evidence"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("display_name");
+        assert!(
+            crate::stdio_arguments::validate_structured_content(search_schema, &missing_label)
+                .is_err(),
+            "the closed search row requires its nullable display label"
+        );
         let packet_schema = &tool(&tools, "packet")["outputSchema"];
         let mut paged_packet = packet_complete.clone();
         paged_packet["evidence"][0]["source_delivery"] =

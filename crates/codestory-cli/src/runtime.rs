@@ -1459,11 +1459,11 @@ mod tests {
         // must see the bump rather than a self-referential comparison.
         assert_eq!(
             value.pointer("/_meta/codestory_publication/schema_version"),
-            Some(&serde_json::json!(4))
+            Some(&serde_json::json!(5))
         );
         assert_eq!(
             value.pointer("/_meta/codestory_publication/minimum_compatible_schema_version"),
-            Some(&serde_json::json!(3))
+            Some(&serde_json::json!(5))
         );
         assert_eq!(
             value.pointer("/_meta/codestory_publication/contract_runtime/cli_version"),

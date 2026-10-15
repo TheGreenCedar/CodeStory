@@ -1,7 +1,7 @@
 {
   "wireContract": {
-    "publicationStampSchemaVersion": 4,
-    "minimumCompatiblePublicationStampSchemaVersion": 3,
+    "publicationStampSchemaVersion": 5,
+    "minimumCompatiblePublicationStampSchemaVersion": 5,
     "supportedMcpProtocolVersions": [
       "2024-11-05",
       "2025-03-26",
@@ -12,8 +12,8 @@
     "discoveryContracts": {
       "2024-11-05": "f66f5345582da21a98b297b98d9f2e2dab054899746c1aa47a72c786bf1f9e69",
       "2025-03-26": "dc0d3ed5d1ac887cb36dd65a2fbb5b4e9ae5eb32664522bed42b02830f375299",
-      "2025-06-18": "12356e0402463316db6ec3dc1b012816057f03d1744264ce9a3977a075220d76",
-      "2025-11-25": "bc3b3a3319a1a1027547a0d5d7f9a3cab1d6df237de5bba1137ac89811cd4ca7"
+      "2025-06-18": "584297572e40cfb7f98c6e2446b15c2e7af4f01bbcf3a27456ec7e384fa554b8",
+      "2025-11-25": "18ce81099cb0cd0f03dd4050af9a45bbc195fdc4fd7002d7b8721cddb9582cbd"
     }
   },
   "revisionProfiles": {
@@ -3940,7 +3940,7 @@
       ]
     },
     "2025-06-18": {
-      "discoveryContractSha256": "12356e0402463316db6ec3dc1b012816057f03d1744264ce9a3977a075220d76",
+      "discoveryContractSha256": "584297572e40cfb7f98c6e2446b15c2e7af4f01bbcf3a27456ec7e384fa554b8",
       "tools": [
         {
           "_meta": {
@@ -6080,6 +6080,17 @@
                         "items": {
                           "additionalProperties": false,
                           "properties": {
+                            "display_name": {
+                              "anyOf": [
+                                {
+                                  "maxLength": 1024,
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            },
                             "end_line": {
                               "anyOf": [
                                 {
@@ -6142,6 +6153,7 @@
                             "identity",
                             "path",
                             "symbol_id",
+                            "display_name",
                             "start_line",
                             "end_line",
                             "excerpt"
@@ -14738,7 +14750,7 @@
       ]
     },
     "2025-11-25": {
-      "discoveryContractSha256": "bc3b3a3319a1a1027547a0d5d7f9a3cab1d6df237de5bba1137ac89811cd4ca7",
+      "discoveryContractSha256": "18ce81099cb0cd0f03dd4050af9a45bbc195fdc4fd7002d7b8721cddb9582cbd",
       "tools": [
         {
           "_meta": {
@@ -16878,6 +16890,17 @@
                         "items": {
                           "additionalProperties": false,
                           "properties": {
+                            "display_name": {
+                              "anyOf": [
+                                {
+                                  "maxLength": 1024,
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            },
                             "end_line": {
                               "anyOf": [
                                 {
@@ -16940,6 +16963,7 @@
                             "identity",
                             "path",
                             "symbol_id",
+                            "display_name",
                             "start_line",
                             "end_line",
                             "excerpt"
@@ -27675,6 +27699,17 @@
                     "items": {
                       "additionalProperties": false,
                       "properties": {
+                        "display_name": {
+                          "anyOf": [
+                            {
+                              "maxLength": 1024,
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
                         "end_line": {
                           "anyOf": [
                             {
@@ -27737,6 +27772,7 @@
                         "identity",
                         "path",
                         "symbol_id",
+                        "display_name",
                         "start_line",
                         "end_line",
                         "excerpt"

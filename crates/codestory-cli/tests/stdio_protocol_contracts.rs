@@ -198,11 +198,11 @@ fn public_v3_negotiates_revision_native_evidence_discovery() {
         assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert_eq!(
             initialized.pointer("/_meta/codestory_publication/schema_version"),
-            Some(&json!(4))
+            Some(&json!(5))
         );
         assert_eq!(
             initialized.pointer("/_meta/codestory_publication/minimum_compatible_schema_version"),
-            Some(&json!(3))
+            Some(&json!(5))
         );
 
         let listed = send_json(
@@ -2074,12 +2074,12 @@ fn initialize_negotiates_the_protocol_revision_and_stamps_the_wire_contract() {
     );
     assert_eq!(
         agreed.pointer("/_meta/codestory_publication/schema_version"),
-        Some(&json!(4)),
-        "the session-start stamp publishes the evidence-only v3 response schema: {agreed}"
+        Some(&json!(5)),
+        "the session-start stamp publishes the current response vocabulary: {agreed}"
     );
     assert_eq!(
         agreed.pointer("/_meta/codestory_publication/minimum_compatible_schema_version"),
-        Some(&json!(3)),
+        Some(&json!(5)),
     );
     assert_eq!(
         agreed.pointer("/_meta/codestory_publication/served_from"),
@@ -2177,12 +2177,12 @@ fn tool_results_carry_the_publication_schema_that_defines_their_vocabulary() {
     let result = assert_success_envelope(&response, json!("ground-stamp"));
     assert_eq!(
         result.pointer("/_meta/codestory_publication/schema_version"),
-        Some(&json!(4)),
+        Some(&json!(5)),
         "a served payload must name the schema its vocabulary belongs to: {response}"
     );
     assert_eq!(
         result.pointer("/_meta/codestory_publication/minimum_compatible_schema_version"),
-        Some(&json!(3)),
+        Some(&json!(5)),
     );
     assert_eq!(
         result.pointer("/_meta/codestory_publication/served_from"),

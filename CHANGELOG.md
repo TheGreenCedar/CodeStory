@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Search results retain indexed display names beside their source locations, including matches without captured excerpts. Custom strict clients must support publication stamp schema 5; the evidence payload family remains schema 3.
+
 - Search and packet requests reuse completed readiness checks within the same pinned operation while continuing to check retrieval health and source freshness.
 
 - Search deadlines, cancellations and exhausted packet budgets no longer recommend rebuilding retrieval data; deadline failures suggest retrying or narrowing the request.

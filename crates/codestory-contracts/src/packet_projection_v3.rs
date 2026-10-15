@@ -556,6 +556,8 @@ pub struct SearchEvidenceRowV3Dto {
     pub identity: EvidenceIdentityV3Dto,
     pub path: PathTextV3,
     pub symbol_id: Option<SymbolIdTextV3>,
+    /// Bounded presentation label from the indexed hit, not source text or identity.
+    pub display_name: Option<SymbolIdTextV3>,
     pub start_line: Option<u32>,
     pub end_line: Option<u32>,
     pub excerpt: Option<ExcerptTextV3>,
@@ -897,6 +899,7 @@ mod tests {
                 identity: evidence_identity("search-evidence-1"),
                 path: text("src/lib.rs"),
                 symbol_id: Some(text("crate::entry")),
+                display_name: Some(text("entry")),
                 start_line: Some(4),
                 end_line: Some(9),
                 excerpt: Some(text("pub fn entry() { runtime(); }")),
@@ -920,6 +923,11 @@ mod tests {
                 gap_ids: list(vec![gap_identity("gap-1")]),
             }]),
         };
+
+        let mut search_json = serde_json::to_value(&search).expect("closed search JSON");
+        assert_eq!(search_json["evidence"][0]["display_name"], "entry");
+        search_json["evidence"][0]["display_name"] = json!("界".repeat(342));
+        assert!(serde_json::from_value::<SearchProjectionV3Dto>(search_json).is_err());
 
         let maximal = json!({
             "packet_variants": [complete, budget_exceeded],

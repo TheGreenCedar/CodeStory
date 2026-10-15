@@ -590,7 +590,7 @@ fn stats_search_fixture() -> Value {
         "publication":{"core":{"project_id":"project-1","generation_id":"core-1","run_id":"run-1"},"retrieval":null},
         "retrieval":{"state":"symbolic","generation_id":null},
         "evidence":[{"identity":{"evidence_id":"row-1"},"path":"src/app.rs","symbol_id":"123",
-            "start_line":2,"end_line":2,"excerpt":"struct AppController;"}],
+            "display_name":"AppController","start_line":2,"end_line":2,"excerpt":"struct AppController;"}],
         "gaps":[],"continuation":null,"diagnostics":{"availability":"unavailable"},
         "_meta":{"operation":{"operation_id":"operation-1","attempt":1}}
     })
@@ -600,6 +600,14 @@ fn stats_search_fixture() -> Value {
 fn repo_stats_consumes_public_v3_search_without_legacy_fields() {
     let projection = stats_search_projection(&stats_search_fixture()).expect("v3 search");
     assert_eq!(projection.retrieval.state, RetrievalStateV3Dto::Symbolic);
+    assert_eq!(
+        projection.evidence.as_slice()[0]
+            .display_name
+            .as_ref()
+            .unwrap()
+            .as_str(),
+        "AppController"
+    );
     assert_eq!(
         projection.evidence.as_slice()[0]
             .symbol_id

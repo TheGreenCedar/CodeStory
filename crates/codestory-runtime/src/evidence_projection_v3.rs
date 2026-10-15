@@ -1427,6 +1427,8 @@ fn search_evidence_row(index: usize, hit: &SearchHit) -> Option<SearchEvidenceRo
         identity: evidence_identity(&format!("search-{index}-{}", hit.node_id.0)),
         path: path_text(path),
         symbol_id: hit.resolvable.then(|| symbol_id_text(&hit.node_id.0)),
+        display_name: (hit.resolvable && !hit.display_name.trim().is_empty())
+            .then(|| symbol_id_text(&hit.display_name)),
         start_line: hit.line,
         end_line: hit.line,
         excerpt: hit.source_excerpt.as_deref().map(bounded_excerpt),
@@ -2223,6 +2225,85 @@ mod tests {
             hybrid_weights: None,
             hybrid_limits: None,
         }
+    }
+
+    #[test]
+    fn search_projection_retains_bounded_symbol_labels_without_fabricating_excerpts() {
+        let (project, _state, _process_cache, controller, service) = indexed_search_fixture();
+        fs::write(
+            project.path().join("src/labels.rs"),
+            "pub fn retained_label_anchor() {}\npub fn neighboring_symbol_control() {}\n",
+        )
+        .expect("callable source");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("index real callable labels");
+        service
+            .run_observational_with_cancel("exact_search", Arc::new(AtomicBool::new(false)), || {
+                let names = ["neighboring_symbol_control", "retained_label_anchor"];
+                let mut results = controller.search_results(core_search_request(names[0]))?;
+                let mut hits = Vec::new();
+                for name in names {
+                    let found = controller.search_results(core_search_request(name))?;
+                    let mut hit = found
+                        .hits
+                        .into_iter()
+                        .find(|hit| hit.display_name == name)
+                        .expect("fixture callable is a real indexed hit");
+                    assert!(hit.resolvable);
+                    assert!(
+                        std::path::Path::new(hit.file_path.as_deref().expect("located callable"))
+                            .ends_with("src/labels.rs")
+                    );
+                    // Broad search can retain a label without capturing source text.
+                    hit.source_excerpt = None;
+                    hits.push(hit);
+                }
+                results.hits = hits.clone();
+                results.indexed_symbol_hits = hits.clone();
+                results.repo_text_hits.clear();
+                let projected =
+                    serde_json::to_value(project_search_v3(&service, "test", &results)?)
+                        .expect("public search JSON");
+                let rows = projected["evidence"].as_array().expect("evidence rows");
+                assert_eq!(rows.len(), 2);
+                for ((row, hit), name) in rows.iter().zip(&hits).zip(names) {
+                    assert_eq!(row["symbol_id"].as_str(), Some(hit.node_id.0.as_str()));
+                    assert_eq!(row["path"].as_str(), hit.file_path.as_deref());
+                    assert_eq!(row["start_line"].as_u64(), hit.line.map(u64::from));
+                    assert!(row["excerpt"].is_null());
+                    assert_eq!(
+                        row["display_name"], name,
+                        "located symbol labels must survive when no excerpt was captured"
+                    );
+                }
+
+                for (name, resolvable) in [("src/text-only.rs", false), (" \t", true)] {
+                    let mut metadata_only = results.clone();
+                    metadata_only.hits[0].display_name = name.into();
+                    metadata_only.hits[0].resolvable = resolvable;
+                    let value =
+                        serde_json::to_value(project_search_v3(&service, "test", &metadata_only)?)
+                            .expect("nullable label JSON");
+                    assert!(value["evidence"][0]["display_name"].is_null());
+                    assert!(value["evidence"][0]["excerpt"].is_null());
+                    assert_eq!(value["evidence"][0]["path"], rows[0]["path"]);
+                    assert_eq!(value["evidence"][0]["identity"], rows[0]["identity"]);
+                }
+
+                let mut overbound = results;
+                overbound.hits[0].display_name = "界".repeat(342);
+                let value = serde_json::to_value(project_search_v3(&service, "test", &overbound)?)
+                    .expect("bounded UTF-8 label JSON");
+                assert_eq!(value["evidence"][0]["display_name"], "界".repeat(341));
+                assert!(value["evidence"][0]["excerpt"].is_null());
+                assert_eq!(value["evidence"][0]["symbol_id"], rows[0]["symbol_id"]);
+                assert_eq!(value["evidence"][0]["identity"], rows[0]["identity"]);
+                assert_eq!(value["evidence"][0]["path"], rows[0]["path"]);
+                assert_eq!(value["evidence"][1], rows[1]);
+                Ok(())
+            })
+            .expect("symbol labels are presentation metadata within the pinned publication");
     }
 
     #[test]
