@@ -8516,13 +8516,14 @@ mod tests {
         assert_eq!(executed_returned_patches, 1);
 
         // Authenticate issued history under the actual owner, then mutate.
-        // Public retrieval freshness rejects the changed input before source
-        // measurement; this does not assert the later history-digest boundary.
+        // The issued source floor must reject changed bytes before measurement.
         // Restore only after the operation has returned.
         let retained_request = retained_request.expect("retained branch issued path history");
         let _hostile_latency =
             crate::enter_packet_latency_scope(retained_request.latency_budget_ms);
         let path = fixture._project.path().join("settings.ini");
+        let changed = content.replace("true", "fake");
+        assert_eq!(content.len(), changed.len());
         let mut public_refusal = None;
         let mut represented_product_returned = false;
         let mut measurements = 0;
@@ -8539,7 +8540,7 @@ mod tests {
                     .iter()
                     .any(|w| w.node_id.is_none() && w.path == "settings.ini")
             );
-            std::fs::write(&path, content.replace("true", "fake")).unwrap();
+            std::fs::write(&path, &changed).unwrap();
             match browser.packet_for_representation_v3(
                 retained_request.clone(),
                 "codestory-cli",
@@ -8572,12 +8573,11 @@ mod tests {
         let (code, message) = public_refusal
             .expect("stage=hostile-public-representation must refuse changed signed path bytes");
         assert_eq!(
-            code, "retrieval_unavailable",
+            code, "invalid_argument",
             "stage=hostile-public-representation actual code={code}, message={message}"
         );
-        assert!(
-            message.contains("retrieval_manifest_stale")
-                && message.contains("sidecar_input_hash_changed"),
+        assert_eq!(
+            message, "Previously issued source witnesses changed or cannot be revalidated.",
             "stage=hostile-public-representation: {message}"
         );
         let propagated = match hostile {
