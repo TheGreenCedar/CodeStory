@@ -324,6 +324,9 @@ impl ReadOnlyBrowserService {
             crate::evidence_projection_v3::bounded_packet_transport_measure_v3(measure);
         let measure = &mut bounded_measure;
         let reserved = crate::PacketProjectionIdentityV3::new();
+        let capture = crate::evidence_projection_v3::PacketRepresentationCaptureV3::new(
+            &self.public_operation,
+        )?;
         let mut full_product = None;
         let mut accepted_product = None;
         let mut baseline_product: Option<(AgentPacketDto, crate::PacketEvidenceProductV3)> = None;
@@ -337,14 +340,7 @@ impl ReadOnlyBrowserService {
         >| {
             // A later refused or failed preview cannot reuse an earlier capacity frame.
             measured_floor_refusal = None;
-            let product = crate::project_packet_v3_with_identity(
-                &self.public_operation,
-                caller_id,
-                &req,
-                packet,
-                &reserved,
-                &mut *measure,
-            )?;
+            let product = capture.project(caller_id, &req, packet, &reserved, &mut *measure)?;
             if issued_record.is_none() {
                 issued_record = Some(crate::agent::packet_served_sources::load(
                     &self.controller,
@@ -372,8 +368,7 @@ impl ReadOnlyBrowserService {
                     {
                         product.clone()
                     } else {
-                        crate::project_packet_v3_with_identity(
-                            &self.public_operation,
+                        capture.project(
                             caller_id,
                             &req,
                             &binding.packet,

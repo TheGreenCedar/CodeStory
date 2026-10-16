@@ -4,6 +4,8 @@
 
 ## 0.18.0
 
+- Packets reuse one repository identity snapshot while selecting a response, avoiding repeated Git status scans within the same request.
+
 - Packets can finish selecting their response during the last second of their time allowance instead of being refused early.
 
 - Refreshing a legacy index keeps one database snapshot during the copy, avoiding repeated restarts when the old database is read-only or changes during the copy.

@@ -226,12 +226,18 @@ impl FinalizedPacketExecutionInputV3 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CapturedPacketPublicationV3 {
+pub(crate) struct CapturedPacketPublicationV3 {
     project: ProjectIdentityV3,
     core_project_id: String,
     core_generation_id: String,
     core_run_id: String,
     retrieval: Option<EmbeddingVectorPublicationIdentityDto>,
+}
+
+impl CapturedPacketPublicationV3 {
+    pub(crate) fn project_id(&self) -> &str {
+        &self.project.project_id
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -328,7 +334,7 @@ impl PacketIdSourceV3 for OsPacketIdSourceV3 {
 }
 
 pub(crate) fn build_packet_execution_record_v3_with_id(
-    service: &PublicOperationService,
+    capture: &CapturedPacketPublicationV3,
     input: &FinalizedPacketExecutionInputV3,
     packet_id: &str,
 ) -> Result<PacketExecutionRecordV3, RecordValidationErrorV3> {
@@ -338,9 +344,8 @@ pub(crate) fn build_packet_execution_record_v3_with_id(
             self.0.to_owned()
         }
     }
-    let capture = capture_packet_publication_v3(service)?;
     // Reuse every normal receipt/publication/identity validator.
-    build_record_from_captured_v3(&capture, input, &mut ReservedId(packet_id))
+    build_record_from_captured_v3(capture, input, &mut ReservedId(packet_id))
 }
 
 pub(crate) fn build_packet_execution_record_v3(
@@ -351,7 +356,7 @@ pub(crate) fn build_packet_execution_record_v3(
     build_record_from_captured_product_v3(&capture, input)
 }
 
-fn capture_packet_publication_v3(
+pub(crate) fn capture_packet_publication_v3(
     service: &PublicOperationService,
 ) -> Result<CapturedPacketPublicationV3, RecordValidationErrorV3> {
     let active = service
