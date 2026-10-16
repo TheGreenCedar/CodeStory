@@ -9,12 +9,39 @@ issue one immutable replacement-worker query.
 from __future__ import annotations
 
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from . import process_identity, publication_protocol
+from . import process_identity, publication_fault_run, publication_protocol
 from .event_producer_liveness import EventProducer, NativeProcessProducer
 from .foundation import ProofFailure, require
+from .publication_fault_setup import _publication_commands, _publication_fixture
+
+
+def _candidate_preserves_core_source_while_changing_lexical_input() -> None:
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        fixture = _publication_fixture(root)
+        commands = _publication_commands(Path("codestory-cli"), fixture.project)
+
+        def spawn(*_args, **_kwargs):
+            require(
+                fixture.source_file.read_text(encoding="utf-8")
+                == fixture.baseline_source,
+                "retrieval-only fault candidate changed its Core parser source",
+            )
+            require(
+                fixture.lexical_file.read_text(encoding="utf-8")
+                != fixture.baseline_lexical,
+                "publication fault candidate did not change its lexical input",
+            )
+            return Mock()
+
+        with patch.object(publication_fault_run.subprocess, "Popen", spawn):
+            publication_fault_run._start_fault_candidate(
+                {}, root, "self-test-nonce", fixture, commands
+            )
 
 
 class _Clock:
@@ -657,6 +684,7 @@ def _replacement_requires_the_durable_accepted_event() -> None:
 
 
 def run_publication_crash_exit_self_tests() -> None:
+    _candidate_preserves_core_source_while_changing_lexical_input()
     _delayed_exit_blocks_then_invokes_exactly_one_replacement()
     _accepted_event_pins_the_process_that_answered()
     _immediate_exit_adds_no_delay()

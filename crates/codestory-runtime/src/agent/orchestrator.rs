@@ -650,7 +650,7 @@ fn agent_packet_with_session(
         let mut full_proposal = None;
         let mut accepted_proposal = None;
         let frozen = prepared_compilation.select_for_representation_with_baseline(|prepared, product, baseline_product| {
-            packet_remaining_for_handoff(
+            check_packet_deadline(
                 controller,
                 packet_latency,
                 "public representation selection",
@@ -736,11 +736,11 @@ fn agent_packet_with_session(
     Ok(packet)
 }
 
-fn packet_remaining_for_handoff(
+fn check_packet_deadline(
     controller: &AppController,
     packet_latency: PacketLatencyBudget,
     phase: &str,
-) -> Result<u32, ApiError> {
+) -> Result<(), ApiError> {
     if crate::services::active_public_operation_cancellation()
         .is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Acquire))
     {
@@ -749,6 +749,22 @@ fn packet_remaining_for_handoff(
             format!("request cancelled before packet {phase}"),
         ));
     }
+    if packet_latency.exhausted() {
+        return Err(sidecar_request_stop_error(
+            controller,
+            "deadline",
+            format!("packet latency budget exhausted before {phase}"),
+        ));
+    }
+    Ok(())
+}
+
+fn packet_remaining_for_handoff(
+    controller: &AppController,
+    packet_latency: PacketLatencyBudget,
+    phase: &str,
+) -> Result<u32, ApiError> {
+    check_packet_deadline(controller, packet_latency, phase)?;
     packet_latency.remaining_for_handoff().ok_or_else(|| {
         sidecar_request_stop_error(
             controller,
@@ -2331,6 +2347,65 @@ fn merge_scored_hits(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packet_representation_uses_remaining_allowance_without_a_retrieval_reserve() {
+        let fixture = crate::services::activation_tests::ready_activation_fixture();
+        let controller = &fixture.runtime.controller;
+        let remaining = PacketLatencyBudget {
+            started_at: Instant::now(),
+            target_ms: 999,
+        };
+        check_packet_deadline(controller, remaining, "public representation selection")
+            .expect("local representation can use the last second of its allowance");
+        assert!(packet_remaining_for_handoff(controller, remaining, "initial retrieval").is_err());
+
+        let expired = PacketLatencyBudget {
+            started_at: Instant::now(),
+            target_ms: 0,
+        };
+        let error = check_packet_deadline(controller, expired, "public representation selection")
+            .expect_err("representation must still reject an expired allowance");
+        assert_eq!(error.code, "retrieval_unavailable");
+        assert_eq!(
+            error.details.unwrap().cause_code.as_deref(),
+            Some("deadline")
+        );
+    }
+
+    #[test]
+    fn packet_representation_cancellation_precedes_its_deadline() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let fixture = crate::services::activation_tests::ready_activation_fixture();
+        for target_ms in [999, 0] {
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let error = fixture
+                .runtime
+                .public_operation_service()
+                .run_with_cancel("packet", Arc::clone(&cancelled), || {
+                    cancelled.store(true, Ordering::Release);
+                    check_packet_deadline(
+                        &fixture.runtime.controller,
+                        PacketLatencyBudget {
+                            started_at: Instant::now(),
+                            target_ms,
+                        },
+                        "public representation selection",
+                    )
+                })
+                .expect_err("cancellation must win even before the actual deadline");
+            assert_eq!(error.code, "cancelled");
+            assert!(
+                error
+                    .message
+                    .contains("cancelled before packet public representation selection")
+            );
+        }
+    }
 
     #[test]
     fn exhausted_packet_handoff_preserves_phase_without_index_repair() {
