@@ -3646,7 +3646,7 @@ fn stdio_public_operation_name<'a>(name: &'a str, request: &serde_json::Value) -
             .and_then(serde_json::Value::as_str)
             .is_some_and(|query| !query.trim().is_empty())
         {
-            "graph_assisted"
+            "resolution"
         } else {
             "graph"
         }
@@ -10121,7 +10121,7 @@ mod tests {
     }
 
     #[test]
-    fn query_resolved_graph_tools_use_the_complete_retrieval_operation() {
+    fn query_resolved_graph_tools_use_fresh_core_resolution() {
         for tool in [
             "symbol",
             "trail",
@@ -10146,7 +10146,7 @@ mod tests {
                 if tool == "snippet" {
                     "source_snippet"
                 } else {
-                    "graph_assisted"
+                    "resolution"
                 },
                 "{tool} query resolution keeps its owning publication capability"
             );

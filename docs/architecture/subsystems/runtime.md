@@ -46,10 +46,13 @@ trigger a retry. Unreadable source, incomplete discovery, source drift, and
 collector failures still prevent publication.
 
 Runtime publishes the core index through store, then asks retrieval to finalize
-immutable lexical/vector/SCIP state when a broad operation needs it. On reads it
-requires query hits and candidate resolution to share one
-`RetrievalPublicationIdentity`, holds the core read and generation leases, and
-revalidates before returning. Publication drift permits one bounded retry.
+immutable lexical/vector/SCIP state when a broad operation needs it. Broad reads
+require query hits and candidate resolution to share one
+`RetrievalPublicationIdentity`, hold the core read and generation leases, and
+revalidate before returning. Indexed-name navigation instead resolves from a
+fresh complete Core publication without attaching search state or pinning
+retrieval; stale or incomplete Core cannot admit it. Publication drift permits
+one bounded retry.
 
 Cache rehydrate selects its source's physical core generation after taking the
 source writer guard. Schema, file count, freshness, space accounting, and the

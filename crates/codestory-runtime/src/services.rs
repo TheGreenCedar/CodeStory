@@ -2655,14 +2655,12 @@ impl OperationReadClass {
 /// Anything not listed is a pure graph read.
 pub fn operation_read_class(operation: &str) -> OperationReadClass {
     match operation {
-        // Retrieval readiness admits only operations whose results execute
-        // through the retrieval sidecars (`packet`, hybrid `search`, `context`,
-        // `drill`) or resolve evidence against a pinned retrieval generation
-        // (`resolution`, `graph_assisted`).
-        "packet" | "search" | "context" | "drill" | "resolution" | "graph_assisted" => {
+        // Broad evidence and the graph-query DSL retain full retrieval admission.
+        "packet" | "search" | "context" | "drill" | "graph_assisted" => {
             OperationReadClass::Retrieval
         }
-        "exact_search" | "source_snippet" => OperationReadClass::SourceBacked,
+        // Name-selected navigation resolves only the fresh complete Core index.
+        "resolution" | "exact_search" | "source_snippet" => OperationReadClass::SourceBacked,
         "affected" | crate::call_path_kernel::PROOF_DOMAIN => OperationReadClass::PinnedObserver,
         _ => OperationReadClass::GraphOnly,
     }
@@ -4717,6 +4715,7 @@ mod freshness_gate_tests {
             "graph",
             "exact_search",
             "source_snippet",
+            "resolution",
             "affected",
             crate::call_path_kernel::PROOF_DOMAIN,
         ] {
@@ -4726,14 +4725,7 @@ mod freshness_gate_tests {
                 "{operation}"
             );
         }
-        for operation in [
-            "packet",
-            "search",
-            "context",
-            "drill",
-            "resolution",
-            "graph_assisted",
-        ] {
+        for operation in ["packet", "search", "context", "drill", "graph_assisted"] {
             assert_eq!(
                 operation_read_class(operation).activation_goal(),
                 ActivationGoal::Full,
@@ -5106,6 +5098,150 @@ pub(crate) mod activation_tests {
         );
 
         (project, cache, storage_path, retrieval_pointer)
+    }
+
+    #[test]
+    fn indexed_name_navigation_uses_fresh_core_without_search_attachment() {
+        use crate::{TargetResolution, TargetSelection};
+        use codestory_contracts::api::{
+            LayoutDirection, TrailCallerScope, TrailDirection, TrailMode,
+        };
+
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("cache");
+        let storage_path = cache.path().join("codestory.db");
+        let source = project.path().join("lib.rs");
+        fs::write(
+            &source,
+            "pub fn indexed_anchor() {}\npub fn invoke_anchor() { indexed_anchor(); }\n\
+             #[cfg(test)] mod tests { #[test] fn invoke_anchor_test() { super::indexed_anchor(); } }\n",
+        )
+        .expect("write indexed-name fixture");
+        {
+            let seed = crate::test_runtime_with_owned_cache_root(process_cache.path());
+            seed.project_service()
+                .open_project_summary_with_storage_path(
+                    project.path().to_path_buf(),
+                    storage_path.clone(),
+                )
+                .expect("bind indexed-name fixture");
+            seed.index_service()
+                .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+                .expect("publish complete Core");
+        }
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
+        runtime
+            .project_service()
+            .open_core_read_only_with_storage_path(
+                project.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("fresh controller attaches only complete Core");
+        let retrieval_pointer =
+            codestory_store::CorePublicationLayout::from_storage_path(&storage_path)
+                .expect("Core layout")
+                .retrieval_publication_path();
+        assert!(!retrieval_pointer.exists());
+        assert!(runtime.controller.state.lock().search_engine.is_none());
+        let browser = runtime.browser_service();
+        let query = TargetSelection::Query {
+            query: "indexed_anchor".into(),
+            choose: None,
+        };
+        let TargetResolution::Resolved(target) = browser
+            .resolve_target(query.clone(), None)
+            .expect("indexed-name Browser admission must not require retrieval")
+        else {
+            panic!("unique indexed callable must resolve");
+        };
+        let selected_id = target.selected.node_id.clone();
+        let service = runtime.public_operation_service();
+        for max_nodes in [12, 50] {
+            for caller_scope in [
+                TrailCallerScope::ProductionOnly,
+                TrailCallerScope::IncludeTestsAndBenches,
+            ] {
+                let mut graphs = Vec::new();
+                for (operation, selection) in [
+                    ("resolution", query.clone()),
+                    ("graph", TargetSelection::Id(selected_id.clone())),
+                ] {
+                    let result = service
+                        .run_with_cancel(operation, Arc::new(AtomicBool::new(false)), || {
+                            let TargetResolution::Resolved(resolved) =
+                                browser.resolve_target(selection.clone(), None)?
+                            else {
+                                return Err(ApiError::internal("indexed target did not resolve"));
+                            };
+                            browser
+                                .trail_context(TrailConfigDto {
+                                    root_id: resolved.selected.node_id.clone(),
+                                    mode: TrailMode::Neighborhood,
+                                    target_id: None,
+                                    depth: 2,
+                                    direction: TrailDirection::Incoming,
+                                    caller_scope,
+                                    edge_filter: Vec::new(),
+                                    show_utility_calls: false,
+                                    hide_speculative: false,
+                                    story: false,
+                                    node_filter: Vec::new(),
+                                    max_nodes,
+                                    layout_direction: LayoutDirection::Horizontal,
+                                })
+                                .map(|context| context.trail)
+                        })
+                        .expect("indexed graph navigation must need only fresh complete Core");
+                    assert!(result.core_publication.is_some());
+                    assert!(result.retrieval_publication.is_none());
+                    assert_eq!(result.freshness, OperationFreshness::Fresh);
+                    assert_eq!(result.value.center_id, selected_id);
+                    assert!(
+                        !result.value.edges.is_empty(),
+                        "must return actual caller evidence"
+                    );
+                    assert!(
+                        result
+                            .value
+                            .nodes
+                            .iter()
+                            .any(|node| node.label.contains("invoke_anchor"))
+                    );
+                    assert_eq!(
+                        result
+                            .value
+                            .nodes
+                            .iter()
+                            .any(|node| node.label.contains("invoke_anchor_test")),
+                        caller_scope == TrailCallerScope::IncludeTestsAndBenches
+                    );
+                    graphs.push(serde_json::to_value(result.value).expect("graph JSON"));
+                }
+                assert_eq!(
+                    graphs[0], graphs[1],
+                    "query and ID must preserve the complete graph at cap {max_nodes}"
+                );
+            }
+        }
+        assert!(
+            runtime.controller.state.lock().search_engine.is_none(),
+            "indexed navigation must not attach persisted search state"
+        );
+        assert!(
+            !retrieval_pointer.exists(),
+            "indexed navigation must not prepare retrieval"
+        );
+
+        let cancelled = service
+            .run_with_cancel("resolution", Arc::new(AtomicBool::new(true)), || Ok(()))
+            .expect_err("pre-cancelled name navigation must refuse");
+        assert_eq!(cancelled.code, "cancelled");
+        fs::write(&source, "pub fn replacement_anchor() {}\n").expect("change indexed source");
+        let stale = browser
+            .resolve_target(query, None)
+            .expect_err("stale name navigation must not serve historical Core");
+        assert_eq!(stale.code, "project_unavailable");
     }
 
     fn tree_snapshot(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
@@ -5708,7 +5844,7 @@ pub(crate) mod activation_tests {
     }
 
     #[test]
-    fn packet_public_admission_refuses_missing_retrieval_before_response_building() {
+    fn retrieval_public_admission_refuses_missing_retrieval_before_response_building() {
         let (project, _cache, storage_path, _) = complete_core_without_retrieval_pointer_fixture();
         let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
@@ -5720,7 +5856,10 @@ pub(crate) mod activation_tests {
         let request = warm_packet_request();
         let _latency_scope = crate::enter_packet_latency_scope(request.latency_budget_ms);
 
-        for observational in [false, true] {
+        for (operation, observational) in ["packet", "search", "context", "drill", "graph_assisted"]
+            .into_iter()
+            .flat_map(|operation| [false, true].map(|observational| (operation, observational)))
+        {
             let mut body_calls = 0;
             let mut build = || {
                 body_calls += 1;
@@ -5728,12 +5867,12 @@ pub(crate) mod activation_tests {
             };
             let error = if observational {
                 service.run_observational_with_cancel(
-                    "packet",
+                    operation,
                     Arc::new(AtomicBool::new(false)),
                     &mut build,
                 )
             } else {
-                service.run_with_cancel("packet", Arc::new(AtomicBool::new(false)), &mut build)
+                service.run_with_cancel(operation, Arc::new(AtomicBool::new(false)), &mut build)
             }
             .expect_err("missing retrieval must refuse before the response builder");
             assert_eq!(error.code, "retrieval_unavailable", "{error:?}");
@@ -11116,8 +11255,25 @@ pub(crate) mod activation_tests {
         assert!(snapshot.allows_operation("exact_search"));
         assert!(snapshot.allows_operation("ground"));
         assert!(!snapshot.allows_operation("graph_assisted"));
-        assert!(!snapshot.allows_operation("resolution"));
+        assert!(snapshot.allows_operation("resolution"));
         assert!(!snapshot.allows_operation("packet"));
+        for state in [ActivationState::Preparing, ActivationState::Updating] {
+            let refreshing = ActivationSnapshot {
+                state,
+                ..snapshot.clone()
+            };
+            assert!(!refreshing.allows_operation("resolution"));
+            assert!(refreshing.allows_operation("ground"));
+        }
+        let retained = ActivationSnapshot {
+            capabilities: ActivationCapabilities {
+                local_navigation: ActivationCapabilityState::Retained,
+                broad_search: ActivationCapabilityState::Unavailable,
+            },
+            ..snapshot
+        };
+        assert!(!retained.allows_operation("resolution"));
+        assert!(retained.allows_operation("ground"));
     }
 }
 

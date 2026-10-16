@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Symbol-name navigation uses the current Core index without preparing search, so symbol details, callers and trails remain available without broad retrieval.
+
 - Symbol search ranks standalone Go type declarations ahead of incidental matches with the same name, making definitions easier to find among configuration labels and references.
 
 ## 0.18.0

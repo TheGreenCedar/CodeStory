@@ -312,56 +312,23 @@ impl AppController {
         deduped
     }
 
-    /// Resolve DB/index-backed symbol candidates for read commands.
-    ///
-    /// This intentionally bypasses mandatory sidecar product search so symbol,
-    /// snippet, trail, and graph-query target resolution can work from an
-    /// already-open indexed store. Explicit `search --repo-text off` composes
-    /// this resolver as its complete-core lane. Ordinary search and packet
-    /// evidence still use the sidecar-primary paths.
+    /// Resolve indexed names from the pinned Core without attaching search state.
+    /// Ordinary search and packet evidence retain their sidecar-primary paths.
     pub fn resolve_indexed_symbol_candidates(
         &self,
         query: &str,
         max_results: usize,
     ) -> Result<Vec<SearchHit>, ApiError> {
-        self.ensure_search_state()?;
-        let storage = self.open_storage_read_only()?;
-        let (matches, node_names) = {
-            let mut s = self.state.lock();
-            let engine = s.search_engine.as_mut().ok_or_else(|| {
-                ApiError::invalid_argument("Search engine not initialized. Open a project first.")
-            })?;
-            let matches = engine.search_symbol_with_scores(query);
-            let node_names = node_names_for_ids(&s.node_names, matches.iter().map(|(id, _)| *id));
-            (matches, node_names)
-        };
-
-        let mut hits = matches
-            .into_iter()
-            .map(|(id, score)| Self::build_search_hit(&storage, &node_names, id, score))
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .flatten()
-            .map(|mut hit| {
-                decorate_lexical_search_hit_evidence(&mut hit);
-                hit
-            })
-            .collect::<Vec<_>>();
-        let project_root = self.require_project_root().ok();
-        hits.sort_by(|left, right| {
-            compare_search_hits_with_project_root(project_root.as_deref(), query, left, right, None)
-        });
-        hits.truncate(max_results.clamp(1, 50));
-        Ok(hits)
+        self.resolve_core_symbol_candidates(query, max_results)
     }
 
     /// Resolve symbols from the immutable core projection only.
     ///
     /// This deliberately avoids `ensure_search_state`: that path attaches the
     /// persisted search generation and therefore acquires its catalog lock.
-    /// An explicit `repo_text=off` query owns no retrieval or search-generation
-    /// dependency, so it streams canonical identities from the already-pinned
-    /// core and applies the same in-memory fuzzy matcher directly.
+    /// Indexed-name navigation and explicit `repo_text=off` search own no
+    /// retrieval dependency, so they stream canonical identities from the pinned
+    /// Core and apply the same in-memory fuzzy matcher directly.
     pub(crate) fn resolve_core_symbol_candidates(
         &self,
         query: &str,

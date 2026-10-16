@@ -917,6 +917,24 @@ fn search_requires_full_sidecars_for_exact_type_queries() {
     assert!(!exact.indexed_symbol_hits.is_empty());
     assert!(exact.repo_text_hits.is_empty());
 
+    for query in [
+        "src/lib.rs".to_string(),
+        temp.path()
+            .join("src/lib.rs")
+            .to_string_lossy()
+            .into_owned(),
+    ] {
+        let candidates = controller
+            .resolve_indexed_symbol_candidates(&query, 10)
+            .expect("relative and absolute indexed FILE names remain resolvable");
+        assert!(
+            candidates
+                .iter()
+                .any(|hit| hit.node_id == NodeId("10".into())),
+            "{query}: {candidates:?}"
+        );
+    }
+
     let error = controller
         .search(SearchRequest {
             query: "AppController".to_string(),
@@ -1035,6 +1053,19 @@ fn dotted_owner_method_query_resolves_with_file_constraint() {
         1,
         "other owners must be excluded"
     );
+
+    let absolute_filter = parser_file.to_string_lossy();
+    let absolute = controller
+        .resolve_target(
+            TargetSelection::Query {
+                query: "OAuth2CodeParser.parseCode".into(),
+                choose: None,
+            },
+            Some(absolute_filter.as_ref()),
+        )
+        .expect("absolute file filter must preserve the indexed target");
+    assert!(matches!(absolute, TargetResolution::Resolved(target)
+        if target.selected.node_id == NodeId("11".into())));
 
     let fully_qualified = controller
         .resolve_target(
