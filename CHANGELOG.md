@@ -2,9 +2,9 @@
 
 ## Unreleased
 
-- Packets reuse one repository identity snapshot while selecting a response, avoiding repeated Git status scans within the same request.
-
 ## 0.18.0
+
+- Packets reuse one repository identity snapshot while selecting a response, avoiding repeated Git status scans within the same request.
 
 - Packets can finish selecting their response during the last second of their time allowance instead of being refused early.
 
