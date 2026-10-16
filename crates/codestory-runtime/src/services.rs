@@ -5130,6 +5130,14 @@ pub(crate) mod activation_tests {
                 .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
                 .expect("publish complete Core");
         }
+        let retrieval_pointer =
+            codestory_store::CorePublicationLayout::from_storage_path(&storage_path)
+                .expect("Core layout")
+                .retrieval_publication_path();
+        if retrieval_pointer.exists() {
+            fs::remove_file(&retrieval_pointer).expect("remove fixture retrieval publication pointer");
+        }
+        assert!(!retrieval_pointer.exists());
         let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
         runtime
             .project_service()
@@ -5138,10 +5146,6 @@ pub(crate) mod activation_tests {
                 storage_path.clone(),
             )
             .expect("fresh controller attaches only complete Core");
-        let retrieval_pointer =
-            codestory_store::CorePublicationLayout::from_storage_path(&storage_path)
-                .expect("Core layout")
-                .retrieval_publication_path();
         assert!(!retrieval_pointer.exists());
         assert!(runtime.controller.state.lock().search_engine.is_none());
         let browser = runtime.browser_service();
