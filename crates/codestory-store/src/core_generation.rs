@@ -335,6 +335,8 @@ pub(crate) fn copy_legacy_rollback_snapshot(
         OpenFlags::SQLITE_OPEN_READ_ONLY,
     )?;
     input.busy_timeout(Duration::from_millis(2_500))?;
+    // Hold one source snapshot so later backup steps cannot restart its read.
+    input.execute_batch("BEGIN DEFERRED TRANSACTION; PRAGMA user_version;")?;
     let reserved = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -941,6 +943,80 @@ mod tests {
             fs::read(destination).expect("copied stage"),
             b"immutable generation"
         );
+    }
+
+    #[test]
+    fn legacy_backup_pins_read_only_and_live_wal_sources() {
+        for read_only in [true, false] {
+            let root = tempfile::TempDir::new().expect("tempdir");
+            let source = root.path().join("legacy.db");
+            let destination = root.path().join("rollback.db");
+            let connection = rusqlite::Connection::open(&source).expect("legacy database");
+            connection
+                .execute_batch(
+                    "PRAGMA journal_mode=WAL;
+                     PRAGMA wal_autocheckpoint=0;
+                     CREATE TABLE backup_probe (value INTEGER, payload BLOB);
+                     INSERT INTO backup_probe VALUES (1, zeroblob(262144));",
+                )
+                .expect("multi-step source with committed WAL pages");
+            let writer = if read_only {
+                drop(connection);
+                make_file_immutable(&source).expect("read-only source");
+                None
+            } else {
+                Some(connection)
+            };
+            let original = fs::read(&source).expect("source bytes");
+            let polls = std::cell::Cell::new(0);
+            copy_legacy_rollback_snapshot(&source, &destination, &|| {
+                polls.set(polls.get() + 1);
+                if polls.get() == 2
+                    && let Some(writer) = &writer
+                {
+                    writer
+                        .execute("UPDATE backup_probe SET value = 2", [])
+                        .expect("concurrent WAL commit");
+                }
+                // Bound a regression that restarts forever without completing.
+                polls.get() > 128
+            })
+            .expect("copy one pinned source snapshot");
+            let copied = rusqlite::Connection::open(&destination).expect("copied database");
+            let actual: (i64, i64) = copied
+                .query_row(
+                    "SELECT value, length(payload) FROM backup_probe",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("copied source row");
+            assert_eq!(actual, (1, 262144));
+            if let Some(writer) = writer {
+                assert_eq!(
+                    writer
+                        .query_row("SELECT value FROM backup_probe", [], |row| row
+                            .get::<_, i64>(0))
+                        .expect("changed live source"),
+                    2
+                );
+            } else {
+                assert_eq!(fs::read(&source).expect("source unchanged"), original);
+                assert!(
+                    fs::metadata(&source)
+                        .expect("source mode")
+                        .permissions()
+                        .readonly()
+                );
+            }
+            let polls = std::cell::Cell::new(0);
+            let cancelled =
+                copy_legacy_rollback_snapshot(&source, &root.path().join("cancelled.db"), &|| {
+                    polls.set(polls.get() + 1);
+                    polls.get() == 2
+                })
+                .expect_err("cancellation must still stop a multi-step copy");
+            assert!(cancelled.to_string().contains("cancelled"));
+        }
     }
 
     #[test]

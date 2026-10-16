@@ -42,6 +42,16 @@ impl Fixture {
                 .unwrap_or(0)
                 > 0
         );
+        // Migrating a real legacy-layout core produces the retirement receipt.
+        let seed_database =
+            codestory_runtime::resolve_core_database_path(&fixture.cache.join("codestory.db"))
+                .expect("seeded core");
+        let migrated_cache = fixture._root.path().join("migrated-cache");
+        fs::create_dir(&migrated_cache).expect("migration cache");
+        fs::copy(&seed_database, migrated_cache.join("codestory.db"))
+            .expect("read-only legacy core");
+        fixture.cache = migrated_cache;
+        fixture.success(&["index", "--refresh", "full", "--format", "json"]);
         let pointer: Value = serde_json::from_slice(
             &fs::read(fixture.cache.join("core/publication.json")).expect("complete pointer"),
         )

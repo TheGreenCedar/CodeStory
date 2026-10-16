@@ -224,6 +224,7 @@ fn index_workspace(workspace: &Path, cache_dir: &Path) {
         &["index", "--refresh", "full", "--format", "json"],
     );
     assert_success(&index, "index command failed");
+    test_support::publish_agent_query_fixture(workspace, cache_dir);
 }
 
 fn parse_stdout_json(output: &std::process::Output) -> Value {

@@ -2776,7 +2776,7 @@ pub fn changed_after_index() -> bool {
         String::from_utf8_lossy(&query.stderr)
     );
     assert!(
-        query_output.contains("graph requires a fresh complete core publication"),
+        query_output.contains("graph_assisted requires a fresh complete core publication"),
         "query must remain fail-closed on the stale source after affected observation: {query_output}"
     );
 
@@ -3115,6 +3115,7 @@ fn bookmarks_degrade_gracefully_after_reindex_removes_target() {
         "bookmark list should report a typed orphan reason: {bookmarks:#}"
     );
 
+    test_support::publish_agent_query_fixture(workspace.path(), cache_dir.path());
     let context = run_cli(
         workspace.path(),
         cache_dir.path(),

@@ -4247,23 +4247,23 @@ mod tests {
         use sha2::{Digest, Sha256};
 
         for source in [
-            "pub fn focused_source_anchor() -> &'static str {\n    \"retained-source-body\"\n}\n"
+            "function focused_source_anchor() {\n    return \"retained-source-body\";\n}\n"
                 .to_owned(),
             format!(
-                "pub fn focused_source_anchor() -> &'static str {{\n    \"retained-source-body{}\"\n}}\n",
+                "function focused_source_anchor() {{\n    return \"retained-source-body{}\";\n}}\n",
                 "界".repeat(12_000)
             ),
         ] {
             let project = tempfile::tempdir().expect("project");
             let state = tempfile::tempdir().expect("isolated state");
-            let source_path = project.path().join("fixture.rs");
+            let source_path = project.path().join("fixture.js");
             fs::write(&source_path, &source).expect("source");
             let storage_path = state.path().join("codestory.db");
             let mut store = Store::open(&storage_path).expect("store");
             let file = FileInfo {
                 id: 10,
                 path: source_path.clone(),
-                language: "rust".into(),
+                language: "javascript".into(),
                 modification_time: codestory_workspace::clamp_system_time_to_epoch_millis(
                     fs::metadata(&source_path)
                         .expect("metadata")

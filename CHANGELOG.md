@@ -4,6 +4,8 @@
 
 ## 0.18.0
 
+- Refreshing a legacy index keeps one database snapshot during the copy, avoiding repeated restarts when the old database is read-only or changes during the copy.
+
 - Packets retain already found evidence when optional call metadata reaches its deadline, with the incomplete retrieval recorded instead of discarding the results.
 
 - ID-based navigation reports exact matches instead of labelling correctly selected IDs as fuzzy.
