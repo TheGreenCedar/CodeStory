@@ -1,7 +1,7 @@
 {
   "calibration_required_values": {
     "capacity_retry_policy": {
-      "retry_after_ms": 100,
+      "retry_after_ms": 99,
       "retry_class": "after_capacity_change",
       "retry_condition_source": "named_condition_from_typed_capacity_response"
     },
@@ -43,7 +43,22 @@
     "query_queue_capacity": 64,
     "true_idle_observation_grace_ms": 2500
   },
-  "freeze_record": null,
+  "freeze_record": {
+    "calibration_bundle_sha256": "7de20c0063229c2c925c48fff0e629d980d00221f5b13321daf09a7d40b4ef73",
+    "calibration_freeze_digest": "e276e92783c947c554b5a6ffd1813e5baf35bc5d7ff148e251aacc241770a970",
+    "input_constant_set_sha256": "7a8bb8bfc64e805d3b3c59fd582ab2a3502110ab360ba0e0dddc951e92ef6f60",
+    "measurement_protocol_sha256": "9eb303b6204ca6218e97ae299356370b16921a485350146fe85203a298e59269",
+    "protocol_sha256": "8a13ce655901ed8bc3b3b7f83a5bdb684719e204e1699afa33fc0e540a9a28f8",
+    "run_artifact_sha256s": [
+      "37d37eb79f82cc198c7d1600a4cba964f741881934d0c43781976983e2dc0469",
+      "71db78585207520fe4e00ce7d30db312e1befd1fd31aba17ed7fcd62508df7f1",
+      "97a13e30f195d1ecf649620717e41065af53207c6fb77db053733acd097f5338"
+    ],
+    "selected_at": "github-actions-run:38886318343:1",
+    "selection_rule": "constant_only_three_fresh_generations_one_sample_each+slow_host_floors_v2",
+    "selection_source_commit": "12e1c22e878b169efda2afd0e022eaf01947a825",
+    "selection_source_tree": "520189cf4cf7fd8a1ca5e6a08b3dc568c7f35f1b"
+  },
   "qualification_threshold_overrides": {
     "protected_windows_x64_vulkan": {
       "existing_owner_connect": 125,
@@ -66,5 +81,5 @@
   },
   "schema_version": 1,
   "selection_protocol": "codestory-per-user-embedding-server-v1",
-  "status": "unfrozen"
+  "status": "frozen"
 }
