@@ -1,6 +1,6 @@
 ---
 name: codestory-grounding
-description: Use when discovering repository structure, tracing relationships, analyzing change impact, or validating CodeStory retrieval or an installed plugin through the CodeStory plugin MCP. Skip only for bounded inspection or editing of named files that does not require those operations.
+description: Use when discovering repository structure, tracing relationships, analyzing change impact, or validating CodeStory retrieval or an installed plugin through the CodeStory plugin MCP. Skip only for bounded inspection or editing of named files that does not require those operations. If tool discovery is needed in code mode, inspect a known operation's complete declaration by exact name or print names only before selecting complete declarations. Use this skill's lossless result-display example, retaining distinct content and metadata.
 ---
 
 # CodeStory Grounding
