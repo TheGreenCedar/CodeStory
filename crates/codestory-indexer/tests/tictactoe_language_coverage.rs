@@ -952,6 +952,64 @@ class HumanPlayer implements Player {
 }
 
 #[test]
+fn go_member_access_follows_the_member_export_name() -> Result<()> {
+    let source = r#"
+package boundary
+type PublicOwner struct{}
+type privateOwner struct{}
+// public
+func (o *PublicOwner) hidden() {}
+func (o *PublicOwner) Exported() {}
+func (o privateOwner) ExportedFromPrivateOwner() {}
+func (o privateOwner) hiddenFromPrivateOwner() {}
+// private
+func (o *PublicOwner) ExportedWithPrivateComment() {}
+func (o *PublicOwner) Private() {}
+func (o *PublicOwner) Éxported() {}
+func (o *PublicOwner) éxported() {}
+func (o *PublicOwner) ǅtitlecase() {}
+func (o *PublicOwner) ᴬmodifier() {}
+func (o *PublicOwner) _hidden() {}
+type Boundary interface {
+    ExportedInterface()
+    hiddenInterface()
+}
+"#;
+    let config = get_language_for_ext("go").expect("Go parser");
+    let result = index_file(Path::new("boundary.go"), source, &config, None, None)?;
+    for (name, expected) in [
+        ("hidden", AccessKind::Private),
+        ("Exported", AccessKind::Public),
+        ("ExportedFromPrivateOwner", AccessKind::Public),
+        ("hiddenFromPrivateOwner", AccessKind::Private),
+        ("ExportedWithPrivateComment", AccessKind::Public),
+        ("Private", AccessKind::Public),
+        ("Éxported", AccessKind::Public),
+        ("éxported", AccessKind::Private),
+        ("ǅtitlecase", AccessKind::Private),
+        ("ᴬmodifier", AccessKind::Private),
+        ("_hidden", AccessKind::Private),
+        ("ExportedInterface", AccessKind::Public),
+        ("hiddenInterface", AccessKind::Private),
+    ] {
+        let node = result
+            .nodes
+            .iter()
+            .find(|node| {
+                node.kind == NodeKind::METHOD
+                    && node.serialized_name.rsplit('.').next() == Some(name)
+            })
+            .unwrap_or_else(|| panic!("missing Go method {name}"));
+        let actual = result
+            .component_access
+            .iter()
+            .find_map(|(id, access)| (*id == node.id).then_some(*access));
+        assert_eq!(actual, Some(expected), "Go member {name}");
+    }
+    Ok(())
+}
+
+#[test]
 fn test_cpp_access_specifiers_are_captured_from_rules() -> Result<()> {
     let source = r#"
 class Widget {

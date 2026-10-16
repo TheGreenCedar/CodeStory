@@ -32,6 +32,7 @@ use crate::stdio_catalog::{
     resources_list_json as stdio_resources_list_json, tools_list_json as stdio_tools_list_json,
 };
 pub(crate) use artifacts::preflight_output_file;
+pub(crate) use lifecycle::open_target_surface;
 use resolution::{
     StructuredCommandFailure, command_failure_details_markdown, command_failure_envelope,
     command_failure_message, emit_command_failure, generic_command_failure, json_output_requested,

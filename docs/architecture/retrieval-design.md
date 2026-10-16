@@ -5,6 +5,36 @@ one complete retrieval generation, and one live embedding engine agree.
 Artifact completeness, producer identity, and live execution are separate
 proofs; none can substitute for another.
 
+## Ranking and packet source eligibility
+
+`weighted_rrf_v4_present_lanes_scaled_broad_eligible` normalizes reciprocal ranks over the
+positive-weight lanes present for each identity. Dense membership is selective,
+so absent membership contributes no negative vote. A singleton lane winner can
+tie a winner shared by several lanes: this policy removes the lane-cardinality
+bonus and does not infer absolute reliability from ranks. A common per-query
+scale, strongest configured lane divided by configured total weight, preserves
+the strongest single-lane amplitude relative to the unchanged auxiliary
+features. Weaker singleton lanes can still rise relative to the prior policy;
+this is a calibration tradeoff, not a claim of unchanged rankings. Typed graph support,
+text quality, requested roles, overlap and exact selectors retain their separate
+contracts. Ranking policy participates in the in-memory cache fingerprint and
+the packet score-version receipt.
+
+Broad-question retrieval admits matching candidates across effective file roles.
+Adding a primary source candidate does not remove an already eligible test,
+benchmark, generated, or vendor candidate. Strict literal queries retain their
+role exclusions. Eligibility does not reserve packet space: the shared ranking,
+identity and byte limits can still displace useful evidence. This policy does
+not establish improved delivered coverage or answer quality.
+
+Generated component reports remain navigation evidence. They cannot claim a
+source byte reservation. Lexical symbols reserve source only with a positive
+line point; real lexical source-file rows keep their path route. Published dense
+source anchors retain their legacy bound because that schema has no line
+metadata. Fusion transfers bounds only between compatible identity, path and
+location metadata, retaining the larger bound. None of these checks opens Core
+before admission or changes the packet identity and source-byte caps.
+
 ## Engine scope
 
 Release executables contain the checksum-pinned CodeRankEmbed Q8 GGUF model and
@@ -81,7 +111,15 @@ flowchart LR
 ```
 
 Model state is shared for efficiency; source, vectors, manifests, identities,
-and retention remain project-owned.
+and retention remain project-owned. The current and rollback publication records
+carry the producer's artifact scope atomically with their Core bindings. An agent
+consumer resolves that scope independently of its request profile and run; its
+Full readiness and accelerator policy still apply. Query leases, status, rollback,
+and cleanup use the resolved scope and the process-captured global cache fence.
+Legacy records without scope are admitted only from the selected scope or an
+owner-registered canonical local scope whose vector metadata authenticates the
+exact Core and retrieval generations. Ambiguous or unauthenticated origins fail
+closed. Observational reads never backfill metadata or move artifacts.
 
 ## Publication identity
 
@@ -89,7 +127,8 @@ and retention remain project-owned.
 
 - core `generation_id` and `run_id`;
 - retrieval generation and input hash;
-- semantic generation.
+- semantic generation;
+- producer artifact scope (local or captured workspace/run), when recorded.
 
 The manifest additionally records lexical/source fingerprints, graph artifact
 identity, counts, schema and policy versions, and a versioned embedding producer

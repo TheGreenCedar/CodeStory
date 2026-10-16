@@ -434,6 +434,7 @@ fn symbol_to_hit(
         file_role: None,
         scip_hop_distance: Some(hop),
         graph_evidence,
+        published_calls: None,
         rank_features: None,
     };
     hit.record_lane(

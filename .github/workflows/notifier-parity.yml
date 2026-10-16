@@ -36,6 +36,9 @@ jobs:
       - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref || github.sha }}
+      - name: Reconstruct pinned native source
+        uses: ./.github/actions/native-source
+
       - name: Install pinned Rust
         shell: bash
         run: |
@@ -61,6 +64,9 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
       # The self-hosted Windows service account runs under the default Restricted
       # execution policy, so every run step carries the bypass shell.
+      - name: Reconstruct pinned native source
+        uses: ./.github/actions/native-source
+
       - name: Install pinned Rust
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
@@ -91,6 +97,9 @@ jobs:
       # The WSL runner service does not inherit the interactive shell's user
       # toolchain paths even though the pinned Rust and native build dependencies
       # live there.
+      - name: Reconstruct pinned native source
+        uses: ./.github/actions/native-source
+
       - name: Expose the protected-host toolchain
         shell: bash
         run: |

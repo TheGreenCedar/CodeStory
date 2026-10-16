@@ -13,7 +13,7 @@ node FUNCTION name=Notifier.notify qn=Notifier.notify canonical=<ROOT>/fidelity.
 node FUNCTION name=Repository.save qn=Repository.save canonical=<ROOT>/fidelity.py:Repository.save#0 line=33 col=5 end=34:25 file=FILE:<ROOT>/fidelity.py@1
 node FUNCTION name=Repository.track qn=Repository.track canonical=<ROOT>/fidelity.py:Repository.track#0 line=36 col=5 end=37:17 file=FILE:<ROOT>/fidelity.py@1
 node FUNCTION name=Workflow.decorate qn=Workflow.decorate canonical=<ROOT>/fidelity.py:Workflow.decorate#0 line=58 col=5 end=59:53 file=FILE:<ROOT>/fidelity.py@1
-node FUNCTION name=Workflow.run qn=Workflow.run canonical=<ROOT>/fidelity.py:Workflow.run#0 line=47 col=5 end=50:29 file=FILE:<ROOT>/fidelity.py@1
+node FUNCTION name=Workflow.run qn=Workflow.run canonical=<ROOT>/fidelity.py:Workflow.run#0 line=46 col=5 end=50:29 file=FILE:<ROOT>/fidelity.py@1
 node FUNCTION name=Workflow.run_async qn=Workflow.run_async canonical=<ROOT>/fidelity.py:Workflow.run_async#0 line=52 col=5 end=56:46 file=FILE:<ROOT>/fidelity.py@1
 node FUNCTION name=orchestrate qn=orchestrate canonical=<ROOT>/fidelity.py:orchestrate#0 line=62 col=1 end=68:60 file=FILE:<ROOT>/fidelity.py@1
 node FUNCTION name=trace qn=trace canonical=<ROOT>/fidelity.py:trace#0 line=12 col=1 end=16:19 file=FILE:<ROOT>/fidelity.py@1
@@ -60,17 +60,17 @@ edge CALL src=FUNCTION:Repository.save@33 dst=FUNCTION:Repository.track@36 resol
 edge CALL src=FUNCTION:Workflow.decorate@58 dst=UNKNOWN:float@59 resolved_src=FUNCTION:Workflow.decorate@58 resolved_dst=- line=59 confidence=- certainty=- callsite=h0:59:30:h3 candidates=[]
 edge CALL src=FUNCTION:Workflow.decorate@58 dst=UNKNOWN:len@59 resolved_src=FUNCTION:Workflow.decorate@58 resolved_dst=- line=59 confidence=- certainty=- callsite=h0:59:36:h4 candidates=[]
 edge CALL src=FUNCTION:Workflow.decorate@58 dst=UNKNOWN:sqrt@59 resolved_src=FUNCTION:Workflow.decorate@58 resolved_dst=- line=59 confidence=- certainty=- callsite=h0:59:25:h5|syntax:python-attribute-call candidates=[]
-edge CALL src=FUNCTION:Workflow.run@47 dst=FUNCTION:Notifier.notify@20 resolved_src=FUNCTION:Workflow.run@47 resolved_dst=FUNCTION:Notifier.notify@20 line=48 confidence=1.0000 certainty=Certain callsite=h0:48:1:h6 candidates=[]
-edge CALL src=FUNCTION:Workflow.run@47 dst=FUNCTION:Repository.save@33 resolved_src=FUNCTION:Workflow.run@47 resolved_dst=FUNCTION:Repository.save@33 line=49 confidence=1.0000 certainty=Certain callsite=h0:49:1:h7 candidates=[]
-edge CALL src=FUNCTION:Workflow.run@47 dst=FUNCTION:Workflow.decorate@58 resolved_src=FUNCTION:Workflow.run@47 resolved_dst=FUNCTION:Workflow.decorate@58 line=50 confidence=1.0000 certainty=Certain callsite=h0:50:1:h8 candidates=[]
-edge CALL src=FUNCTION:Workflow.run@47 dst=FUNCTION:trace@12 resolved_src=FUNCTION:Workflow.run@47 resolved_dst=FUNCTION:trace@12 line=46 confidence=0.9500 certainty=Certain callsite=h0:46:1:h9 candidates=[]
-edge CALL src=FUNCTION:Workflow.run@47 dst=FUNCTION:trace@46 resolved_src=FUNCTION:Workflow.run@47 resolved_dst=FUNCTION:trace@12 line=0 confidence=0.9500 certainty=Certain callsite=h0:0:1:h10 candidates=[]
+edge CALL src=FUNCTION:Workflow.run@46 dst=FUNCTION:Notifier.notify@20 resolved_src=FUNCTION:Workflow.run@46 resolved_dst=FUNCTION:Notifier.notify@20 line=48 confidence=1.0000 certainty=Certain callsite=h0:48:1:h6 candidates=[]
+edge CALL src=FUNCTION:Workflow.run@46 dst=FUNCTION:Repository.save@33 resolved_src=FUNCTION:Workflow.run@46 resolved_dst=FUNCTION:Repository.save@33 line=49 confidence=1.0000 certainty=Certain callsite=h0:49:1:h7 candidates=[]
+edge CALL src=FUNCTION:Workflow.run@46 dst=FUNCTION:Workflow.decorate@58 resolved_src=FUNCTION:Workflow.run@46 resolved_dst=FUNCTION:Workflow.decorate@58 line=50 confidence=1.0000 certainty=Certain callsite=h0:50:1:h8 candidates=[]
+edge CALL src=FUNCTION:Workflow.run@46 dst=FUNCTION:trace@12 resolved_src=FUNCTION:Workflow.run@46 resolved_dst=FUNCTION:trace@12 line=46 confidence=0.9500 certainty=Certain callsite=h0:46:1:h9 candidates=[]
+edge CALL src=FUNCTION:Workflow.run@46 dst=FUNCTION:trace@46 resolved_src=FUNCTION:Workflow.run@46 resolved_dst=FUNCTION:trace@12 line=0 confidence=0.9500 certainty=Certain callsite=h0:0:1:h10 candidates=[]
 edge CALL src=FUNCTION:Workflow.run_async@52 dst=FUNCTION:Notifier.notify@20 resolved_src=FUNCTION:Workflow.run_async@52 resolved_dst=FUNCTION:Notifier.notify@20 line=54 confidence=1.0000 certainty=Certain callsite=h0:54:1:h6 candidates=[]
-edge CALL src=FUNCTION:Workflow.run_async@52 dst=FUNCTION:Workflow.run@47 resolved_src=FUNCTION:Workflow.run_async@52 resolved_dst=FUNCTION:Workflow.run@47 line=56 confidence=1.0000 certainty=Certain callsite=h0:56:1:h11 candidates=[]
+edge CALL src=FUNCTION:Workflow.run_async@52 dst=FUNCTION:Workflow.run@46 resolved_src=FUNCTION:Workflow.run_async@52 resolved_dst=FUNCTION:Workflow.run@46 line=56 confidence=1.0000 certainty=Certain callsite=h0:56:1:h11 candidates=[]
 edge CALL src=FUNCTION:Workflow.run_async@52 dst=UNKNOWN:picker@54 resolved_src=FUNCTION:Workflow.run_async@52 resolved_dst=- line=54 confidence=- certainty=- callsite=h0:54:25:h12 candidates=[]
 edge CALL src=FUNCTION:Workflow.run_async@52 dst=UNKNOWN:sleep@55 resolved_src=FUNCTION:Workflow.run_async@52 resolved_dst=- line=55 confidence=- certainty=- callsite=h0:55:23:h13|syntax:python-attribute-call candidates=[]
 edge CALL src=FUNCTION:Workflow.run_async@52 dst=UNKNOWN:upper@53 resolved_src=FUNCTION:Workflow.run_async@52 resolved_dst=- line=53 confidence=- certainty=- callsite=h0:53:62:h14|syntax:python-attribute-call candidates=[]
-edge CALL src=FUNCTION:orchestrate@62 dst=FUNCTION:Workflow.run@47 resolved_src=FUNCTION:orchestrate@62 resolved_dst=FUNCTION:Workflow.run@47 line=68 confidence=1.0000 certainty=Certain callsite=h0:68:1:h11 candidates=[]
+edge CALL src=FUNCTION:orchestrate@62 dst=FUNCTION:Workflow.run@46 resolved_src=FUNCTION:orchestrate@62 resolved_dst=FUNCTION:Workflow.run@46 line=68 confidence=1.0000 certainty=Certain callsite=h0:68:1:h11 candidates=[]
 edge CALL src=FUNCTION:orchestrate@62 dst=UNKNOWN:ConsoleNotifier@65 resolved_src=FUNCTION:orchestrate@62 resolved_dst=- line=65 confidence=- certainty=- callsite=h0:65:16:h15 candidates=[]
 edge CALL src=FUNCTION:orchestrate@62 dst=UNKNOWN:Event@63 resolved_src=FUNCTION:orchestrate@62 resolved_dst=- line=63 confidence=- certainty=- callsite=h0:63:24:h16 candidates=[]
 edge CALL src=FUNCTION:orchestrate@62 dst=UNKNOWN:Repository@66 resolved_src=FUNCTION:orchestrate@62 resolved_dst=- line=66 confidence=- certainty=- callsite=h0:66:37:h17 candidates=[]
@@ -90,5 +90,5 @@ edge MEMBER src=CLASS:Notifier@19 dst=FUNCTION:Notifier.notify@20 resolved_src=-
 edge MEMBER src=CLASS:Repository@32 dst=FUNCTION:Repository.save@33 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 edge MEMBER src=CLASS:Repository@32 dst=FUNCTION:Repository.track@36 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 edge MEMBER src=CLASS:Workflow@45 dst=FUNCTION:Workflow.decorate@58 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=CLASS:Workflow@45 dst=FUNCTION:Workflow.run@47 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=CLASS:Workflow@45 dst=FUNCTION:Workflow.run@46 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 edge MEMBER src=CLASS:Workflow@45 dst=FUNCTION:Workflow.run_async@52 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]

@@ -14,7 +14,8 @@
 use anyhow::{Result, anyhow};
 use codestory_contracts::graph::{
     AccessKind, CallableProjectionState, Edge, EdgeId, EdgeKind, FileCoverageReason, Node, NodeId,
-    NodeKind, Occurrence, OccurrenceKind, ResolutionCertainty, SourceLocation,
+    NodeKind, Occurrence, OccurrenceKind, RUST_ORDINAL_CANONICAL_ID_PREFIX, ResolutionCertainty,
+    SourceLocation,
 };
 use codestory_contracts::language_support::normalize_extension;
 use codestory_contracts::workspace::{OversizedSourceExclusionCandidate, SourceIndexPolicy};
@@ -22,6 +23,7 @@ use codestory_store::{
     IndexArtifactCacheReader, IndexArtifactCacheWrite, StorageError, Store as Storage,
 };
 use crossbeam_channel::{Receiver, SendTimeoutError, bounded};
+use finl_unicode::categories::CharacterCategories;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -652,15 +654,10 @@ pub(crate) fn normalized_path_extension(path: &Path) -> Option<String> {
 }
 
 fn header_source_has_cpp_signals(source: &str) -> bool {
-    source
-        .lines()
-        .map(str::trim)
-        .filter(|line| {
-            !line.is_empty()
-                && !line.starts_with("//")
-                && !line.starts_with("/*")
-                && !line.starts_with('*')
-        })
+    strip_c_style_comments_inner(source, true)
+        .iter()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
         .any(|line| {
             line.starts_with("class ")
                 || line.starts_with("namespace ")
@@ -1498,16 +1495,32 @@ impl<'a> ProjectionWriter<'a> {
                 &existing_states,
                 &local_storage.callable_projection_states,
             );
+            let mut extraction_changed = false;
+            for identity in &local_storage.file_extraction_identities {
+                extraction_changed |= !self
+                    .storage
+                    .file_extraction_identity_matches(
+                        identity.file_id,
+                        &identity.language,
+                        &identity.extraction_revision,
+                    )
+                    .map_err(|error| {
+                        anyhow!("Storage extraction identity lookup error: {error}")
+                    })?;
+            }
             let access_only = component_access_changed
+                && !extraction_changed
                 && file_complete
                 && compatible_file_metadata
                 && matches!(&classified_mode, ProjectionUpdateMode::NoChanges);
-            let update_mode =
-                if replace_file_owned_projection || component_access_changed && !access_only {
-                    ProjectionUpdateMode::FullReplace
-                } else {
-                    classified_mode
-                };
+            let update_mode = if extraction_changed
+                || replace_file_owned_projection
+                || component_access_changed && !access_only
+            {
+                ProjectionUpdateMode::FullReplace
+            } else {
+                classified_mode
+            };
             source_identity_only = matches!(&update_mode, ProjectionUpdateMode::NoChanges)
                 && compatible_file_metadata
                 && !component_access_changed;
@@ -1547,6 +1560,7 @@ impl<'a> ProjectionWriter<'a> {
                 local_storage
                     .nodes
                     .retain(|node| node.id != NodeId(file_id));
+                local_storage.file_extraction_identities.clear();
                 self.stats.graph_projection_changed = true;
             } else {
                 let cleanup_started = Instant::now();
@@ -1614,6 +1628,9 @@ impl<'a> ProjectionWriter<'a> {
             // semantics while keeping the store batch contract unambiguous.
             self.batched_storage
                 .file_content_hashes
+                .retain(|identity| !incoming_file_ids.contains(&identity.file_id));
+            self.batched_storage
+                .file_extraction_identities
                 .retain(|identity| !incoming_file_ids.contains(&identity.file_id));
             self.batched_storage
                 .structural_text_units
@@ -2118,7 +2135,7 @@ impl WorkspaceIndexer {
             .saturating_add(duration_ms_u64(type_usage_finalize_started.elapsed()));
 
         // 3.5 Resolve call/import edges post-pass
-        let (resolution_scope_file_ids, expanded_resolution_scope_files) =
+        let (mut resolution_scope_file_ids, expanded_resolution_scope_files) =
             if plan.mode == codestory_workspace::BuildMode::Incremental {
                 let mut file_ids = Self::collect_touched_file_ids(&root, &plan.files_to_index);
                 // Expansion looks for callers unblocked by *new* definitions, so
@@ -2133,13 +2150,29 @@ impl WorkspaceIndexer {
             } else {
                 (HashSet::new(), 0)
             };
+        // Module ownership can invalidate or newly enable a qualified call in an
+        // unchanged file, including a removal-only refresh with no new edges.
+        let mut rust_qualified_caller_files = HashSet::new();
+        let prepared_resolver = if stats.graph_projection_changed || go_return_inputs_changed {
+            let resolver = resolution::ResolutionPass::for_workspace(&root, storage)?;
+            let (invalidated, caller_files) =
+                resolver.invalidate_changed_rust_qualified_call_resolutions(storage)?;
+            stats.graph_projection_changed |= invalidated > 0;
+            rust_qualified_caller_files = caller_files;
+            resolution_scope_file_ids.extend(rust_qualified_caller_files.iter().copied());
+            Some(resolver)
+        } else {
+            None
+        };
         if (stats.graph_projection_changed || go_return_inputs_changed)
             && (had_edges
                 || expanded_resolution_scope_files > 0
                 || !removal_affected_caller_file_ids.is_empty()
-                || go_return_inputs_changed)
+                || go_return_inputs_changed
+                || !rust_qualified_caller_files.is_empty())
         {
-            let resolver = resolution::ResolutionPass::for_workspace(&root, storage)?;
+            let resolver =
+                prepared_resolver.expect("graph changes prepared the resolution context");
             let resolution_scope = if go_return_inputs_changed {
                 // Factory signatures and module ownership can change without a
                 // caller source byte changing. Reset and recompute this narrow
@@ -3107,6 +3140,7 @@ impl WorkspaceIndexer {
         let projection_batch = codestory_store::ProjectionBatch {
             files: &batched_storage.files,
             file_content_hashes: &batched_storage.file_content_hashes,
+            file_extraction_identities: &batched_storage.file_extraction_identities,
             nodes: &batched_storage.nodes,
             structural_text_units: &batched_storage.structural_text_units,
             structural_text_projections: &batched_storage.structural_text_projections,
@@ -3332,6 +3366,29 @@ impl WorkspaceIndexer {
         };
         let content_hash = source_content_hash(&bytes);
         let source_utf8_exact = std::str::from_utf8(&bytes).is_ok();
+        let existing_projection_id = if let Some(revision) =
+            current_file_extraction_revision(language_config.language_name)
+        {
+            existing_projection_id.filter(|file_id| {
+                cache_access.storage_mut().is_some_and(|storage| {
+                    storage
+                        .file_extraction_identity_matches(
+                            *file_id,
+                            language_config.language_name,
+                            revision,
+                        )
+                        .unwrap_or(false)
+                        && storage
+                            .get_file_content_hash(*file_id)
+                            .ok()
+                            .flatten()
+                            .as_deref()
+                            == Some(content_hash.as_str())
+                })
+            })
+        } else {
+            existing_projection_id
+        };
         // Inspect the parser source before building the cache key so source-aware header
         // detection chooses the same language that will be used for indexing. The key remains
         // bound to the raw bytes even when ordinary graph indexing uses a lossy view.
@@ -3487,6 +3544,9 @@ impl WorkspaceIndexer {
                                 file_id: file_info.id,
                                 content_hash,
                             });
+                    }
+                    if source_utf8_exact {
+                        add_current_file_extraction_identities(&mut local_storage);
                     }
                     Ok(PreparedIndexWork::Immediate(local_storage))
                 }
@@ -4002,6 +4062,9 @@ impl WorkspaceIndexer {
                             content_hash: prepared_input.content_hash.clone(),
                         });
                 }
+                if prepared_input.source_utf8_exact {
+                    add_current_file_extraction_identities(&mut local_storage);
+                }
                 PreparedIndexJobResult {
                     local_storage,
                     cache_write,
@@ -4274,12 +4337,50 @@ fn source_content_hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// Current extraction revisions requiring durable per-file compatibility checks.
+pub fn current_file_extraction_revision(language: &str) -> Option<&'static str> {
+    match language {
+        "python" => Some(languages::python::CALLABLE_DECLARATION_REVISION),
+        "rust" => Some(languages::rust::CALLABLE_DECLARATION_REVISION),
+        _ => None,
+    }
+}
+
+fn add_current_file_extraction_identities(storage: &mut IntermediateStorage) {
+    for file in &storage.files {
+        if !file.indexed || !file.complete {
+            continue;
+        }
+        let Some(revision) = current_file_extraction_revision(&file.language) else {
+            continue;
+        };
+        let Some(hash) = storage
+            .file_content_hashes
+            .iter()
+            .find(|hash| hash.file_id == file.id)
+        else {
+            continue;
+        };
+        storage
+            .file_extraction_identities
+            .push(codestory_store::FileExtractionIdentity {
+                file_id: file.id,
+                language: file.language.clone(),
+                source_content_hash: hash.content_hash.clone(),
+                extraction_revision: revision.to_string(),
+            });
+    }
+}
+
 fn resolution_parser_fingerprint(language_config: &LanguageConfig) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"codestory-proof-parser-rules-v4\0");
     hasher.update(language_config.language_name.as_bytes());
     hasher.update(language_config.language.abi_version().to_be_bytes());
     hasher.update(language_config.graph_query.as_bytes());
+    if let Some(revision) = current_file_extraction_revision(language_config.language_name) {
+        hasher.update(revision.as_bytes());
+    }
     if let Some(tags_query) = language_config.tags_query {
         hasher.update(tags_query.as_bytes());
     }
@@ -4407,6 +4508,7 @@ fn duration_ms_u64(duration: std::time::Duration) -> u64 {
 fn projection_batch_has_rows(storage: &IntermediateStorage) -> bool {
     !storage.files.is_empty()
         || !storage.file_content_hashes.is_empty()
+        || !storage.file_extraction_identities.is_empty()
         || !storage.nodes.is_empty()
         || !storage.structural_text_units.is_empty()
         || !storage.structural_text_projections.is_empty()
@@ -4594,7 +4696,12 @@ fn rebase_cached_index_artifact(
     }
 
     let old_file_id = artifact.files.first().map(|file| NodeId(file.id));
-    let (nodes, id_remap) = canonicalize_nodes(&file_identity, artifact.nodes, &HashMap::new());
+    let (nodes, id_remap) = canonicalize_nodes(
+        &file_identity,
+        artifact.nodes,
+        &HashMap::new(),
+        language_name,
+    );
     let new_file_id = old_file_id
         .and_then(|file_id| id_remap.get(&file_id).copied())
         .unwrap_or(rebased_file_id);
@@ -4627,6 +4734,17 @@ fn rebase_cached_index_artifact(
         input.caller = input
             .caller
             .map(|caller| id_remap.get(&caller).copied().unwrap_or(caller));
+        if let Some(path) = &mut input.ordinary_rust_path {
+            path.associated_owner = path
+                .associated_owner
+                .map(|owner| id_remap.get(&owner).copied().unwrap_or(owner));
+            if let Some(import) = &mut path.import {
+                import.import = id_remap
+                    .get(&import.import)
+                    .copied()
+                    .unwrap_or(import.import);
+            }
+        }
         use cache::CachedResolutionBinding;
         input.binding = match input.binding.clone() {
             CachedResolutionBinding::SameFile {
@@ -5639,7 +5757,21 @@ fn graph_capture_span_policy(
     name: &str,
     has_token_surface_edge: bool,
 ) -> NodeSpanPolicy {
-    if rust_impl_expr || has_token_surface_edge {
+    if rust_impl_expr {
+        return NodeSpanPolicy::Token;
+    }
+    if language_name == "rust"
+        && matches!(kind, NodeKind::FUNCTION | NodeKind::METHOD)
+        && matches!(
+            canonical_role,
+            CanonicalNodeRole::Definition
+                | CanonicalNodeRole::Declaration
+                | CanonicalNodeRole::ForwardDeclaration
+        )
+    {
+        return NodeSpanPolicy::Definition;
+    }
+    if has_token_surface_edge {
         return NodeSpanPolicy::Token;
     }
 
@@ -5812,6 +5944,26 @@ struct GraphCaptureNormalizationInput<'a> {
 fn normalize_graph_capture(
     input: &GraphCaptureNormalizationInput<'_>,
 ) -> Option<(String, u32, u32, u32, u32)> {
+    if matches!(input.language_name, "c" | "cpp")
+        && input.kind == NodeKind::MACRO
+        && input.graph_span.end_col == 1
+        && input.graph_span.end_line > input.graph_span.start_line
+    {
+        // Native directive nodes include the terminating newline. Keep the
+        // half-open endpoint on the last directive line so an adjacent
+        // declaration or call cannot fall within this macro's line range.
+        let end_line = input.graph_span.end_line - 1;
+        let line = input.source.split('\n').nth((end_line - 1) as usize)?;
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        return Some((
+            input.name.to_string(),
+            input.graph_span.start_line,
+            input.graph_span.start_col,
+            end_line,
+            line.len() as u32 + 1,
+        ));
+    }
+
     if input.language_name == "rust" && input.rust_impl_expr {
         let (normalized_name, normalized_span) =
             normalize_rust_impl_expr_surface(input.name, input.graph_span)?;
@@ -11411,8 +11563,15 @@ fn canonicalize_nodes(
     file_name: &str,
     final_nodes: Vec<Node>,
     canonical_roles: &HashMap<NodeId, CanonicalNodeRole>,
+    language_name: &str,
 ) -> (Vec<Node>, HashMap<NodeId, NodeId>) {
-    canonicalize_nodes_with_file_identity(file_name, file_name, final_nodes, canonical_roles)
+    canonicalize_nodes_with_file_identity(
+        file_name,
+        file_name,
+        final_nodes,
+        canonical_roles,
+        language_name,
+    )
 }
 
 /// Separator between a qualified name and its declaration ordinal.
@@ -11500,6 +11659,7 @@ fn canonicalize_nodes_with_file_identity(
     file_identity: &str,
     final_nodes: Vec<Node>,
     canonical_roles: &HashMap<NodeId, CanonicalNodeRole>,
+    language_name: &str,
 ) -> (Vec<Node>, HashMap<NodeId, NodeId>) {
     let mut id_remap = HashMap::<NodeId, NodeId>::new();
     let mut grouped_nodes = BTreeMap::<String, Vec<Node>>::new();
@@ -11520,8 +11680,23 @@ fn canonicalize_nodes_with_file_identity(
                 } else if node.kind == NodeKind::FILE {
                     format!("{file_identity}:{file_identity}:1")
                 } else {
-                    let ordinal = ordinals_by_node.get(&node.id).copied().unwrap_or(0);
-                    format!("{file_name}:{qualified_name}{DECLARATION_ORDINAL_SEPARATOR}{ordinal}")
+                    // Cached nodes retain their role-ordered ordinal even though
+                    // the cache does not retain the extraction role map.
+                    let cached_rust_ordinal = (language_name == "rust"
+                        && node.canonical_id.as_deref().is_some_and(|id| {
+                            id.starts_with(RUST_ORDINAL_CANONICAL_ID_PREFIX)
+                        }))
+                    .then(|| canonical_declaration_ordinal(&node))
+                    .flatten();
+                    let ordinal = cached_rust_ordinal
+                        .or_else(|| ordinals_by_node.get(&node.id).copied())
+                        .unwrap_or(0);
+                    let prefix = if language_name == "rust" {
+                        RUST_ORDINAL_CANONICAL_ID_PREFIX
+                    } else {
+                        ""
+                    };
+                    format!("{prefix}{file_name}:{qualified_name}{DECLARATION_ORDINAL_SEPARATOR}{ordinal}")
                 }
             });
         grouped_nodes.entry(canonical_id).or_default().push(node);
@@ -11894,8 +12069,12 @@ fn post_process_index_results(
         );
     }
     // Stage 2: canonicalize nodes and capture the remap used by later repair stages.
-    let (mut final_nodes, id_remap) =
-        canonicalize_nodes(file_name, final_nodes, canonical_role_by_node_id);
+    let (mut final_nodes, id_remap) = canonicalize_nodes(
+        file_name,
+        final_nodes,
+        canonical_role_by_node_id,
+        language_name,
+    );
     let new_file_id = id_remap.get(&file_id).copied().unwrap_or(file_id);
 
     // Stage 3: remap nodes, edges, and occurrences to the canonical IDs.
@@ -11912,7 +12091,39 @@ fn post_process_index_results(
     // Stage 5: rewrite override placeholders after remap so synthetic nodes are canonical.
     rewrite_override_placeholders(new_file_id, &mut final_nodes, result_edges);
     // Stage 6: attribute calls to enclosing callables after the structural rewrites settle.
-    apply_line_range_call_attribution(&final_nodes, result_edges, flags);
+    if language_name == "python" {
+        let declaration_ids = canonical_role_by_node_id
+            .iter()
+            .filter_map(|(id, role)| {
+                matches!(
+                    *role,
+                    CanonicalNodeRole::Definition
+                        | CanonicalNodeRole::Declaration
+                        | CanonicalNodeRole::ForwardDeclaration
+                )
+                .then_some(id_remap.get(id).copied().unwrap_or(*id))
+            })
+            .collect::<HashSet<_>>();
+        let reference_ids = canonical_role_by_node_id
+            .iter()
+            .filter_map(|(id, role)| {
+                let remapped = id_remap.get(id).copied().unwrap_or(*id);
+                (*role == CanonicalNodeRole::Reference && !declaration_ids.contains(&remapped))
+                    .then_some(remapped)
+            })
+            .collect::<HashSet<_>>();
+        // A decorator's FUNCTION reference is a callee, not a lexical owner.
+        // Keep public references and explicit decorator edges; only the owner
+        // candidates exclude references without a canonical declaration.
+        let lexical_nodes = final_nodes
+            .iter()
+            .filter(|node| !reference_ids.contains(&node.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        apply_line_range_call_attribution(&lexical_nodes, result_edges, flags);
+    } else {
+        apply_line_range_call_attribution(&final_nodes, result_edges, flags);
+    }
     // Stage 7: runtime module imports should not retain generic CALL placeholders.
     suppress_runtime_import_call_edges(&final_nodes, result_edges, runtime_import_specs);
 
@@ -12550,6 +12761,7 @@ fn index_template_file(
         &file_identity,
         local_storage.nodes,
         &HashMap::new(),
+        surface_language,
     );
     let new_file_id = id_remap.get(&file_id).copied().unwrap_or(file_id);
     local_storage.nodes = final_nodes;
@@ -12818,7 +13030,7 @@ fn go_symbol_access(name: &str) -> AccessKind {
     if terminal
         .chars()
         .next()
-        .is_some_and(|ch| ch.is_ascii_uppercase())
+        .is_some_and(|ch| ch.is_letter_uppercase())
     {
         AccessKind::Public
     } else {
@@ -13254,6 +13466,10 @@ fn route_language_uses_c_style_comments(language_name: &str) -> bool {
 }
 
 fn strip_c_style_comments(source: &str) -> Vec<String> {
+    strip_c_style_comments_inner(source, false)
+}
+
+fn strip_c_style_comments_inner(source: &str, preserve_separator: bool) -> Vec<String> {
     let mut lines = vec![String::new()];
     let mut chars = source.chars().peekable();
     let mut quote: Option<char> = None;
@@ -13319,6 +13535,15 @@ fn strip_c_style_comments(source: &str) -> Vec<String> {
             }
             if next == '*' {
                 chars.next();
+                if preserve_separator {
+                    // C preprocessing replaces each comment with whitespace.
+                    // Keep adjacent header tokens separate without changing
+                    // the existing framework collector's comment handling.
+                    lines
+                        .last_mut()
+                        .expect("strip_c_style_comments keeps one current line")
+                        .push(' ');
+                }
                 in_block_comment = true;
                 continue;
             }
@@ -16383,6 +16608,10 @@ fn index_file_with_resolution_inputs(
                         AccessKind::Default
                     },
                 )
+            } else if language_config.language_name == "go" && kind == NodeKind::METHOD {
+                // Go exports a method by its own initial, independently of its
+                // receiver's name and any modifier-like text in nearby source.
+                Some(go_symbol_access(&name_str))
             } else {
                 access_kind.or_else(|| {
                     if language_config.language_name == "java"
@@ -16876,9 +17105,6 @@ fn index_file_with_resolution_inputs(
         &mut impl_anchor_node_ids,
     );
 
-    let callable_projection_states =
-        build_callable_projection_states(&final_nodes, &result_edges, &result_occurrences);
-
     if let Some(st) = &symbol_table {
         for node in &final_nodes {
             st.insert(node.id.0, node.kind);
@@ -16895,6 +17121,14 @@ fn index_file_with_resolution_inputs(
         file_id,
         &final_nodes,
     );
+
+    if language_config.language_name == "python" {
+        languages::python::apply_callable_declaration_envelopes(&tree, &mut final_nodes);
+    } else if language_config.language_name == "rust" {
+        languages::rust::apply_callable_declaration_envelopes(&tree, &mut final_nodes);
+    }
+    let callable_projection_states =
+        build_callable_projection_states(&final_nodes, &result_edges, &result_occurrences);
 
     Ok((
         IndexResult {
@@ -17133,7 +17367,10 @@ fn call_edge_still_has_unresolved_placeholder(edge: &Edge, callable_ids: &HashSe
 
 pub(crate) mod projection;
 use projection::*;
-pub use projection::{CALLABLE_OUTLINE_SIGNATURE_TAG, CALLABLE_SHAPE_SIGNATURE_TAG};
+pub use projection::{
+    CALLABLE_OUTLINE_SIGNATURE_TAG, CALLABLE_SHAPE_SIGNATURE_TAG, ParsedCallableBodySpan,
+    parsed_callable_body_spans,
+};
 
 fn hash_parts<'a>(parts: impl IntoIterator<Item = &'a str>) -> i64 {
     let mut h: u64 = 0xcbf29ce484222325;
@@ -17305,6 +17542,17 @@ mod proof_resolution_cache_tests {
                         },
                         method_name: "target".to_owned(),
                     },
+                    ordinary_rust_path: Some(cache::CachedRustQualifiedPath {
+                        module_path: Vec::new(),
+                        components: vec!["C".to_owned(), "target".to_owned()],
+                        import: Some(cache::CachedRustUseBinding {
+                            module_path: Vec::new(),
+                            local_name: "C".to_owned(),
+                            components: vec!["crate".to_owned(), "C".to_owned()],
+                            import: old_import,
+                        }),
+                        associated_owner: Some(old_owner),
+                    }),
                     language: "typescript".to_owned(),
                     adapter_version: "reference-v9".to_owned(),
                     parser_fingerprint: "b".repeat(64),
@@ -17321,6 +17569,7 @@ mod proof_resolution_cache_tests {
                         },
                         method_name: "target".to_owned(),
                     },
+                    ordinary_rust_path: None,
                     language: "typescript".to_owned(),
                     adapter_version: "reference-v9".to_owned(),
                     parser_fingerprint: "b".repeat(64),
@@ -17423,6 +17672,19 @@ mod proof_resolution_cache_tests {
                 class_binding: CachedClassBinding::StaticImport { import, .. }, ..
             } if *import == new_import
         ));
+        let ordinary_path = rebased.call_resolution_inputs[0]
+            .ordinary_rust_path
+            .as_ref()
+            .expect("ordinary Rust metadata");
+        assert_eq!(ordinary_path.associated_owner, Some(new_owner));
+        assert_eq!(
+            ordinary_path
+                .import
+                .as_ref()
+                .expect("ordinary import")
+                .import,
+            new_import
+        );
         let file = rebased.resolution_file.expect("resolution file");
         assert_eq!(file.file_id, new_file);
         assert_eq!(file.top_level_declarations[0].declaration, new_method);
@@ -17435,6 +17697,78 @@ mod proof_resolution_cache_tests {
         assert_eq!(file.direct_exports[0].declaration, new_owner);
         assert!(!file.export_poison_all);
         assert_eq!(file.poisoned_export_names, ["unrelated"]);
+    }
+
+    #[test]
+    fn rebases_rust_ordinal_epoch_like_fresh_extraction() -> Result<()> {
+        let source = "fn caller() { target(); println!(\"Hello\"); }\nfn target() {}\n";
+        let config = get_language_for_ext("rs").expect("Rust config");
+        let indexed = index_file(
+            Path::new("/tmp/original/source.rs"),
+            source,
+            &config,
+            None,
+            None,
+        )?;
+        let artifact = CachedIndexArtifact {
+            resolution_input_schema_version: 28,
+            files: indexed.files,
+            nodes: indexed.nodes,
+            edges: indexed.edges,
+            occurrences: indexed.occurrences,
+            component_access: indexed.component_access,
+            callable_projection_states: indexed.callable_projection_states,
+            impl_anchor_node_ids: indexed.impl_anchor_node_ids,
+            call_resolution_inputs: Vec::new(),
+            resolution_file: None,
+        };
+        let destination = Path::new("/tmp/rebased/source.payload");
+        let rebased = rebase_cached_index_artifact(
+            artifact,
+            destination,
+            source,
+            "rust",
+            index_feature_flags(),
+        );
+        let fresh = index_file(destination, source, &config, None, None)?;
+        let identities = |nodes: &[Node]| {
+            nodes
+                .iter()
+                .map(|node| {
+                    (
+                        node.canonical_id.clone().expect("canonical key"),
+                        (
+                            node.id,
+                            node.kind,
+                            node.start_line,
+                            node.start_col,
+                            node.end_line,
+                            node.end_col,
+                        ),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        assert_eq!(identities(&rebased.nodes), identities(&fresh.nodes));
+        let calls = |edges: &[Edge]| {
+            edges
+                .iter()
+                .filter(|edge| edge.kind == EdgeKind::CALL)
+                .map(|edge| (edge.effective_source(), edge.effective_target(), edge.line))
+                .collect::<HashSet<_>>()
+        };
+        assert_eq!(calls(&rebased.edges), calls(&fresh.edges));
+        assert!(
+            fresh.nodes.iter().any(|node| {
+                node.kind == NodeKind::UNKNOWN
+                    && node
+                        .canonical_id
+                        .as_deref()
+                        .is_some_and(|id| id.starts_with(RUST_ORDINAL_CANONICAL_ID_PREFIX))
+            }),
+            "the reference-before-declaration cache control must be present"
+        );
+        Ok(())
     }
 
     #[test]

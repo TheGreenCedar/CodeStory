@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "error": {
+    "code": "internal",
+    "message": "No requested page fits without losing authenticated context."
+  }
+}

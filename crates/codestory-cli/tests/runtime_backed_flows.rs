@@ -60,6 +60,66 @@ fn run_cli_with_cache(workspace: &Path, cache_dir: &Path, args: &[&str]) -> std:
     command.output().expect("run codestory-cli")
 }
 
+fn run_cli_without_agent_defaults(workspace: &Path, args: &[&str]) -> std::process::Output {
+    let mut command = test_support::cli_command();
+    command.args(args).arg("--project").arg(workspace);
+    for variable in [
+        "CI",
+        "GITHUB_ACTIONS",
+        "CODESTORY_RETRIEVAL_PROFILE",
+        "CODESTORY_RETRIEVAL_RUN_ID",
+    ] {
+        command.env_remove(variable);
+    }
+    command
+        .output()
+        .expect("run CLI without ambient agent defaults")
+}
+
+fn indexed_query_target_fixture() -> (tempfile::TempDir, String) {
+    let workspace = tempdir().expect("query target fixture");
+    fs::write(
+        workspace.path().join("target.rs"),
+        "pub fn selected_target() -> u32 { 7 }\npub fn caller_target() { selected_target(); }\n",
+    )
+    .expect("write query target source");
+    let indexed = run_cli_without_agent_defaults(
+        workspace.path(),
+        &["index", "--refresh", "full", "--format", "json"],
+    );
+    assert!(
+        indexed.status.success(),
+        "fixture index failed: {indexed:?}"
+    );
+    publish_agent_fixture(workspace.path(), true);
+    let ground = run_cli_without_agent_defaults(
+        workspace.path(),
+        &["ground", "--refresh", "none", "--format", "json"],
+    );
+    assert!(ground.status.success(), "fixture ground failed: {ground:?}");
+    let ground: Value = serde_json::from_slice(&ground.stdout).expect("fixture grounding JSON");
+    let id = ground["root_symbols"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(
+            ground["files"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|file| file["symbols"].as_array().into_iter().flatten()),
+        )
+        .find(|symbol| {
+            symbol["label"]
+                .as_str()
+                .is_some_and(|label| label.starts_with("selected_target @ "))
+        })
+        .and_then(|symbol| symbol["id"].as_str())
+        .expect("independent Core grounding must locate selected_target")
+        .to_string();
+    (workspace, id)
+}
+
 fn snapshot_file_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     fn visit(root: &Path, path: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
         for entry in fs::read_dir(path).expect("read cache snapshot directory") {
@@ -387,7 +447,7 @@ fn index_workspace(workspace: &Path) {
     );
 }
 
-fn publish_zero_dense_agent_fixture(workspace: &Path) {
+fn publish_agent_fixture(workspace: &Path, dense: bool) {
     let project = fs::canonicalize(workspace).expect("canonical project fixture");
     let process_cache = fs::canonicalize(test_support::test_state_root().join("stdio-cache"))
         .expect("canonical CLI cache root");
@@ -400,12 +460,20 @@ fn publish_zero_dense_agent_fixture(workspace: &Path) {
             codestory_retrieval::SidecarProfile::Agent,
         )
     });
-    codestory_retrieval::test_support::publish_zero_dense_pinned_query_fixture(
-        &project,
-        &storage_path,
-        &runtime,
-    )
-    .expect("publish strict zero-dense agent fixture");
+    let published = if dense {
+        codestory_retrieval::test_support::publish_deterministic_dense_pinned_query_fixture(
+            &project,
+            &storage_path,
+            &runtime,
+        )
+    } else {
+        codestory_retrieval::test_support::publish_zero_dense_pinned_query_fixture(
+            &project,
+            &storage_path,
+            &runtime,
+        )
+    };
+    published.expect("publish strict agent fixture");
 }
 
 fn assert_publication_metadata(json: &Value, surface: &str, retrieval_expected: bool) {
@@ -556,6 +624,7 @@ fn read_commands_support_explicit_auto_refresh_after_indexing() {
 fn symbol_query_file_filter_resolves_expected_fixture() {
     let workspace = copy_tictactoe_workspace();
     index_workspace(workspace.path());
+    publish_agent_fixture(workspace.path(), true);
 
     let symbol = run_cli(
         workspace.path(),
@@ -571,12 +640,13 @@ fn symbol_query_file_filter_resolves_expected_fixture() {
     );
     assert!(
         symbol.status.success(),
-        "symbol command failed: {}",
+        "symbol command failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&symbol.stdout),
         String::from_utf8_lossy(&symbol.stderr)
     );
 
     let json: Value = serde_json::from_slice(&symbol.stdout).expect("parse symbol json");
-    assert_publication_metadata(&json, "symbol", false);
+    assert_publication_metadata(&json, "symbol", true);
     let resolved_path = json["resolution"]["resolved"]["file_path"]
         .as_str()
         .expect("resolved file path");
@@ -590,6 +660,7 @@ fn symbol_query_file_filter_resolves_expected_fixture() {
 fn query_command_runs_search_filter_limit_pipeline() {
     let workspace = copy_tictactoe_workspace();
     index_workspace(workspace.path());
+    publish_agent_fixture(workspace.path(), true);
 
     let query = run_cli(
         workspace.path(),
@@ -602,12 +673,13 @@ fn query_command_runs_search_filter_limit_pipeline() {
     );
     assert!(
         query.status.success(),
-        "query command failed: {}",
+        "query command failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&query.stdout),
         String::from_utf8_lossy(&query.stderr)
     );
 
     let json: Value = serde_json::from_slice(&query.stdout).expect("parse query json");
-    assert_publication_metadata(&json, "query", false);
+    assert_publication_metadata(&json, "query", true);
     let items = json["items"].as_array().expect("items array");
     assert_eq!(items.len(), 2, "limit should cap filtered items");
     assert!(
@@ -624,6 +696,7 @@ fn query_command_runs_search_filter_limit_pipeline() {
 fn query_symbol_prefers_same_exact_target_as_symbol_command() {
     let workspace = copy_tictactoe_workspace();
     index_workspace(workspace.path());
+    publish_agent_fixture(workspace.path(), true);
 
     let symbol = run_cli(
         workspace.path(),
@@ -631,7 +704,8 @@ fn query_symbol_prefers_same_exact_target_as_symbol_command() {
     );
     assert!(
         symbol.status.success(),
-        "symbol command failed: {}",
+        "symbol command failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&symbol.stdout),
         String::from_utf8_lossy(&symbol.stderr)
     );
     let symbol_json: Value = serde_json::from_slice(&symbol.stdout).expect("parse symbol json");
@@ -650,7 +724,8 @@ fn query_symbol_prefers_same_exact_target_as_symbol_command() {
     );
     assert!(
         query.status.success(),
-        "query command failed: {}",
+        "query command failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&query.stdout),
         String::from_utf8_lossy(&query.stderr)
     );
     let query_json: Value = serde_json::from_slice(&query.stdout).expect("parse query json");
@@ -668,6 +743,7 @@ fn query_symbol_prefers_same_exact_target_as_symbol_command() {
 fn trail_command_default_width_matches_query_dsl_trail() {
     let workspace = copy_tictactoe_workspace();
     index_workspace(workspace.path());
+    publish_agent_fixture(workspace.path(), true);
 
     let trail = run_cli(
         workspace.path(),
@@ -675,11 +751,12 @@ fn trail_command_default_width_matches_query_dsl_trail() {
     );
     assert!(
         trail.status.success(),
-        "trail command failed: {}",
+        "trail command failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&trail.stdout),
         String::from_utf8_lossy(&trail.stderr)
     );
     let trail_json: Value = serde_json::from_slice(&trail.stdout).expect("parse trail json");
-    assert_publication_metadata(&trail_json, "trail", false);
+    assert_publication_metadata(&trail_json, "trail", true);
     let trail_nodes = trail_json["trail"]["trail"]["nodes"]
         .as_array()
         .expect("trail nodes");
@@ -695,7 +772,8 @@ fn trail_command_default_width_matches_query_dsl_trail() {
     );
     assert!(
         query.status.success(),
-        "query command failed: {}",
+        "query command failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&query.stdout),
         String::from_utf8_lossy(&query.stderr)
     );
     let query_json: Value = serde_json::from_slice(&query.stdout).expect("parse query json");
@@ -706,6 +784,305 @@ fn trail_command_default_width_matches_query_dsl_trail() {
         query_items.len(),
         "trail --query and query trail(...) should expose the same default graph width"
     );
+}
+
+#[test]
+fn query_target_commands_select_agent_without_environment_defaults() {
+    let (workspace, target_id) = indexed_query_target_fixture();
+    let cases: &[(&str, &[&str], &str)] = &[
+        (
+            "trail",
+            &["trail", "--query", "selected_target", "--file", "target.rs"],
+            "/resolution/resolved/node_id",
+        ),
+        (
+            "callees",
+            &[
+                "callees",
+                "--query",
+                "selected_target",
+                "--file",
+                "target.rs",
+            ],
+            "/resolution/resolved/node_id",
+        ),
+        (
+            "symbol",
+            &[
+                "symbol",
+                "--query",
+                "selected_target",
+                "--file",
+                "target.rs",
+            ],
+            "/symbol/node/id",
+        ),
+        (
+            "impact",
+            &[
+                "impact",
+                "--query",
+                "selected_target",
+                "--file",
+                "target.rs",
+            ],
+            "/symbol/node/id",
+        ),
+        (
+            "test-map",
+            &[
+                "test-map",
+                "--query",
+                "selected_target",
+                "--file",
+                "target.rs",
+            ],
+            "/symbol/node/id",
+        ),
+        (
+            "explore",
+            &[
+                "explore",
+                "--query",
+                "selected_target",
+                "--file",
+                "target.rs",
+                "--no-tui",
+            ],
+            "/symbol/node/id",
+        ),
+        (
+            "query",
+            &["query", "symbol('selected_target') | limit(1)"],
+            "/items/0/node_id",
+        ),
+    ];
+    for (surface, args, id_pointer) in cases {
+        let mut args = args.to_vec();
+        args.extend(["--refresh", "none", "--format", "json"]);
+        let output = run_cli_without_agent_defaults(workspace.path(), &args);
+        assert!(output.status.success(), "{surface} failed: {output:?}");
+        let json: Value = serde_json::from_slice(&output.stdout).expect("target response JSON");
+        assert_eq!(
+            json.pointer(id_pointer).and_then(Value::as_str),
+            Some(target_id.as_str()),
+            "{surface} must resolve the independently grounded Core identity: {json:#}"
+        );
+        assert_publication_metadata(&json, surface, true);
+        if *surface != "query" {
+            assert!(
+                json["resolution"]["resolved"]["file_path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("target.rs")),
+                "{surface} lost the requested file: {json:#}"
+            );
+        }
+    }
+    let bookmark = run_cli_without_agent_defaults(
+        workspace.path(),
+        &[
+            "bookmark",
+            "add",
+            "--query",
+            "selected_target",
+            "--file",
+            "target.rs",
+            "--category",
+            "Query activation",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        bookmark.status.success(),
+        "query bookmark failed: {bookmark:?}"
+    );
+    let bookmark: Value = serde_json::from_slice(&bookmark.stdout).expect("bookmark JSON");
+    assert_eq!(bookmark["bookmark"]["bookmark"]["node_id"], target_id);
+    assert_eq!(bookmark["category"]["name"], "Query activation");
+}
+
+#[test]
+fn query_target_backend_refusal_preserves_id_and_source_reads_without_bookmark_writes() {
+    let (workspace, target_id) = indexed_query_target_fixture();
+    let source_before = snapshot_file_bytes(workspace.path());
+    let marker = test_support::test_state_root()
+        .join("stdio-cache")
+        .join(codestory_retrieval::TEST_EMBEDDING_UNAVAILABLE_MARKER);
+    fs::create_dir_all(marker.parent().expect("isolated backend cache root"))
+        .expect("create isolated backend cache root");
+    fs::write(&marker, b"backend unavailable").expect("block the selected test backend");
+    let before =
+        run_cli_without_agent_defaults(workspace.path(), &["bookmark", "list", "--format", "json"]);
+    assert!(
+        before.status.success(),
+        "bookmark baseline failed: {before:?}"
+    );
+    let before: Value = serde_json::from_slice(&before.stdout).expect("bookmark baseline JSON");
+
+    let refused = run_cli_without_agent_defaults(
+        workspace.path(),
+        &[
+            "bookmark",
+            "add",
+            "--query",
+            "selected_target",
+            "--category",
+            "Must not exist",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        !refused.status.success(),
+        "blocked backend was ignored: {refused:?}"
+    );
+    assert!(
+        refused.stderr.is_empty(),
+        "JSON failure must stay on stdout"
+    );
+    let failure: Value = serde_json::from_slice(&refused.stdout).expect("backend refusal JSON");
+    assert_eq!(failure["error"]["code"], "command_failed", "{failure:#}");
+    assert_eq!(
+        failure["error"]["message"], "initialize retrieval for bookmark add",
+        "query opening must reach the existing embedding preflight: {failure:#}"
+    );
+    assert!(
+        failure
+            .to_string()
+            .contains("embedding backend unavailable by test marker"),
+        "the causal backend failure must survive error mapping: {failure:#}"
+    );
+    let after =
+        run_cli_without_agent_defaults(workspace.path(), &["bookmark", "list", "--format", "json"]);
+    assert!(
+        after.status.success(),
+        "bookmark observer failed: {after:?}"
+    );
+    let after: Value = serde_json::from_slice(&after.stdout).expect("bookmark after JSON");
+    assert_eq!(
+        after, before,
+        "backend refusal must precede category/bookmark writes"
+    );
+
+    for surface in [
+        "trail", "callees", "symbol", "impact", "test-map", "explore",
+    ] {
+        let mut args = vec![
+            surface,
+            "--id",
+            &target_id,
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ];
+        if surface == "explore" {
+            args.push("--no-tui");
+        }
+        let output = run_cli_without_agent_defaults(workspace.path(), &args);
+        assert!(
+            output.status.success(),
+            "ID {surface} used the blocked backend: {output:?}"
+        );
+        let json: Value = serde_json::from_slice(&output.stdout).expect("ID response JSON");
+        assert_publication_metadata(&json, surface, false);
+        assert!(
+            json["_meta"]["codestory_publication"]["retrieval_publication"].is_null(),
+            "ID {surface} must remain a Core read: {json:#}"
+        );
+        assert_eq!(json["resolution"]["resolved"]["node_id"], target_id);
+    }
+    let snippet = run_cli_without_agent_defaults(
+        workspace.path(),
+        &[
+            "snippet",
+            "--query",
+            "selected_target",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        snippet.status.success(),
+        "source query used the blocked backend: {snippet:?}"
+    );
+    let snippet: Value = serde_json::from_slice(&snippet.stdout).expect("source response JSON");
+    assert_eq!(snippet["resolution"]["resolved"]["node_id"], target_id);
+    assert!(snippet["_meta"]["codestory_publication"]["retrieval_publication"].is_null());
+    assert_eq!(snapshot_file_bytes(workspace.path()), source_before);
+}
+
+#[test]
+fn query_target_preflight_rejects_invalid_selectors_before_backend_initialization() {
+    let (workspace, _) = indexed_query_target_fixture();
+    let marker = test_support::test_state_root()
+        .join("stdio-cache")
+        .join(codestory_retrieval::TEST_EMBEDDING_UNAVAILABLE_MARKER);
+    fs::create_dir_all(marker.parent().expect("isolated backend cache root"))
+        .expect("create isolated backend cache root");
+    fs::write(&marker, b"backend unavailable").expect("block test backend");
+    for surface in ["trail", "symbol", "impact", "test-map", "explore"] {
+        let output = run_cli_without_agent_defaults(
+            workspace.path(),
+            &[
+                surface,
+                "--query",
+                "   ",
+                "--refresh",
+                "none",
+                "--format",
+                "json",
+            ],
+        );
+        assert!(
+            !output.status.success(),
+            "invalid {surface} selector succeeded"
+        );
+        let failure: Value = serde_json::from_slice(&output.stdout).expect("selector refusal JSON");
+        assert_eq!(
+            failure["error"]["message"], "--query cannot be empty.",
+            "{failure:#}"
+        );
+        assert!(
+            !failure
+                .to_string()
+                .contains("embedding backend unavailable")
+        );
+    }
+    let missing_output = workspace.path().join("absent/output.json");
+    let output = run_cli_without_agent_defaults(
+        workspace.path(),
+        &[
+            "symbol",
+            "--query",
+            "selected_target",
+            "--output-file",
+            missing_output.to_str().expect("output path"),
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(!output.status.success(), "missing output parent succeeded");
+    assert!(!missing_output.exists());
+    let failure = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        failure.contains("Output parent directory does not exist"),
+        "{failure}"
+    );
+    assert!(!failure.contains("embedding backend unavailable"));
 }
 
 #[test]
@@ -769,7 +1146,7 @@ fn graph_cli_json_surfaces_share_publication_metadata() {
 fn broad_cli_json_surfaces_share_core_and_retrieval_publications() {
     let workspace = broad_metadata_workspace();
     index_workspace(workspace.path());
-    publish_zero_dense_agent_fixture(workspace.path());
+    publish_agent_fixture(workspace.path(), false);
     let cases: &[(&str, &[&str])] = &[
         (
             "search",
@@ -878,7 +1255,7 @@ fn republish_projections_cli_uses_stored_core_after_all_source_is_removed() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
             .expect("read migrated schema"),
-        36
+        37
     );
     assert_eq!(
         connection

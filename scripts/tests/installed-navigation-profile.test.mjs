@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { validateManifest, navigationCommand, navigationEnvironment, participantToolchainContract } from '../installed-navigation-profile.mjs';
 
-const fixture = () => ({ schema_version: 1, profile: 'pilot', model: { name: 'gpt-5.6-terra', reasoning_effort: 'low' },
+const fixture = () => ({ schema_version: 1, profile: 'pilot', model: { name: 'gpt-6.1-sol', reasoning_effort: 'low' },
   repositories: [{ id: 'r', commit: 'a'.repeat(40), tree: 'b'.repeat(40), seed_clone: '/tmp/seed' }],
   tasks: [{ id: 't', repository_id: 'r', effect_mode: 'read_only', prompt: 'Inspect source.' }],
   arms: ['native', 'published'], repeats: 1,
@@ -19,13 +19,19 @@ test('schedule and source mutations fail closed before execution', () => {
     m => { m.sessions[0].sequence = 2; },
     m => { m.repositories[0].commit = 'main'; },
     m => { m.model.reasoning_effort = 'xhigh'; },
+    m => { delete m.model; },
+    m => { delete m.model.name; },
+    m => { delete m.model.reasoning_effort; },
+    m => { m.model.name = 'gpt-5.6-terra'; },
+    m => { m.model.name = 'gpt-5.6-sol'; },
+    m => { m.model.name = 'arbitrary'; },
     m => { m.tasks[0].repository_id = 'missing'; },
     m => { m.profile = 'codestory-0176-navigation-maintenance'; },
   ]) { const manifest = fixture(); mutate(manifest); assert.throws(() => validateManifest(manifest)); }
 });
 test('task effect mode selects the model sandbox without changing the common invocation policy', () => {
   const readOnly = navigationCommand('codex', '/checkout', '/output/answer.md', '/session/tmp', 'read_only');
-  assert.deepEqual(readOnly.args, ['exec', '--disable', 'remote_plugin', '--model', 'gpt-5.6-terra', '--config', 'model_reasoning_effort="low"', '--sandbox', 'read-only', '--cd', '/checkout', '--add-dir', '/session/tmp', '--json', '--output-last-message', '/output/answer.md', '-']);
+  assert.deepEqual(readOnly.args, ['exec', '--disable', 'remote_plugin', '--model', 'gpt-6.1-sol', '--config', 'model_reasoning_effort="low"', '--sandbox', 'read-only', '--cd', '/checkout', '--add-dir', '/session/tmp', '--json', '--output-last-message', '/output/answer.md', '-']);
   const change = navigationCommand('codex', '/checkout', '/output/answer.md', '/session/tmp', 'change');
   assert.equal(change.args[change.args.indexOf('--sandbox') + 1], 'workspace-write');
   const normalizedChange = [...change.args]; normalizedChange[normalizedChange.indexOf('--sandbox') + 1] = 'read-only';
@@ -196,8 +202,12 @@ async function accountingFixture(t, option) {
       send() {}, async stop() {}, stderr: () => '',
       async request({id, method, params}) {
         if (method === 'initialize') return {id,result:{}};
-        if (method === 'thread/start') return {id,result:{thread:{id:'fixture'}, approvalPolicy:'never',
-          sandbox:{type:'workspaceWrite',networkAccess:false,writableRoots:[...params.config['sandbox_workspace_write.writable_roots'], ...(option === 'native-canary-extra-root' ? [template] : [])]}}};
+        if (method === 'thread/start') {
+          assert.equal(params.model, 'gpt-6.1-sol');
+          assert.equal(params.config.model_reasoning_effort, 'low');
+          return {id,result:{thread:{id:'fixture'}, approvalPolicy:'never',
+            sandbox:{type:'workspaceWrite',networkAccess:false,writableRoots:[...params.config['sandbox_workspace_write.writable_roots'], ...(option === 'native-canary-extra-root' ? [template] : [])]}}};
+        }
         if (method === 'mcpServerStatus/list') return {id,result:{data:[]}};
         assert.equal(method, 'command/exec');
         const {expected,directories}=participantToolchainContract(options.env, options.cwd);
@@ -228,6 +238,8 @@ async function accountingFixture(t, option) {
       if (option === 'preparation' && options.env.CODEX_HOME.includes('native-1')) return {...pass(''),status:'fail',stderr:'inventory unavailable'};
       return pass('{"installed":[]}');
     }
+    assert.equal(args[args.indexOf('--model') + 1], 'gpt-6.1-sol');
+    assert.equal(args[args.indexOf('--config') + 1], 'model_reasoning_effort="low"');
     attempts++; invocations.push(args); assert.ok(args.includes('--disable') && args.includes('remote_plugin')); assert.equal(options.stdin, manifest.tasks[0].prompt); assert.ok(options.timeoutMs > 0 && options.timeoutMs <= 600000);
     if (option === 'spawn') throw new Error('spawn unavailable');
     const usage = option === 'usage' ? {input_tokens:11} : {input_tokens:11,output_tokens:7,total_tokens:18};
@@ -254,6 +266,7 @@ test('runner records the selected task and actual read-only model invocation pol
     assert.ok(result.invocations.every(args => args[args.indexOf('--sandbox') + 1] === sandbox));
     for (const effective of result.effective) {
       assert.equal(effective.sandbox, 'workspace-write');
+      assert.deepEqual(effective.model, {name: 'gpt-6.1-sol', reasoning_effort: 'low'});
       assert.deepEqual(effective.model_policy, { task_id: 't', effect_mode: effectMode, sandbox });
     }
   }

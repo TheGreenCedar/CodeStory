@@ -27,6 +27,8 @@ def require(condition: bool, message: str) -> None:
 STATUS_URI = "codestory://status"
 ENGINE_DIAGNOSTICS_URI = "codestory://diagnostics/retrieval-engine"
 SERVER_PROOF_SCHEMA_VERSION = 1
+SERVER_PROTOCOL_SCHEMA_VERSION = 2
+SERVER_SNAPSHOT_SCHEMA_VERSION = 2
 QUALIFICATION_SCHEMA_VERSION = 1
 # Outer wire contract of the packaged CLI qualification worker. This must
 # equal EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION in

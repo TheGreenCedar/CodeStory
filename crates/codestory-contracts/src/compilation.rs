@@ -20,10 +20,14 @@ pub const INTERIM_MAX_ADMITTED_CANDIDATES: usize = 16;
 /// source/graph hydration. Matches the public serialized packet cap.
 pub const INTERIM_MAX_ADMITTED_SOURCE_BYTES: usize = PUBLIC_PACKET_SERIALIZED_MAX_BYTES;
 
-/// Maximum source bytes one interim candidate may contribute to the public
-/// evidence row. Retrieval descriptors record this bound explicitly; a
-/// missing bound is not silently replaced with a speculative fallback.
+/// Initial source-page bound recorded by retrieval descriptors. A missing
+/// bound is not replaced with a speculative fallback.
 pub const INTERIM_SOURCE_ROW_UPPER_BOUND: usize = 512;
+
+/// Sealed admitted node identities may share spare source capacity up to
+/// this page bound before hydration. Descriptors retain their initial 512-byte
+/// reservation; all growth is charged to the same packet-wide source budget.
+pub const INTERIM_SOURCE_CONTINUATION_UPPER_BOUND: usize = 4 * 1024;
 
 /// Production never asserts semantic sufficiency. Offline evaluation owns that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, Default)]
@@ -75,6 +79,64 @@ pub struct VersionedRetrievalScoreV1 {
     pub value: f32,
 }
 
+fn packet_flag_is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Maximum indexed callsites inspected per producer-owned symbol.
+pub const PACKET_CALL_DESCRIPTOR_MAX_EDGES_V1: usize = 32;
+pub const PACKET_CALL_DESCRIPTOR_SCHEMA_V1: u16 = 1;
+
+/// Investigation metadata, never proof of a certain relationship. The immutable
+/// component's project/input hash is joined to the pinned retrieval publication.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(deny_unknown_fields)]
+pub struct PacketCallTargetV1 {
+    pub stable_identity: String,
+    pub representative_edge_id: String,
+    pub callsite_count: u32,
+    pub certainty: PacketRelationCertaintyV1,
+    pub minimum_confidence: Option<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(deny_unknown_fields)]
+pub struct PacketCallNeighborhoodV1 {
+    pub schema_version: u16,
+    pub source_identity: String,
+    pub truncated: bool,
+    pub targets: Vec<PacketCallTargetV1>,
+}
+
+impl PacketCallNeighborhoodV1 {
+    pub fn is_valid_for(&self, source: &str) -> bool {
+        self.schema_version == PACKET_CALL_DESCRIPTOR_SCHEMA_V1
+            && self.source_identity == source
+            && self.targets.len() <= PACKET_CALL_DESCRIPTOR_MAX_EDGES_V1
+            && self.targets.iter().all(|t| {
+                t.stable_identity
+                    .strip_prefix("node:")
+                    .is_some_and(|id| id.parse::<i64>().is_ok())
+                    && t.representative_edge_id.parse::<i64>().is_ok()
+                    && t.callsite_count > 0
+                    && t.callsite_count <= PACKET_CALL_DESCRIPTOR_MAX_EDGES_V1 as u32
+                    && t.minimum_confidence
+                        .is_none_or(|v| v.is_finite() && (0.0..=1.0).contains(&v))
+            })
+            && self
+                .targets
+                .windows(2)
+                .all(|pair| pair[0].stable_identity < pair[1].stable_identity)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(deny_unknown_fields)]
+pub struct PacketPublishedCallsV1 {
+    pub sidecar_input_hash: String,
+    pub neighborhood: PacketCallNeighborhoodV1,
+}
+
 /// Metadata sufficient to decide admission without opening core records.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
 #[serde(deny_unknown_fields)]
@@ -89,6 +151,10 @@ pub struct PacketCandidateDescriptorV1 {
     pub source_bytes_upper_bound: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exact_selector_ordinal: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_calls: Option<PacketPublishedCallsV1>,
+    #[serde(default, skip_serializing_if = "packet_flag_is_false")]
+    pub published_calls_conflicted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -139,6 +205,9 @@ pub enum PacketParserCompletenessV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(deny_unknown_fields)]
 pub struct PacketHydratedSourceRangeV1 {
+    /// Parser-backed body in the original indexed callable; legacy input stays unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callable_body: Option<PacketCallableBodyV1>,
     pub stable_identity: String,
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -147,6 +216,82 @@ pub struct PacketHydratedSourceRangeV1 {
     pub end_line: u32,
     pub source: String,
     pub parser_completeness: PacketParserCompletenessV1,
+    /// Authenticated requested bounds; delivered bounds above cover complete lines only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<PacketSourceDeliveryV1>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq, Hash)]
+#[serde(deny_unknown_fields)]
+pub struct PacketSourceRangeV1 {
+    pub start_line: u32,
+    pub end_line: u32,
+}
+
+impl PacketSourceRangeV1 {
+    pub fn is_valid(self) -> bool {
+        self.start_line > 0 && self.end_line >= self.start_line
+    }
+}
+
+/// Syntax observed in the same verified file as the delivered page. This is
+/// body presence and its original extent, never behavior or answer sufficiency.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(deny_unknown_fields)]
+pub struct PacketCallableBodyV1 {
+    pub unit_range: PacketSourceRangeV1,
+    pub body_range: PacketSourceRangeV1,
+    pub source_sha256: String,
+}
+
+impl PacketCallableBodyV1 {
+    pub fn matches_delivery(&self, delivery: &PacketSourceDeliveryV1) -> bool {
+        self.unit_range.is_valid()
+            && self.body_range.is_valid()
+            && self.unit_range.start_line <= self.body_range.start_line
+            && self.body_range.end_line <= self.unit_range.end_line
+            && self.unit_range.start_line <= delivery.requested_range.start_line
+            && delivery.requested_range.end_line <= self.unit_range.end_line
+            && self.source_sha256 == delivery.source_sha256
+    }
+}
+
+/// Source progress is independent of parser completeness and answer sufficiency.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq, Hash)]
+#[serde(deny_unknown_fields)]
+pub struct PacketSourceDeliveryV1 {
+    pub requested_range: PacketSourceRangeV1,
+    pub source_sha256: String,
+    pub remaining_source_bytes: u64,
+    pub next_start_line: Option<u32>,
+    pub blocked_line_rendered_bytes: Option<u64>,
+}
+
+impl PacketSourceDeliveryV1 {
+    pub fn matches_delivery(&self, start_line: u32, end_line: u32) -> bool {
+        let requested = self.requested_range;
+        requested.is_valid()
+            && requested.start_line == start_line
+            && end_line >= start_line
+            && end_line <= requested.end_line
+            && self.source_sha256.len() == 64
+            && self
+                .source_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            && if end_line == requested.end_line {
+                self.remaining_source_bytes == 0
+                    && self.next_start_line.is_none()
+                    && self.blocked_line_rendered_bytes.is_none()
+            } else {
+                self.remaining_source_bytes > 0
+                    && match (self.next_start_line, self.blocked_line_rendered_bytes) {
+                        (Some(next), None) => next == end_line + 1,
+                        (None, Some(bytes)) => bytes > INTERIM_SOURCE_ROW_UPPER_BOUND as u64,
+                        _ => false,
+                    }
+            }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Type)]
@@ -261,6 +406,8 @@ pub struct PacketContinuationSelectorV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub symbol_id: Option<String>,
     pub reason: PacketStructuralGapReasonV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_range: Option<PacketSourceRangeV1>,
 }
 
 #[cfg(test)]
@@ -276,6 +423,10 @@ mod tests {
             PUBLIC_PACKET_SERIALIZED_MAX_BYTES
         );
         assert_eq!(INTERIM_SOURCE_ROW_UPPER_BOUND, 512);
+        assert_eq!(INTERIM_SOURCE_CONTINUATION_UPPER_BOUND, 4 * 1024);
+        const {
+            assert!(INTERIM_SOURCE_CONTINUATION_UPPER_BOUND <= INTERIM_MAX_ADMITTED_SOURCE_BYTES);
+        }
     }
 
     #[test]

@@ -701,6 +701,11 @@ impl EmbeddedVectorIndex {
         }
     }
 
+    pub(crate) fn with_query_identity_pin(mut self, pin: Option<ProductEmbeddingIdentity>) -> Self {
+        self.embedding = self.embedding.with_query_identity_pin(pin);
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn build_with_points(
         layout: &SidecarLayout,
@@ -1232,15 +1237,11 @@ impl EmbeddedVectorIndex {
     }
 
     pub(crate) fn search(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>> {
-        let vector = self.embedding.embed_query(query)?;
-        search_database(
-            &self.path,
-            &self.generation,
-            &self.input_hash,
-            &vector,
-            limit,
-            || false,
-        )
+        let windows = self
+            .embedding
+            .embed_query_windows_with_control(query, None, &|| false)?;
+        let mut results = self.search_window_batches(&[windows], limit, &|| false)?;
+        Ok(results.remove(0))
     }
 
     pub(crate) fn search_with_context(
@@ -1249,20 +1250,17 @@ impl EmbeddedVectorIndex {
         limit: usize,
         context: &SearchExecutionContext,
     ) -> Result<Vec<CandidateHit>> {
-        let timeout = context.timeout(std::time::Duration::from_secs(2))?;
-        let vector = self
-            .embedding
-            .embed_query_with_control(query, Some(timeout), &|| context.is_cancelled())?;
+        let timeout = context.timeout(Duration::from_secs(2))?;
+        let windows =
+            self.embedding
+                .embed_query_windows_with_control(query, Some(timeout), &|| {
+                    context.is_cancelled()
+                })?;
         context.check_cancelled()?;
-        let context = context.clone();
-        search_database(
-            &self.path,
-            &self.generation,
-            &self.input_hash,
-            &vector,
-            limit,
-            move || context.is_cancelled(),
-        )
+        let mut results =
+            self.search_window_batches(&[windows], limit, &|| context.is_cancelled())?;
+        context.check_cancelled()?;
+        Ok(results.remove(0))
     }
 
     pub(crate) fn search_batch(
@@ -1274,38 +1272,187 @@ impl EmbeddedVectorIndex {
         if queries.is_empty() {
             return Ok(Vec::new());
         }
-        let mut vectors = Vec::with_capacity(queries.len());
+        let mut batches = Vec::new();
         for query_batch in
             queries.chunks(crate::per_user_embedding::PER_USER_EMBEDDING_QUERY_BATCH_MAX)
         {
-            let timeout = context.timeout(std::time::Duration::from_secs(2))?;
-            let batch_vectors =
-                self.embedding
-                    .embed_queries_with_control(query_batch, Some(timeout), &|| {
-                        context.is_cancelled()
-                    })?;
-            if batch_vectors.len() != query_batch.len() {
-                bail!(
-                    "embedding_vector_row_count_mismatch: expected={} observed={}",
-                    query_batch.len(),
-                    batch_vectors.len()
-                );
+            let inherited = batches
+                .iter()
+                .filter(|batch: &&crate::query_windows::QueryWindowBatch| batch.expanded)
+                .map(|batch| batch.deadline)
+                .min();
+            let cancelled = || {
+                context.is_cancelled()
+                    || inherited.is_some_and(|deadline| Instant::now() >= deadline)
+            };
+            if let Some(deadline) = inherited {
+                crate::query_windows::check_window_control(deadline, &cancelled)?;
             }
-            vectors.extend(batch_vectors);
+            let timeout = context.timeout(Duration::from_secs(2))?;
+            let fresh = Instant::now()
+                .checked_add(timeout)
+                .ok_or_else(|| anyhow::anyhow!("embedding_server_deadline_invalid"))?;
+            let deadline = inherited.map_or(fresh, |pin| pin.min(fresh));
+            let batch = if inherited.is_some() {
+                self.embedding
+                    .embed_queries_windows_until(query_batch, deadline, &cancelled)?
+            } else {
+                self.embedding.embed_queries_windows_with_control(
+                    query_batch,
+                    Some(timeout),
+                    &cancelled,
+                )?
+            };
+            batches.push(batch);
         }
         context.check_cancelled()?;
-        let vector_queries = vectors
+        let results = self.search_window_batches(&batches, limit, &|| context.is_cancelled())?;
+        context.check_cancelled()?;
+        Ok(results)
+    }
+
+    fn search_window_batches(
+        &self,
+        batches: &[crate::query_windows::QueryWindowBatch],
+        limit: usize,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Vec<Vec<CandidateHit>>> {
+        use crate::query_windows::{check_window_control, same_query_engine};
+        let deadline = batches
             .iter()
-            .map(|vector| (vector.as_slice(), limit))
+            .filter(|batch| batch.expanded)
+            .map(|batch| batch.deadline)
+            .min();
+        if deadline.is_some() {
+            let pin = &batches[0].identity;
+            if batches
+                .iter()
+                .any(|batch| !same_query_engine(pin, &batch.identity))
+            {
+                bail!("embedding_query_window_engine_identity_changed");
+            }
+        }
+        let check = || -> Result<()> {
+            if let Some(deadline) = deadline {
+                check_window_control(deadline, cancelled)?;
+            }
+            Ok(())
+        };
+        check()?;
+        let vector_queries = batches
+            .iter()
+            .flat_map(|batch| &batch.groups)
+            .flat_map(|group| group.iter().map(|window| (window.vector.as_slice(), limit)))
             .collect::<Vec<_>>();
-        search_database_batch(
+        let per_window = search_database_batch(
             &self.path,
             &self.generation,
             &self.input_hash,
             &vector_queries,
-            || context.is_cancelled(),
-        )
+            || cancelled() || deadline.is_some_and(|deadline| Instant::now() >= deadline),
+        )?;
+        check()?;
+        let mut per_window = per_window.into_iter();
+        let mut results = Vec::new();
+        for batch in batches {
+            for group in &batch.groups {
+                let hits = per_window.by_ref().take(group.len()).collect::<Vec<_>>();
+                results.push(merge_query_window_hits_with_control(
+                    group,
+                    hits,
+                    batch.expanded,
+                    limit,
+                    &check,
+                )?);
+            }
+        }
+        if per_window.next().is_some() {
+            bail!("embedding_query_window_result_count_mismatch");
+        }
+        check()?;
+        Ok(results)
     }
+}
+
+/// Union admitted window neighbours using maximum cosine, without voting or
+/// adding repeated-window scores. Existing abstention ran before this boundary.
+#[cfg(test)]
+pub(crate) fn merge_query_window_hits(
+    windows: &[crate::query_windows::QueryWindowVector],
+    per_window: Vec<Vec<CandidateHit>>,
+    expanded: bool,
+    limit: usize,
+) -> Result<Vec<CandidateHit>> {
+    merge_query_window_hits_with_control(windows, per_window, expanded, limit, &|| Ok(()))
+}
+
+fn merge_query_window_hits_with_control(
+    windows: &[crate::query_windows::QueryWindowVector],
+    per_window: Vec<Vec<CandidateHit>>,
+    expanded: bool,
+    limit: usize,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<Vec<CandidateHit>> {
+    check()?;
+    if windows.is_empty() || windows.len() != per_window.len() {
+        bail!("embedding_query_window_result_count_mismatch");
+    }
+    if !expanded {
+        if windows.len() != 1 {
+            bail!("embedding_query_window_coverage_invalid");
+        }
+        return Ok(per_window.into_iter().next().expect("one checked window"));
+    }
+    let mut union: HashMap<String, CandidateHit> = HashMap::new();
+    for (window, hits) in windows.iter().zip(per_window) {
+        check()?;
+        for mut hit in hits {
+            check()?;
+            let id = hit
+                .node_id
+                .clone()
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("embedding_query_window_node_identity_missing"))?;
+            if !hit.score.is_finite() {
+                bail!("embedding_query_window_score_invalid");
+            }
+            hit.add_provenance(format!(
+                "query_window_policy:{}",
+                crate::query_windows::QUERY_WINDOW_POLICY
+            ));
+            hit.add_provenance(format!(
+                "query_window_bytes:{}..{}",
+                window.range.start, window.range.end
+            ));
+            match union.entry(id) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(hit);
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    if hit.score > entry.get().score {
+                        for label in &entry.get().provenance {
+                            hit.add_provenance(label);
+                        }
+                        entry.insert(hit);
+                    } else {
+                        for label in &hit.provenance {
+                            entry.get_mut().add_provenance(label);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut hits = union.into_values().collect::<Vec<_>>();
+    hits.sort_unstable_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.node_id.cmp(&right.node_id))
+    });
+    hits.truncate(limit);
+    check()?;
+    Ok(hits)
 }
 
 pub(crate) fn index_path(layout: &SidecarLayout, collection: &str) -> PathBuf {
@@ -2403,6 +2550,7 @@ pub(crate) fn read_published_vectors_for_benchmark(
     Ok(vectors)
 }
 
+#[cfg(any(test, feature = "benchmark-support"))]
 pub(crate) fn search_database(
     path: &Path,
     generation: &str,
@@ -2414,6 +2562,11 @@ pub(crate) fn search_database(
     search_database_with_abstention(path, generation, input_hash, query, limit, cancelled, true)
 }
 
+#[cfg(any(
+    test,
+    feature = "benchmark-support",
+    feature = "semantic-calibration-support"
+))]
 fn search_database_with_abstention(
     path: &Path,
     generation: &str,
@@ -2574,8 +2727,15 @@ fn scored_hits_to_candidates(scored: Vec<ScoredHit>) -> Vec<CandidateHit> {
                     CandidateSource::Semantic,
                 );
                 hit.node_id = Some(node_id);
-                hit.source_bytes_upper_bound =
-                    Some(codestory_contracts::compilation::INTERIM_SOURCE_ROW_UPPER_BOUND as u32);
+                // A component summary has no canonical source span. Keep
+                // its navigation score without manufacturing a source budget.
+                // Source anchors retain their legacy bound: the published
+                // dense schema does not yet carry line metadata.
+                if dense_reason.as_deref() != Some("component_report") {
+                    hit.source_bytes_upper_bound = Some(
+                        codestory_contracts::compilation::INTERIM_SOURCE_ROW_UPPER_BOUND as u32,
+                    );
+                }
                 hit.file_role = file_role
                     .as_deref()
                     .map(codestory_store::FileRole::from_db_value);
@@ -2676,6 +2836,35 @@ fn cosine_similarity_bytes(query: &[f32], query_norm: f64, bytes: &[u8]) -> Resu
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dense_summary_does_not_reserve_source_but_semantic_anchor_does() {
+        let rows = super::scored_hits_to_candidates(vec![
+            (
+                0.9,
+                "41".into(),
+                "component summary".into(),
+                Some("src/service.rs".into()),
+                None,
+                Some("component_report".into()),
+            ),
+            (
+                0.8,
+                "42".into(),
+                "Service".into(),
+                Some("src/service.rs".into()),
+                None,
+                Some("entry_point".into()),
+            ),
+        ]);
+        assert!(rows[0].packet_descriptor().is_none());
+        assert!(rows[0].provenance.iter().any(|p| p == "component_report"));
+        assert_eq!(rows[1].start_line, None);
+        assert!(
+            rows[1].packet_descriptor().is_some(),
+            "legacy semantic-only source metadata remains admissible"
+        );
+    }
+
     use super::*;
     use crate::config::SidecarLayout;
     use codestory_contracts::graph::{Node, NodeId, NodeKind};
@@ -2909,6 +3098,7 @@ mod tests {
             execution_observation_source: "ggml_eval_callback",
             encode_count: 1,
             execution_node_count: 1,
+            completed_operator_counts: std::collections::BTreeMap::from([("MUL_MAT".into(), 1)]),
             resident_accelerator_tensor_count: 1,
             resident_accelerator_tensor_bytes: 1,
             model_layer_count: 13,
@@ -2937,6 +3127,7 @@ mod tests {
 
     fn reader_manifest(embedding_backend: &str) -> RetrievalIndexManifest {
         RetrievalIndexManifest {
+            artifact_scope: None,
             project_id: "reader-project".into(),
             lexical_version: crate::lexical_index::LEXICAL_INDEX_VERSION.into(),
             semantic_generation: "codestory_reader_admission".into(),
@@ -5255,3 +5446,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "query_window_union_tests.rs"]
+mod query_window_union_tests;

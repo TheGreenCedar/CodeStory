@@ -881,7 +881,7 @@ mod tests {
             EmbeddingServerClockSnapshot {
                 domain: "awake_monotonic".into(),
                 api: "script_clock".into(),
-                boot_id: "test-boot".into(),
+                boot_id: Some("test-boot".into()),
                 resolution_ns: 1,
             }
         }
@@ -966,7 +966,7 @@ mod tests {
             clock: EmbeddingServerClockSnapshot {
                 domain: "awake_monotonic".into(),
                 api: "script_clock".into(),
-                boot_id: "test-boot".into(),
+                boot_id: Some("test-boot".into()),
                 resolution_ns: 1,
             },
             protocol: EmbeddingServerProtocolSnapshot::current(),

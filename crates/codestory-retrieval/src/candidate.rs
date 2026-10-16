@@ -124,6 +124,8 @@ pub struct CandidateHit {
     pub scip_hop_distance: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graph_evidence: Option<CandidateGraphEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_calls: Option<codestory_contracts::compilation::PacketPublishedCallsV1>,
     /// Populated by the feature ranker after fusion.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rank_features: Option<RankFeatures>,
@@ -209,11 +211,28 @@ impl CandidateHit {
                 CandidateSource::Legacy => PacketRetrievalLaneV1::Legacy,
             },
             retrieval_score: VersionedRetrievalScoreV1 {
-                version: PACKET_RETRIEVAL_SCORE_VERSION_V1.to_string(),
+                version: format!(
+                    "{}/{}",
+                    PACKET_RETRIEVAL_SCORE_VERSION_V1,
+                    crate::ranker::RANKING_POLICY_VERSION
+                ),
                 value: self.score,
             },
             source_bytes_upper_bound: Some(source_bytes_upper_bound),
             exact_selector_ordinal: None,
+            published_calls: if self
+                .provenance
+                .iter()
+                .any(|p| p == "published-call-descriptors-conflict")
+            {
+                None
+            } else {
+                self.published_calls.clone()
+            },
+            published_calls_conflicted: self
+                .provenance
+                .iter()
+                .any(|p| p == "published-call-descriptors-conflict"),
         })
     }
 
@@ -242,6 +261,7 @@ impl CandidateHit {
             file_role: None,
             scip_hop_distance: None,
             graph_evidence: None,
+            published_calls: None,
             rank_features: None,
         }
     }
@@ -269,6 +289,7 @@ impl CandidateHit {
             file_role: None,
             scip_hop_distance: None,
             graph_evidence: None,
+            published_calls: None,
             rank_features: None,
         };
         hit.record_lane(source.lane(), score, 0, source.default_provenance());

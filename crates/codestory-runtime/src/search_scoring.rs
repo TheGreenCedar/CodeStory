@@ -95,6 +95,14 @@ pub(super) fn did_you_mean_suggestions(scored_hits: &[HybridSearchScoredHit]) ->
         .collect()
 }
 
+/// Derived component reports describe graph neighborhoods, not physical source.
+/// Keep their graph identity available without spending a source-result slot.
+pub(super) fn is_diagnostic_component_report_hit(hit: &SearchHit) -> bool {
+    hit.evidence_tier == Some(codestory_contracts::api::PacketEvidenceTierDto::ComponentReport)
+        && hit.resolution_status
+            == Some(codestory_contracts::api::PacketEvidenceResolutionDto::DiagnosticOnly)
+}
+
 impl AppController {
     pub(crate) fn build_search_hit(
         storage: &Storage,
@@ -139,6 +147,7 @@ impl AppController {
             }
         }
 
+        let component_report = crate::semantic_projection::is_retrieval_artifact_node(&node);
         let openapi_endpoint = node
             .canonical_id
             .as_deref()
@@ -161,19 +170,33 @@ impl AppController {
             target: None,
             match_quality: None,
             resolvable: true,
-            evidence_tier: structural_unit
-                .as_ref()
-                .map(|_| codestory_contracts::api::PacketEvidenceTierDto::StructuralText)
+            evidence_tier: component_report
+                .then_some(codestory_contracts::api::PacketEvidenceTierDto::ComponentReport)
                 .or_else(|| {
-                    openapi_endpoint
-                        .then_some(codestory_contracts::api::PacketEvidenceTierDto::ExactSource)
+                    structural_unit
+                        .as_ref()
+                        .map(|_| codestory_contracts::api::PacketEvidenceTierDto::StructuralText)
+                        .or_else(|| {
+                            openapi_endpoint.then_some(
+                                codestory_contracts::api::PacketEvidenceTierDto::ExactSource,
+                            )
+                        })
                 }),
-            evidence_producer: structural_unit
-                .as_ref()
-                .map(|unit| unit.producer.clone())
-                .or_else(|| openapi_endpoint.then(|| "openapi_endpoint_schema".to_string())),
-            resolution_status: (structural_unit.is_some() || openapi_endpoint)
-                .then_some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly),
+            evidence_producer: component_report
+                .then(|| "component_report".to_string())
+                .or_else(|| {
+                    structural_unit
+                        .as_ref()
+                        .map(|unit| unit.producer.clone())
+                        .or_else(|| openapi_endpoint.then(|| "openapi_endpoint_schema".to_string()))
+                }),
+            resolution_status: if component_report {
+                Some(codestory_contracts::api::PacketEvidenceResolutionDto::DiagnosticOnly)
+            } else {
+                (structural_unit.is_some() || openapi_endpoint).then_some(
+                    codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly,
+                )
+            },
             loss_reason: None,
             eligible_for_sufficiency: (structural_unit.is_some() || openapi_endpoint)
                 .then_some(false),

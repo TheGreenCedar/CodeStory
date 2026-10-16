@@ -20,6 +20,7 @@ use super::{
     test_index_publication, test_retrieval_manifest, test_sidecar_runtime_from_env, unbounded,
     write_search_generation_completion, write_semantic_fixture,
 };
+use codestory_contracts::api::SearchMatchQualityDto;
 use codestory_contracts::bounded_locks::{self, FileLockKind};
 
 #[test]
@@ -127,6 +128,42 @@ fn build_search_hit_prefers_declaration_coordinates_and_filters_unknown_nodes() 
             .is_none(),
         "unknown placeholder nodes should be dropped from indexed results"
     );
+}
+
+#[test]
+fn build_search_hit_classifies_component_reports_without_forging_source() {
+    use codestory_contracts::api::{PacketEvidenceResolutionDto, PacketEvidenceTierDto};
+    let mut storage = Storage::new_in_memory().expect("storage");
+    storage
+        .insert_nodes_batch(&[Node {
+            id: CoreNodeId(700),
+            kind: NodeKind::MODULE,
+            serialized_name: "component_report:dir:src".into(),
+            canonical_id: Some("codestory:component_report:dir:src".into()),
+            ..Default::default()
+        }])
+        .expect("derived report");
+    let mut report =
+        AppController::build_search_hit(&storage, &HashMap::new(), CoreNodeId(700), 1.0)
+            .expect("report lookup")
+            .expect("graph diagnostic retained");
+    crate::agent::packet_evidence::decorate_search_hit_evidence(&mut report);
+    assert!(report.file_path.is_none());
+    assert_eq!(
+        report.evidence_tier,
+        Some(PacketEvidenceTierDto::ComponentReport)
+    );
+    assert_eq!(
+        report.resolution_status,
+        Some(PacketEvidenceResolutionDto::DiagnosticOnly)
+    );
+    assert_eq!(
+        report.evidence_producer.as_deref(),
+        Some("component_report")
+    );
+    assert!(crate::search_scoring::is_diagnostic_component_report_hit(
+        &report
+    ));
 }
 
 #[test]
@@ -564,6 +601,7 @@ fn build_search_hit_marks_generic_structural_collectors_as_non_sufficient() {
                 line_count: 2,
                 file_role: codestory_store::FileRole::Source,
             }],
+            file_extraction_identities: &[],
             file_content_hashes: &[codestory_store::FileContentHash {
                 file_id: 40,
                 content_hash: source_hash.clone(),
@@ -1082,8 +1120,15 @@ fn dotted_owner_method_query_resolves_with_file_constraint() {
             Some("MissingParser.java"),
         )
         .expect("resolve exact id");
-    assert!(matches!(exact_id, TargetResolution::Resolved(target)
-        if target.selected.node_id == NodeId("11".to_string())));
+    let TargetResolution::Resolved(exact_id) = exact_id else {
+        panic!("an explicit id must select its stored node: {exact_id:?}");
+    };
+    assert_eq!(exact_id.selected.node_id, NodeId("11".to_string()));
+    assert_eq!(
+        exact_id.selected.match_quality,
+        Some(SearchMatchQualityDto::Exact),
+        "ID selection is exact even when the requested ID differs from the symbol name"
+    );
 
     let mut rust_method = target.selected.clone();
     rust_method.display_name = "crate::RustType::parseCode".to_string();

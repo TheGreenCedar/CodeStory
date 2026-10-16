@@ -546,10 +546,11 @@ fn build_incremental_wall_receipt(
     }
     let vector_complete = phase_total(retrieval, "embedded vectors");
     let vector_incremental = phase_total(retrieval, "incremental embedded vectors");
-    if vector_complete > 0 && vector_incremental > 0 {
-        bail!("retrieval finalization reported both complete and incremental vector totals");
-    }
-    let vector_total = vector_complete.max(vector_incremental);
+    // Incremental attempts can decline before a complete fallback. Those
+    // durations are serial work inside the same vector worker.
+    let vector_total = vector_complete
+        .checked_add(vector_incremental)
+        .context("vector phase duration overflow")?;
     let retrieval_input_fingerprint_ms = phase_total(retrieval, "input fingerprint");
     let lexical_ms = phase_total(retrieval, "lexical sidecar");
     let graph_ms = phase_total(retrieval, "graph artifact");
@@ -1264,14 +1265,21 @@ mod tests {
     #[test]
     fn incremental_wall_receipt_selects_longest_worker_with_deterministic_ties() {
         let core = codestory_contracts::api::IncrementalCoreWallTimings::default();
-        for (lexical, vector, graph, expected) in [
-            (90, 100, 80, (0, 75, 0, 25)),
-            (100, 90, 80, (100, 0, 0, 0)),
-            (80, 90, 100, (0, 0, 100, 0)),
-            (100, 100, 100, (0, 75, 0, 25)),
-            (100, 0, 100, (100, 0, 0, 0)),
-            (0, 0, 0, (0, 0, 0, 0)),
+        for (lexical, incremental_vector, complete_vector, graph, expected) in [
+            (90, 100, 0, 80, (0, 75, 0, 25)),
+            (100, 90, 0, 80, (100, 0, 0, 0)),
+            (80, 90, 0, 100, (0, 0, 100, 0)),
+            (100, 100, 0, 100, (0, 75, 0, 25)),
+            (100, 0, 0, 100, (100, 0, 0, 0)),
+            (0, 0, 0, 0, (0, 0, 0, 0)),
+            // An incremental attempt may decline before a complete fallback.
+            // Both are serial work within the same vector worker.
+            (90, 60, 40, 80, (0, 75, 0, 25)),
+            (100, 45, 45, 80, (100, 0, 0, 0)),
+            (80, 45, 45, 100, (0, 0, 100, 0)),
+            (100, 50, 50, 100, (0, 75, 0, 25)),
         ] {
+            let vector = incremental_vector + complete_vector;
             let retrieval = vec![
                 FinalizePhaseTiming {
                     phase: "lexical sidecar".into(),
@@ -1279,7 +1287,11 @@ mod tests {
                 },
                 FinalizePhaseTiming {
                     phase: "incremental embedded vectors".into(),
-                    elapsed_ms: vector,
+                    elapsed_ms: incremental_vector,
+                },
+                FinalizePhaseTiming {
+                    phase: "embedded vectors".into(),
+                    elapsed_ms: complete_vector,
                 },
                 FinalizePhaseTiming {
                     phase: "vector ipc and orchestration".into(),
@@ -1303,6 +1315,44 @@ mod tests {
                 expected
             );
             assert_eq!(receipt.accounted_ms, wall_ms);
+        }
+    }
+
+    #[test]
+    fn incremental_wall_receipt_reconciles_vector_fallback_boundaries() {
+        let core = codestory_contracts::api::IncrementalCoreWallTimings::default();
+        let phases = |incremental, complete, ipc, lexical| {
+            [
+                ("incremental embedded vectors", incremental),
+                ("embedded vectors", complete),
+                ("vector ipc and orchestration", ipc),
+                ("lexical sidecar", lexical),
+            ]
+            .into_iter()
+            .map(|(phase, elapsed_ms)| FinalizePhaseTiming {
+                phase: phase.into(),
+                elapsed_ms,
+            })
+            .collect::<Vec<_>>()
+        };
+        let receipt = build_incremental_wall_receipt(100, 100, &core, &phases(60, 40, 75, 90))
+            .expect("IPC may span both serial vector attempts");
+        assert_eq!(receipt.phases.vector_ms, 25);
+        assert_eq!(receipt.phases.process_ipc_ms, 75);
+        assert_eq!(receipt.accounted_ms, 100);
+
+        for (wall, timings, expected_error) in [
+            (100, phases(60, 40, 101, 90), "vector ipc exceeds"),
+            (999, phases(600, 400, 0, 900), "exceed finalization wall"),
+            (
+                u64::MAX,
+                phases(u64::MAX, 1, 0, 0),
+                "vector phase duration overflow",
+            ),
+        ] {
+            let error = build_incremental_wall_receipt(wall, wall, &core, &timings)
+                .expect_err("invalid fallback timing must fail closed");
+            assert!(error.to_string().contains(expected_error), "{error}");
         }
     }
 

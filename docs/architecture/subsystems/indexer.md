@@ -43,7 +43,7 @@ The indexer does not choose staged versus live storage. It only consumes a refre
 - full refresh indexes every discovered source file, does not remove file rows, and runs unscoped resolution
 - incremental refresh only touches files whose mtime changed, whose verified
   parser or structural source hash no longer matches, or that were previously
-  not indexed; it tracks removed file IDs, seeds the symbol table from existing
+  not indexed, plus files whose durable extraction revision is outdated; it tracks removed file IDs, seeds the symbol table from existing
   rows, and scopes resolution to touched files
 
 Incremental work also does more cleanup:
@@ -57,6 +57,18 @@ The core path inside `WorkspaceIndexer::run` is documented in the
 [indexing pipeline](../indexing-pipeline.md). At a high level: discover files,
 parse or reuse cached artifacts, flush projection batches, run `ResolutionPass`,
 and clean up removed files on incremental runs.
+
+Python callable inspection retains the exact outer `decorated_definition`
+source range. Lexical call ownership, receiver mapping and proof inputs are
+collected against the inner function before that displayed range is expanded.
+Decorator callee references remain graph nodes but cannot act as lexical
+callers for argument expressions; canonical declarations, including one-line
+functions, remain eligible owners.
+Parser body metadata joins the outer declaration coordinates to the proper
+execution-body range. Successful verified extraction and current cache replay
+record the Python extraction revision with the file's source hash; incomplete
+extraction cannot certify an inherited projection. A revision mismatch forces
+file projection replacement before equality-based reuse.
 
 ## What Gets Flushed
 

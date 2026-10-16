@@ -1,5 +1,58 @@
 use super::*;
+mod file_extraction_identity;
 use rusqlite::OptionalExtension;
+
+#[test]
+fn go_test_suffix_classifies_and_scopes_normalized_paths() {
+    for path in [
+        "worker_test.go",
+        "pkg/worker_test.go",
+        "pkg/nested/worker_test.go",
+        r"C:\work\pkg\worker_test.go",
+        "PKG/WORKER_TEST.GO",
+        "target/repo-cache/repos/example/pkg/worker_test.go",
+    ] {
+        assert_eq!(
+            FileRole::classify_path(Path::new(path)),
+            FileRole::Test,
+            "{path}"
+        );
+        assert!(FileRole::path_is_test_or_bench(path), "{path}");
+    }
+}
+
+#[test]
+fn go_test_suffix_rejects_similar_production_filenames() {
+    for path in [
+        "worker.go",
+        "contest.go",
+        "worker_tests.go",
+        "worker_test.go.bak",
+        "test.go",
+        "test-tools/worker.go",
+        "pkg_test.go/worker.go",
+    ] {
+        assert_eq!(
+            FileRole::classify_path(Path::new(path)),
+            FileRole::Source,
+            "{path}"
+        );
+        assert!(!FileRole::path_is_test_or_bench(path), "{path}");
+    }
+}
+
+#[test]
+fn go_test_suffix_preserves_role_precedence_and_caller_scope() {
+    for (path, role) in [
+        ("vendor/dep/worker_test.go", FileRole::Vendor),
+        ("generated/worker_test.go", FileRole::Generated),
+        ("docs/worker_test.go", FileRole::Test),
+        ("benchmarks/worker_test.go", FileRole::Test),
+    ] {
+        assert_eq!(FileRole::classify_path(Path::new(path)), role, "{path}");
+        assert!(FileRole::path_is_test_or_bench(path), "{path}");
+    }
+}
 
 #[test]
 fn file_role_classification_ignores_materialized_repo_cache_prefix() {
@@ -1309,6 +1362,389 @@ fn observational_open_reports_rollback_journal_without_recovery() {
     fs::remove_file(path).expect("remove rollback database");
 }
 
+// A genuine legacy retention projection: no modern proof, suffix, or comment
+// tables/columns are installed just to make observation pass.
+fn create_legacy_retention_fixture(path: &Path, version: u32) {
+    let connection = Connection::open(path).expect("create legacy retention fixture");
+    connection
+        .execute_batch(
+            "CREATE TABLE retrieval_index_manifest (
+            project_id TEXT PRIMARY KEY, lexical_version TEXT NOT NULL,
+            semantic_generation TEXT NOT NULL, scip_revision TEXT,
+            built_at_epoch_ms INTEGER NOT NULL, disk_bytes INTEGER,
+            degraded_modes_json TEXT NOT NULL, embedding_backend TEXT,
+            embedding_dim INTEGER, sidecar_schema_version INTEGER,
+            sidecar_input_hash TEXT, sidecar_generation TEXT, projection_count INTEGER,
+            symbol_doc_count INTEGER, dense_projection_count INTEGER,
+            semantic_policy_version TEXT, graph_artifact_hash TEXT,
+            dense_reason_counts_json TEXT, precise_semantic_import_status TEXT,
+            precise_semantic_import_reason TEXT, precise_semantic_import_revision TEXT,
+            precise_semantic_import_producer TEXT, rollback_record_json TEXT
+        );
+        INSERT INTO retrieval_index_manifest (
+            project_id, lexical_version, semantic_generation, built_at_epoch_ms,
+            degraded_modes_json, sidecar_input_hash, sidecar_generation
+        ) VALUES ('proj', 'v1', 'codestory_proj_aaaaaaaaaaaaaaaa', 2,
+                  '[]', 'input-a', 'proj-aaaaaaaaaaaaaaaa');",
+        )
+        .expect("create legacy pointer rows");
+    connection
+        .pragma_update(None, "user_version", version)
+        .expect("legacy schema");
+    let rollback_manifest: RetrievalIndexManifest = serde_json::from_value(serde_json::json!({
+        "project_id": "proj", "lexical_version": "v1",
+        "semantic_generation": "codestory_proj_bbbbbbbbbbbbbbbb",
+        "built_at_epoch_ms": 1, "degraded_modes_json": "[]",
+        "sidecar_generation": "proj-bbbbbbbbbbbbbbbb", "sidecar_input_hash": "input-b"
+    }))
+    .expect("rollback manifest");
+    let rollback = RetrievalIndexRollbackRecord {
+        manifest: rollback_manifest,
+        verified_at_epoch_ms: 2,
+    };
+    connection
+        .execute(
+            "UPDATE retrieval_index_manifest SET rollback_record_json = ?1",
+            [serde_json::to_string(&rollback).expect("serialize rollback")],
+        )
+        .expect("set legacy rollback");
+}
+
+#[test]
+fn historical_complete_publication_observation_is_bounded_and_nonmutating() {
+    let publication = IndexPublicationRecord {
+        generation: 1,
+        generation_id: "11111111-1111-4111-8111-111111111111".into(),
+        run_id: "historical-publication-run".into(),
+        mode: IndexPublicationMode::Full,
+        published_at_epoch_ms: 1,
+    };
+    for version in [
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        SCHEMA_VERSION,
+        SCHEMA_VERSION + 1,
+        INCOMPLETE_INCREMENTAL_SCHEMA_VERSION,
+    ] {
+        let path = unique_temp_db_path("historical-publication-observation");
+        create_versioned_observation_fixture(&path, version);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE index_publication (id INTEGER PRIMARY KEY, generation INTEGER,
+                 generation_id TEXT, run_id TEXT, mode TEXT, published_at_epoch_ms INTEGER);
+                 CREATE TABLE incomplete_index_run (id INTEGER PRIMARY KEY, started_at_epoch_ms INTEGER);
+                 INSERT INTO index_publication VALUES (1, 1,
+                 '11111111-1111-4111-8111-111111111111', 'historical-publication-run', 'full', 1);",
+            ).unwrap();
+        }
+        let before = durable_sqlite_state(&path);
+        let observed = Storage::observe_complete_index_publication(&path);
+        if (32..=FILE_EXTRACTION_IDENTITY_SCHEMA_VERSION).contains(&version) {
+            assert_eq!(observed.unwrap(), Some(publication.clone()));
+        } else {
+            assert!(
+                observed
+                    .unwrap_err()
+                    .to_string()
+                    .contains("supports Core schemas")
+            );
+        }
+        assert_eq!(durable_sqlite_state(&path), before);
+        assert_no_sqlite_sidecars(&path);
+        if version != SCHEMA_VERSION {
+            assert!(Storage::open_observational(&path).is_err());
+            assert!(Storage::open_read_only(&path).is_err());
+        }
+        fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
+fn historical_complete_publication_observation_refuses_incomplete_or_invalid_rows() {
+    for (mutation, absent) in [
+        ("INSERT INTO incomplete_index_run VALUES (1, 1)", true),
+        ("DELETE FROM index_publication", true),
+        ("UPDATE index_publication SET run_id = ''", false),
+        ("UPDATE index_publication SET mode = 'unknown'", false),
+        (
+            "ALTER TABLE index_publication RENAME COLUMN run_id TO unknown_run",
+            false,
+        ),
+    ] {
+        let path = unique_temp_db_path("historical-publication-row-fence");
+        {
+            let storage = Storage::open(&path).unwrap();
+            storage
+                .put_index_publication(&IndexPublicationRecord {
+                    generation: 1,
+                    generation_id: "11111111-1111-4111-8111-111111111111".into(),
+                    run_id: "historical-publication-run".into(),
+                    mode: IndexPublicationMode::Full,
+                    published_at_epoch_ms: 1,
+                })
+                .unwrap();
+        }
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("DROP TABLE file_extraction_identity; PRAGMA user_version = 36;")
+                .unwrap();
+            // Bypass row constraints only to exercise corrupt persisted
+            // metadata that the observer must independently reject.
+            conn.execute_batch("PRAGMA ignore_check_constraints = ON;")
+                .unwrap();
+            conn.execute_batch(mutation).unwrap();
+        }
+        let before = durable_sqlite_state(&path);
+        let result = Storage::observe_complete_index_publication(&path);
+        if absent {
+            assert_eq!(result.unwrap(), None, "{mutation}");
+        } else {
+            assert!(result.is_err(), "{mutation}");
+        }
+        assert_eq!(
+            Storage::database_schema_version_observational(&path).unwrap(),
+            36
+        );
+        assert_eq!(durable_sqlite_state(&path), before);
+        assert_no_sqlite_sidecars(&path);
+        fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
+fn retention_publication_observation_reads_known_legacy_projection_without_migration() {
+    for version in [32, 33, 34, 35, 36, FILE_EXTRACTION_IDENTITY_SCHEMA_VERSION] {
+        let path = unique_temp_db_path("retention-legacy-projection");
+        create_legacy_retention_fixture(&path, version);
+        let before = durable_sqlite_state(&path);
+        let rows = Storage::observe_retrieval_index_publications(&path).expect("observe roots");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].0.sidecar_generation.as_deref(),
+            Some("proj-aaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(
+            rows[0]
+                .1
+                .as_ref()
+                .expect("rollback")
+                .manifest
+                .sidecar_generation
+                .as_deref(),
+            Some("proj-bbbbbbbbbbbbbbbb")
+        );
+        assert_eq!(
+            Storage::database_schema_version_observational(&path).unwrap(),
+            version
+        );
+        assert_eq!(durable_sqlite_state(&path), before);
+        assert_no_sqlite_sidecars(&path);
+        if version != SCHEMA_VERSION {
+            assert!(
+                Storage::open_observational(&path).is_err(),
+                "general observer stays strict"
+            );
+        }
+        fs::remove_file(path).expect("remove fixture");
+    }
+}
+
+#[test]
+fn retention_publication_observation_rejects_unknown_schema_and_incomplete_rows() {
+    for version in [
+        31,
+        SCHEMA_VERSION + 1,
+        INCOMPLETE_INCREMENTAL_SCHEMA_VERSION,
+    ] {
+        let path = unique_temp_db_path("retention-unknown-schema");
+        create_legacy_retention_fixture(&path, version);
+        let before = durable_sqlite_state(&path);
+        let error = Storage::observe_retrieval_index_publications(&path)
+            .expect_err("unknown Core schemas cannot establish retention protection");
+        assert!(
+            error.to_string().contains("supports Core schemas"),
+            "{error}"
+        );
+        assert_eq!(durable_sqlite_state(&path), before);
+        assert_no_sqlite_sidecars(&path);
+        fs::remove_file(path).unwrap();
+    }
+    for mutation in [
+        "DROP TABLE retrieval_index_manifest",
+        "ALTER TABLE retrieval_index_manifest RENAME COLUMN semantic_generation TO unknown_generation",
+        "UPDATE retrieval_index_manifest SET rollback_record_json = 'not-json'",
+        "UPDATE retrieval_index_manifest SET sidecar_generation = NULL",
+        "UPDATE retrieval_index_manifest SET project_id = ''",
+        "ALTER TABLE retrieval_index_manifest ADD COLUMN artifact_scope_json TEXT; UPDATE retrieval_index_manifest SET artifact_scope_json = 'not-json'",
+    ] {
+        let path = unique_temp_db_path("retention-incomplete-projection");
+        create_legacy_retention_fixture(&path, 32);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(mutation)
+            .unwrap();
+        let before = durable_sqlite_state(&path);
+        assert!(
+            Storage::observe_retrieval_index_publications(&path).is_err(),
+            "{mutation}"
+        );
+        assert_eq!(durable_sqlite_state(&path), before);
+        assert_no_sqlite_sidecars(&path);
+        fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
+fn retention_publication_observation_preserves_committed_wal_and_recovery_fences() {
+    let path = unique_temp_db_path("retention-wal-projection");
+    create_legacy_retention_fixture(&path, 32);
+    let writer = Connection::open(&path).unwrap();
+    writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+    writer.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+    writer
+        .execute(
+            "UPDATE retrieval_index_manifest SET built_at_epoch_ms = 9",
+            [],
+        )
+        .unwrap();
+    let before = durable_sqlite_state(&path);
+    let rows = Storage::observe_retrieval_index_publications(&path).expect("committed WAL roots");
+    assert_eq!(rows[0].0.built_at_epoch_ms, 9);
+    assert_eq!(durable_sqlite_state(&path), before);
+    drop(writer);
+    assert_no_sqlite_sidecars(&path);
+    for evidence in [
+        sqlite_sidecar_path(&path, "-journal"),
+        promotion_prepared_journal_path(&path),
+    ] {
+        fs::write(&evidence, b"pending recovery").unwrap();
+        let before = fs::read(&path).unwrap();
+        assert!(Storage::observe_retrieval_index_publications(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(fs::read(&evidence).unwrap(), b"pending recovery");
+        fs::remove_file(evidence).unwrap();
+    }
+    let wal = sqlite_sidecar_path(&path, "-wal");
+    fs::write(&wal, b"incomplete pair").unwrap();
+    assert!(Storage::observe_retrieval_index_publications(&path).is_err());
+    assert!(!sqlite_sidecar_path(&path, "-shm").exists());
+    assert_eq!(fs::read(&wal).unwrap(), b"incomplete pair");
+    fs::remove_file(wal).unwrap();
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn retention_publication_observation_pins_schema_and_rows_in_one_wal_snapshot() {
+    let path = unique_temp_db_path("retention-snapshot");
+    create_legacy_retention_fixture(&path, 32);
+    let writer = Connection::open(&path).unwrap();
+    writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+    writer.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+    let reader = Storage::open_nonmutating(&path, NonmutatingOpenPolicy::RetentionPublications)
+        .expect("pin retention schema snapshot");
+    writer
+        .execute(
+            "UPDATE retrieval_index_manifest SET built_at_epoch_ms = 9",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        reader.list_retrieval_index_publications().unwrap()[0]
+            .0
+            .built_at_epoch_ms,
+        2
+    );
+    assert_eq!(
+        Storage::observe_retrieval_index_publications(&path).unwrap()[0]
+            .0
+            .built_at_epoch_ms,
+        9
+    );
+    drop(reader);
+    drop(writer);
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn retention_publication_observation_fences_external_pointer_schema_and_bindings() {
+    for mutation in [
+        "PRAGMA user_version = 2",
+        "ALTER TABLE retrieval_index_manifest RENAME COLUMN core_generation_id TO unknown_binding",
+        "UPDATE retrieval_index_manifest SET core_run_id = ''",
+        "UPDATE retrieval_index_manifest SET rollback_record_json = '{}'",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let live = root.path().join("codestory.db");
+        let layout = crate::CorePublicationLayout::from_storage_path(&live).unwrap();
+        let stage = layout.create_staging_database_path().unwrap();
+        seed_promotion_file(&stage, 1, "source.rs").unwrap();
+        Storage::promote_staged_snapshot(&stage, &live).unwrap();
+        let manifest: RetrievalIndexManifest = serde_json::from_value(serde_json::json!({
+            "project_id": "proj", "lexical_version": "v1",
+            "semantic_generation": "codestory_proj_aaaaaaaaaaaaaaaa",
+            "built_at_epoch_ms": 1, "degraded_modes_json": "[]",
+            "sidecar_generation": "proj-aaaaaaaaaaaaaaaa", "sidecar_input_hash": "input-a"
+        }))
+        .unwrap();
+        let mut storage = Storage::open(&live).unwrap();
+        storage.upsert_retrieval_index_manifest(&manifest).unwrap();
+        drop(storage);
+        let pointer = layout.retrieval_publication_path();
+        let before = durable_sqlite_state(&pointer);
+        assert_eq!(
+            Storage::observe_retrieval_index_publications(&live).unwrap()[0].0,
+            manifest
+        );
+        assert_eq!(durable_sqlite_state(&pointer), before);
+        assert_no_sqlite_sidecars(&pointer);
+        Connection::open(&pointer)
+            .unwrap()
+            .execute_batch(mutation)
+            .unwrap();
+        let before = durable_sqlite_state(&pointer);
+        assert!(
+            Storage::observe_retrieval_index_publications(&live).is_err(),
+            "{mutation}"
+        );
+        assert_eq!(durable_sqlite_state(&pointer), before);
+        assert_no_sqlite_sidecars(&pointer);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn retention_publication_observation_refuses_linked_external_pointer_without_target_changes() {
+    let root = tempfile::tempdir().unwrap();
+    let live = root.path().join("codestory.db");
+    let layout = crate::CorePublicationLayout::from_storage_path(&live).unwrap();
+    let stage = layout.create_staging_database_path().unwrap();
+    seed_promotion_file(&stage, 1, "source.rs").unwrap();
+    Storage::promote_staged_snapshot(&stage, &live).unwrap();
+    let pointer = layout.retrieval_publication_path();
+    let target = root.path().join("outside-pointer.sqlite3");
+    fs::rename(&pointer, &target).unwrap();
+    std::os::unix::fs::symlink(&target, &pointer).unwrap();
+    let core = layout.resolve_generation_database("generation-1").unwrap();
+    let before = [target.clone(), core, layout.publication_path()]
+        .map(|path| (path.clone(), fs::read(path).unwrap()));
+    let error = Storage::observe_retrieval_index_publications(&live)
+        .expect_err("linked external pointer must remain unavailable protection");
+    assert!(
+        error.to_string().contains("pointer is not a regular file"),
+        "{error}"
+    );
+    for (path, bytes) in before {
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_no_sqlite_sidecars(&path);
+    }
+    assert_eq!(fs::read_link(&pointer).unwrap(), target);
+}
+
 #[test]
 fn observational_open_reports_old_schema_without_migration_or_sidecars() {
     let path = unique_temp_db_path("observational-old-schema");
@@ -2168,6 +2604,7 @@ fn projection_file_upsert_updates_language_across_structural_transitions()
             .flush_projection_batch(ProjectionBatch {
                 files: std::slice::from_ref(file),
                 file_content_hashes: &[],
+                file_extraction_identities: &[],
                 nodes: &[],
                 structural_text_units: &[],
                 structural_text_projections: &[],
@@ -2393,6 +2830,7 @@ fn projection_flush_prefers_framework_definition_over_usage() -> Result<(), Stor
     storage.flush_projection_batch(ProjectionBatch {
         files: &[],
         file_content_hashes: &[],
+        file_extraction_identities: &[],
         nodes: &[definition],
         structural_text_units: &[],
         structural_text_projections: &[],
@@ -2741,6 +3179,7 @@ fn structural_projection_cache_write_is_atomic_with_file_and_unit_rows() -> Resu
     let error = storage
         .flush_projection_batch(ProjectionBatch {
             files: std::slice::from_ref(&file),
+            file_extraction_identities: &[],
             file_content_hashes: &[FileContentHash {
                 file_id: file.id,
                 content_hash: source_hash,
@@ -2860,6 +3299,7 @@ fn structural_projection_preparation_visits_each_unit_once() -> Result<(), Stora
     let batch = ProjectionBatch {
         files: &[],
         file_content_hashes: &file_content_hashes,
+        file_extraction_identities: &[],
         nodes: &[],
         structural_text_units: &structural_units,
         structural_text_projections: &structural_projections,
@@ -2920,6 +3360,7 @@ fn structural_projection_validation_rejects_duplicates_before_transaction()
         .flush_projection_batch(ProjectionBatch {
             files: &[],
             file_content_hashes: &duplicate_hashes,
+            file_extraction_identities: &[],
             nodes: &[],
             structural_text_units: &[],
             structural_text_projections: &[],
@@ -2955,6 +3396,7 @@ fn structural_projection_validation_rejects_duplicates_before_transaction()
         .flush_projection_batch(ProjectionBatch {
             files: &[],
             file_content_hashes: &file_content_hashes,
+            file_extraction_identities: &[],
             nodes: &[],
             structural_text_units: &[],
             structural_text_projections: std::slice::from_ref(&invalid_projection),
@@ -3001,6 +3443,7 @@ fn structural_projection_preparation_rejects_duplicate_projection_and_cache_writ
     let duplicate_projection_batch = ProjectionBatch {
         files: &[],
         file_content_hashes: &[],
+        file_extraction_identities: &[],
         nodes: &[],
         structural_text_units: &[],
         structural_text_projections: &duplicate_projections,
@@ -3035,6 +3478,7 @@ fn structural_projection_preparation_rejects_duplicate_projection_and_cache_writ
     let duplicate_cache_batch = ProjectionBatch {
         files: &[],
         file_content_hashes: &[],
+        file_extraction_identities: &[],
         nodes: &[],
         structural_text_units: &[],
         structural_text_projections: std::slice::from_ref(&projection),
@@ -3106,6 +3550,7 @@ fn structural_publication_prunes_deleted_excluded_and_changed_cache_membership()
     ];
     storage.flush_projection_batch(ProjectionBatch {
         files: &files,
+        file_extraction_identities: &[],
         file_content_hashes: &[
             FileContentHash {
                 file_id: files[0].id,
@@ -3471,6 +3916,7 @@ fn projection_batch_round_trips_and_clears_file_content_hash() -> Result<(), Sto
     storage.flush_projection_batch(ProjectionBatch {
         files: &files,
         file_content_hashes: &hashes,
+        file_extraction_identities: &[],
         nodes: &[],
         structural_text_units: &[],
         structural_text_projections: &[],
@@ -3489,6 +3935,7 @@ fn projection_batch_round_trips_and_clears_file_content_hash() -> Result<(), Sto
     storage.flush_projection_batch(ProjectionBatch {
         files: &files,
         file_content_hashes: &[],
+        file_extraction_identities: &[],
         nodes: &[],
         structural_text_units: &[],
         structural_text_projections: &[],
@@ -3623,6 +4070,7 @@ fn flush_projection_persistence_fixture(
     storage.flush_projection_batch(ProjectionBatch {
         files: &files,
         file_content_hashes: &file_content_hashes,
+        file_extraction_identities: &[],
         nodes: &nodes,
         structural_text_units: &structural_units,
         structural_text_projections: &structural_projections,
@@ -3660,8 +4108,8 @@ fn projection_batch_reports_exact_shape_and_commits_once() -> Result<(), Storage
     assert_eq!(breakdown.persistence.file_errors.row_attempts, 2);
     assert_eq!(breakdown.persistence.dirty_state.row_attempts, 4);
     assert_eq!(breakdown.persistence.row_attempts(), 18);
-    assert_eq!(breakdown.persistence.statement_executions(), 18);
-    assert_eq!(breakdown.persistence.files.bound_bytes, 122);
+    assert_eq!(breakdown.persistence.statement_executions(), 19);
+    assert_eq!(breakdown.persistence.files.bound_bytes, 130);
     assert_eq!(breakdown.persistence.file_errors.bound_bytes, 52);
     assert_eq!(breakdown.persistence.dirty_state.bound_bytes, 48);
     assert!(breakdown.persistence.bound_bytes() > 1_000);
@@ -6494,6 +6942,7 @@ fn schema_24_adds_atomic_retrieval_rollback_without_losing_current() -> Result<(
     let db_path = unique_temp_db_path("v24-retrieval-rollback-migration");
     let _ = std::fs::remove_file(&db_path);
     let current = RetrievalIndexManifest {
+        artifact_scope: None,
         project_id: "proj".into(),
         lexical_version: "v1".into(),
         semantic_generation: "codestory_proj_aaaaaaaaaaaaaaaa".into(),
@@ -7016,6 +7465,7 @@ fn retrieval_publication_names_exact_immutable_core_without_mutating_core_bytes(
 
     fn retrieval_manifest(suffix: &str) -> RetrievalIndexManifest {
         RetrievalIndexManifest {
+            artifact_scope: None,
             project_id: "test-project".into(),
             lexical_version: "sqlite-fts5-v1".into(),
             semantic_generation: format!("semantic-{suffix}"),
@@ -7840,6 +8290,7 @@ fn publish_bound_test_structural_cache(path: &Path) -> Result<(), StorageError> 
     };
     storage.flush_projection_batch(ProjectionBatch {
         files: std::slice::from_ref(&file),
+        file_extraction_identities: &[],
         file_content_hashes: &[FileContentHash {
             file_id: file.id,
             content_hash: source_hash,
@@ -10869,27 +11320,75 @@ fn batched_edges_for_node_ids_matches_single_node_lookup() -> Result<(), Storage
             confidence: Some(1.0),
             ..Default::default()
         },
+        Edge {
+            id: EdgeId(-9),
+            source: NodeId(1),
+            target: NodeId(2),
+            kind: EdgeKind::CALL,
+            resolved_target: Some(NodeId(3)),
+            certainty: Some(ResolutionCertainty::Uncertain),
+            confidence: Some(1.0),
+            ..Default::default()
+        },
     ])?;
 
-    let node_ids = [NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
-    let batched = storage.get_edges_for_node_ids(&node_ids)?;
-    for node_id in node_ids {
-        let single_edge_ids = storage
-            .get_edges_for_node_id(node_id)?
-            .into_iter()
-            .map(|edge| edge.id)
-            .collect::<Vec<_>>();
-        let batched_edge_ids = batched
-            .get(&node_id)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|edge| edge.id)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            batched_edge_ids, single_edge_ids,
-            "batched lookup should match single-node lookup for {node_id:?}"
-        );
+    let expectations = [
+        (
+            NodeId(1),
+            vec![EdgeId(-9), EdgeId(1), EdgeId(3)],
+            vec![EdgeId(3), EdgeId(-9), EdgeId(1)],
+        ),
+        (
+            NodeId(2),
+            vec![EdgeId(-9), EdgeId(1)],
+            vec![EdgeId(-9), EdgeId(1)],
+        ),
+        (
+            NodeId(3),
+            vec![EdgeId(2), EdgeId(3)],
+            vec![EdgeId(3), EdgeId(2)],
+        ),
+        (NodeId(4), vec![EdgeId(2)], vec![EdgeId(2)]),
+        (NodeId(999), vec![], vec![]),
+    ];
+    let node_ids = expectations
+        .iter()
+        .map(|(node_id, _, _)| *node_id)
+        .collect::<Vec<_>>();
+    let mut reversed_node_ids = node_ids.clone();
+    reversed_node_ids.reverse();
+    reversed_node_ids.push(NodeId(1));
+    for seed_ids in [&node_ids, &reversed_node_ids] {
+        let batched = storage.get_edges_for_node_ids(seed_ids)?;
+        for (node_id, expected_batched_ids, expected_single_ids) in &expectations {
+            let mut single_edges = storage.get_edges_for_node_id(*node_id)?;
+            let batched_edges = batched
+                .get(node_id)
+                .expect("requested node has a batch entry");
+            assert_eq!(
+                batched_edges
+                    .iter()
+                    .map(|edge| edge.id)
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                expected_batched_ids.as_slice(),
+                "batched lookup must keep edge-ID order for {node_id:?}"
+            );
+            assert_eq!(
+                single_edges
+                    .iter()
+                    .map(|edge| edge.id)
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                expected_single_ids.as_slice(),
+                "single-node lookup must keep trail priority for {node_id:?}"
+            );
+            single_edges.sort_by_key(|edge| edge.id);
+            assert_eq!(
+                batched_edges, &single_edges,
+                "lookups must return the same normalized edges for {node_id:?}"
+            );
+        }
     }
 
     Ok(())
@@ -12945,6 +13444,8 @@ fn trail_production_scope_honours_every_classified_test_or_bench_marker() -> Res
         "src/spec/thing.rs",
         "src/fixtures/thing.rs",
         "pkg/util_test.py",
+        "pkg/worker_test.go",
+        "vendor/dep/worker_test.go",
         "web/widget.spec.ts",
         "app/__test__/one.ts",
         "node_modules/dep/test/dep.js",
@@ -14321,6 +14822,7 @@ fn seed_structural_promotion_corpus(path: &Path, generation: i64) -> Result<(), 
     storage.flush_projection_batch(ProjectionBatch {
         files: &files,
         file_content_hashes: &file_content_hashes,
+        file_extraction_identities: &[],
         nodes: &nodes,
         structural_text_units: &units,
         structural_text_projections: &projections,
@@ -14477,6 +14979,7 @@ fn minted_staged_candidate(
         let source_hash = format!("{:064x}", file.id);
         store.flush_projection_batch(ProjectionBatch {
             files: std::slice::from_ref(&file),
+            file_extraction_identities: &[],
             file_content_hashes: &[FileContentHash {
                 file_id: file.id,
                 content_hash: source_hash.clone(),
@@ -14843,4 +15346,208 @@ fn a_replayed_migration_ladder_produces_the_same_schema_as_a_fresh_create() {
         replayed_shape, fresh_shape,
         "the migration ladder and the CREATE TABLE definitions must agree; a fresh cache and a migrated cache have drifted"
     );
+}
+
+#[test]
+fn test_trail_caps_keep_certain_neighbors_before_unknown_placeholders() -> Result<(), StorageError>
+{
+    for direction in [
+        TrailDirection::Outgoing,
+        TrailDirection::Incoming,
+        TrailDirection::Both,
+    ] {
+        for fanout in [12, 160] {
+            let mut storage = Storage::new_in_memory()?;
+            let mut nodes = vec![Node {
+                id: NodeId(1),
+                kind: NodeKind::METHOD,
+                serialized_name: "owner".into(),
+                ..Default::default()
+            }];
+            for id in 10..10 + fanout {
+                nodes.push(Node {
+                    id: NodeId(id),
+                    kind: NodeKind::UNKNOWN,
+                    serialized_name: format!("placeholder{id}"),
+                    ..Default::default()
+                });
+            }
+            for id in [9000, 9001] {
+                nodes.push(Node {
+                    id: NodeId(id),
+                    kind: NodeKind::METHOD,
+                    serialized_name: format!("anonymous{id}"),
+                    ..Default::default()
+                });
+            }
+            storage.insert_nodes_batch(&nodes)?;
+            let incoming = direction == TrailDirection::Incoming;
+            let mut edges = (10..10 + fanout)
+                .map(|id| Edge {
+                    id: EdgeId(-id),
+                    kind: EdgeKind::CALL,
+                    source: if incoming { NodeId(id) } else { NodeId(1) },
+                    target: if incoming { NodeId(1) } else { NodeId(id) },
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>();
+            for (offset, certainty) in [Some(ResolutionCertainty::Certain), None]
+                .into_iter()
+                .enumerate()
+            {
+                // Real methods have late IDs and can be resolved from raw placeholders.
+                edges.push(Edge {
+                    id: EdgeId(100000 + offset as i64),
+                    kind: EdgeKind::CALL,
+                    source: if incoming {
+                        NodeId(10 + offset as i64)
+                    } else {
+                        NodeId(1)
+                    },
+                    target: if incoming {
+                        NodeId(1)
+                    } else {
+                        NodeId(10 + offset as i64)
+                    },
+                    resolved_source: incoming.then_some(NodeId(9000 + offset as i64)),
+                    resolved_target: (!incoming).then_some(NodeId(9000 + offset as i64)),
+                    certainty,
+                    confidence: Some(ResolutionCertainty::CERTAIN_MIN),
+                    ..Default::default()
+                });
+            }
+            storage.insert_edges_batch(&edges)?;
+            let config = TrailConfig {
+                root_id: NodeId(1),
+                mode: TrailMode::Neighborhood,
+                target_id: None,
+                depth: 2,
+                direction,
+                caller_scope: TrailCallerScope::IncludeTestsAndBenches,
+                edge_filter: vec![EdgeKind::CALL],
+                show_utility_calls: true,
+                node_filter: vec![],
+                max_nodes: 3,
+            };
+            let result = storage.get_trail(&config)?;
+            assert_eq!(
+                result.nodes.iter().map(|n| n.id).collect::<Vec<_>>(),
+                vec![NodeId(1), NodeId(9000), NodeId(9001)],
+                "direction {direction:?}, fanout {fanout}"
+            );
+            assert!(result.truncated);
+            assert!(result.edges.len() <= 128);
+            assert!(result.omitted_edge_count > 0);
+            assert_eq!(
+                result
+                    .edges
+                    .iter()
+                    .find(|e| e.id == EdgeId(100000))
+                    .unwrap()
+                    .certainty,
+                Some(ResolutionCertainty::Certain)
+            );
+            assert_eq!(
+                result
+                    .edges
+                    .iter()
+                    .find(|e| e.id == EdgeId(100001))
+                    .unwrap()
+                    .certainty,
+                None,
+                "ordering does not upgrade legacy confidence to explicit certainty"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_trail_priority_refuses_conflicting_certainty_and_filters_before_cap()
+-> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    storage.insert_nodes_batch(&[
+        Node {
+            id: NodeId(1),
+            kind: NodeKind::METHOD,
+            serialized_name: "owner".into(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(2),
+            kind: NodeKind::UNKNOWN,
+            serialized_name: "remove".into(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(3),
+            kind: NodeKind::METHOD,
+            serialized_name: "probable".into(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(4),
+            kind: NodeKind::METHOD,
+            serialized_name: "certain".into(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(5),
+            kind: NodeKind::METHOD,
+            serialized_name: "filtered".into(),
+            ..Default::default()
+        },
+    ])?;
+    storage.insert_edges_batch(&[
+        Edge {
+            id: EdgeId(-100),
+            source: NodeId(1),
+            target: NodeId(2),
+            resolved_target: Some(NodeId(3)),
+            kind: EdgeKind::CALL,
+            certainty: Some(ResolutionCertainty::Probable),
+            confidence: Some(1.0),
+            ..Default::default()
+        },
+        Edge {
+            id: EdgeId(100),
+            source: NodeId(1),
+            target: NodeId(4),
+            kind: EdgeKind::CALL,
+            certainty: Some(ResolutionCertainty::Certain),
+            ..Default::default()
+        },
+        Edge {
+            id: EdgeId(-200),
+            source: NodeId(1),
+            target: NodeId(5),
+            kind: EdgeKind::MEMBER,
+            certainty: Some(ResolutionCertainty::Certain),
+            ..Default::default()
+        },
+    ])?;
+    let config = TrailConfig {
+        root_id: NodeId(1),
+        mode: TrailMode::Neighborhood,
+        target_id: None,
+        depth: 1,
+        direction: TrailDirection::Outgoing,
+        caller_scope: TrailCallerScope::IncludeTestsAndBenches,
+        edge_filter: vec![EdgeKind::CALL],
+        show_utility_calls: true,
+        node_filter: vec![],
+        max_nodes: 2,
+    };
+    let result = storage.get_trail(&config)?;
+    assert_eq!(
+        result.nodes.iter().map(|n| n.id).collect::<Vec<_>>(),
+        vec![NodeId(1), NodeId(4)]
+    );
+    assert_eq!(result.edges.len(), 1);
+    assert_eq!(
+        result.edges[0].certainty,
+        Some(ResolutionCertainty::Certain)
+    );
+    assert!(result.truncated);
+    Ok(())
 }

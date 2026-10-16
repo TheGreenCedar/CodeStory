@@ -1,0 +1,124 @@
+--- a/llama.cpp/ggml/include/ggml-backend.h
++++ b/llama.cpp/ggml/include/ggml-backend.h
+@@ -313,6 +313,12 @@
+     //
+     typedef bool (*ggml_backend_sched_eval_callback)(struct ggml_tensor * t, bool ask, void * user_data);
+ 
++    // Valid only during an eval callback. The backend is the actual selected
++    // split executor. Abort rejects the whole call before submission when used
++    // during ask, or before successful delivery when used after completion.
++    GGML_API ggml_backend_t ggml_backend_sched_current_eval_backend(void);
++    GGML_API void ggml_backend_sched_abort_current_eval(void);
++
+     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
+     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
+     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
+--- a/llama.cpp/ggml/src/ggml-backend.cpp
++++ b/llama.cpp/ggml/src/ggml-backend.cpp
+@@ -1538,6 +1538,33 @@
+     return true;
+ }
+ 
++// The active callback is scoped to this scheduler invocation/thread. Nested
++// callbacks restore their caller's context on every return, including abort.
++struct ggml_backend_eval_context {
++    ggml_backend_t backend;
++    bool * abort;
++};
++static thread_local ggml_backend_eval_context ggml_backend_active_eval = { nullptr, nullptr };
++
++struct ggml_backend_eval_scope {
++    ggml_backend_eval_context previous;
++    bool aborted = false;
++    explicit ggml_backend_eval_scope(ggml_backend_t backend) : previous(ggml_backend_active_eval) {
++        ggml_backend_active_eval = { backend, &aborted };
++    }
++    ~ggml_backend_eval_scope() { ggml_backend_active_eval = previous; }
++};
++
++ggml_backend_t ggml_backend_sched_current_eval_backend(void) {
++    return ggml_backend_active_eval.backend;
++}
++
++void ggml_backend_sched_abort_current_eval(void) {
++    if (ggml_backend_active_eval.abort) {
++        *ggml_backend_active_eval.abort = true;
++    }
++}
++
+ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+     GGML_ASSERT(sched);
+     struct ggml_backend_sched_split * splits = sched->splits;
+@@ -1685,7 +1712,9 @@
+                 struct ggml_tensor * t = split->graph.nodes[j0];
+ 
+                 // check if the user needs data from this node
++                ggml_backend_eval_scope eval_scope(split_backend);
+                 bool need = sched->callback_eval(t, true, sched->callback_eval_user_data);
++                if (eval_scope.aborted) { return GGML_STATUS_ABORTED; }
+ 
+                 int j1 = j0;
+ 
+@@ -1693,6 +1722,7 @@
+                 while (!need && j1 < split->graph.n_nodes - 1) {
+                     t = split->graph.nodes[++j1];
+                     need = sched->callback_eval(t, true, sched->callback_eval_user_data);
++                    if (eval_scope.aborted) { return GGML_STATUS_ABORTED; }
+                 }
+ 
+                 struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1 + 1);
+@@ -1705,8 +1735,10 @@
+                 // TODO: pass backend to the callback, then the user can decide if they want to synchronize
+                 ggml_backend_synchronize(split_backend);
+ 
+-                if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
+-                    break;
++                if (need) {
++                    const bool proceed = sched->callback_eval(t, false, sched->callback_eval_user_data);
++                    if (eval_scope.aborted) { return GGML_STATUS_ABORTED; }
++                    if (!proceed) { break; }
+                 }
+ 
+                 j0 = j1;
+--- /dev/null
++++ b/llama.cpp/src/llama-model-offload.h
+@@ -0,0 +1,12 @@
++#pragma once
++
++#include "ggml-backend.h"
++
++// Complete offload includes the input weights. Use the actual first layer's
++// device, so a zero-share device in a split cannot silently own the input.
++// Partial offload keeps the upstream CPU input policy.
++inline ggml_backend_dev_t llama_model_input_layer_device(
++        ggml_backend_dev_t cpu, ggml_backend_dev_t first_layer_device,
++        int n_gpu_layers, int n_layer_all) {
++    return first_layer_device && n_gpu_layers > n_layer_all ? first_layer_device : cpu;
++}
+--- a/llama.cpp/src/llama-model.cpp
++++ b/llama.cpp/src/llama-model.cpp
+@@ -1,4 +1,5 @@
+ #include "llama-model.h"
++#include "llama-model-offload.h"
+ 
+ #include "llama-arch.h"
+ #include "llama-ext.h"
+@@ -1278,9 +1279,15 @@
+         return {dev, &pimpl->gpu_buft_list.at(dev)};
+     };
+ 
+-    // assign the input layer
+-    // there is very little benefit to offloading the input layer, so always keep it on the CPU
+-    pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
++    // Complete offload must include input lookup weights: leaving these on CPU
++    // assigns GET_ROWS to CPU even when every repeating/output layer is on GPU.
++    // Select the same device as the first repeating layer, respecting splits.
++    const auto first_layer_dev = n_gpu_layers > n_layer_all && !devices.empty()
++        ? get_layer_buft_list(0).dev : cpu_dev;
++    const auto input_dev = llama_model_input_layer_device(cpu_dev, first_layer_dev, n_gpu_layers, n_layer_all);
++    pimpl->dev_input = input_dev == cpu_dev
++        ? llama_model::impl::layer_dev{cpu_dev, &pimpl->cpu_buft_list}
++        : llama_model::impl::layer_dev{input_dev, &pimpl->gpu_buft_list.at(input_dev)};
+ 
+     // assign the repeating layers to the devices according to the splits
+     pimpl->dev_layer.resize(n_layer_all);

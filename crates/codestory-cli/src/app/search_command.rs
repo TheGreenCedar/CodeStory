@@ -53,12 +53,25 @@ fn render_search_projection_markdown(
         let line = row
             .start_line
             .map_or(String::new(), |line| format!(":{line}"));
-        let _ = writeln!(markdown, "- {}{line}", row.path.as_str());
+        if let Some(name) = &row.display_name {
+            let _ = writeln!(
+                markdown,
+                "- {} — {}{line}",
+                name.as_str(),
+                row.path.as_str()
+            );
+        } else {
+            let _ = writeln!(markdown, "- {}{line}", row.path.as_str());
+        }
     }
     if !search.gaps.as_slice().is_empty() {
         let _ = writeln!(markdown, "\n## Gaps");
         for gap in search.gaps.as_slice() {
-            let _ = writeln!(markdown, "- {:?}", gap.kind);
+            if let Some(message) = &gap.message {
+                let _ = writeln!(markdown, "- {:?}: {}", gap.kind, message.as_str());
+            } else {
+                let _ = writeln!(markdown, "- {:?}", gap.kind);
+            }
         }
     }
     markdown
@@ -72,5 +85,79 @@ fn search_request_from_command(cmd: &SearchCommand) -> SearchRequest {
         expand_search_plan: false,
         hybrid_weights: None,
         hybrid_limits: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_search_projection_markdown;
+    use codestory_contracts::packet_projection_v3::SearchProjectionV3Dto;
+    use serde_json::json;
+
+    fn projection_with_gap_message(message: Option<&str>) -> SearchProjectionV3Dto {
+        serde_json::from_value(json!({
+            "kind": "complete",
+            "schema_version": 3,
+            "identity": {
+                "packet_id": "search-projection-test",
+                "request_id": "search-request-test",
+                "question_sha256": "0".repeat(64)
+            },
+            "publication": {
+                "core": {"project_id": "project-test", "generation_id": "core-test", "run_id": "run-test"},
+                "retrieval": null
+            },
+            "status": "no_useful_evidence",
+            "evidence": [],
+            "gaps": [{
+                "identity": {"gap_id": "scope-test"},
+                "kind": "evidence_missing",
+                "message": message
+            }],
+            "continuation": null,
+            "retrieval": {"state": "symbolic", "generation_id": null},
+            "diagnostics": {"availability": "unavailable"}
+        }))
+        .expect("bounded public search projection")
+    }
+
+    #[test]
+    fn search_markdown_preserves_gap_messages_and_kind_only_rows() {
+        let message = "Semantic and repository-text retrieval were not requested.";
+        let with_message = projection_with_gap_message(Some(message));
+        let rendered = render_search_projection_markdown(&with_message);
+        assert_eq!(
+            rendered.lines().last(),
+            Some("- EvidenceMissing: Semantic and repository-text retrieval were not requested.")
+        );
+        assert!(rendered.contains("status: `NoUsefulEvidence`"));
+        assert!(rendered.contains("packet_id: `search-projection-test`"));
+
+        let without_message = projection_with_gap_message(None);
+        let rendered = render_search_projection_markdown(&without_message);
+        assert_eq!(rendered.lines().last(), Some("- EvidenceMissing"));
+    }
+
+    #[test]
+    fn search_markdown_includes_labels_without_inventing_source_text() {
+        let mut value = serde_json::to_value(projection_with_gap_message(None)).unwrap();
+        value["evidence"] = json!([
+            {
+                "identity": {"evidence_id": "named-hit"},
+                "path": "src/refresh.rs", "symbol_id": "42",
+                "display_name": "preserve_previous_publication",
+                "start_line": 12, "end_line": 12, "excerpt": null
+            },
+            {
+                "identity": {"evidence_id": "text-hit"},
+                "path": "README.md", "symbol_id": null, "display_name": null,
+                "start_line": null, "end_line": null, "excerpt": null
+            }
+        ]);
+        let projection = serde_json::from_value(value).expect("closed search rows");
+        let rendered = render_search_projection_markdown(&projection);
+        assert!(rendered.contains("\n- preserve_previous_publication — src/refresh.rs:12\n"));
+        assert!(rendered.contains("\n- README.md\n"));
+        assert!(!rendered.contains("null"));
     }
 }

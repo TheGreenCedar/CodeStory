@@ -9,6 +9,8 @@ use anyhow::Context;
 use anyhow::Result;
 use codestory_contracts::api::{ProjectSummary, SearchRepoTextMode};
 use std::fmt::Write as _;
+use std::sync::{Arc, atomic::AtomicBool};
+use std::time::Duration;
 
 pub(super) fn embedding_client_transport_mode(
     command: &Command,
@@ -94,14 +96,65 @@ pub(super) fn open_agent_surface(
     let runtime = new_agent_surface_runtime(project, profile, run_id)?;
     let (before, opened) = runtime.ensure_open_with_before(refresh)?;
     ensure_index_ready(&opened, surface)?;
-    codestory_runtime::ensure_product_embedding_backend_for_runtime(&runtime.sidecar)
-        .map_err(map_embedding_preflight_error)
-        .with_context(|| format!("initialize retrieval for {surface}"))?;
+    if matches!(refresh, args::RefreshMode::Auto | args::RefreshMode::Full) {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut activation = runtime.activation.activate_project(
+            &runtime.project_root,
+            &runtime.storage_path,
+            Arc::clone(&cancelled),
+        );
+        if activation
+            .as_ref()
+            .is_err_and(|error| error.code == "activation_preparing")
+        {
+            let snapshot = runtime
+                .activation
+                .snapshot()
+                .context("CLI preparation omitted its activation identity")?;
+            // A foreground slice is not the end of a blocking CLI command.
+            // Keep waiting on this exact operation instead of starting another.
+            while activation
+                .as_ref()
+                .is_err_and(|error| error.code == "activation_preparing")
+            {
+                activation = runtime.activation.wait_for_existing_operation(
+                    &runtime.project_root,
+                    &runtime.storage_path,
+                    (&snapshot.operation_id, snapshot.attempt),
+                    cancelled.as_ref(),
+                    Duration::from_secs(5),
+                    codestory_runtime::ActivationGoal::Full,
+                );
+            }
+        }
+        activation.map_err(map_api_error)?;
+    } else {
+        codestory_runtime::ensure_product_embedding_backend_for_runtime(&runtime.sidecar)
+            .map_err(map_embedding_preflight_error)
+            .with_context(|| format!("initialize retrieval for {surface}"))?;
+    }
     Ok(OpenedAgentSurface {
         runtime,
         before,
         opened,
     })
+}
+
+/// Query selectors use the full retrieval facade; exact IDs retain graph opening.
+pub(crate) fn open_target_surface(
+    project: &ProjectArgs,
+    refresh: args::RefreshMode,
+    target: &args::TargetSelection,
+    surface: &'static str,
+) -> Result<(RuntimeContext, runtime::OpenedProject)> {
+    if matches!(target, args::TargetSelection::Query { .. }) {
+        let opened = open_agent_surface(project, None, None, refresh, surface)?;
+        return Ok((opened.runtime, opened.opened));
+    }
+    let runtime = RuntimeContext::new(project)?;
+    let opened = runtime.ensure_open(refresh)?;
+    ensure_index_ready(&opened, surface)?;
+    Ok((runtime, opened))
 }
 
 pub(super) fn open_search_surface(

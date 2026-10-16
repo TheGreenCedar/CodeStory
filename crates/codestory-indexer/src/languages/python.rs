@@ -41,12 +41,12 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
-use codestory_contracts::graph::EdgeKind;
+use codestory_contracts::graph::{EdgeKind, Node, NodeKind};
 use tree_sitter::{Node as TsNode, Tree};
 
 use super::LanguageExtraction;
 use crate::{
-    CompiledLanguageRules, ImportedTypeBinding, LanguageRuleset, ManualEdgeSpec,
+    CompiledLanguageRules, GraphNodeSpan, ImportedTypeBinding, LanguageRuleset, ManualEdgeSpec,
     ManualMemberEdgeSpec, ManualReceiverCallSpec, ManualReceiverSource,
     OptionalReceiverOwnerBinding, ReceiverCallSiteKey, collect_colon_parameter_types,
     collect_receiver_call_specs_in_callable, declaration_name, enclosing_node_with_kind,
@@ -105,6 +105,57 @@ pub(crate) const EXTRACTION: LanguageExtraction = LanguageExtraction {
 
 fn python_language() -> tree_sitter::Language {
     tree_sitter_python::LANGUAGE.into()
+}
+
+pub(crate) const CALLABLE_DECLARATION_REVISION: &str = "python-callable-declaration-v1";
+
+pub(crate) fn callable_declaration_node(node: TsNode<'_>) -> TsNode<'_> {
+    node.parent()
+        .filter(|parent| {
+            parent.kind() == "decorated_definition"
+                && parent
+                    .child_by_field_name("definition")
+                    .is_some_and(|definition| same_ts_span(definition, node))
+        })
+        .unwrap_or(node)
+}
+
+/// Expand displayed source only after lexical ownership and stable identities are resolved.
+pub(crate) fn apply_callable_declaration_envelopes(tree: &Tree, nodes: &mut [Node]) {
+    if tree.root_node().has_error() {
+        return;
+    }
+    let mut envelopes = HashMap::<GraphNodeSpan, GraphNodeSpan>::new();
+    walk_tree_nodes(tree.root_node(), &mut |node| {
+        if node.kind() != "function_definition" {
+            return;
+        }
+        let declaration = callable_declaration_node(node);
+        if !same_ts_span(declaration, node) {
+            envelopes.insert(ts_node_graph_span(node), ts_node_graph_span(declaration));
+        }
+    });
+    for node in nodes {
+        if !matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD) {
+            continue;
+        }
+        let (Some(start_line), Some(start_col), Some(end_line), Some(end_col)) =
+            (node.start_line, node.start_col, node.end_line, node.end_col)
+        else {
+            continue;
+        };
+        if let Some(envelope) = envelopes.get(&GraphNodeSpan {
+            start_line,
+            start_col,
+            end_line,
+            end_col,
+        }) {
+            node.start_line = Some(envelope.start_line);
+            node.start_col = Some(envelope.start_col);
+            node.end_line = Some(envelope.end_line);
+            node.end_col = Some(envelope.end_col);
+        }
+    }
 }
 
 pub(crate) fn is_constant_name(name: &str) -> bool {

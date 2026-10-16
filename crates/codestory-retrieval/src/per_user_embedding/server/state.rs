@@ -215,7 +215,7 @@ impl PerUserEmbeddingServerState {
         self: &Arc<Self>,
     ) -> Option<ServerConnectionGuard> {
         self.connections
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |connections| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |connections| {
                 (connections < SERVER_CONNECTION_HANDLER_CAPACITY).then_some(connections + 1)
             })
             .ok()?;
@@ -229,7 +229,7 @@ impl PerUserEmbeddingServerState {
         self: &Arc<Self>,
     ) -> Option<ServerConnectionGuard> {
         self.connections
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |connections| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |connections| {
                 (connections < SERVER_TOTAL_CONNECTION_HANDLER_CAPACITY).then_some(connections + 1)
             })
             .ok()?;
@@ -243,7 +243,7 @@ impl PerUserEmbeddingServerState {
         self: &Arc<Self>,
     ) -> Option<ServerPreRequestGuard> {
         self.pre_request_connections
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |connections| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |connections| {
                 (connections < SERVER_CONTROL_CONNECTION_RESERVE).then_some(connections + 1)
             })
             .ok()?;

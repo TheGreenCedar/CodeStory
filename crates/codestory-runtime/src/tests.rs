@@ -87,9 +87,9 @@ use crate::test_support::git;
 use codestory_contracts::api::{
     ArtifactCachePolicyDto, BookmarkOrphanReasonDto, BookmarkResolutionStatusDto,
     CorePromotionTimings, CreateBookmarkCategoryRequest, CreateBookmarkRequest,
-    IncrementalPlanProbeOutcomeDto, IndexMode, IndexedFilesRequest, ListRootSymbolsRequest,
-    OpenProjectRequest, PromotedValidationDto, StartIndexingRequest, UpdateBookmarkCategoryRequest,
-    UpdateBookmarkRequest, WriteFileTextRequest,
+    IncrementalPlanProbeOutcomeDto, IndexMode, IndexedFilesRequest, ListChildrenSymbolsRequest,
+    ListRootSymbolsRequest, OpenProjectRequest, PromotedValidationDto, StartIndexingRequest,
+    UpdateBookmarkCategoryRequest, UpdateBookmarkRequest, WriteFileTextRequest,
 };
 use codestory_contracts::events::{Event, EventBus};
 use codestory_contracts::graph::FileCoverageReason;
@@ -275,6 +275,7 @@ fn test_retrieval_manifest(
     dense_projection_count: i64,
 ) -> RetrievalIndexManifest {
     RetrievalIndexManifest {
+        artifact_scope: None,
         project_id: project_id.to_string(),
         lexical_version: "retained-v1".to_string(),
         semantic_generation: "retained-v1".to_string(),
@@ -691,6 +692,7 @@ pub(super) fn finalize_semantic_docs_for_test(
 ) -> Result<SemanticProjectionStats, ApiError> {
     crate::semantic_projection::finalize_staged_semantic_docs_for_runtime(
         storage,
+        None,
         None,
         None,
         "core:test-publication",
@@ -1593,8 +1595,19 @@ fn semantic_graph_context_keeps_normalized_paths_once_per_file() {
         second_function_node.clone(),
     ];
     let semantic_nodes = vec![&function_node, &second_function_node];
-    let context =
-        SemanticDocGraphContext::build(&storage, &semantic_nodes, &nodes).expect("context");
+    let (file_paths, file_read_paths) = crate::semantic_projection::semantic_file_table_path_maps(
+        storage.get_files().expect("files"),
+        Some(Path::new(r"C:\work\nvm")),
+    );
+    let context = SemanticDocGraphContext::build_for_scope(
+        &storage,
+        &semantic_nodes,
+        &nodes,
+        SemanticDocScope::DurableSymbols,
+        file_paths,
+        file_read_paths,
+    )
+    .expect("context");
 
     assert_eq!(context.file_paths.len(), 1);
     assert_eq!(context.file_read_paths.len(), 1);
@@ -10382,10 +10395,20 @@ struct EmptyPlanShortCircuitFixture {
 }
 
 fn publish_empty_plan_short_circuit_baseline() -> EmptyPlanShortCircuitFixture {
+    publish_empty_plan_short_circuit_baseline_for_source(
+        "lib.rs",
+        "pub fn steady_state() -> i32 { 1 }\n",
+    )
+}
+
+fn publish_empty_plan_short_circuit_baseline_for_source(
+    filename: &str,
+    source: &str,
+) -> EmptyPlanShortCircuitFixture {
     let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = tempdir().expect("workspace dir");
-    let source_path = workspace.path().join("lib.rs");
-    fs::write(&source_path, "pub fn steady_state() -> i32 { 1 }\n").expect("write baseline source");
+    let source_path = workspace.path().join(filename);
+    fs::write(&source_path, source).expect("write baseline source");
     let storage_path = workspace.path().join(".cache").join("codestory.db");
     let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
@@ -10916,15 +10939,19 @@ fn incremental_refresh_republishes_when_the_source_policy_byte_cap_changes() {
 
 #[test]
 fn incremental_refresh_refuses_an_empty_plan_over_a_stored_coverage_gap() {
-    let fixture = publish_empty_plan_short_circuit_baseline();
+    let fixture = publish_empty_plan_short_circuit_baseline_for_source(
+        "lib.js",
+        "function steady_state() { return 1; }\n",
+    );
     // An indexed file published without verified content and without completion
     // is a stored `CollectorFailure` gap. It does not schedule any work, so only
     // the coverage check stands between it and a successful refresh.
     mutate_published_core(&fixture.storage_path, |storage| {
         storage
             .get_connection()
-            .execute_batch(
-                "UPDATE file SET complete = 0, content_hash = NULL WHERE path LIKE '%lib.rs';",
+            .execute(
+                "UPDATE file SET complete = 0, content_hash = NULL WHERE path = ?1",
+                [fixture.source_path.to_string_lossy().as_ref()],
             )
             .expect("stage a stored coverage gap");
     });
@@ -12267,6 +12294,141 @@ fn write_file_text_rejects_paths_outside_project_root() {
         .expect_err("write should fail");
 
     assert_eq!(err.code, "invalid_argument");
+}
+
+#[test]
+fn list_children_symbols_preserves_distinct_same_label_declarations() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+    let temp = tempdir().expect("create temp dir");
+    let db_path = temp.path().join("codestory.db");
+    let file_path = temp.path().join("main.tf").to_string_lossy().to_string();
+
+    {
+        let mut storage = Storage::open(&db_path).expect("open storage");
+        storage
+            .insert_nodes_batch(&[
+                Node {
+                    id: CoreNodeId(101),
+                    kind: NodeKind::FILE,
+                    serialized_name: file_path.clone(),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(102),
+                    kind: NodeKind::ANNOTATION,
+                    serialized_name: "desired_size".to_string(),
+                    canonical_id: Some("terraform:object-key:one:desired_size".to_string()),
+                    file_node_id: Some(CoreNodeId(101)),
+                    start_line: Some(3),
+                    start_col: Some(5),
+                    end_line: Some(3),
+                    end_col: Some(16),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(103),
+                    kind: NodeKind::ANNOTATION,
+                    serialized_name: "desired_size".to_string(),
+                    canonical_id: Some("terraform:object-key:two:desired_size".to_string()),
+                    file_node_id: Some(CoreNodeId(101)),
+                    start_line: Some(6),
+                    start_col: Some(5),
+                    end_line: Some(6),
+                    end_col: Some(16),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(104),
+                    kind: NodeKind::ANNOTATION,
+                    serialized_name: "cluster_name".to_string(),
+                    file_node_id: Some(CoreNodeId(101)),
+                    start_line: Some(9),
+                    ..Default::default()
+                },
+                // Incomplete source metadata does not erase a distinct
+                // indexed child identity.
+                Node {
+                    id: CoreNodeId(105),
+                    kind: NodeKind::ANNOTATION,
+                    serialized_name: "desired_size".to_string(),
+                    file_node_id: Some(CoreNodeId(101)),
+                    ..Default::default()
+                },
+            ])
+            .expect("insert file and distinct declarations");
+        storage
+            .insert_edges_batch(&[
+                Edge {
+                    id: EdgeId(201),
+                    source: CoreNodeId(101),
+                    target: CoreNodeId(102),
+                    kind: EdgeKind::MEMBER,
+                    ..Default::default()
+                },
+                Edge {
+                    id: EdgeId(202),
+                    source: CoreNodeId(101),
+                    target: CoreNodeId(103),
+                    kind: EdgeKind::MEMBER,
+                    ..Default::default()
+                },
+                Edge {
+                    id: EdgeId(203),
+                    source: CoreNodeId(101),
+                    target: CoreNodeId(104),
+                    kind: EdgeKind::MEMBER,
+                    ..Default::default()
+                },
+                // Multiple membership projections of one node must not
+                // duplicate its public selector.
+                Edge {
+                    id: EdgeId(204),
+                    source: CoreNodeId(101),
+                    target: CoreNodeId(102),
+                    kind: EdgeKind::MEMBER,
+                    file_node_id: Some(CoreNodeId(101)),
+                    line: Some(3),
+                    ..Default::default()
+                },
+                Edge {
+                    id: EdgeId(205),
+                    source: CoreNodeId(101),
+                    target: CoreNodeId(105),
+                    kind: EdgeKind::MEMBER,
+                    ..Default::default()
+                },
+            ])
+            .expect("insert declaration membership");
+    }
+
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
+    controller
+        .open_project(OpenProjectRequest {
+            path: temp.path().to_string_lossy().to_string(),
+        })
+        .expect("open project");
+    let children = controller
+        .list_children_symbols(ListChildrenSymbolsRequest {
+            parent_id: NodeId("101".to_string()),
+        })
+        .expect("list file declarations");
+
+    assert!(children.iter().any(|symbol| symbol.id.0 == "104"));
+    let mut repeated_label_ids = children
+        .iter()
+        .filter(|symbol| symbol.label == "desired_size")
+        .map(|symbol| symbol.id.0.clone())
+        .collect::<Vec<_>>();
+    repeated_label_ids.sort();
+    assert_eq!(
+        repeated_label_ids,
+        ["102".to_string(), "103".to_string(), "105".to_string()],
+        "distinct declarations in one file must retain their opaque selectors"
+    );
+    assert_eq!(children.len(), 4, "one selector per child node identity");
+    assert!(children.iter().all(|symbol| {
+        symbol.file_path.as_deref() == Some(file_path.as_str()) && !symbol.has_children
+    }));
 }
 
 #[test]
@@ -14167,3 +14329,6 @@ fn a_pre_cutover_bookmark_id_still_addresses_its_annotation_after_the_cutover() 
             .is_empty()
     );
 }
+
+#[path = "tests/root_symbol_pages.rs"]
+mod root_symbol_pages;

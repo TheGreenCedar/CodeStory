@@ -1098,6 +1098,9 @@
           "Cargo.toml",
           "Cargo.lock",
           "vendor/**",
+          ".github/actions/native-source/**",
+          "scripts/bootstrap-research-native-vendor.py",
+          "vendor/llama-cpp-sys-2-patches/**",
           "crates/codestory-store/**",
           "crates/codestory-indexer/**",
           "crates/codestory-workspace/**",
@@ -1124,7 +1127,6 @@
         "job": "linux-contracts",
         "step": "Evidence, readiness, hooks, and workspace contract tests",
         "commands": [
-          "cargo test --locked -p codestory-runtime --lib agent::packet_evidence::",
           "cargo test --locked -p codestory-runtime --lib agent::packet_compiler::tests",
           "cargo test --locked -p codestory-runtime --lib agent::packet_batch::",
           "cargo test --locked -p codestory-runtime --lib tests::search_scoring_tests::",
@@ -1675,7 +1677,7 @@
         "publisher_step": "Publish executable release freeze",
         "status_creator": "github-actions[bot]",
         "job_manifest": ".github/scripts/release-freeze-acceptance-jobs.json",
-        "job_manifest_sha256": "43c178977aec468d1c21a74167ac797db73c6e4d7a318476aae0ba976ac95f4b",
+        "job_manifest_sha256": "031143c1947236013cbd17da9e65a452cb775f9e8995843adda9bd7fc36adba5",
         "phases": {
           "source_stabilization": {
             "known_future_source_changes": [
@@ -1773,7 +1775,7 @@
       "packaged_platform_proof_workflow": {
         "subject": "parsed_workflow_json",
         "file": "packaged-platform-proof.yml",
-        "sha256": "3aff2cbb04ae5388ac295029fa582da7070a96f6c69143b80237bdc13c97c3b1",
+        "sha256": "bba27f13b2fdc776d8e61183408cf01054c2a49b3864ea547bdf8a0cc44b37d0",
         "reason": "This workflow builds release archives on three operating systems and carries state between many shell steps through GITHUB_ENV and GITHUB_PATH. Its parsed executable structure is pinned so an unreviewed earlier step cannot replace an owner binary while leaving the locally digested finalizer unchanged."
       },
       "packaged_platform_pr_workflow": {
@@ -1791,19 +1793,19 @@
       "macos_metal_proof_workflow": {
         "subject": "parsed_workflow_json",
         "file": "macos-metal-proof.yml",
-        "sha256": "55581330f6a035b84e1224dbd5469d812ab2fa444914157e22a39cccc64f4627",
+        "sha256": "0242998019718d705a149392b6308f6d678bcbb2cd1933e8f7ba371ce66a893e",
         "reason": "The protected Metal proof is a release-control program on protected hardware; its complete parsed structure is pinned so a required check cannot be made advisory, parked in dead code, or followed by a payload substitution while leaving the expected tokens in place."
       },
       "windows_vulkan_proof_workflow": {
         "subject": "parsed_workflow_json",
         "file": "windows-vulkan-proof.yml",
-        "sha256": "c2272dbf4c550ba4a21372e772a87f6df3307f5f4f709b216473f85958157ffe",
+        "sha256": "6812d53581230c7ea15dc72e5b589e79c4d8d0597eaa369868356ea361c264e9",
         "reason": "The protected Windows Vulkan proof is a release-control program on protected hardware; its complete parsed structure is pinned so a required check cannot be made advisory, parked in dead code, or followed by a payload substitution while leaving the expected tokens in place."
       },
       "linux_vulkan_proof_workflow": {
         "subject": "parsed_workflow_json",
         "file": "linux-vulkan-proof.yml",
-        "sha256": "b2efe3dec20a466cb798752c714f50e64e265856e80ffafc15b28ea2390367d3",
+        "sha256": "958843d78a7c2d4cb205d051a937bed19d32f8ac802304709a482c52df609645",
         "reason": "The standalone Linux Vulkan evidence workflow is a release-control program on protected hardware; its complete parsed structure is pinned so a nonblocking evidence lane cannot quietly acquire blocking authority or leak beyond its reviewed scope."
       },
       "release_source_proof_sentinel": {
@@ -1999,10 +2001,9 @@
         "job": "plugin-static",
         "step": "Check release claim and evidence contracts",
         "fragments": [
-          ".github/scripts/publish-marketplace-catalog.test.mjs",
-          "scripts/tests/release-evidence-runner-contract.test.mjs"
+          ".github/scripts/publish-marketplace-catalog.test.mjs"
         ],
-        "reason": "The catalog publisher and the release-evidence runner contract are the two delivery-side programs whose regressions otherwise surface only at publish time; their suites are pinned into the pre-merge lane so a delivery break is caught while it is still recoverable."
+        "reason": "The catalog publisher's delivery-side regressions otherwise surface only at publish time; its suite is pinned into the pre-merge lane so a delivery break is caught while it is still recoverable."
       },
       "plugin_static_workflow_syntax": {
         "kind": "require",

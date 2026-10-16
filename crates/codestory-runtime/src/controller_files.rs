@@ -1,6 +1,3 @@
-use crate::snippets::{
-    BoundedSnippet, BoundedSnippetRangeOptions, bounded_markdown_snippet_range_from_path,
-};
 use crate::support::clamp_i64_to_u32;
 use crate::{AppController, path_resolution};
 use codestory_contracts::api::{
@@ -25,6 +22,18 @@ pub(crate) struct VerifiedNodeSource {
     pub(crate) generation_id: Option<String>,
     pub(crate) run_id: Option<String>,
     pub(crate) project_id: String,
+}
+
+/// A file node names its own indexed file; other nodes require an explicit
+/// association. Never infer a file from an orphan symbol's numeric identity.
+pub(crate) fn source_file_id(
+    node: &codestory_contracts::graph::Node,
+) -> Option<codestory_contracts::graph::NodeId> {
+    if node.kind == codestory_contracts::graph::NodeKind::FILE {
+        Some(node.id)
+    } else {
+        node.file_node_id
+    }
 }
 
 impl AppController {
@@ -56,7 +65,7 @@ impl AppController {
             .ok()
             .flatten()
             .ok_or_else(unavailable)?;
-        let file_id = stored_node.file_node_id.ok_or_else(unavailable)?.0;
+        let file_id = source_file_id(&stored_node).ok_or_else(unavailable)?.0;
         let file = storage
             .get_file_by_id(file_id)
             .ok()
@@ -182,7 +191,7 @@ impl AppController {
         else {
             return false;
         };
-        if node.file_node_id.map(|id| id.0) != Some(source.file_id) {
+        if source_file_id(&node).map(|id| id.0) != Some(source.file_id) {
             return false;
         }
         let Some(file) = storage.get_file_by_id(source.file_id).ok().flatten() else {
@@ -245,26 +254,35 @@ impl AppController {
         })
     }
 
-    pub(crate) fn bounded_file_snippet_range(
+    /// One open/scan for every window of the same contained file. This reads
+    /// current workspace bytes; it does not mint a symbol or indexed digest.
+    pub(crate) fn path_source_windows(
         &self,
         path: &str,
-        options: BoundedSnippetRangeOptions<'_>,
-    ) -> Result<(String, BoundedSnippet), ApiError> {
+        requests: &[(u32, u32)],
+        maximum_bytes: usize,
+    ) -> Result<(String, Vec<crate::snippets::PathSourceWindow>), ApiError> {
         let candidate = self.resolve_project_file_path(path, false)?;
-        let snippet = bounded_markdown_snippet_range_from_path(
-            &candidate,
-            options.focus_line,
-            options.start_line,
-            options.end_line,
-            options.context_lines,
-            options.max_bytes,
-            options.truncation_suffix,
+        let root = self
+            .require_project_root()?
+            .canonicalize()
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        let relative = candidate
+            .strip_prefix(&root)
+            .map_err(|_| ApiError::invalid_argument("Source path escaped the project"))?;
+        let relative = relative
+            .to_str()
+            .ok_or_else(|| ApiError::invalid_argument("Source path is not UTF-8"))?
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        let file = open_regular_source_file_with(&candidate, |path| std::fs::File::open(path))
+            .map_err(|error| ApiError::new("source_unavailable", error.to_string()))?;
+        let windows = crate::snippets::read_path_source_windows(
+            std::io::BufReader::new(file),
+            requests,
+            maximum_bytes,
         )
-        .map_err(|e| {
-            ApiError::internal(format!("Failed to read file {}: {e}", candidate.display()))
-        })?;
-
-        Ok((candidate.to_string_lossy().to_string(), snippet))
+        .map_err(|error| ApiError::new("source_unavailable", error.to_string()))?;
+        Ok((relative, windows))
     }
 
     pub fn write_file_text(
@@ -280,4 +298,28 @@ impl AppController {
             bytes_written: clamp_i64_to_u32(req.text.len() as i64),
         })
     }
+}
+
+/// Reject known nonregular paths before opening (notably FIFOs), then verify
+/// the opened handle as well. This is not a race-free anchored-open contract:
+/// ordinary replacement between metadata/open remains outside that guarantee.
+/// The opener seam lets a finite test prove ordering without a blocking FIFO.
+pub(crate) fn open_regular_source_file_with(
+    path: &std::path::Path,
+    open: impl FnOnce(&std::path::Path) -> std::io::Result<std::fs::File>,
+) -> std::io::Result<std::fs::File> {
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Source path must name a regular file",
+        ));
+    }
+    let file = open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Opened source handle must be a regular file",
+        ));
+    }
+    Ok(file)
 }

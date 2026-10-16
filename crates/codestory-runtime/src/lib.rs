@@ -197,15 +197,19 @@ mod snippets;
 pub mod v3_evidence_qualification_support;
 mod workspace_state;
 use affected::{AffectedOperationIdentityIndex, IndexFreshnessObservation};
+#[doc(hidden)]
+pub use agent::packet_replay::write_packet_stdio_replay_from_env;
+#[doc(hidden)]
+pub use agent::trace_export::packet_step_trace_destination_from_env;
 pub use agent::{
     bind_packet_follow_up_program, enforce_packet_output_budget_for_representation,
     packet_step_trace_json, plan_packet,
 };
 pub use evidence_projection_v3::{
-    PacketDiagnosticProjectionV3, PacketEvidenceProductV3,
-    finalize_packet_projection_v3_for_representation,
+    PacketDiagnosticProjectionV3, PacketEvidenceProductV3, PacketProjectionIdentityV3,
+    RepresentedPacketProductV3, finalize_packet_projection_v3_for_representation,
     packet_budget_exceeded_projection_v3_from_envelope, project_context_v3, project_packet_v3,
-    project_search_v3,
+    project_packet_v3_with_identity, project_search_v3,
 };
 
 #[cfg(feature = "test-support")]
@@ -383,9 +387,7 @@ use semantic_projection::{
     semantic_doc_shape_contract_for_runtime, semantic_doc_text_budget_cost,
     sort_pending_dense_anchor_inputs,
 };
-pub(crate) use snippets::{
-    BoundedSnippetRangeOptions, DIRECT_SNIPPET_MAX_BYTES, DIRECT_SNIPPET_TRUNCATION_SUFFIX,
-};
+pub(crate) use snippets::{DIRECT_SNIPPET_MAX_BYTES, DIRECT_SNIPPET_TRUNCATION_SUFFIX};
 
 mod browser;
 mod cache_rehydrate;
@@ -440,7 +442,10 @@ pub use activation_status::{
 pub use browser::{BrowserQueryItem, ReadOnlyBrowserService};
 // Separate export so the pinned read-only-browser boundary line above stays byte-exact for
 // `runtime_exposes_read_only_browser_service_boundary`.
-pub use browser::{SourceRangeRequest, SourceRangeSnippet};
+pub use browser::{
+    PreparedSourceRanges, SOURCE_RANGES_MAX_ENTRIES, SOURCE_RANGES_MAX_LINE,
+    SOURCE_RANGES_MAX_RESPONSE_BYTES, SourceRangeRequest, SourceRangeSnippet,
+};
 pub use cache_rehydrate::{CacheRehydrateOutput, CacheRehydrateRequest, rehydrate_cache};
 pub use codestory_contracts as contracts;
 pub use codestory_store::LegacyRetirementReport;
@@ -494,7 +499,7 @@ pub(crate) fn test_sidecar_runtime_from_env() -> codestory_retrieval::SidecarRun
 /// Runtime config whose process-owned defaults carry `cache_root` instead of
 /// the ambient process cache. The caller owns the directory and must keep it
 /// alive until every worker a runtime built from it has quiesced.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn test_sidecar_runtime_with_cache_root(
     cache_root: &std::path::Path,
 ) -> codestory_retrieval::SidecarRuntimeConfig {
@@ -550,10 +555,11 @@ pub use services::{
     ACTIVATION_QUIESCENCE_FAIL_STOP, ActivationCapabilities, ActivationCapabilityState,
     ActivationFailStopHook, ActivationGoal, ActivationOperation, ActivationQuiescence,
     ActivationRun, ActivationService, ActivationSnapshot, ActivationStage, ActivationState,
-    ActivePublicOperationPublication, AgentService, BookmarkService, GroundingService,
-    HistoricalServedReason, IndexService, OperationFreshness, OperationReadClass, ProjectService,
-    PublicOperation, PublicOperationService, SearchService, TrailService, embedding_api_error,
-    operation_read_class, search_operation_name, set_activation_fail_stop_hook,
+    ActivePacketRepresentationContextV3, ActivePublicOperationPublication, AgentService,
+    BookmarkService, GroundingService, HistoricalServedReason, IndexService, OperationFreshness,
+    OperationReadClass, ProjectService, PublicOperation, PublicOperationService, SearchService,
+    TrailService, embedding_api_error, operation_read_class, search_operation_name,
+    set_activation_fail_stop_hook,
 };
 pub use symbol_workflow::{
     SymbolWorkflowCaps, SymbolWorkflowMode, SymbolWorkflowNode, SymbolWorkflowOutcome,
@@ -860,3 +866,7 @@ impl Default for AppController {
         Self::new()
     }
 }
+
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use evidence_projection_v3::representation_budget_test_support;

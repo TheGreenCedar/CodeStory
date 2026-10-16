@@ -1777,7 +1777,7 @@ fn affected_graph_seeds(
                 .unwrap_or_else(|| {
                     AffectedGraphEvidence::seed(
                         *node_id,
-                        "symbol declared in file matched by current input path",
+                        "indexed symbol or occurrence in file matched by current input path",
                         AffectedConfidenceFloor::from_label("direct"),
                         false,
                     )
@@ -1860,8 +1860,9 @@ fn affected_symbol_impacts(
     let direct_count = symbols.iter().filter(|symbol| symbol.distance == 0).count();
     let propagated_count = symbols.iter().filter(|symbol| symbol.distance > 0).count();
     symbols.sort_by(|left, right| {
-        left.distance
-            .cmp(&right.distance)
+        (left.kind == NodeKind::UNKNOWN)
+            .cmp(&(right.kind == NodeKind::UNKNOWN))
+            .then(left.distance.cmp(&right.distance))
             .then(left.file_path.cmp(&right.file_path))
             .then(left.display_name.cmp(&right.display_name))
             .then(left.node_id.0.cmp(&right.node_id.0))

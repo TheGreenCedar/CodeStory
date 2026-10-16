@@ -25,7 +25,7 @@ pub(super) fn retained_retrieval_core_ids(path: &Path) -> Result<Vec<String>, St
     }
     crate::sqlite_observation::observe_sqlite_database(path)?;
     let connection = open_external_retrieval_publication(path, false)?;
-    let mut statement = connection.prepare(MANIFEST_SELECT)?;
+    let mut statement = connection.prepare(&manifest_select(&connection, true)?)?;
     let mut rows = statement.query([])?;
     let mut ids = Vec::new();
     while let Some(row) = rows.next()? {
@@ -70,6 +70,7 @@ const RETRIEVAL_PUBLICATION_SCHEMA_VERSION: u32 = 1;
 const CREATE_RETRIEVAL_PUBLICATION_TABLE: &str =
     "CREATE TABLE IF NOT EXISTS retrieval_index_manifest (
     project_id TEXT PRIMARY KEY,
+    artifact_scope_json TEXT,
     core_generation_id TEXT NOT NULL,
     core_run_id TEXT NOT NULL,
     lexical_version TEXT NOT NULL,
@@ -127,6 +128,7 @@ const MANIFEST_SELECT: &str = "
         core_run_id,
         rollback_core_generation_id,
         rollback_core_run_id
+        , NULL AS artifact_scope_json
     FROM retrieval_index_manifest";
 
 const EMBEDDED_MANIFEST_SELECT: &str = "
@@ -154,6 +156,7 @@ const EMBEDDED_MANIFEST_SELECT: &str = "
         precise_semantic_import_revision,
         precise_semantic_import_producer,
         rollback_record_json
+        , NULL AS artifact_scope_json
     FROM retrieval_index_manifest";
 
 /// Manifest row describing retrieval sidecar freshness for one project id.
@@ -162,8 +165,47 @@ const EMBEDDED_MANIFEST_SELECT: &str = "
 /// schema, input hash, artifact generation, and graph/search projection counts.
 /// Degraded modes are recorded explicitly so callers can fail closed instead of
 /// treating SQLite graph state as equivalent to fresh sidecars.
+/// Producer-owned immutable artifact location, relative to the captured cache root.
+/// Request profile/run identity does not change a published generation's owner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "profile", rename_all = "snake_case")]
+pub enum RetrievalArtifactScope {
+    Local,
+    Agent {
+        workspace_id: String,
+        run_id: String,
+    },
+}
+
+impl RetrievalArtifactScope {
+    pub fn validate(&self) -> Result<(), StorageError> {
+        if let Self::Agent {
+            workspace_id,
+            run_id,
+        } = self
+        {
+            for component in [workspace_id, run_id] {
+                if component.is_empty()
+                    || component.len() > 128
+                    || !component
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                {
+                    return Err(StorageError::Other(
+                        "Invalid retrieval artifact scope component".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetrievalIndexManifest {
+    /// Absent only in legacy publications; readers must authenticate a bounded origin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_scope: Option<RetrievalArtifactScope>,
     pub project_id: String,
     pub lexical_version: String,
     pub semantic_generation: String,
@@ -328,11 +370,7 @@ impl Storage {
     ) -> Result<Option<(RetrievalIndexManifest, Option<RetrievalIndexRollbackRecord>)>, StorageError>
     {
         self.with_retrieval_publication_connection(false, |connection, external| {
-            let select = if external {
-                MANIFEST_SELECT
-            } else {
-                EMBEDDED_MANIFEST_SELECT
-            };
+            let select = manifest_select(connection, external)?;
             let mut stmt = connection.prepare(&format!("{select} WHERE project_id = ?1"))?;
             let mut rows = stmt.query(rusqlite::params![project_id])?;
             let Some(row) = rows.next()? else {
@@ -348,11 +386,7 @@ impl Storage {
         project_id: &str,
     ) -> Result<Option<RetrievalIndexManifest>, StorageError> {
         self.with_retrieval_publication_connection(false, |connection, external| {
-            let select = if external {
-                MANIFEST_SELECT
-            } else {
-                EMBEDDED_MANIFEST_SELECT
-            };
+            let select = manifest_select(connection, external)?;
             let mut stmt = connection.prepare(&format!("{select} WHERE project_id = ?1"))?;
             let mut rows = stmt.query(rusqlite::params![project_id])?;
             let Some(row) = rows.next()? else {
@@ -371,8 +405,10 @@ impl Storage {
             if external {
                 return read_bound_manifest_on(connection, project_id);
             }
-            let mut statement =
-                connection.prepare(&format!("{EMBEDDED_MANIFEST_SELECT} WHERE project_id = ?1"))?;
+            let mut statement = connection.prepare(&format!(
+                "{} WHERE project_id = ?1",
+                manifest_select(connection, false)?
+            ))?;
             let mut rows = statement.query(rusqlite::params![project_id])?;
             let Some(row) = rows.next()? else {
                 return Ok(None);
@@ -423,7 +459,7 @@ impl Storage {
             if publication.generation_id != generation_id || publication.run_id != run_id {
                 return Ok(None);
             }
-            let mut statement = connection.prepare(EMBEDDED_MANIFEST_SELECT)?;
+            let mut statement = connection.prepare(&manifest_select(connection, false)?)?;
             let mut rows = statement.query([])?;
             let Some(row) = rows.next()? else {
                 return Ok(None);
@@ -450,12 +486,8 @@ impl Storage {
     ) -> Result<Vec<(RetrievalIndexManifest, Option<RetrievalIndexRollbackRecord>)>, StorageError>
     {
         self.with_retrieval_publication_connection(false, |connection, external| {
-            let select = if external {
-                MANIFEST_SELECT
-            } else {
-                EMBEDDED_MANIFEST_SELECT
-            };
-            let mut stmt = connection.prepare(select)?;
+            let select = manifest_select(connection, external)?;
+            let mut stmt = connection.prepare(&select)?;
             let rows = stmt.query_map([], publication_from_row)?;
             let mut publications = Vec::new();
             for row in rows {
@@ -473,12 +505,8 @@ impl Storage {
         &self,
     ) -> Result<Vec<RetrievalIndexManifest>, StorageError> {
         self.with_retrieval_publication_connection(false, |connection, external| {
-            let select = if external {
-                MANIFEST_SELECT
-            } else {
-                EMBEDDED_MANIFEST_SELECT
-            };
-            let mut stmt = connection.prepare(select)?;
+            let select = manifest_select(connection, external)?;
+            let mut stmt = connection.prepare(&select)?;
             let rows = stmt.query_map([], manifest_from_row)?;
             let mut manifests = Vec::new();
             for row in rows {
@@ -528,11 +556,62 @@ impl Storage {
     }
 }
 
+fn artifact_scope_column_exists(connection: &Connection) -> Result<bool, StorageError> {
+    let mut statement = connection.prepare("PRAGMA table_info(retrieval_index_manifest)")?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for column in columns {
+        if column? == "artifact_scope_json" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn manifest_select(connection: &Connection, external: bool) -> Result<String, StorageError> {
+    let select = if external {
+        MANIFEST_SELECT
+    } else {
+        EMBEDDED_MANIFEST_SELECT
+    };
+    Ok(if artifact_scope_column_exists(connection)? {
+        select.replace("NULL AS artifact_scope_json", "artifact_scope_json")
+    } else {
+        select.to_string()
+    })
+}
+
+fn ensure_artifact_scope_column(connection: &Connection) -> Result<(), StorageError> {
+    if !artifact_scope_column_exists(connection)? {
+        connection.execute(
+            "ALTER TABLE retrieval_index_manifest ADD COLUMN artifact_scope_json TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn serialized_artifact_scope(
+    manifest: &RetrievalIndexManifest,
+) -> Result<Option<String>, StorageError> {
+    manifest
+        .artifact_scope
+        .as_ref()
+        .map(|scope| {
+            scope.validate()?;
+            serde_json::to_string(scope).map_err(|error| {
+                StorageError::Other(format!("Serialize retrieval artifact scope: {error}"))
+            })
+        })
+        .transpose()
+}
+
 fn publish_embedded_retrieval_index_publication_on(
     connection: &Connection,
     manifest: &RetrievalIndexManifest,
     rollback_record_json: Option<&str>,
 ) -> Result<(), StorageError> {
+    ensure_artifact_scope_column(connection)?;
+    let artifact_scope_json = serialized_artifact_scope(manifest)?;
     connection.execute(
             "INSERT INTO retrieval_index_manifest (
                 project_id,
@@ -557,8 +636,9 @@ fn publish_embedded_retrieval_index_publication_on(
                 precise_semantic_import_reason,
                 precise_semantic_import_revision,
                 precise_semantic_import_producer,
-                rollback_record_json
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
+                rollback_record_json,
+                artifact_scope_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
             ON CONFLICT(project_id) DO UPDATE SET
                 lexical_version = excluded.lexical_version,
                 semantic_generation = excluded.semantic_generation,
@@ -581,7 +661,8 @@ fn publish_embedded_retrieval_index_publication_on(
                 precise_semantic_import_reason = excluded.precise_semantic_import_reason,
                 precise_semantic_import_revision = excluded.precise_semantic_import_revision,
                 precise_semantic_import_producer = excluded.precise_semantic_import_producer,
-                rollback_record_json = excluded.rollback_record_json",
+                rollback_record_json = excluded.rollback_record_json,
+                artifact_scope_json = excluded.artifact_scope_json",
             rusqlite::params![
                 manifest.project_id,
                 manifest.lexical_version,
@@ -606,6 +687,7 @@ fn publish_embedded_retrieval_index_publication_on(
                 manifest.precise_semantic_import_revision,
                 manifest.precise_semantic_import_producer,
                 rollback_record_json,
+                artifact_scope_json,
             ],
         )?;
     Ok(())
@@ -680,6 +762,8 @@ fn publish_external_retrieval_index_publication_on(
             "Retrieval rollback record and core binding must be published together".into(),
         ));
     }
+    ensure_artifact_scope_column(connection)?;
+    let artifact_scope_json = serialized_artifact_scope(manifest)?;
     connection.execute(
         "INSERT INTO retrieval_index_manifest (
             project_id,
@@ -708,10 +792,11 @@ fn publish_external_retrieval_index_publication_on(
             precise_semantic_import_producer,
             rollback_record_json,
             rollback_core_generation_id,
-            rollback_core_run_id
+            rollback_core_run_id,
+            artifact_scope_json
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-            ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27
+            ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28
         )
         ON CONFLICT(project_id) DO UPDATE SET
             core_generation_id = excluded.core_generation_id,
@@ -739,7 +824,8 @@ fn publish_external_retrieval_index_publication_on(
             precise_semantic_import_producer = excluded.precise_semantic_import_producer,
             rollback_record_json = excluded.rollback_record_json,
             rollback_core_generation_id = excluded.rollback_core_generation_id,
-            rollback_core_run_id = excluded.rollback_core_run_id",
+            rollback_core_run_id = excluded.rollback_core_run_id,
+            artifact_scope_json = excluded.artifact_scope_json",
         rusqlite::params![
             manifest.project_id,
             core.generation_id,
@@ -768,6 +854,7 @@ fn publish_external_retrieval_index_publication_on(
             rollback_record_json,
             rollback_core.map(|binding| binding.generation_id.as_str()),
             rollback_core.map(|binding| binding.run_id.as_str()),
+            artifact_scope_json,
         ],
     )?;
     Ok(())
@@ -809,6 +896,7 @@ fn open_external_retrieval_publication(
     }
     let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     connection.busy_timeout(std::time::Duration::from_millis(2_500))?;
+    connection.execute_batch("BEGIN DEFERRED TRANSACTION")?;
     let version: u32 = connection
         .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?
         .max(0) as u32;
@@ -855,7 +943,7 @@ pub(super) fn read_embedded_retrieval_publications(
     if table_exists == 0 {
         return Ok(Vec::new());
     }
-    let mut statement = connection.prepare(EMBEDDED_MANIFEST_SELECT)?;
+    let mut statement = connection.prepare(&manifest_select(&connection, false)?)?;
     let rows = statement.query_map([], publication_from_row)?;
     let mut publications = Vec::new();
     for row in rows {
@@ -868,7 +956,10 @@ fn read_bound_manifest_on(
     connection: &Connection,
     project_id: &str,
 ) -> Result<Option<BoundRetrievalIndexManifest>, StorageError> {
-    let mut statement = connection.prepare(&format!("{MANIFEST_SELECT} WHERE project_id = ?1"))?;
+    let mut statement = connection.prepare(&format!(
+        "{} WHERE project_id = ?1",
+        manifest_select(connection, true)?
+    ))?;
     let mut rows = statement.query(rusqlite::params![project_id])?;
     let Some(row) = rows.next()? else {
         return Ok(None);
@@ -896,8 +987,9 @@ fn read_bound_manifest_for_core_on(
     run_id: &str,
 ) -> Result<Option<BoundRetrievalIndexManifest>, StorageError> {
     let mut statement = connection.prepare(&format!(
-        "{MANIFEST_SELECT} WHERE core_generation_id = ?1 AND core_run_id = ?2 \
-         ORDER BY built_at_epoch_ms DESC, project_id"
+        "{} WHERE core_generation_id = ?1 AND core_run_id = ?2 \
+         ORDER BY built_at_epoch_ms DESC, project_id",
+        manifest_select(connection, true)?
     ))?;
     let mut rows = statement.query(rusqlite::params![generation_id, run_id])?;
     let Some(row) = rows.next()? else {
@@ -919,7 +1011,28 @@ fn read_bound_manifest_for_core_on(
 }
 
 fn manifest_from_row(row: &Row<'_>) -> rusqlite::Result<RetrievalIndexManifest> {
+    let artifact_scope = row
+        .get::<_, Option<String>>("artifact_scope_json")?
+        .map(|value| {
+            let scope: RetrievalArtifactScope = serde_json::from_str(&value).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            scope.validate().map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            Ok::<_, rusqlite::Error>(scope)
+        })
+        .transpose()?;
     Ok(RetrievalIndexManifest {
+        artifact_scope,
         project_id: row.get(0)?,
         lexical_version: row.get(1)?,
         semantic_generation: row.get(2)?,
@@ -971,9 +1084,15 @@ fn validate_rollback_record(
     current: &RetrievalIndexManifest,
     rollback: Option<&RetrievalIndexRollbackRecord>,
 ) -> Result<(), StorageError> {
+    if let Some(scope) = &current.artifact_scope {
+        scope.validate()?;
+    }
     let Some(rollback) = rollback else {
         return Ok(());
     };
+    if let Some(scope) = &rollback.manifest.artifact_scope {
+        scope.validate()?;
+    }
     let current_generation = current
         .sidecar_generation
         .as_deref()
@@ -1020,6 +1139,7 @@ mod tests {
         ] {
             storage
                 .upsert_retrieval_index_manifest(&RetrievalIndexManifest {
+                    artifact_scope: None,
                     project_id: project_id.into(),
                     lexical_version: "v1".into(),
                     semantic_generation: collection.into(),
@@ -1064,6 +1184,7 @@ mod tests {
         let db_path = dir.path().join("codestory.db");
         let mut storage = Storage::open(&db_path).expect("open storage");
         let manifest = RetrievalIndexManifest {
+            artifact_scope: None,
             project_id: "proj".into(),
             lexical_version: "v1".into(),
             semantic_generation: "codestory_proj_deadbeef".into(),
@@ -1110,6 +1231,7 @@ mod tests {
         ] {
             storage
                 .upsert_retrieval_index_manifest(&RetrievalIndexManifest {
+                    artifact_scope: None,
                     project_id: project_id.into(),
                     lexical_version: "v1".into(),
                     semantic_generation: format!("codestory_{project_id}_{suffix}"),
@@ -1158,6 +1280,7 @@ mod tests {
     fn retrieval_publication_updates_current_and_rollback_atomically() {
         fn manifest(suffix: &str, built_at_epoch_ms: i64) -> RetrievalIndexManifest {
             RetrievalIndexManifest {
+                artifact_scope: None,
                 project_id: "proj".into(),
                 lexical_version: "v1".into(),
                 semantic_generation: format!("codestory_proj_{suffix}"),
@@ -1283,6 +1406,7 @@ mod tests {
 
     fn retrieval_manifest_fixture_for_store(suffix: &str) -> RetrievalIndexManifest {
         RetrievalIndexManifest {
+            artifact_scope: None,
             project_id: "proj".into(),
             lexical_version: "v1".into(),
             semantic_generation: format!("codestory_proj_{suffix}"),
@@ -1320,6 +1444,7 @@ mod tests {
         ] {
             storage
                 .upsert_retrieval_index_manifest(&RetrievalIndexManifest {
+                    artifact_scope: None,
                     project_id: project_id.into(),
                     lexical_version: "v1".into(),
                     semantic_generation: collection.into(),
@@ -1355,6 +1480,66 @@ mod tests {
                 "codestory_proj_a".to_string(),
                 "codestory_proj_b".to_string()
             ]
+        );
+    }
+    #[test]
+    fn artifact_scope_round_trips_atomically_with_rollback_and_abort() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("codestory.db");
+        let mut store = Storage::open(&path).unwrap();
+        let mut old = retrieval_manifest_fixture_for_store("old");
+        old.artifact_scope = Some(RetrievalArtifactScope::Local);
+        store.upsert_retrieval_index_manifest(&old).unwrap();
+        let mut current = retrieval_manifest_fixture_for_store("new");
+        current.artifact_scope = Some(RetrievalArtifactScope::Agent {
+            workspace_id: "workspace".into(),
+            run_id: "producer-run".into(),
+        });
+        let rollback = RetrievalIndexRollbackRecord {
+            manifest: old.clone(),
+            verified_at_epoch_ms: 1,
+        };
+        store
+            .publish_retrieval_index_publication(&current, Some(&rollback))
+            .unwrap();
+        assert_eq!(
+            store
+                .get_retrieval_index_publication(&current.project_id)
+                .unwrap(),
+            Some((current.clone(), Some(rollback.clone())))
+        );
+        {
+            let mut transaction = store.write_transaction().unwrap();
+            transaction
+                .storage_mut()
+                .publish_retrieval_index_publication(&old, None)
+                .unwrap();
+        }
+        assert_eq!(
+            store
+                .get_retrieval_index_publication(&current.project_id)
+                .unwrap(),
+            Some((current, Some(rollback)))
+        );
+    }
+    #[test]
+    fn malformed_artifact_scope_is_rejected_without_replacing_publication() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("codestory.db");
+        let mut store = Storage::open(&path).unwrap();
+        let manifest = retrieval_manifest_fixture_for_store("old");
+        store.upsert_retrieval_index_manifest(&manifest).unwrap();
+        let mut invalid = manifest.clone();
+        invalid.artifact_scope = Some(RetrievalArtifactScope::Agent {
+            workspace_id: "workspace".into(),
+            run_id: "../../escape".into(),
+        });
+        assert!(store.upsert_retrieval_index_manifest(&invalid).is_err());
+        assert_eq!(
+            store
+                .get_retrieval_index_manifest(&manifest.project_id)
+                .unwrap(),
+            Some(manifest)
         );
     }
 }

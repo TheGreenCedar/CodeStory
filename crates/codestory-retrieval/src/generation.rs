@@ -234,6 +234,7 @@ mod tests {
 
     fn manifest(project_id: &str, hash: &str) -> RetrievalIndexManifest {
         RetrievalIndexManifest {
+            artifact_scope: None,
             project_id: project_id.into(),
             lexical_version: crate::lexical_index::LEXICAL_INDEX_VERSION.into(),
             semantic_generation: sidecar_vector_generation(project_id, hash),

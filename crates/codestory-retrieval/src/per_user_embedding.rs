@@ -23,7 +23,7 @@ pub use qualification_control::{
     EmbeddingQualificationAttemptResult, EmbeddingQualificationOperationResult,
     EmbeddingQualificationParameters, EmbeddingQualificationRequest, EmbeddingQualificationResult,
     QualificationGateEnvironment, qualification_gate_environment,
-    run_per_user_embedding_qualification,
+    run_per_user_embedding_qualification, validate_qualification_clock_gate,
 };
 pub use qualification_worker::{
     EMBEDDING_BUSY_RETRY_QUEUE_CLASS, EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION,
@@ -113,3 +113,5 @@ const SERVER_QUALIFICATION_MAX_EVENT_RECORDS: u64 = 2_048;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::test_engine_identity;

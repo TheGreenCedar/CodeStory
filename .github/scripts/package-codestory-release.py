@@ -23,7 +23,11 @@ from native_binary_contract import (
     managed_native_runtime_dependencies,
     runtime_artifact_role,
 )
-from packaged_agent_proof.foundation import LOWER_TIER_NONCLAIMS, TARGET_CONTRACTS
+from packaged_agent_proof.foundation import (
+    LOWER_TIER_NONCLAIMS,
+    SERVER_PROTOCOL_SCHEMA_VERSION,
+    TARGET_CONTRACTS,
+)
 
 NORMALIZED_MTIME = 315532800  # 1980-01-01T00:00:00Z, valid for zip and tar.
 NATIVE_ENGINE_MARKER_PREFIX = b"codestory-native-engine-v1|"
@@ -169,7 +173,10 @@ def parse_server_proof_marker(marker: str) -> dict[str, object]:
             raise PackageContractError(f"embedding server proof {field} is not an integer") from exc
         require(numbers[field] > 0, f"embedding server proof {field} must be positive")
     require(numbers["bootstrap"] == 1, "embedding server bootstrap version is unsupported")
-    require(numbers["protocol_schema"] == 1, "embedding server protocol schema is unsupported")
+    require(
+        numbers["protocol_schema"] == SERVER_PROTOCOL_SCHEMA_VERSION,
+        "embedding server protocol schema is unsupported",
+    )
     require(numbers["query_capacity"] == 64, "embedding server query capacity is not accepted")
     require(numbers["bulk_capacity"] == 64, "embedding server bulk capacity is not accepted")
     require(numbers["idle_timeout_ms"] == 60_000, "embedding server idle timeout is not accepted")
@@ -760,7 +767,9 @@ def native_marker(
 
 
 TEST_MEASUREMENT_PROTOCOL = b'{"protocol_id":"self-test","schema_version":1}\n'
-TEST_SERVER_PROTOCOL = b'{"protocol_id":"self-test-wire","schema_version":1}\n'
+TEST_SERVER_PROTOCOL = (
+    b'{"protocol_id":"self-test-wire","schema_version":2,"snapshot":{"schema_version":2}}\n'
+)
 TEST_CONSTANT_SET = b'{"schema_version":1,"status":"frozen"}\n'
 
 
@@ -771,7 +780,7 @@ def server_proof_marker(
 ) -> str:
     return (
         "codestory-embedding-server-proof-v1|"
-        "bootstrap=1|protocol_schema=1|"
+        "bootstrap=1|protocol_schema=2|"
         f"protocol_sha256={protocol_sha256}|constant_set_sha256={constant_set_sha256}|"
         f"measurement_protocol_sha256={measurement_protocol_sha256}|"
         "clock_policy=awake_monotonic|query_capacity=64|bulk_capacity=64|"
@@ -954,6 +963,23 @@ def write_synthetic_runtime(
 
 
 def run_self_test() -> None:
+    marker = server_proof_marker()
+    proof = parse_server_proof_marker(marker)
+    require(
+        proof["schema_version"] == 1 and proof["protocol_schema_version"] == 2,
+        "package marker schema and wire protocol schema were conflated",
+    )
+    for version in (1, 3):
+        incompatible = marker.replace("|protocol_schema=2|", f"|protocol_schema={version}|")
+        try:
+            parse_server_proof_marker(incompatible)
+        except PackageContractError as error:
+            require(
+                str(error) == "embedding server protocol schema is unsupported",
+                f"package marker protocol schema rejection changed: {error}",
+            )
+        else:
+            raise AssertionError(f"package marker protocol schema {version} was accepted")
     with tempfile.TemporaryDirectory(prefix="codestory-package-self-test-") as temp_dir:
         temp_root = Path(temp_dir)
         dependency_names = ("kernel32.dll", "KERNEL32.dll", "User32.dll")

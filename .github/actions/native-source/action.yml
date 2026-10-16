@@ -1,0 +1,17 @@
+name: Reconstruct pinned native source
+description: Verify or reconstruct the exact authored native source before workspace Cargo commands.
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v7.0.0
+      # The macOS installer requires /Users/runner; protected Macs already provide Python.
+      if: runner.os != 'macOS'
+      env:
+        PSExecutionPolicyPreference: Bypass
+      with:
+        python-version: "3.13"
+    - shell: bash
+      run: |
+        set -euo pipefail
+        python_command="$(command -v python || command -v python3)"
+        "$python_command" scripts/bootstrap-research-native-vendor.py --ensure --download

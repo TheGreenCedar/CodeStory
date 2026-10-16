@@ -2064,6 +2064,58 @@ pub enum SnippetScopeDto {
     FunctionBody,
 }
 
+/// Source range delivery is a workspace read, not a fabricated symbol identity.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceRangeKindDto {
+    WorkspaceRead,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceRangeOmissionDto {
+    ByteBudget,
+    LineExceedsByteBudget,
+}
+
+/// Requested endpoints retain their legacy meaning. Delivered endpoints are
+/// nullable because an empty file, EOF, or a byte budget can deliver no lines.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct SourceRangeSnippetDto {
+    pub path: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub snippet: String,
+    #[serde(rename = "snippet_truncated")]
+    pub truncated: bool,
+    pub delivered_start_line: Option<u32>,
+    pub delivered_end_line: Option<u32>,
+    /// Known only when the single source scan actually observed EOF.
+    pub source_total_lines: Option<u32>,
+    pub last_line_terminated: Option<bool>,
+    /// SHA-256 of delivered source bytes, including original LF/CRLF endings;
+    /// this is deliberately not the file's indexed content hash.
+    pub source_range_sha256: Option<String>,
+    pub source_kind: SourceRangeKindDto,
+    /// Complete for the requested window, including natural EOF clipping.
+    /// This does not assert complete-file or complete-index coverage.
+    pub complete: bool,
+    pub omission_reason: Option<SourceRangeOmissionDto>,
+    pub next_start_line: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct SourceRangesDto {
+    pub ranges: Vec<SourceRangeSnippetDto>,
+    /// Legacy field: shared rendered-snippet byte allowance, not wire size.
+    pub max_total_bytes: u32,
+    /// Separate bound for the serialized structured result including metadata.
+    pub max_response_bytes: u32,
+    pub requested_count: u32,
+    pub omitted_count: u32,
+    pub complete: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct SnippetContextDto {
     pub node: NodeDetailsDto,
@@ -2796,6 +2848,11 @@ pub fn validate_packet_probe(probe: &PacketProbeDto) -> Result<(), String> {
                 validate_packet_probe_text("retrieval_generation", retrieval_generation)?;
             }
             validate_packet_probe_text("stable_identity", &selector.stable_identity)?;
+            if selector.source_range.is_some_and(|range| !range.is_valid()) {
+                return Err(
+                    "continuation source range must have positive ordered bounds".to_string(),
+                );
+            }
             if let Some(path) = selector.path.as_deref() {
                 validate_packet_probe_text("path", path)?;
             }
@@ -2981,6 +3038,8 @@ pub enum SupportUnitKindDto {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
 pub struct SupportUnitDto {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_delivery: Option<crate::compilation::PacketSourceDeliveryV1>,
     pub id: String,
     pub kind: SupportUnitKindDto,
     pub summary: String,
@@ -3024,6 +3083,11 @@ pub enum DrillGapKindDto {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
 pub struct DrillOptionDto {
+    /// Display metadata from the pinned hydrated source; never an executable selector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_label: Option<DrillSourceLabelDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_range: Option<crate::compilation::PacketSourceRangeV1>,
     pub id: String,
     pub gap_id: String,
     pub kind: DrillGapKindDto,
@@ -3033,6 +3097,13 @@ pub struct DrillOptionDto {
     pub symbol_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structural_reason: Option<crate::compilation::PacketStructuralGapReasonV1>,
+}
+
+/// Repository-derived display context. Missing or conflicting fields stay unknown.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct DrillSourceLabelDto {
+    pub path: Option<String>,
+    pub symbol: Option<String>,
 }
 
 pub const PACKET_DRILL_MAX_OPTIONS: usize = 8;
@@ -3112,10 +3183,27 @@ impl PacketDispositionDto {
 }
 
 impl DrillOptionDto {
+    pub fn with_source_range(mut self, range: crate::compilation::PacketSourceRangeV1) -> Self {
+        let target = if let Some(symbol_id) = self.symbol_id.as_deref() {
+            format!("symbol:{symbol_id}")
+        } else {
+            format!("path:{}", self.path.as_deref().unwrap_or_default())
+        };
+        self.id = encode_drill_option_id(
+            DrillGapKindDto::OmittedMandatorySupport,
+            &format!("range:{}:{}:{target}", range.start_line, range.end_line),
+        );
+        self.kind = DrillGapKindDto::OmittedMandatorySupport;
+        self.source_range = Some(range);
+        self
+    }
+
     pub fn bounded_source_read(gap_id: impl Into<String>, path: impl Into<String>) -> Self {
         let path = path.into();
         let gap_id = gap_id.into();
         Self {
+            source_label: None,
+            source_range: None,
             id: encode_drill_option_id(DrillGapKindDto::BoundedSourceRead, &path),
             gap_id,
             kind: DrillGapKindDto::BoundedSourceRead,
@@ -3131,6 +3219,8 @@ impl DrillOptionDto {
         let symbol_id = symbol_id.into();
         let gap_id = gap_id.into();
         Self {
+            source_label: None,
+            source_range: None,
             id: encode_drill_option_id(
                 DrillGapKindDto::OmittedMandatorySupport,
                 &format!("symbol:{symbol_id}"),
@@ -3149,6 +3239,8 @@ impl DrillOptionDto {
         let path = path.into();
         let gap_id = gap_id.into();
         Self {
+            source_label: None,
+            source_range: None,
             id: encode_drill_option_id(
                 DrillGapKindDto::OmittedMandatorySupport,
                 &format!("path:{path}"),
@@ -3164,7 +3256,15 @@ impl DrillOptionDto {
     }
 }
 
+/// IDs are reversible references, not capabilities. Only canonical numeric
+/// node ranges use the versioned compact spelling; other selectors keep the
+/// legacy representation. Publication and source access are checked by runtime.
 pub fn encode_drill_option_id(kind: DrillGapKindDto, target: &str) -> String {
+    if kind == DrillGapKindDto::OmittedMandatorySupport
+        && let Some((start, end, node)) = numeric_drill_range(target)
+    {
+        return format!("ms1:{start}:{end}:{node}");
+    }
     let kind = match kind {
         DrillGapKindDto::OmittedMandatorySupport => "omitted_mandatory_support",
         DrillGapKindDto::BoundedSourceRead => "bounded_source_read",
@@ -3174,12 +3274,47 @@ pub fn encode_drill_option_id(kind: DrillGapKindDto, target: &str) -> String {
 
 pub fn decode_drill_option_id(id: &str) -> Option<(DrillGapKindDto, String)> {
     let (kind, encoded) = id.split_once(':')?;
+    if kind == "ms1" {
+        let mut parts = encoded.split(':');
+        let target = format!(
+            "range:{}:{}:symbol:{}",
+            parts.next()?,
+            parts.next()?,
+            parts.next()?
+        );
+        if parts.next().is_some() {
+            return None;
+        }
+        let (start, end, node) = numeric_drill_range(&target)?;
+        return (id == format!("ms1:{start}:{end}:{node}"))
+            .then_some((DrillGapKindDto::OmittedMandatorySupport, target));
+    }
     let kind = match kind {
         "omitted_mandatory_support" => DrillGapKindDto::OmittedMandatorySupport,
         "bounded_source_read" => DrillGapKindDto::BoundedSourceRead,
         _ => return None,
     };
-    Some((kind, percent_decode_drill_target(encoded)))
+    let target = percent_decode_drill_target(encoded);
+    // Keep accepting canonical legacy IDs even when their new spelling is
+    // compact. Noncanonical escapes cannot alias an executable reference.
+    (percent_encode_drill_target(&target) == encoded).then_some((kind, target))
+}
+
+fn numeric_drill_range(target: &str) -> Option<(u32, u32, i64)> {
+    let mut parts = target.strip_prefix("range:")?.splitn(3, ':');
+    let start = parts.next()?;
+    let end = parts.next()?;
+    let node = parts.next()?.strip_prefix("symbol:")?;
+    let range = crate::compilation::PacketSourceRangeV1 {
+        start_line: start.parse().ok()?,
+        end_line: end.parse().ok()?,
+    };
+    let node_id: i64 = node.parse().ok()?;
+    (range.is_valid()
+        && range.start_line.to_string() == start
+        && range.end_line.to_string() == end
+        && node_id.to_string() == node)
+        .then_some((range.start_line, range.end_line, node_id))
 }
 
 fn percent_encode_drill_target(value: &str) -> String {
@@ -3535,6 +3670,7 @@ mod packet_tests {
                 core_generation_id: "core-generation".into(),
                 retrieval_generation: Some("retrieval-generation".into()),
                 selector: PacketContinuationSelectorV1 {
+                    source_range: None,
                     stable_identity: "node:42".into(),
                     path: None,
                     symbol_id: Some("42".into()),
@@ -3583,6 +3719,7 @@ mod packet_tests {
                 core_generation_id: "core-generation".into(),
                 retrieval_generation: Some("retrieval-generation".into()),
                 selector: PacketContinuationSelectorV1 {
+                    source_range: None,
                     stable_identity: "node:42".into(),
                     path: None,
                     symbol_id: Some("42".into()),
@@ -3930,6 +4067,7 @@ mod packet_tests {
     #[test]
     fn packet_disposition_and_support_units_round_trip() {
         let support = SupportUnitDto {
+            source_delivery: None,
             id: "sym-1".to_string(),
             kind: SupportUnitKindDto::SymbolLocation,
             summary: "AgentPacketDto at dto.rs:3251".to_string(),
@@ -3999,6 +4137,77 @@ mod packet_tests {
         let (kind, target) = decode_drill_option_id(&option.id).expect("decode option id");
         assert_eq!(kind, DrillGapKindDto::BoundedSourceRead);
         assert_eq!(target, "src/main.rs");
+    }
+
+    #[test]
+    fn numeric_range_reference_codec_preserves_legacy_and_selector_domains() {
+        let kind = DrillGapKindDto::OmittedMandatorySupport;
+        for start in [1, 12, u32::MAX] {
+            for end in [start, u32::MAX] {
+                for node in [i64::MIN, -42, 0, i64::MAX] {
+                    let target = format!("range:{start}:{end}:symbol:{node}");
+                    let compact = format!("ms1:{start}:{end}:{node}");
+                    let legacy = format!(
+                        "omitted_mandatory_support:{}",
+                        percent_encode_drill_target(&target)
+                    );
+                    assert_eq!(encode_drill_option_id(kind, &target), compact);
+                    for id in [compact, legacy] {
+                        assert_eq!(decode_drill_option_id(&id), Some((kind, target.clone())));
+                    }
+                }
+            }
+        }
+        for target in [
+            "range:1:9:symbol:opaque",
+            "range:1:9:path:src/雪.rs",
+            "symbol:-42",
+            "path:src/雪.rs",
+            "range:1:9:symbol:01",
+        ] {
+            let legacy = format!(
+                "omitted_mandatory_support:{}",
+                percent_encode_drill_target(target)
+            );
+            assert_eq!(encode_drill_option_id(kind, target), legacy);
+            assert_eq!(decode_drill_option_id(&legacy), Some((kind, target.into())));
+        }
+        let target = "range:1:9:symbol:42";
+        let path = encode_drill_option_id(DrillGapKindDto::BoundedSourceRead, target);
+        assert!(path.starts_with("bounded_source_read:"));
+        assert_eq!(
+            decode_drill_option_id(&path),
+            Some((DrillGapKindDto::BoundedSourceRead, target.into()))
+        );
+    }
+
+    #[test]
+    fn numeric_range_reference_codec_rejects_aliases_and_unknown_versions() {
+        for id in [
+            "ms2:1:9:42",
+            "ms1:0:9:42",
+            "ms1:10:9:42",
+            "ms1:01:9:42",
+            "ms1:+1:9:42",
+            "ms1:1:09:42",
+            "ms1:1:4294967296:42",
+            "ms1:1:9:+42",
+            "ms1:1:9:01",
+            "ms1:1:9:-0",
+            "ms1:1:9:9223372036854775808",
+            "ms1:1:9:-9223372036854775809",
+            "ms1:1:9:42:extra",
+            "ms1:1:9",
+            "ms1:1:9:4%32",
+            "ms1:1:9:雪",
+            "ms1:1:9:42\n",
+            "omitted_mandatory_support:range%3a1%3A9%3Asymbol%3A42",
+            "omitted_mandatory_support:%FF",
+            "bounded_source_read:%",
+            "bounded_source_read:%41",
+        ] {
+            assert!(decode_drill_option_id(id).is_none(), "{id}");
+        }
     }
 
     #[test]

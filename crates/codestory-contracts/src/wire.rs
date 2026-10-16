@@ -33,7 +33,10 @@ use serde::{Deserialize, Serialize};
 /// * **v4** — additive: `freshness` reports whether the response came from the
 ///   fresh current source or a retained publication during a refresh, and
 ///   `served_from` now derives from that runtime decision.
-pub const PUBLICATION_STAMP_SCHEMA_VERSION: u32 = 4;
+/// * **v5** — closed search evidence rows include a required nullable bounded
+///   `display_name`. Older strict readers cannot decode the added field; the
+///   evidence-projection payload family remains v3.
+pub const PUBLICATION_STAMP_SCHEMA_VERSION: u32 = 5;
 
 /// Oldest reader schema version that can still interpret a payload stamped with
 /// [`PUBLICATION_STAMP_SCHEMA_VERSION`] without misreading it.
@@ -43,7 +46,8 @@ pub const PUBLICATION_STAMP_SCHEMA_VERSION: u32 = 4;
 /// client against a v2 server receives `-32602` for requests it believes are
 /// valid. Consumers must compare against this bound rather than assuming the
 /// stamp is purely additive.
-pub const MINIMUM_COMPATIBLE_PUBLICATION_STAMP_SCHEMA_VERSION: u32 = 3;
+/// v5 likewise requires a v5 reader for the extended closed search row.
+pub const MINIMUM_COMPATIBLE_PUBLICATION_STAMP_SCHEMA_VERSION: u32 = 5;
 
 /// Schema version a reader must assume when `_meta.codestory_publication` is
 /// absent from a response that should carry it.
@@ -267,10 +271,12 @@ mod tests {
 
     #[test]
     fn stamp_window_is_closed_on_both_sides() {
-        assert_eq!(
-            classify_publication_stamp(Some(1), None),
-            Err(PublicationStampSkew::ProducerTooOld)
-        );
+        for older in [1, 2, 3, 4] {
+            assert_eq!(
+                classify_publication_stamp(Some(older), None),
+                Err(PublicationStampSkew::ProducerTooOld)
+            );
+        }
         assert_eq!(
             classify_publication_stamp(Some(PUBLICATION_STAMP_SCHEMA_VERSION + 1), None),
             Err(PublicationStampSkew::ProducerTooNew)
@@ -295,10 +301,10 @@ mod tests {
     #[test]
     fn published_stamp_bounds_are_the_documented_values() {
         assert_eq!(
-            PUBLICATION_STAMP_SCHEMA_VERSION, 4,
-            "the additive freshness field publishes stamp schema 4"
+            PUBLICATION_STAMP_SCHEMA_VERSION, 5,
+            "closed search display labels require stamp schema 5"
         );
-        assert_eq!(MINIMUM_COMPATIBLE_PUBLICATION_STAMP_SCHEMA_VERSION, 3);
+        assert_eq!(MINIMUM_COMPATIBLE_PUBLICATION_STAMP_SCHEMA_VERSION, 5);
         assert_eq!(LEGACY_PUBLICATION_STAMP_SCHEMA_VERSION, 0);
         assert_eq!(
             SUPPORTED_MCP_PROTOCOL_VERSIONS,

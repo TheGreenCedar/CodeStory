@@ -1,0 +1,200 @@
+{
+  "_meta": {
+    "codestory_publication": {
+      "contract_runtime": {
+        "cli_sha256": null,
+        "cli_source": "direct_cli_launch",
+        "cli_version": "0.17.7",
+        "known_override_skew_channel": false,
+        "pinned_pair_matches": null,
+        "plugin_cli_version": null,
+        "plugin_version": null
+      },
+      "core_publication": {
+        "generation": 1,
+        "generation_id": "1731ee82-b30e-4c5f-8ced-9d87c6a809c5",
+        "mode": "full",
+        "published_at_epoch_ms": 1791502992064,
+        "run_id": "b5714e8a-1fa0-4acc-a69d-0d6d4baa390c"
+      },
+      "freshness": {
+        "served_generation": "1731ee82-b30e-4c5f-8ced-9d87c6a809c5",
+        "state": "fresh"
+      },
+      "minimum_compatible_schema_version": 3,
+      "operation": {
+        "attempt": 1,
+        "operation_id": "public-1"
+      },
+      "publication": {
+        "generation": 1,
+        "generation_id": "1731ee82-b30e-4c5f-8ced-9d87c6a809c5",
+        "mode": "full",
+        "published_at_epoch_ms": 1791502992064,
+        "run_id": "b5714e8a-1fa0-4acc-a69d-0d6d4baa390c"
+      },
+      "retrieval_publication": {
+        "core_generation_id": "1731ee82-b30e-4c5f-8ced-9d87c6a809c5",
+        "core_run_id": "b5714e8a-1fa0-4acc-a69d-0d6d4baa390c",
+        "retrieval_generation": "24f5f6e74fca24e6-ae4ec05bdab9064a",
+        "retrieval_input_hash": "ae4ec05bdab9064a3234655a64bfb06b08280c7efe7163d02caf6f0d2602d43f",
+        "semantic_generation": "codestory_24f5f6e74fca24e6_ae4ec05bdab9064a"
+      },
+      "schema_version": 4,
+      "served_from": "complete_publication"
+    }
+  },
+  "continuation": null,
+  "diagnostics": {
+    "availability": "unavailable"
+  },
+  "evidence": [
+    {
+      "end_line": 270,
+      "excerpt": null,
+      "identity": {
+        "evidence_id": "search-0-4068842746959683004"
+      },
+      "path": "<CRON_ROOT>/parser_test.go",
+      "start_line": 270,
+      "symbol_id": "4068842746959683004"
+    },
+    {
+      "end_line": 66,
+      "excerpt": null,
+      "identity": {
+        "evidence_id": "search-1--947438319266848"
+      },
+      "path": "<CRON_ROOT>/cron_test.go",
+      "start_line": 66,
+      "symbol_id": "-947438319266848"
+    },
+    {
+      "end_line": 206,
+      "excerpt": null,
+      "identity": {
+        "evidence_id": "search-2--5347798547599386580"
+      },
+      "path": "<CRON_ROOT>/parser_test.go",
+      "start_line": 206,
+      "symbol_id": "-5347798547599386580"
+    },
+    {
+      "end_line": 19,
+      "excerpt": null,
+      "identity": {
+        "evidence_id": "search-3-2340103021962982066"
+      },
+      "path": "<CRON_ROOT>/option.go",
+      "start_line": 19,
+      "symbol_id": "2340103021962982066"
+    },
+    {
+      "end_line": 71,
+      "excerpt": null,
+      "identity": {
+        "evidence_id": "search-4--1667004008352814472"
+      },
+      "path": "<CRON_ROOT>/parser.go",
+      "start_line": 71,
+      "symbol_id": "-1667004008352814472"
+    },
+    {
+      "end_line": 17,
+      "excerpt": null,
+      "identity": {
+        "evidence_id": "search-5--2275990764689448031"
+      },
+      "path": "<CRON_ROOT>/option_test.go",
+      "start_line": 17,
+      "symbol_id": "-2275990764689448031"
+    },
+    {
+      "end_line": 88,
+      "excerpt": null,
+      "identity": {
+        "evidence_id": "search-6-6162035085061559411"
+      },
+      "path": "<CRON_ROOT>/parser.go",
+      "start_line": 88,
+      "symbol_id": "6162035085061559411"
+    },
+    {
+      "end_line": 38,
+      "excerpt": null,
+      "identity": {
+        "evidence_id": "search-7--251604735216488775"
+      },
+      "path": "<CRON_ROOT>/chain.go",
+      "start_line": 38,
+      "symbol_id": "-251604735216488775"
+    },
+    {
+      "end_line": 148,
+      "excerpt": null,
+      "identity": {
+        "evidence_id": "search-8-6826276755486560280"
+      },
+      "path": "<CRON_ROOT>/cron.go",
+      "start_line": 148,
+      "symbol_id": "6826276755486560280"
+    },
+    {
+      "end_line": 215,
+      "excerpt": null,
+      "identity": {
+        "evidence_id": "search-9-2047756593943170864"
+      },
+      "path": "<CRON_ROOT>/cron.go",
+      "start_line": 215,
+      "symbol_id": "2047756593943170864"
+    },
+    {
+      "end_line": 49,
+      "excerpt": "\tt.Run(\"panic exits job by default\", func(t *testing.T) {",
+      "identity": {
+        "evidence_id": "search-10--1372976033579102688"
+      },
+      "path": "<CRON_ROOT>/chain_test.go",
+      "start_line": 49,
+      "symbol_id": null
+    },
+    {
+      "end_line": 17,
+      "excerpt": "func TestWithParser(t *testing.T) {",
+      "identity": {
+        "evidence_id": "search-11--8106138437792723148"
+      },
+      "path": "<CRON_ROOT>/option_test.go",
+      "start_line": 17,
+      "symbol_id": null
+    }
+  ],
+  "gaps": [],
+  "identity": {
+    "packet_id": "27b1485a-6238-4d86-956e-41375039926d",
+    "question_sha256": "f42ac9a2683c082727b093430199ff9f0c53866bcb961652494b7725df29eb75",
+    "request_id": "search-f42ac9a2683c082727b093430199ff9f0c53866bcb961652494b7725df29eb75"
+  },
+  "kind": "complete",
+  "publication": {
+    "core": {
+      "generation_id": "1731ee82-b30e-4c5f-8ced-9d87c6a809c5",
+      "project_id": "24f5f6e74fca24e6",
+      "run_id": "b5714e8a-1fa0-4acc-a69d-0d6d4baa390c"
+    },
+    "retrieval": {
+      "core_generation_id": "1731ee82-b30e-4c5f-8ced-9d87c6a809c5",
+      "core_run_id": "b5714e8a-1fa0-4acc-a69d-0d6d4baa390c",
+      "retrieval_generation": "24f5f6e74fca24e6-ae4ec05bdab9064a",
+      "retrieval_input_sha256": "ae4ec05bdab9064a3234655a64bfb06b08280c7efe7163d02caf6f0d2602d43f",
+      "semantic_generation": "codestory_24f5f6e74fca24e6_ae4ec05bdab9064a"
+    }
+  },
+  "retrieval": {
+    "generation_id": "24f5f6e74fca24e6-ae4ec05bdab9064a",
+    "state": "full"
+  },
+  "schema_version": 3,
+  "status": "available"
+}

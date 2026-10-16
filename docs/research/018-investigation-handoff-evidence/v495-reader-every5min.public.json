@@ -1,0 +1,150 @@
+{
+  "_meta": {
+    "codestory_publication": {
+      "contract_runtime": {
+        "cli_sha256": null,
+        "cli_source": "direct_cli_launch",
+        "cli_version": "0.17.7",
+        "known_override_skew_channel": false,
+        "pinned_pair_matches": null,
+        "plugin_cli_version": null,
+        "plugin_version": null
+      },
+      "core_publication": {
+        "generation": 1,
+        "generation_id": "1731ee82-b30e-4c5f-8ced-9d87c6a809c5",
+        "mode": "full",
+        "published_at_epoch_ms": 1791502992064,
+        "run_id": "b5714e8a-1fa0-4acc-a69d-0d6d4baa390c"
+      },
+      "freshness": {
+        "served_generation": "1731ee82-b30e-4c5f-8ced-9d87c6a809c5",
+        "state": "fresh"
+      },
+      "minimum_compatible_schema_version": 3,
+      "operation": {
+        "attempt": 1,
+        "operation_id": "public-1"
+      },
+      "publication": {
+        "generation": 1,
+        "generation_id": "1731ee82-b30e-4c5f-8ced-9d87c6a809c5",
+        "mode": "full",
+        "published_at_epoch_ms": 1791502992064,
+        "run_id": "b5714e8a-1fa0-4acc-a69d-0d6d4baa390c"
+      },
+      "retrieval_publication": null,
+      "schema_version": 4,
+      "served_from": "complete_publication"
+    }
+  },
+  "resolution": {
+    "alternatives": [
+      {
+        "display_name": "every5min5s",
+        "evidence_producer": "lexical_source",
+        "evidence_tier": "lexical_source",
+        "file_path": "parser_test.go",
+        "kind": "FUNCTION",
+        "line": 365,
+        "match_quality": "prefix",
+        "node_id": "329455072174418384",
+        "node_ref": "parser_test.go:365:every5min5s",
+        "origin": "indexed_symbol",
+        "primary_occurrence_kind": "definition",
+        "resolution_status": "resolved",
+        "resolvable": true,
+        "score": 244.0,
+        "score_breakdown": {
+          "graph": 0.0,
+          "lexical": 244.0,
+          "provenance": [
+            "lexical_source"
+          ],
+          "semantic": 0.0,
+          "total": 244.0
+        },
+        "symbol_role": "definition",
+        "verification_targets": [
+          {
+            "line": 365,
+            "node_ref": "parser_test.go:365:every5min5s",
+            "path": "parser_test.go",
+            "reason": "primary source occurrence selected for this symbol",
+            "role": "definition"
+          }
+        ]
+      }
+    ],
+    "requested": "every5min",
+    "resolved": {
+      "display_name": "every5min",
+      "evidence_producer": "lexical_source",
+      "evidence_tier": "lexical_source",
+      "file_path": "parser_test.go",
+      "kind": "FUNCTION",
+      "line": 361,
+      "match_quality": "exact",
+      "node_id": "5740067372129563664",
+      "node_ref": "parser_test.go:361:every5min",
+      "origin": "indexed_symbol",
+      "primary_occurrence_kind": "definition",
+      "resolution_status": "resolved",
+      "resolvable": true,
+      "score": 244.0,
+      "score_breakdown": {
+        "graph": 0.0,
+        "lexical": 244.0,
+        "provenance": [
+          "lexical_source"
+        ],
+        "semantic": 0.0,
+        "total": 244.0
+      },
+      "symbol_role": "definition",
+      "verification_targets": [
+        {
+          "line": 361,
+          "node_ref": "parser_test.go:361:every5min",
+          "path": "parser_test.go",
+          "reason": "primary source occurrence selected for this symbol",
+          "role": "definition"
+        }
+      ]
+    },
+    "selector": "query"
+  },
+  "snippet": {
+    "line": 361,
+    "max_snippet_bytes": 65536,
+    "node": {
+      "canonical_id": "<CRON_ROOT>/parser_test.go:every5min#0",
+      "display_name": "every5min",
+      "end_col": 2,
+      "end_line": 363,
+      "file_path": "<CRON_ROOT>/parser_test.go",
+      "id": "5740067372129563664",
+      "kind": "FUNCTION",
+      "member_access": null,
+      "qualified_name": "every5min",
+      "serialized_name": "every5min",
+      "start_col": 1,
+      "start_line": 361
+    },
+    "path": "<CRON_ROOT>/parser_test.go",
+    "range_source": "indexed_symbol_range",
+    "requested_context": 0,
+    "scope": "function_body",
+    "snippet": "```text\n>  361 | func every5min(loc *time.Location) *SpecSchedule {\n   362 | \treturn &SpecSchedule{1 << 0, 1 << 5, all(hours), all(dom), all(months), all(dow), loc}\n   363 | }\n```",
+    "snippet_truncated": false
+  },
+  "verification_targets": [
+    {
+      "line": 361,
+      "node_ref": "parser_test.go:361:every5min",
+      "path": "parser_test.go",
+      "reason": "primary source occurrence selected for this symbol",
+      "role": "definition"
+    }
+  ]
+}

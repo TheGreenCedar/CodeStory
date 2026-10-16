@@ -27,7 +27,8 @@ export function githubFixture() {
     jobs: new Map(), artifacts: new Map(), containers: new Map(), statuses: new Map(), calls: [],
     clock: new Date('2026-09-09T04:00:00.000Z'), nextId: 121, artifactId: 1000,
     dirty: '', cancelHonored: true, heartbeat: true, constantsFrozen: false,
-    pulls: [], branches: new Map(), worktreeHeads: new Map(), sourceFiles: new Map(), lineageChecks: 0 };
+    pulls: [], branches: new Map(), localBranch: 'dev/codestory-next',
+    localBranches: new Map([['dev/codestory-next', C]]), sourceFiles: new Map(), lineageChecks: 0 };
   for (const name of ['per-user-embedding-server-measurement-protocol.json', 'per-user-embedding-server-protocol.json', path.basename(CONSTANT_SET)]) {
     const file = `crates/codestory-llama-sys/${name}`;
     let bytes = readFileSync(path.join(ROOT, file), 'utf8');
@@ -149,24 +150,29 @@ export function githubFixture() {
       throw new Error(`unhandled hermetic process ${program} ${args.join(' ')}`);
     }
     if (program === 'git') {
-      const scope = args[1]; let command = args.slice(2);
+      let command = args.slice(2);
       while (command[0] === '-c') command = command.slice(2);
-      if (command[0] === 'rev-parse' && command[1] === 'HEAD') return data.worktreeHeads.get(scope) ?? data.localHead;
-      if (command[0] === 'rev-parse' && command[1].endsWith('^{tree}')) return TREES[data.worktreeHeads.get(scope) ?? F];
+      if (command[0] === 'rev-parse' && command[1] === 'HEAD') return data.localHead;
+      if (command[0] === 'rev-parse' && command[1].startsWith('refs/heads/')) return data.localBranches.get(command[1].slice(11));
+      if (command[0] === 'rev-parse' && command[1].endsWith('^{tree}')) return TREES[command[1].slice(0, -7)];
       if (command[0] === 'status') return data.dirty;
       if (command[0] === 'ls-remote') { const ref = command.at(-1).replace('refs/heads/', ''); return data.branches.has(ref) ? `${data.branches.get(ref)}\trefs/heads/${ref}` : ''; }
       if (command[0] === 'fetch' || command[0] === 'cat-file') return '';
       if (command[0] === 'rev-list') return `${F} ${C}`;
       if (command[0] === 'diff') return data.wrongFreezePath ? 'README.md' : CONSTANT_SET;
       if (command[0] === 'show') return data.frozenBytes;
-      if (command[0] === 'add') return '';
-      if (command[0] === 'commit') { data.worktreeHeads.set(scope, F); return F; }
-      if (command[0] === 'push') { data.branches.set(command.at(-1).split('refs/heads/')[1], F); return ''; }
-      if (command[0] === 'worktree' && command[1] === 'add') {
-        const checkout = command.at(-2); mkdirSync(path.join(checkout, path.dirname(CONSTANT_SET)), { recursive: true });
-        data.worktreeHeads.set(checkout, command.at(-1)); return '';
+      if (command[0] === 'read-tree' || command[0] === 'update-index') return '';
+      if (command[0] === 'hash-object') return 'a'.repeat(40);
+      if (command[0] === 'ls-tree') return '100644';
+      if (command[0] === 'write-tree') return TREES[F];
+      if (command[0] === 'commit-tree') return F;
+      if (command[0] === 'branch') return data.localBranch;
+      if (command[0] === 'switch') {
+        data.localBranch = command[1] === '--detach' ? '' : command[1];
+        data.localHead = data.localBranch ? data.localBranches.get(data.localBranch) : command[2];
+        return '';
       }
-      if (command[0] === 'worktree' && command[1] === 'remove') { data.worktreeHeads.delete(command.at(-1)); return ''; }
+      if (command[0] === 'push') { data.branches.set(command.at(-1).split('refs/heads/')[1], F); return ''; }
       throw new Error(`unhandled hermetic git ${command.join(' ')}`);
     }
     if (args[0] === 'issue' && args[1] === 'list') {

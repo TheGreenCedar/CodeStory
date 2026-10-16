@@ -1,0 +1,90 @@
+{
+  "_meta": {
+    "codestory_publication": {
+      "contract_runtime": {
+        "cli_sha256": null,
+        "cli_source": "direct_cli_launch",
+        "cli_version": "0.17.7",
+        "known_override_skew_channel": false,
+        "pinned_pair_matches": null,
+        "plugin_cli_version": null,
+        "plugin_version": null
+      },
+      "core_publication": {
+        "generation": 1,
+        "generation_id": "1731ee82-b30e-4c5f-8ced-9d87c6a809c5",
+        "mode": "full",
+        "published_at_epoch_ms": 1791502992064,
+        "run_id": "b5714e8a-1fa0-4acc-a69d-0d6d4baa390c"
+      },
+      "freshness": {
+        "served_generation": "1731ee82-b30e-4c5f-8ced-9d87c6a809c5",
+        "state": "fresh"
+      },
+      "minimum_compatible_schema_version": 3,
+      "operation": {
+        "attempt": 1,
+        "operation_id": "public-1"
+      },
+      "publication": {
+        "generation": 1,
+        "generation_id": "1731ee82-b30e-4c5f-8ced-9d87c6a809c5",
+        "mode": "full",
+        "published_at_epoch_ms": 1791502992064,
+        "run_id": "b5714e8a-1fa0-4acc-a69d-0d6d4baa390c"
+      },
+      "retrieval_publication": null,
+      "schema_version": 4,
+      "served_from": "complete_publication"
+    },
+    "com.thegreencedar.codestory/protocolRevision": "2025-11-25"
+  },
+  "content": [
+    {
+      "text": "{\"complete\":true,\"max_response_bytes\":131072,\"max_total_bytes\":65536,\"omitted_count\":0,\"ranges\":[{\"complete\":true,\"delivered_end_line\":57,\"delivered_start_line\":1,\"end_line\":57,\"last_line_terminated\":true,\"next_start_line\":null,\"omission_reason\":null,\"path\":\"spec.go\",\"snippet\":\"```text\\n     1 | package cron\\n     2 | \\n     3 | import \\\"time\\\"\\n     4 | \\n     5 | // SpecSchedule specifies a duty cycle (to the second granularity), based on a\\n     6 | // traditional crontab specification. It is computed initially and stored as bit sets.\\n     7 | type SpecSchedule struct {\\n     8 | \\tSecond, Minute, Hour, Dom, Month, Dow uint64\\n     9 | \\n    10 | \\t// Override location for this schedule.\\n    11 | \\tLocation *time.Location\\n    12 | }\\n    13 | \\n    14 | // bounds provides a range of acceptable values (plus a map of name to value).\\n    15 | type bounds struct {\\n    16 | \\tmin, max uint\\n    17 | \\tnames    map[string]uint\\n    18 | }\\n    19 | \\n    20 | // The bounds for each field.\\n    21 | var (\\n    22 | \\tseconds = bounds{0, 59, nil}\\n    23 | \\tminutes = bounds{0, 59, nil}\\n    24 | \\thours   = bounds{0, 23, nil}\\n    25 | \\tdom     = bounds{1, 31, nil}\\n    26 | \\tmonths  = bounds{1, 12, map[string]uint{\\n    27 | \\t\\t\\\"jan\\\": 1,\\n    28 | \\t\\t\\\"feb\\\": 2,\\n    29 | \\t\\t\\\"mar\\\": 3,\\n    30 | \\t\\t\\\"apr\\\": 4,\\n    31 | \\t\\t\\\"may\\\": 5,\\n    32 | \\t\\t\\\"jun\\\": 6,\\n    33 | \\t\\t\\\"jul\\\": 7,\\n    34 | \\t\\t\\\"aug\\\": 8,\\n    35 | \\t\\t\\\"sep\\\": 9,\\n    36 | \\t\\t\\\"oct\\\": 10,\\n    37 | \\t\\t\\\"nov\\\": 11,\\n    38 | \\t\\t\\\"dec\\\": 12,\\n    39 | \\t}}\\n    40 | \\tdow = bounds{0, 6, map[string]uint{\\n    41 | \\t\\t\\\"sun\\\": 0,\\n    42 | \\t\\t\\\"mon\\\": 1,\\n    43 | \\t\\t\\\"tue\\\": 2,\\n    44 | \\t\\t\\\"wed\\\": 3,\\n    45 | \\t\\t\\\"thu\\\": 4,\\n    46 | \\t\\t\\\"fri\\\": 5,\\n    47 | \\t\\t\\\"sat\\\": 6,\\n    48 | \\t}}\\n    49 | )\\n    50 | \\n    51 | const (\\n    52 | \\t// Set the top bit if a star was included in the expression.\\n    53 | \\tstarBit = 1 << 63\\n    54 | )\\n    55 | \\n    56 | // Next returns the next time this schedule is activated, greater than the given\\n    57 | // time.  If no time can be found to satisfy the schedule, return the zero time.\\n```\",\"snippet_truncated\":false,\"source_kind\":\"workspace_read\",\"source_range_sha256\":\"ceb5c987d4d66a527056cd291d5cbca52f4beb026a6c663f01b4888c3e023800\",\"source_total_lines\":null,\"start_line\":1},{\"complete\":true,\"delivered_end_line\":315,\"delivered_start_line\":215,\"end_line\":315,\"last_line_terminated\":true,\"next_start_line\":null,\"omission_reason\":null,\"path\":\"parser.go\",\"snippet\":\"```text\\n   215 | }\\n   216 | \\n   217 | var standardParser = NewParser(\\n   218 | \\tMinute | Hour | Dom | Month | Dow | Descriptor,\\n   219 | )\\n   220 | \\n   221 | // ParseStandard returns a new crontab schedule representing the given\\n   222 | // standardSpec (https://en.wikipedia.org/wiki/Cron). It requires 5 entries\\n   223 | // representing: minute, hour, day of month, month and day of week, in that\\n   224 | // order. It returns a descriptive error if the spec is not valid.\\n   225 | //\\n   226 | // It accepts\\n   227 | //   - Standard crontab specs, e.g. \\\"* * * * ?\\\"\\n   228 | //   - Descriptors, e.g. \\\"@midnight\\\", \\\"@every 1h30m\\\"\\n   229 | func ParseStandard(standardSpec string) (Schedule, error) {\\n   230 | \\treturn standardParser.Parse(standardSpec)\\n   231 | }\\n   232 | \\n   233 | // getField returns an Int with the bits set representing all of the times that\\n   234 | // the field represents or error parsing field value.  A \\\"field\\\" is a comma-separated\\n   235 | // list of \\\"ranges\\\".\\n   236 | func getField(field string, r bounds) (uint64, error) {\\n   237 | \\tvar bits uint64\\n   238 | \\tranges := strings.FieldsFunc(field, func(r rune) bool { return r == ',' })\\n   239 | \\tfor _, expr := range ranges {\\n   240 | \\t\\tbit, err := getRange(expr, r)\\n   241 | \\t\\tif err != nil {\\n   242 | \\t\\t\\treturn bits, err\\n   243 | \\t\\t}\\n   244 | \\t\\tbits |= bit\\n   245 | \\t}\\n   246 | \\treturn bits, nil\\n   247 | }\\n   248 | \\n   249 | // getRange returns the bits indicated by the given expression:\\n   250 | //   number | number \\\"-\\\" number [ \\\"/\\\" number ]\\n   251 | // or error parsing range.\\n   252 | func getRange(expr string, r bounds) (uint64, error) {\\n   253 | \\tvar (\\n   254 | \\t\\tstart, end, step uint\\n   255 | \\t\\trangeAndStep     = strings.Split(expr, \\\"/\\\")\\n   256 | \\t\\tlowAndHigh       = strings.Split(rangeAndStep[0], \\\"-\\\")\\n   257 | \\t\\tsingleDigit      = len(lowAndHigh) == 1\\n   258 | \\t\\terr              error\\n   259 | \\t)\\n   260 | \\n   261 | \\tvar extra uint64\\n   262 | \\tif lowAndHigh[0] == \\\"*\\\" || lowAndHigh[0] == \\\"?\\\" {\\n   263 | \\t\\tstart = r.min\\n   264 | \\t\\tend = r.max\\n   265 | \\t\\textra = starBit\\n   266 | \\t} else {\\n   267 | \\t\\tstart, err = parseIntOrName(lowAndHigh[0], r.names)\\n   268 | \\t\\tif err != nil {\\n   269 | \\t\\t\\treturn 0, err\\n   270 | \\t\\t}\\n   271 | \\t\\tswitch len(lowAndHigh) {\\n   272 | \\t\\tcase 1:\\n   273 | \\t\\t\\tend = start\\n   274 | \\t\\tcase 2:\\n   275 | \\t\\t\\tend, err = parseIntOrName(lowAndHigh[1], r.names)\\n   276 | \\t\\t\\tif err != nil {\\n   277 | \\t\\t\\t\\treturn 0, err\\n   278 | \\t\\t\\t}\\n   279 | \\t\\tdefault:\\n   280 | \\t\\t\\treturn 0, fmt.Errorf(\\\"too many hyphens: %s\\\", expr)\\n   281 | \\t\\t}\\n   282 | \\t}\\n   283 | \\n   284 | \\tswitch len(rangeAndStep) {\\n   285 | \\tcase 1:\\n   286 | \\t\\tstep = 1\\n   287 | \\tcase 2:\\n   288 | \\t\\tstep, err = mustParseInt(rangeAndStep[1])\\n   289 | \\t\\tif err != nil {\\n   290 | \\t\\t\\treturn 0, err\\n   291 | \\t\\t}\\n   292 | \\n   293 | \\t\\t// Special handling: \\\"N/step\\\" means \\\"N-max/step\\\".\\n   294 | \\t\\tif singleDigit {\\n   295 | \\t\\t\\tend = r.max\\n   296 | \\t\\t}\\n   297 | \\t\\tif step > 1 {\\n   298 | \\t\\t\\textra = 0\\n   299 | \\t\\t}\\n   300 | \\tdefault:\\n   301 | \\t\\treturn 0, fmt.Errorf(\\\"too many slashes: %s\\\", expr)\\n   302 | \\t}\\n   303 | \\n   304 | \\tif start < r.min {\\n   305 | \\t\\treturn 0, fmt.Errorf(\\\"beginning of range (%d) below minimum (%d): %s\\\", start, r.min, expr)\\n   306 | \\t}\\n   307 | \\tif end > r.max {\\n   308 | \\t\\treturn 0, fmt.Errorf(\\\"end of range (%d) above maximum (%d): %s\\\", end, r.max, expr)\\n   309 | \\t}\\n   310 | \\tif start > end {\\n   311 | \\t\\treturn 0, fmt.Errorf(\\\"beginning of range (%d) beyond end of range (%d): %s\\\", start, end, expr)\\n   312 | \\t}\\n   313 | \\tif step == 0 {\\n   314 | \\t\\treturn 0, fmt.Errorf(\\\"step of range should be a positive number: %s\\\", expr)\\n   315 | \\t}\\n```\",\"snippet_truncated\":false,\"source_kind\":\"workspace_read\",\"source_range_sha256\":\"a09321beba641a8af921139b1a88053ad76a496e68daf99da4c701a3f59f6f62\",\"source_total_lines\":null,\"start_line\":215}],\"requested_count\":2}",
+      "type": "text"
+    }
+  ],
+  "isError": false,
+  "structuredContent": {
+    "complete": true,
+    "max_response_bytes": 131072,
+    "max_total_bytes": 65536,
+    "omitted_count": 0,
+    "ranges": [
+      {
+        "complete": true,
+        "delivered_end_line": 57,
+        "delivered_start_line": 1,
+        "end_line": 57,
+        "last_line_terminated": true,
+        "next_start_line": null,
+        "omission_reason": null,
+        "path": "spec.go",
+        "snippet": "```text\n     1 | package cron\n     2 | \n     3 | import \"time\"\n     4 | \n     5 | // SpecSchedule specifies a duty cycle (to the second granularity), based on a\n     6 | // traditional crontab specification. It is computed initially and stored as bit sets.\n     7 | type SpecSchedule struct {\n     8 | \tSecond, Minute, Hour, Dom, Month, Dow uint64\n     9 | \n    10 | \t// Override location for this schedule.\n    11 | \tLocation *time.Location\n    12 | }\n    13 | \n    14 | // bounds provides a range of acceptable values (plus a map of name to value).\n    15 | type bounds struct {\n    16 | \tmin, max uint\n    17 | \tnames    map[string]uint\n    18 | }\n    19 | \n    20 | // The bounds for each field.\n    21 | var (\n    22 | \tseconds = bounds{0, 59, nil}\n    23 | \tminutes = bounds{0, 59, nil}\n    24 | \thours   = bounds{0, 23, nil}\n    25 | \tdom     = bounds{1, 31, nil}\n    26 | \tmonths  = bounds{1, 12, map[string]uint{\n    27 | \t\t\"jan\": 1,\n    28 | \t\t\"feb\": 2,\n    29 | \t\t\"mar\": 3,\n    30 | \t\t\"apr\": 4,\n    31 | \t\t\"may\": 5,\n    32 | \t\t\"jun\": 6,\n    33 | \t\t\"jul\": 7,\n    34 | \t\t\"aug\": 8,\n    35 | \t\t\"sep\": 9,\n    36 | \t\t\"oct\": 10,\n    37 | \t\t\"nov\": 11,\n    38 | \t\t\"dec\": 12,\n    39 | \t}}\n    40 | \tdow = bounds{0, 6, map[string]uint{\n    41 | \t\t\"sun\": 0,\n    42 | \t\t\"mon\": 1,\n    43 | \t\t\"tue\": 2,\n    44 | \t\t\"wed\": 3,\n    45 | \t\t\"thu\": 4,\n    46 | \t\t\"fri\": 5,\n    47 | \t\t\"sat\": 6,\n    48 | \t}}\n    49 | )\n    50 | \n    51 | const (\n    52 | \t// Set the top bit if a star was included in the expression.\n    53 | \tstarBit = 1 << 63\n    54 | )\n    55 | \n    56 | // Next returns the next time this schedule is activated, greater than the given\n    57 | // time.  If no time can be found to satisfy the schedule, return the zero time.\n```",
+        "snippet_truncated": false,
+        "source_kind": "workspace_read",
+        "source_range_sha256": "ceb5c987d4d66a527056cd291d5cbca52f4beb026a6c663f01b4888c3e023800",
+        "source_total_lines": null,
+        "start_line": 1
+      },
+      {
+        "complete": true,
+        "delivered_end_line": 315,
+        "delivered_start_line": 215,
+        "end_line": 315,
+        "last_line_terminated": true,
+        "next_start_line": null,
+        "omission_reason": null,
+        "path": "parser.go",
+        "snippet": "```text\n   215 | }\n   216 | \n   217 | var standardParser = NewParser(\n   218 | \tMinute | Hour | Dom | Month | Dow | Descriptor,\n   219 | )\n   220 | \n   221 | // ParseStandard returns a new crontab schedule representing the given\n   222 | // standardSpec (https://en.wikipedia.org/wiki/Cron). It requires 5 entries\n   223 | // representing: minute, hour, day of month, month and day of week, in that\n   224 | // order. It returns a descriptive error if the spec is not valid.\n   225 | //\n   226 | // It accepts\n   227 | //   - Standard crontab specs, e.g. \"* * * * ?\"\n   228 | //   - Descriptors, e.g. \"@midnight\", \"@every 1h30m\"\n   229 | func ParseStandard(standardSpec string) (Schedule, error) {\n   230 | \treturn standardParser.Parse(standardSpec)\n   231 | }\n   232 | \n   233 | // getField returns an Int with the bits set representing all of the times that\n   234 | // the field represents or error parsing field value.  A \"field\" is a comma-separated\n   235 | // list of \"ranges\".\n   236 | func getField(field string, r bounds) (uint64, error) {\n   237 | \tvar bits uint64\n   238 | \tranges := strings.FieldsFunc(field, func(r rune) bool { return r == ',' })\n   239 | \tfor _, expr := range ranges {\n   240 | \t\tbit, err := getRange(expr, r)\n   241 | \t\tif err != nil {\n   242 | \t\t\treturn bits, err\n   243 | \t\t}\n   244 | \t\tbits |= bit\n   245 | \t}\n   246 | \treturn bits, nil\n   247 | }\n   248 | \n   249 | // getRange returns the bits indicated by the given expression:\n   250 | //   number | number \"-\" number [ \"/\" number ]\n   251 | // or error parsing range.\n   252 | func getRange(expr string, r bounds) (uint64, error) {\n   253 | \tvar (\n   254 | \t\tstart, end, step uint\n   255 | \t\trangeAndStep     = strings.Split(expr, \"/\")\n   256 | \t\tlowAndHigh       = strings.Split(rangeAndStep[0], \"-\")\n   257 | \t\tsingleDigit      = len(lowAndHigh) == 1\n   258 | \t\terr              error\n   259 | \t)\n   260 | \n   261 | \tvar extra uint64\n   262 | \tif lowAndHigh[0] == \"*\" || lowAndHigh[0] == \"?\" {\n   263 | \t\tstart = r.min\n   264 | \t\tend = r.max\n   265 | \t\textra = starBit\n   266 | \t} else {\n   267 | \t\tstart, err = parseIntOrName(lowAndHigh[0], r.names)\n   268 | \t\tif err != nil {\n   269 | \t\t\treturn 0, err\n   270 | \t\t}\n   271 | \t\tswitch len(lowAndHigh) {\n   272 | \t\tcase 1:\n   273 | \t\t\tend = start\n   274 | \t\tcase 2:\n   275 | \t\t\tend, err = parseIntOrName(lowAndHigh[1], r.names)\n   276 | \t\t\tif err != nil {\n   277 | \t\t\t\treturn 0, err\n   278 | \t\t\t}\n   279 | \t\tdefault:\n   280 | \t\t\treturn 0, fmt.Errorf(\"too many hyphens: %s\", expr)\n   281 | \t\t}\n   282 | \t}\n   283 | \n   284 | \tswitch len(rangeAndStep) {\n   285 | \tcase 1:\n   286 | \t\tstep = 1\n   287 | \tcase 2:\n   288 | \t\tstep, err = mustParseInt(rangeAndStep[1])\n   289 | \t\tif err != nil {\n   290 | \t\t\treturn 0, err\n   291 | \t\t}\n   292 | \n   293 | \t\t// Special handling: \"N/step\" means \"N-max/step\".\n   294 | \t\tif singleDigit {\n   295 | \t\t\tend = r.max\n   296 | \t\t}\n   297 | \t\tif step > 1 {\n   298 | \t\t\textra = 0\n   299 | \t\t}\n   300 | \tdefault:\n   301 | \t\treturn 0, fmt.Errorf(\"too many slashes: %s\", expr)\n   302 | \t}\n   303 | \n   304 | \tif start < r.min {\n   305 | \t\treturn 0, fmt.Errorf(\"beginning of range (%d) below minimum (%d): %s\", start, r.min, expr)\n   306 | \t}\n   307 | \tif end > r.max {\n   308 | \t\treturn 0, fmt.Errorf(\"end of range (%d) above maximum (%d): %s\", end, r.max, expr)\n   309 | \t}\n   310 | \tif start > end {\n   311 | \t\treturn 0, fmt.Errorf(\"beginning of range (%d) beyond end of range (%d): %s\", start, end, expr)\n   312 | \t}\n   313 | \tif step == 0 {\n   314 | \t\treturn 0, fmt.Errorf(\"step of range should be a positive number: %s\", expr)\n   315 | \t}\n```",
+        "snippet_truncated": false,
+        "source_kind": "workspace_read",
+        "source_range_sha256": "a09321beba641a8af921139b1a88053ad76a496e68daf99da4c701a3f59f6f62",
+        "source_total_lines": null,
+        "start_line": 215
+      }
+    ],
+    "requested_count": 2
+  }
+}

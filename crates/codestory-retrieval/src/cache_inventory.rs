@@ -1009,6 +1009,7 @@ mod tests {
             workspace_id,
             worktree.path(),
             RetrievalIndexManifest {
+                artifact_scope: None,
                 project_id: "repo-v1-project".into(),
                 lexical_version: "v1".into(),
                 semantic_generation: "codestory_repo-v1-project_aaaaaaaaaaaaaaaa".into(),

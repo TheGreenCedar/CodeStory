@@ -1,0 +1,162 @@
+[
+  {
+    "file": "v495-question-1.json",
+    "original_SHA256": "eb0e840894b93ff3a564dbb032104d29195b736a9e68c741f4732d5ff15d2fec",
+    "original_bytes": 1257,
+    "published_bytes": 1193,
+    "published_SHA256": "5114c79bb97c14e3e4d45c09398ac6abb82b199cd946b1e15273bac246e90b4b",
+    "transformation": "machine-root substitution only; published bytes are not the original receipt"
+  },
+  {
+    "file": "v495-question-2.json",
+    "original_SHA256": "f774ec2dd1dcb91be3c8d5485c3277a8e9c9ac60e05ec3c8b301bd43a2757d59",
+    "original_bytes": 1113,
+    "published_bytes": 1049,
+    "published_SHA256": "2e0208cdd2ca07560e80834765cd2ea7c6bd33fcf3412907b59e10acbc15521e",
+    "transformation": "machine-root substitution only; published bytes are not the original receipt"
+  },
+  {
+    "file": "v495-baseline-1.packet.json",
+    "original_SHA256": "30cbe30cdc8aa53713f4ad5757732dc7e0781261aaa7770cf7bd3b8425f30d63",
+    "original_bytes": 16382,
+    "published_bytes": 16382,
+    "published_SHA256": "30cbe30cdc8aa53713f4ad5757732dc7e0781261aaa7770cf7bd3b8425f30d63",
+    "transformation": "machine-root substitution only; published bytes are not the original receipt"
+  },
+  {
+    "file": "v495-baseline-2.packet.json",
+    "original_SHA256": "c6e41fd90775e92be3577472b204164bc3c863e94c72f34b039253da0a60e534",
+    "original_bytes": 16243,
+    "published_bytes": 16243,
+    "published_SHA256": "c6e41fd90775e92be3577472b204164bc3c863e94c72f34b039253da0a60e534",
+    "transformation": "machine-root substitution only; published bytes are not the original receipt"
+  },
+  {
+    "file": "v495-continuation-1.packet.json",
+    "original_SHA256": "00767236661a05c5c615331d7c7db194f02b567c7618d60df8722256224866eb",
+    "original_bytes": 146,
+    "published_bytes": 146,
+    "published_SHA256": "00767236661a05c5c615331d7c7db194f02b567c7618d60df8722256224866eb",
+    "transformation": "machine-root substitution only; published bytes are not the original receipt"
+  },
+  {
+    "file": "v495-continuation-2.packet.json",
+    "original_SHA256": "e36abe014898254fd7c82778ae23c6e11ab874cd276ffa7167e54e86b1ab24a6",
+    "original_bytes": 16225,
+    "published_bytes": 16225,
+    "published_SHA256": "e36abe014898254fd7c82778ae23c6e11ab874cd276ffa7167e54e86b1ab24a6",
+    "transformation": "machine-root substitution only; published bytes are not the original receipt"
+  },
+  {
+    "file": "v495-reader-search-1.public.json",
+    "original_SHA256": "6551cc52322eb05f90125ff3d10ca0444883f89f862668a7185f08aab22eec8e",
+    "original_bytes": 8302,
+    "published_bytes": 7342,
+    "published_SHA256": "3ff87e627e78f3cea9bbe58c44472d12213d793777655d6d0f6636e625431aac",
+    "transformation": "machine-root substitution only; published bytes are not the original receipt"
+  },
+  {
+    "file": "v495-reader-snippet-1-config-public.json",
+    "original_SHA256": "3f2ce81cebb34421d875155785064e22130bea3557d60831a7c9a89c3912f5c6",
+    "original_bytes": 22720,
+    "published_bytes": 22720,
+    "published_SHA256": "3f2ce81cebb34421d875155785064e22130bea3557d60831a7c9a89c3912f5c6",
+    "transformation": "machine-root substitution only; published bytes are not the original receipt"
+  },
+  {
+    "file": "v495-reader-snippet-1-tests-public.json",
+    "original_SHA256": "30ede25fb1711c219aa62d88d4b1818b15f8f03affdaa36a626766540b85b0c9",
+    "original_bytes": 22001,
+    "published_bytes": 22001,
+    "published_SHA256": "30ede25fb1711c219aa62d88d4b1818b15f8f03affdaa36a626766540b85b0c9",
+    "transformation": "machine-root substitution only; published bytes are not the original receipt"
+  },
+  {
+    "file": "v495-reader-snippet-2-corrected-public.json",
+    "original_SHA256": "473edf930a490b81acab524c7336ae539425c3c728777fd45349270411285212",
+    "original_bytes": 29979,
+    "published_bytes": 29979,
+    "published_SHA256": "473edf930a490b81acab524c7336ae539425c3c728777fd45349270411285212",
+    "transformation": "machine-root substitution only; published bytes are not the original receipt"
+  },
+  {
+    "file": "v495-reader-daymatches.public.json",
+    "original_SHA256": "9c5704ebf200269c2e881fa3c5594eb8579cccf55f1207431305a0a653f63160",
+    "original_bytes": 3779,
+    "published_bytes": 3587,
+    "published_SHA256": "44c2ce4b151bf3ff6032dc748eda879bcd003d3d1dcfc34c68e7d9fe45731b2a",
+    "transformation": "machine-root substitution only; published bytes are not the original receipt"
+  },
+  {
+    "file": "v495-reader-gettime.public.json",
+    "original_SHA256": "447afb0a199ece0224ac35466fb78485d596d80cc55cc4ed73a39be68904034c",
+    "original_bytes": 5599,
+    "published_bytes": 5407,
+    "published_SHA256": "f0f7ba0f3e400f55ee926e2e8c6a13ff438a30579208532611665ce65d0b22fa",
+    "transformation": "machine-root substitution only; published bytes are not the original receipt"
+  },
+  {
+    "file": "v495-reader-parser-bounds-public.json",
+    "original_SHA256": "49d914bfeab39777bdc09f39eae4115c85c5bd51380625210fec9f2f6f1e6912",
+    "original_bytes": 15620,
+    "published_bytes": 15620,
+    "published_SHA256": "49d914bfeab39777bdc09f39eae4115c85c5bd51380625210fec9f2f6f1e6912",
+    "transformation": "machine-root substitution only; published bytes are not the original receipt"
+  },
+  {
+    "file": "v495-reader-every5min.public.json",
+    "original_SHA256": "f5c2ad24c6b3b3904aca1d20d7dcaee664e5d1b7c6ff0b61e30770fd4f8d8e92",
+    "original_bytes": 4745,
+    "published_bytes": 4553,
+    "published_SHA256": "f3818efa1c7bdf41e6a23bd76c7c464afb8e6caf58e6fffd88a93f1a2a361e03",
+    "transformation": "machine-root substitution only; published bytes are not the original receipt"
+  },
+  {
+    "file": "v495-reader-every5min5s.public.json",
+    "original_SHA256": "02333f297def7dd4cd3b34bee4dd83e77ee89c570e89738e72220a0c49454124",
+    "original_bytes": 3646,
+    "published_bytes": 3454,
+    "published_SHA256": "8d093190a76475c1e620439456dfed22a22c83e2a7eec844a5186aa1a4aa2893",
+    "transformation": "machine-root substitution only; published bytes are not the original receipt"
+  },
+  {
+    "file": "v495-reader-constructor-search.public.json",
+    "original_SHA256": "137c1afb267b1818a11210f0895559c56937ac9a3435ea97ade6ce55536ce4a7",
+    "original_bytes": 6550,
+    "published_bytes": 5782,
+    "published_SHA256": "8448cc78d6c2b8d14c9287f9ccbea66983dbcb794204ce9b88a7f13b39aa6e99",
+    "transformation": "machine-root substitution only; published bytes are not the original receipt"
+  },
+  {
+    "file": "baseline-reader-answer-1.md",
+    "original_SHA256": "30c95c99aafc62316be2979b18ec2825669d6bdd7fedbfdb3ad2301fe473b7f8",
+    "original_bytes": 7296,
+    "published_bytes": 7232,
+    "published_SHA256": "d29b8af7d0f27209caab115d812ca43415f584eff839b1ac4b17e083aa84c91d",
+    "transformation": "machine-root substitution only; published bytes are not the original receipt"
+  },
+  {
+    "file": "baseline-reader-answer-2.md",
+    "original_SHA256": "e4603d23c23738320e8e1964af459922401b28f025a4946aba23d3656ff2b823",
+    "original_bytes": 7899,
+    "published_bytes": 7835,
+    "published_SHA256": "3abe76fc27c13a3aa592df6106ac35933d789ea09a52b9fd699ad141c15054ff",
+    "transformation": "machine-root substitution only; published bytes are not the original receipt"
+  },
+  {
+    "file": "baseline-reader-coverage-assessment.md",
+    "original_SHA256": "36bb24723cb00b2c7437f223216168763d126753810339095261c6f189ba1b53",
+    "original_bytes": 2965,
+    "published_bytes": 2965,
+    "published_SHA256": "36bb24723cb00b2c7437f223216168763d126753810339095261c6f189ba1b53",
+    "transformation": "machine-root substitution only; published bytes are not the original receipt"
+  },
+  {
+    "file": "baseline-reader-artifact-read-inventory.json",
+    "original_SHA256": "a4a4bca1443e08d60f91c6a538e273af0dc33f128889ea80496bf27ee05effb6",
+    "original_bytes": 2327,
+    "published_bytes": 2264,
+    "published_SHA256": "c0a2b0544faf5169317a80431a2c24933abe08235e49cea9c2d8334ee672c29d",
+    "transformation": "machine-root substitution only; published bytes are not the original receipt"
+  }
+]

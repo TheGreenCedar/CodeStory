@@ -231,11 +231,41 @@ fn status_with_runtime(
         && codestory_store::core_database_exists(path)
             .context("resolve core publication for retrieval status")?
     {
+        let _global_origin_guard = crate::publication_scope::observe_publication_global(&runtime)?;
         let storage = Store::open_observational(path)
             .context("open storage observationally for retrieval manifest")?;
         let manifest = storage
             .get_retrieval_index_manifest(&project_id)
             .context("load retrieval manifest")?;
+        let runtime = match manifest.as_ref() {
+            Some(manifest) => match crate::publication_scope::resolve_publication_runtime(
+                project_root,
+                &storage,
+                manifest,
+                &runtime,
+            ) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    return Ok(enrich_stored_status(
+                        unavailable_status_report_with_embedding_device(
+                            format!("retrieval_publication_origin_unavailable: {error:#}"),
+                            Some(manifest.clone()),
+                            &embedding_device,
+                        ),
+                        project_root,
+                        &storage,
+                        &runtime,
+                    ));
+                }
+            },
+            None => runtime,
+        };
+        let _origin_guard =
+            crate::publication_scope::observe_publication_origin(&runtime, &project_id)?;
+        if storage.get_retrieval_index_manifest(&project_id)? != manifest {
+            anyhow::bail!("retrieval publication changed while resolving artifact origin");
+        }
+        let layout = runtime.layout.clone();
         if let Some(manifest) = manifest.as_ref()
             && embedding_probe
                 .as_ref()
@@ -543,7 +573,7 @@ fn strict_readiness_unavailable_reason_for_runtime(
         )));
     }
     Ok(Some(format!(
-        "sidecar_input_hash_changed: manifest={} current={}; symbol_doc_count manifest={} current={}; dense_projection_count manifest={} current={}; projection_count manifest={} current={}",
+        "sidecar_input_hash_changed: manifest={} current={}; symbol_doc_count manifest={} current={}; dense_projection_count manifest={} current={}; projection_count manifest={} current={}; lexical_file_count current={}; lexical_hash current={}; graph_artifact_hash current={}; producer_compatibility_identity current={}",
         manifest
             .sidecar_input_hash
             .as_deref()
@@ -563,7 +593,11 @@ fn strict_readiness_unavailable_reason_for_runtime(
             .projection_count
             .map(|count| count.to_string())
             .unwrap_or_else(|| "<missing>".into()),
-        current_input.projection_count
+        current_input.projection_count,
+        current_input.lexical_file_count,
+        current_input.lexical_hash,
+        current_input.graph_artifact_hash,
+        producer_compatibility_identity,
     )))
 }
 
@@ -832,6 +866,18 @@ mod tests {
         .expect("strict readiness")
         .expect("stale sidecar input");
         assert!(reason.starts_with("sidecar_input_hash_changed:"));
+        for expected in [
+            format!("lexical_file_count current={}", input.lexical_file_count),
+            format!("lexical_hash current={}", input.lexical_hash),
+            format!("graph_artifact_hash current={}", input.graph_artifact_hash),
+            format!("producer_compatibility_identity current={producer_compatibility_identity}"),
+        ] {
+            assert!(
+                reason.contains(&expected),
+                "missing current component: {expected}"
+            );
+        }
+        assert!(!reason.contains("graph_artifact_hash current=stale-graph-artifact-hash"));
         assert!(!reason.contains("indexable_file_added_or_changed"));
         assert!(!reason.contains("meta.json"));
     }

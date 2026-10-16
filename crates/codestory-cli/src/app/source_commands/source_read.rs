@@ -1,4 +1,5 @@
 use super::super::artifacts::{ensure_dot_only_for_trail, preflight_output_file};
+use super::super::lifecycle::{OpenedAgentSurface, open_agent_surface};
 use super::super::rendering::build_query_resolution_output_with_runtime;
 use super::super::resolution::{quote_command_value, resolve_source_target_or_emit_ambiguity};
 use super::affected_rendering::render_files_markdown;
@@ -20,15 +21,11 @@ pub(in crate::app) fn run_snippet(cmd: SnippetCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "snippet")?;
     preflight_output_file(cmd.output_file.as_deref())?;
     let runtime = RuntimeContext::new(&cmd.project)?;
-    let opened = runtime.ensure_open(cmd.refresh)?;
+    let opened = runtime.ensure_core_open(cmd.refresh)?;
     ensure_index_ready(&opened, "snippet")?;
 
     let file_filter = cmd.target.file_filter();
-    let operation = if cmd.target.query.is_some() {
-        "graph_assisted"
-    } else {
-        "source_snippet"
-    };
+    let operation = "source_snippet";
     let colorize = cmd.format == args::OutputFormat::Markdown
         && cmd.output_file.is_none()
         && std::io::stdout().is_terminal();
@@ -96,10 +93,9 @@ pub(in crate::app) fn run_query(cmd: QueryCommand) -> Result<()> {
         .context("Query cannot be empty.")?;
     let ast =
         codestory_runtime::parse_graph_query(query).map_err(|error| anyhow::anyhow!("{error}"))?;
-    let runtime = RuntimeContext::new(&cmd.project)?;
-    let opened = runtime.ensure_open(cmd.refresh)?;
-    ensure_index_ready(&opened, "query")?;
-    let operation = runtime.run_public_operation("graph", || {
+    let OpenedAgentSurface { runtime, .. } =
+        open_agent_surface(&cmd.project, None, None, cmd.refresh, "query")?;
+    let operation = runtime.run_public_operation("graph_assisted", || {
         let items = runtime
             .browser
             .query(&ast)

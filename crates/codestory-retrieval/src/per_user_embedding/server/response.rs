@@ -53,6 +53,7 @@ pub(in crate::per_user_embedding) fn engine_identity(
         execution_observation_source: identity.execution_observation_source.into(),
         encode_count: identity.encode_count,
         execution_node_count: identity.execution_node_count,
+        completed_operator_counts: identity.completed_operator_counts.clone(),
         resident_accelerator_tensor_count: identity.resident_accelerator_tensor_count,
         resident_accelerator_tensor_bytes: identity.resident_accelerator_tensor_bytes,
         model_layer_count: identity.model_layer_count,
@@ -247,14 +248,19 @@ pub(in crate::per_user_embedding) fn write_engine_failure(
         None => EmbeddingProtocolError {
             code: error.reason_code().into(),
             message: error.to_string(),
-            retry_class: if matches!(error, EngineError::Cancelled) {
-                "none"
-            } else {
-                "after_server_change"
+            retry_class: match error {
+                EngineError::InputTooLong { .. } => "terminal",
+                EngineError::Cancelled => "none",
+                _ => "after_server_change",
             }
             .into(),
             retry_after_ms: 0,
-            retry_condition: "the server instance or engine evidence changes".into(),
+            retry_condition: if matches!(error, EngineError::InputTooLong { .. }) {
+                "the input fits the engine's maximum token limit"
+            } else {
+                "the server instance or engine evidence changes"
+            }
+            .into(),
             capacity: None,
         },
     };
@@ -277,10 +283,20 @@ pub(in crate::per_user_embedding) fn write_anyhow_failure(
                 request_id,
                 EmbeddingProtocolError {
                     code: code.into(),
-                    message: error.to_string(),
-                    retry_class: "after_server_change".into(),
+                    message: format!("{error:#}"),
+                    retry_class: if matches!(engine, EngineError::InputTooLong { .. }) {
+                        "terminal"
+                    } else {
+                        "after_server_change"
+                    }
+                    .into(),
                     retry_after_ms: 0,
-                    retry_condition: "the server instance or engine evidence changes".into(),
+                    retry_condition: if matches!(engine, EngineError::InputTooLong { .. }) {
+                        "the input fits the engine's maximum token limit"
+                    } else {
+                        "the server instance or engine evidence changes"
+                    }
+                    .into(),
                     capacity: engine
                         .capacity_pressure()
                         .map(EmbeddingCapacityPressureWire::from),

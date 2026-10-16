@@ -23,6 +23,16 @@ pinned, through the `PinnedReader` trait implemented by runtime.
   byte-bound selection over `PacketCompilationInputV1`;
 - `PinnedReader`, the only allowed view of pinned runtime state.
 
+Generic retrieval keeps the whole question, then bounded literal paragraph and
+sentence views. At most seven supplemental views are selected without domain
+importance rules or inferred selectors. Sentence handling preserves quoted/code
+content, decimals and ordinal prefixes; it is a punctuation rule, not a language
+parser. The packet plan reserves room for legal typed free-query probes before
+supplemental views consume its query limit. Runtime descriptor admission and
+planned subqueries use that same capped plan, retaining each query's broad or
+strict origin. These bounds do not imply complete investigation or better
+retrieval.
+
 ## Entry points
 
 - `src/lib.rs`: crate contract and module map
@@ -63,3 +73,24 @@ retrieval, or filesystem access.
 
 See [runtime](runtime.md) for assembly and retry, and
 [retrieval](retrieval.md) for fail-closed query execution.
+
+
+Runtime may supply an optional original callable/body extent from bounded parsing
+of the same verified source bytes. Exact Core line/byte-column matching and the
+source digest bind that observation; unsupported, erroneous, conflicting or
+missing observations stay unknown. Selection credits direct delivered body
+progress before speculative call reach, with completion credited only over the
+original callable extent. A fully delivered declaration or requested subrange
+is not evidence of a complete executable body. This does not assert behavior
+or answer sufficiency. Public projection retains exact continuation locators
+individually within its unchanged measured byte cap and routing identities.
+
+The existing complete-first proposal family uses that same body-progress
+objective while preserving exact requests and the prior order on ties. Unknown
+metadata retains ordinary source and navigation credit; it does not establish
+that a body is absent. Authenticated body progress nevertheless ranks ahead of
+unknown ordinary context, which can bias selection across languages or legacy
+publications. The bounded prefix/exchange search does not guarantee a global
+optimum, and a large early body can still block a better combination. Executed
+normal-producer coordinate controls and the captured full-frame replay are
+required before claiming a packet-quality improvement.

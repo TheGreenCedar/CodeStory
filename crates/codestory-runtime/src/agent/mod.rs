@@ -40,6 +40,8 @@ pub(crate) mod packet_candidate;
 pub(crate) mod packet_capping;
 pub(crate) mod packet_compiler;
 pub(crate) mod packet_follow_up;
+pub(crate) mod packet_replay;
+pub(crate) mod packet_served_sources;
 
 pub(crate) mod packet_execution_record_v3;
 
@@ -63,7 +65,7 @@ pub(crate) use codestory_agent::{
 
 #[cfg(feature = "benchmark-support")]
 pub(crate) use orchestrator::agent_packet_for_benchmark;
-pub(crate) use orchestrator::{agent_ask, agent_packet};
+pub(crate) use orchestrator::{agent_ask, agent_packet, agent_packet_for_representation};
 pub use packet_budget::enforce_packet_output_budget_for_representation;
 pub use packet_follow_up::bind_packet_follow_up_program;
 pub use trace_export::packet_step_trace_json;

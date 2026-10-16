@@ -199,7 +199,7 @@ pub(crate) fn finalize_packet_projection_v3(
     let retrieval = retrieval.clone();
     let diagnostics = diagnostics.clone();
 
-    let candidate = |detailed_rows: usize| {
+    let candidate = |detailed_rows: usize, retained_labels: &BTreeSet<IdentityTextV3>| {
         compact_packet_candidate_v3(
             schema_version,
             identity.clone(),
@@ -210,15 +210,60 @@ pub(crate) fn finalize_packet_projection_v3(
             &original_gaps,
             original_continuation.as_ref(),
             detailed_rows,
+            retained_labels,
         )
     };
 
-    // Every evidence and gap identity is mandatory. Optional row context and
-    // prose are the only fields compacted. Measure the mandatory complete
-    // envelope first, then binary-search the largest relevance-ordered prefix
-    // that can retain its useful source or relation context.
-    let minimal = candidate(0)?;
-    let minimal_bytes = measure(&minimal).map_err(|_| ProjectionBuildErrorV3::MeasurementFailed)?;
+    // Keep routing identities and authenticated evidence fixed. Labels are
+    // exact display locators: try all, then restore individually in existing
+    // continuation-option order, skipping an oversized locator. At most
+    // GAP_ROWS_MAX_V3 extra full-renderer probes; no new retrieval or selectors.
+    let label_order = original_continuation
+        .as_ref()
+        .map(|c| c.gap_ids.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|id| {
+            original_gaps
+                .iter()
+                .find(|gap| {
+                    gap.identity == *id
+                        && gap.kind == GapKindV3Dto::ContinuationRequired
+                        && gap.message.is_some()
+                })
+                .map(|gap| gap.identity.gap_id.clone())
+        })
+        .collect::<Vec<_>>();
+    let all_labels = label_order.iter().cloned().collect::<BTreeSet<_>>();
+    let with_labels = candidate(0, &all_labels)?;
+    let with_labels_bytes =
+        measure(&with_labels).map_err(|_| ProjectionBuildErrorV3::MeasurementFailed)?;
+    let (mut retained_labels, mut minimal, mut minimal_bytes) =
+        if with_labels_bytes <= PACKET_PUBLIC_RESULT_MAX_BYTES_V3 {
+            (all_labels.clone(), with_labels, with_labels_bytes)
+        } else {
+            let labels = BTreeSet::new();
+            let minimal = candidate(0, &labels)?;
+            let bytes = measure(&minimal).map_err(|_| ProjectionBuildErrorV3::MeasurementFailed)?;
+            (labels, minimal, bytes)
+        };
+    if minimal_bytes <= PACKET_PUBLIC_RESULT_MAX_BYTES_V3 && retained_labels != all_labels {
+        for label in label_order {
+            let mut trial = retained_labels.clone();
+            trial.insert(label);
+            // This exact all-label frame was already measured and refused.
+            if trial == all_labels {
+                continue;
+            }
+            let next = candidate(0, &trial)?;
+            let bytes = measure(&next).map_err(|_| ProjectionBuildErrorV3::MeasurementFailed)?;
+            if bytes <= PACKET_PUBLIC_RESULT_MAX_BYTES_V3 {
+                retained_labels = trial;
+                minimal = next;
+                minimal_bytes = bytes;
+            }
+        }
+    }
     if minimal_bytes <= PACKET_PUBLIC_RESULT_MAX_BYTES_V3 {
         let mut low = 0_usize;
         let mut high = original_evidence.len();
@@ -226,7 +271,7 @@ pub(crate) fn finalize_packet_projection_v3(
         let mut best_bytes = minimal_bytes;
         while low < high {
             let middle = low + (high - low).div_ceil(2);
-            let next = candidate(middle)?;
+            let next = candidate(middle, &retained_labels)?;
             let next_bytes =
                 measure(&next).map_err(|_| ProjectionBuildErrorV3::MeasurementFailed)?;
             if next_bytes <= PACKET_PUBLIC_RESULT_MAX_BYTES_V3 {
@@ -333,14 +378,22 @@ fn compact_packet_candidate_v3(
         &codestory_contracts::packet_projection_v3::ContinuationStateV3Dto,
     >,
     detailed_rows: usize,
+    retained_labels: &BTreeSet<IdentityTextV3>,
 ) -> Result<PacketProjectionV3Dto, ProjectionBuildErrorV3> {
     let mut evidence = original_evidence.to_vec();
     for row in evidence.iter_mut().skip(detailed_rows) {
-        row.summary = None;
+        if row.source_delivery.is_none() {
+            row.summary = None;
+        }
     }
     let mut gaps = original_gaps.to_vec();
     for row in &mut gaps {
-        row.message = None;
+        if row.kind != GapKindV3Dto::SourceUnavailable
+            && !(retained_labels.contains(&row.identity.gap_id)
+                && row.kind == GapKindV3Dto::ContinuationRequired)
+        {
+            row.message = None;
+        }
     }
     if gaps.len() < GAP_ROWS_MAX_V3 {
         gaps.push(ProjectionGapRowV3Dto {
@@ -499,13 +552,14 @@ fn canonical_continuation_v3(
         .iter()
         .map(|gap| gap.identity.gap_id.as_str())
         .collect::<BTreeSet<_>>();
-    let mut references = source.gap_ids.as_slice().to_vec();
-    references.sort();
-    for pair in references.windows(2) {
-        if pair[0] == pair[1] {
+    let references = source.gap_ids.as_slice().to_vec();
+    // Preserve the producer's choice order while validating identity uniqueness.
+    let mut seen = BTreeSet::new();
+    for reference in &references {
+        if !seen.insert(reference) {
             return Err(ProjectionBuildErrorV3::InvalidInput(
                 ProjectionInputErrorV3::DuplicateContinuationGapReference(
-                    pair[0].gap_id.as_str().to_owned(),
+                    reference.gap_id.as_str().to_owned(),
                 ),
             ));
         }
@@ -519,14 +573,14 @@ fn canonical_continuation_v3(
             ));
         }
     }
-    Ok(Some(
-        codestory_contracts::packet_projection_v3::ContinuationStateV3Dto::new(
-            source.continuation_id.clone(),
-            source.remaining_rounds,
-            BoundedVecV3::new(references).expect("bounded references remain bounded"),
-        )
-        .expect("validated continuation remains positive"),
-    ))
+    let mut canonical = codestory_contracts::packet_projection_v3::ContinuationStateV3Dto::new(
+        source.continuation_id.clone(),
+        source.remaining_rounds,
+        BoundedVecV3::new(references).expect("bounded references remain bounded"),
+    )
+    .expect("validated continuation remains positive");
+    canonical.packet_request_patch = source.packet_request_patch.clone();
+    Ok(Some(canonical))
 }
 
 fn validate_diagnostic_references_v3<T>(
@@ -738,7 +792,7 @@ mod tests {
             GapKindV3Dto, IdentityTextV3, MessageTextV3, PACKET_EVIDENCE_ROWS_MAX_V3,
             PacketEvidenceRowV3Dto, PacketProjectionV3Dto, PathTextV3, ProjectionGapRowV3Dto,
             PublicationIdentityV3Dto, RetrievalStateDescriptorV3Dto, RetrievalStateV3Dto,
-            SearchEvidenceRowV3Dto, SearchProjectionKindV3Dto, SummaryTextV3,
+            SearchEvidenceRowV3Dto, SearchProjectionKindV3Dto, SummaryTextV3, SymbolIdTextV3,
         },
     };
 
@@ -801,6 +855,8 @@ mod tests {
 
     fn packet_evidence(id: &str, summary: Option<&str>) -> PacketEvidenceRowV3Dto {
         PacketEvidenceRowV3Dto {
+            packet_request_patch: None,
+            source_delivery: None,
             identity: EvidenceIdentityV3Dto {
                 evidence_id: identity(id),
             },
@@ -1029,6 +1085,149 @@ mod tests {
     }
 
     #[test]
+    fn partial_continuation_labels_survive_added_source_and_oversized_first_locator() {
+        use codestory_contracts::compilation::{PacketSourceDeliveryV1, PacketSourceRangeV1};
+        for source_rows in [1, 2] {
+            for oversized_first in [true, false] {
+                let mut evidence = (0..source_rows)
+                    .map(|i| {
+                        let mut row = packet_evidence(
+                            &format!("evidence-{i}"),
+                            Some("```text\n>    7 | execute();\n```"),
+                        );
+                        row.source_delivery = Some(PacketSourceDeliveryV1 {
+                            requested_range: PacketSourceRangeV1 {
+                                start_line: 7,
+                                end_line: 7,
+                            },
+                            source_sha256: "a".repeat(64),
+                            remaining_source_bytes: 0,
+                            next_start_line: None,
+                            blocked_line_rendered_bytes: None,
+                        });
+                        row
+                    })
+                    .collect::<Vec<_>>();
+                evidence.sort_by(|a, b| a.identity.cmp(&b.identity));
+                let gaps = vec![
+                    projection_gap(
+                        "gap-a",
+                        GapKindV3Dto::ContinuationRequired,
+                        Some(&"é\"".repeat(100)),
+                    ),
+                    projection_gap(
+                        "gap-b",
+                        GapKindV3Dto::ContinuationRequired,
+                        Some("src/b:7-9"),
+                    ),
+                    projection_gap(
+                        "gap-c",
+                        GapKindV3Dto::ContinuationRequired,
+                        Some("src/c:2-3"),
+                    ),
+                ];
+                let order = if oversized_first {
+                    vec!["gap-a", "gap-b", "gap-c"]
+                } else {
+                    vec!["gap-b", "gap-c", "gap-a"]
+                };
+                let continuation = ContinuationStateV3Dto {
+                    packet_request_patch: None,
+                    continuation_id: identity("continuation"),
+                    remaining_rounds: 1,
+                    gap_ids: BoundedVecV3::new(
+                        order
+                            .iter()
+                            .map(|id| GapIdentityV3Dto {
+                                gap_id: identity(id),
+                            })
+                            .collect(),
+                    )
+                    .unwrap(),
+                };
+                let record = record_fixture_with(
+                    "anonymous label cap",
+                    PacketBudgetModeDto::Compact,
+                    evidence.clone(),
+                    gaps,
+                    Some(continuation.clone()),
+                    RetrievalStateDescriptorV3Dto {
+                        state: RetrievalStateV3Dto::Full,
+                        generation_id: Some(identity("retrieval-generation-1")),
+                    },
+                    Vec::new(),
+                    true,
+                );
+                let mut mandatory =
+                    packet_complete_candidate_v3(&record, diagnostics_capability_fixture())
+                        .unwrap();
+                if let PacketProjectionV3Dto::Complete { gaps, .. } = &mut mandatory {
+                    let mut rows = gaps.as_slice().to_vec();
+                    for row in &mut rows {
+                        row.message = None;
+                    }
+                    rows.push(projection_gap(
+                        "packet-optional-context-omitted",
+                        GapKindV3Dto::OutputBudgetExceeded,
+                        None,
+                    ));
+                    rows.sort_by(|a, b| a.identity.cmp(&b.identity));
+                    *gaps = BoundedVecV3::new(rows).unwrap();
+                }
+                let mirror = |projection: &PacketProjectionV3Dto, padding: &str| {
+                    serde_json::to_vec(&serde_json::json!({
+                    "content":[{"type":"text","text":serde_json::to_string(projection).unwrap()}],
+                    "structuredContent":projection,"_meta":{"refresh_note":padding},"isError":false})).unwrap().len()
+                };
+                let padding =
+                    "x".repeat(PACKET_PUBLIC_RESULT_MAX_BYTES_V3 - mirror(&mandatory, "") - 140);
+                let before = record.clone();
+                let mut probes = 0usize;
+                let projected = build_packet_projection_v3(
+                    &record,
+                    diagnostics_capability_fixture(),
+                    |candidate| {
+                        probes += 1;
+                        if let PacketProjectionV3Dto::Complete {
+                            evidence: actual, ..
+                        } = candidate
+                        {
+                            assert_eq!(actual.as_slice(), evidence.as_slice());
+                        }
+                        Ok(mirror(candidate, &padding))
+                    },
+                )
+                .unwrap();
+                assert!(mirror(&projected, &padding) <= PACKET_PUBLIC_RESULT_MAX_BYTES_V3);
+                let PacketProjectionV3Dto::Complete {
+                    gaps,
+                    continuation: actual,
+                    ..
+                } = projected
+                else {
+                    panic!("short labels fit")
+                };
+                let visible = gaps
+                    .as_slice()
+                    .iter()
+                    .filter_map(|g| {
+                        g.message
+                            .as_ref()
+                            .map(|m| (g.identity.gap_id.as_str(), m.as_str()))
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    visible,
+                    vec![("gap-b", "src/b:7-9"), ("gap-c", "src/c:2-3")]
+                );
+                assert_eq!(actual, Some(continuation));
+                assert_eq!(before, record);
+                assert!(probes <= GAP_ROWS_MAX_V3 + 10);
+            }
+        }
+    }
+
+    #[test]
     fn packet_projection_v3_trims_only_optional_context_and_retains_every_identity() {
         let gaps = vec![
             projection_gap("gap-b", GapKindV3Dto::EvidenceMissing, Some("second gap")),
@@ -1039,6 +1238,7 @@ mod tests {
             ),
         ];
         let continuation = ContinuationStateV3Dto {
+            packet_request_patch: None,
             continuation_id: identity("continuation-1"),
             remaining_rounds: 1,
             gap_ids: BoundedVecV3::new(vec![GapIdentityV3Dto {
@@ -1096,8 +1296,8 @@ mod tests {
             panic!("optional-context trimming should retain a complete projection");
         };
         assert_eq!(
-            measurements, 4,
-            "measure complete, mandatory envelope, and the binary-search probes"
+            measurements, 5,
+            "measure complete, labeled and unlabeled mandatory frames, then binary-search probes"
         );
         assert_eq!(
             evidence
@@ -1493,6 +1693,7 @@ mod tests {
             vec![location],
             vec![gap],
             Some(ContinuationStateV3Dto {
+                packet_request_patch: None,
                 continuation_id: identity("continue-source"),
                 remaining_rounds: 1,
                 gap_ids: BoundedVecV3::new(vec![GapIdentityV3Dto {
@@ -1622,6 +1823,7 @@ mod tests {
                 },
                 path: PathTextV3::new("src/search.rs").unwrap(),
                 symbol_id: None,
+                display_name: Some(SymbolIdTextV3::new("search_entry").unwrap()),
                 start_line: Some(8),
                 end_line: Some(9),
                 excerpt: None,
@@ -1681,6 +1883,7 @@ mod tests {
                 projection_gap("gap-a", GapKindV3Dto::ContinuationRequired, None),
             ],
             Some(ContinuationStateV3Dto {
+                packet_request_patch: None,
                 continuation_id: identity("continuation-1"),
                 remaining_rounds: 1,
                 gap_ids: BoundedVecV3::new(vec![GapIdentityV3Dto {
@@ -1733,6 +1936,7 @@ mod tests {
                 },
                 path: PathTextV3::new(format!("src/definition_{index}.rs")).unwrap(),
                 symbol_id: None,
+                display_name: Some(SymbolIdTextV3::new(format!("item_{index}")).unwrap()),
                 start_line: Some(index as u32 + 1),
                 end_line: None,
                 excerpt: Some(ExcerptTextV3::new(format!("fn item_{index}() {{}}")).unwrap()),
@@ -1785,6 +1989,30 @@ mod tests {
                     maximum: EVIDENCE_ROWS_MAX_V3,
                     actual: count,
                 }
+            ))
+        );
+    }
+
+    #[test]
+    fn continuation_progress_rejects_nonadjacent_duplicate_public_references() {
+        let record = record_fixture("finalized typed context");
+        let mut input = context_input_fixture(&record);
+        input.continuation.as_mut().unwrap().gap_ids = BoundedVecV3::new(vec![
+            GapIdentityV3Dto {
+                gap_id: identity("gap-b"),
+            },
+            GapIdentityV3Dto {
+                gap_id: identity("gap-a"),
+            },
+            GapIdentityV3Dto {
+                gap_id: identity("gap-b"),
+            },
+        ])
+        .unwrap();
+        assert_eq!(
+            build_context_projection_v3(&input),
+            Err(ProjectionBuildErrorV3::InvalidInput(
+                ProjectionInputErrorV3::DuplicateContinuationGapReference("gap-b".into())
             ))
         );
     }
@@ -1904,6 +2132,7 @@ mod tests {
                     },
                     path: PathTextV3::new("src/b.rs").unwrap(),
                     symbol_id: None,
+                    display_name: None,
                     start_line: Some(7),
                     end_line: Some(8),
                     excerpt: None,
@@ -1914,6 +2143,7 @@ mod tests {
                     },
                     path: PathTextV3::new("src/a.rs").unwrap(),
                     symbol_id: None,
+                    display_name: None,
                     start_line: Some(3),
                     end_line: Some(4),
                     excerpt: None,

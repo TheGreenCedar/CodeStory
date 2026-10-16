@@ -302,6 +302,142 @@ pub fn make_widget() -> Widget {
     Ok(())
 }
 
+#[test]
+fn test_rust_scoped_enum_import_preserves_raw_reference_and_reaches_declaration()
+-> anyhow::Result<()> {
+    for (case, importer_count, declaration_kind, ambiguous) in [
+        ("single enum import", 1, NodeKind::ENUM, false),
+        ("two enum importers", 2, NodeKind::ENUM, false),
+        ("five enum importers", 5, NodeKind::ENUM, false),
+        ("real module declaration", 2, NodeKind::MODULE, false),
+        ("ambiguous enum declarations", 2, NodeKind::ENUM, true),
+    ] {
+        let declaration_source = if declaration_kind == NodeKind::ENUM {
+            "pub enum Action { Fail, Cancel }\npub struct Widget;\n"
+        } else {
+            "pub mod Action {}\npub struct Widget;\n"
+        };
+        let mut root_source = String::from("mod actions;\n");
+        let mut files = vec![("src/actions.rs".to_owned(), declaration_source.to_owned())];
+        for index in 1..importer_count {
+            root_source.push_str(&format!("mod consumer_{index};\n"));
+            files.push((
+                format!("src/consumer_{index}.rs"),
+                "use crate::actions::{Action};\npub fn retain() {}\n".to_owned(),
+            ));
+        }
+        root_source.push_str(
+            "use crate::actions::{Action};\nuse crate::actions::Widget;\npub fn retain() {}\n",
+        );
+        files.push(("src/lib.rs".to_owned(), root_source));
+        if ambiguous {
+            // Scoped-use extraction retains the leaf name, not a unique owner.
+            files.push((
+                "alternate/actions.rs".to_owned(),
+                "pub enum Action { Other }\n".to_owned(),
+            ));
+        }
+        let inputs = files
+            .iter()
+            .map(|(path, source)| (path.as_str(), source.as_str()))
+            .collect::<Vec<_>>();
+        let (nodes, edges) = index_workspace(&inputs)?;
+        assert_import_resolved_to(&nodes, &edges, "src/lib.rs", "src/actions.rs", "Widget");
+        let nodes_by_id = nodes
+            .iter()
+            .map(|node| (node.id, node))
+            .collect::<std::collections::HashMap<_, _>>();
+        let declaration = node_in_file(
+            &nodes,
+            &nodes_by_id,
+            "Action",
+            declaration_kind,
+            "src/actions.rs",
+        )
+        .expect("indexed declaration");
+        let declarations = nodes
+            .iter()
+            .filter(|node| {
+                node.kind == declaration_kind
+                    && matches_name(&node.serialized_name, "Action")
+                    && file_path_for_node(&nodes_by_id, node)
+                        .is_some_and(|path| path_ends_with(path, "actions.rs"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(declarations.len(), if ambiguous { 2 } else { 1 }, "{case}");
+        let module = node_in_file(
+            &nodes,
+            &nodes_by_id,
+            "actions",
+            NodeKind::MODULE,
+            "src/lib.rs",
+        )
+        .expect("module declaration stays distinct from the imported symbol");
+        let raw_imports = edges
+            .iter()
+            .filter(|edge| {
+                edge.kind == EdgeKind::IMPORT
+                    && nodes_by_id
+                        .get(&edge.target)
+                        .is_some_and(|target| matches_name(&target.serialized_name, "Action"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(raw_imports.len(), importer_count, "{case}: {edges:#?}");
+        let raw_ids = raw_imports
+            .iter()
+            .map(|edge| edge.target)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            raw_ids.len(),
+            importer_count,
+            "distinct raw references: {case}"
+        );
+        for import in &raw_imports {
+            let raw_target = nodes_by_id[&import.target];
+            assert_eq!(raw_target.kind, NodeKind::MODULE, "{case}");
+            assert_eq!(
+                import.source, import.target,
+                "retain raw self-import: {case}"
+            );
+            assert_eq!(
+                file_path_for_node(&nodes_by_id, raw_target),
+                edge_importer_path(&nodes_by_id, import),
+                "raw reference stays in its importing file: {case}"
+            );
+            assert_ne!(raw_target.id, declaration.id, "{case}");
+            assert_ne!(raw_target.id, module.id, "{case}");
+            assert_eq!(
+                import.resolved_target,
+                (!ambiguous).then_some(declaration.id),
+                "{case}: import occurrences are not declarations and multiple real declarations require unique owner evidence: raw={raw_target:#?}, effective={:#?}, edge={import:#?}, declarations={declarations:#?}",
+                nodes_by_id.get(&import.effective_target())
+            );
+        }
+        let mut incoming_imports = edges
+            .iter()
+            .filter(|edge| {
+                edge.kind == EdgeKind::IMPORT
+                    && declarations
+                        .iter()
+                        .any(|node| node.id == edge.effective_target())
+            })
+            .map(|edge| edge.id)
+            .collect::<Vec<_>>();
+        let mut expected = if ambiguous {
+            Vec::new()
+        } else {
+            raw_imports.iter().map(|edge| edge.id).collect()
+        };
+        incoming_imports.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(
+            incoming_imports, expected,
+            "incoming declaration references: {case}"
+        );
+    }
+    Ok(())
+}
+
 fn go_import_occurrence_fixture(external_peer_count: usize) -> Vec<(&'static str, &'static str)> {
     assert!(matches!(external_peer_count, 2 | 3));
     let mut files = vec![

@@ -1,6 +1,6 @@
 use crate::{
-    FileContentHash, FileInfo, ProjectionFlushBreakdown, StorageError, Store,
-    StructuralTextArtifactCacheWrite, StructuralTextProjection, StructuralTextUnit,
+    FileContentHash, FileExtractionIdentity, FileInfo, ProjectionFlushBreakdown, StorageError,
+    Store, StructuralTextArtifactCacheWrite, StructuralTextProjection, StructuralTextUnit,
 };
 use codestory_contracts::graph::{
     AccessKind, CallableProjectionState, Edge, ErrorInfo, Node, NodeId, Occurrence,
@@ -20,6 +20,7 @@ pub struct ProjectionStore<'a> {
 pub struct ProjectionBatch<'a> {
     pub files: &'a [FileInfo],
     pub file_content_hashes: &'a [FileContentHash],
+    pub file_extraction_identities: &'a [FileExtractionIdentity],
     pub nodes: &'a [Node],
     pub structural_text_units: &'a [StructuralTextUnit],
     pub structural_text_projections: &'a [StructuralTextProjection],
@@ -54,6 +55,7 @@ impl<'a> ProjectionStore<'a> {
             .flush_projection_batch(crate::storage_impl::ProjectionBatch {
                 files: batch.files,
                 file_content_hashes: batch.file_content_hashes,
+                file_extraction_identities: batch.file_extraction_identities,
                 nodes: batch.nodes,
                 structural_text_units: batch.structural_text_units,
                 structural_text_projections: batch.structural_text_projections,
@@ -77,6 +79,7 @@ impl<'a> ProjectionStore<'a> {
             .flush_source_identity_projection_batch(crate::storage_impl::ProjectionBatch {
                 files: batch.files,
                 file_content_hashes: batch.file_content_hashes,
+                file_extraction_identities: batch.file_extraction_identities,
                 nodes: batch.nodes,
                 structural_text_units: batch.structural_text_units,
                 structural_text_projections: batch.structural_text_projections,

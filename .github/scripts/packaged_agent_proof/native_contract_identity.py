@@ -16,6 +16,7 @@ from .foundation import (
     SERVER_PROOF_MARKER_PREFIX,
     SERVER_PROOF_MARKER_SUFFIX,
     SERVER_PROOF_SCHEMA_VERSION,
+    SERVER_PROTOCOL_SCHEMA_VERSION,
     ProofFailure,
     require,
 )
@@ -221,7 +222,7 @@ def parse_server_proof_identity(identity: str) -> dict[str, object]:
         numeric["bootstrap"] == 1, "embedding server bootstrap version is unsupported"
     )
     require(
-        numeric["protocol_schema"] == 1,
+        numeric["protocol_schema"] == SERVER_PROTOCOL_SCHEMA_VERSION,
         "embedding server protocol schema is unsupported",
     )
     require(

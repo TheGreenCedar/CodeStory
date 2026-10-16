@@ -15,7 +15,7 @@ struct RrfLaneWeights {
 }
 
 const RRF_K: f32 = 20.0;
-pub const RANKING_POLICY_VERSION: &str = "weighted_rrf_v2";
+pub const RANKING_POLICY_VERSION: &str = "weighted_rrf_v4_present_lanes_scaled_broad_eligible";
 const FUSED_RRF_WEIGHT: f32 = 0.70;
 const GRAPH_SUPPORT_WEIGHT: f32 = 0.15;
 const TEXT_QUALITY_WEIGHT: f32 = 0.05;
@@ -78,10 +78,15 @@ pub(crate) fn retain_primary_candidates_for_query(
     features: &QueryFeatures,
     candidates: &mut Vec<CandidateHit>,
 ) {
-    let query_tokens = tokenize(&features.raw_query);
     for candidate in candidates.iter_mut() {
         candidate.file_role = Some(effective_file_role(candidate));
     }
+    // Broad views share one eligibility policy. Adding a source candidate must
+    // not delete an already retrieved identity because of its repository role.
+    if features.lexical_policy == crate::query_policy::LexicalAdmissionPolicy::BroadQuestionV1 {
+        return;
+    }
+    let query_tokens = tokenize(&features.raw_query);
     if candidates
         .iter()
         .all(|candidate| candidate.file_role.is_some_and(non_primary_search_role))
@@ -198,7 +203,12 @@ fn weighted_rrf(candidate: &CandidateHit, weights: RrfLaneWeights) -> f32 {
     let graph = candidate_has_typed_graph_support(candidate)
         .then_some(candidate.lane_scores.graph.as_ref())
         .flatten();
-    let weighted = [
+    // Dense anchors selectively cover the graph. Absence from that lane is
+    // unknown evidence, rather than a negative vote against lexical source.
+    // Normalize by positive-weight lanes present for this identity. This
+    // deliberately removes a cardinality bonus for cross-lane agreement;
+    // typed graph support remains an independent term in the final score.
+    let (weighted, present_weight) = [
         (candidate.lane_scores.lexical.as_ref(), weights.lexical),
         (candidate.lane_scores.semantic.as_ref(), weights.semantic),
         (graph, weights.graph),
@@ -209,14 +219,26 @@ fn weighted_rrf(candidate: &CandidateHit, weights: RrfLaneWeights) -> f32 {
             return None;
         }
         let evidence = evidence?;
-        Some(weight / (RRF_K + evidence.rank.max(1) as f32))
+        Some((weight / (RRF_K + evidence.rank.max(1) as f32), weight))
     })
-    .sum::<f32>();
-    let maximum = (weights.lexical + weights.semantic + weights.graph) / (RRF_K + 1.0);
-    if maximum <= 0.0 {
+    .fold((0.0, 0.0), |(sum, total), (score, weight)| {
+        (sum + score, total + weight)
+    });
+    let maximum = present_weight / (RRF_K + 1.0);
+    let configured_total =
+        weights.lexical.max(0.0) + weights.semantic.max(0.0) + weights.graph.max(0.0);
+    let strongest_lane = weights
+        .lexical
+        .max(weights.semantic)
+        .max(weights.graph)
+        .max(0.0);
+    if maximum <= 0.0 || configured_total <= 0.0 {
         0.0
     } else {
-        (weighted / maximum).clamp(0.0, 1.0)
+        // Keep the configured strongest-lane amplitude relative to the
+        // unchanged auxiliary features. Pure present-lane normalization
+        // otherwise amplifies adjacent sparse ranks and overwhelms overlap.
+        ((weighted / maximum) * (strongest_lane / configured_total)).clamp(0.0, 1.0)
     }
 }
 
@@ -535,6 +557,91 @@ mod tests {
     use codestory_store::FileRole;
 
     #[test]
+    fn common_calibration_preserves_strongest_lane_amplitude_across_shapes() {
+        for shape in [
+            QueryShape::NaturalLanguage,
+            QueryShape::Mixed,
+            QueryShape::PathLike,
+            QueryShape::SymbolLike,
+        ] {
+            let weights = rrf_weights_for_shape(shape);
+            let (lane, weight) = if weights.graph > weights.lexical {
+                (CandidateLane::Graph, weights.graph)
+            } else {
+                (CandidateLane::Lexical, weights.lexical)
+            };
+            let mut hit =
+                CandidateHit::with_source("src/service.rs", None, 0.8, CandidateSource::Lexical);
+            hit.lane_scores = Default::default();
+            hit.record_lane(lane, 0.8, 1, "measured");
+            if lane == CandidateLane::Graph {
+                hit.scip_hop_distance = Some(1);
+            }
+            let expected = weight / (weights.lexical + weights.semantic + weights.graph);
+            assert!((weighted_rrf(&hit, weights) - expected).abs() < f32::EPSILON * 4.0);
+        }
+    }
+
+    #[test]
+    fn sparse_membership_is_not_a_negative_vote_and_consensus_tradeoff_is_explicit() {
+        let weights = rrf_weights_for_shape(QueryShape::NaturalLanguage);
+        let mut sparse = CandidateHit::lexical_stub("src/sparse.rs", 0.8);
+        sparse.record_lane(CandidateLane::Lexical, 0.8, 1, "symbol_doc");
+        let mut consensus = CandidateHit::lexical_stub("src/consensus.rs", 0.8);
+        consensus.record_lane(CandidateLane::Lexical, 0.8, 16, "symbol_doc");
+        consensus.record_lane(CandidateLane::Semantic, 0.9, 16, "dense_anchor");
+        assert!(weighted_rrf(&sparse, weights) > weighted_rrf(&consensus, weights));
+        consensus.lane_scores.lexical.as_mut().unwrap().rank = 1;
+        consensus.lane_scores.semantic.as_mut().unwrap().rank = 1;
+        assert_eq!(
+            weighted_rrf(&sparse, weights),
+            weighted_rrf(&consensus, weights),
+            "present-lane mean intentionally has no lane-cardinality bonus"
+        );
+        let mut weak_singleton =
+            CandidateHit::with_source("src/weak.rs", None, 0.02, CandidateSource::Semantic);
+        weak_singleton.record_lane(CandidateLane::Semantic, 0.02, 1, "dense_anchor");
+        assert_eq!(
+            weighted_rrf(&weak_singleton, weights),
+            weighted_rrf(&consensus, weights),
+            "rank normalization cannot infer absolute reliability of a singleton lane"
+        );
+    }
+
+    #[test]
+    fn normalization_ignores_disabled_untyped_and_empty_lanes() {
+        let mut hit =
+            CandidateHit::with_source("src/service.rs", None, 0.9, CandidateSource::Semantic);
+        hit.record_lane(CandidateLane::Semantic, 0.9, 1, "dense_anchor");
+        assert_eq!(
+            weighted_rrf(&hit, rrf_weights_for_shape(QueryShape::PathLike)),
+            0.0
+        );
+        hit.record_lane(CandidateLane::Graph, 0.9, 1, "same_file_name_affinity");
+        assert_eq!(
+            weighted_rrf(&hit, rrf_weights_for_shape(QueryShape::PathLike)),
+            0.0
+        );
+        assert_eq!(
+            weighted_rrf(
+                &hit,
+                RrfLaneWeights {
+                    lexical: 0.0,
+                    semantic: 0.0,
+                    graph: 0.0
+                }
+            ),
+            0.0
+        );
+        let mut empty = CandidateHit::lexical_stub("src/empty.rs", 0.0);
+        empty.lane_scores = Default::default();
+        assert_eq!(
+            weighted_rrf(&empty, rrf_weights_for_shape(QueryShape::NaturalLanguage)),
+            0.0
+        );
+    }
+
+    #[test]
     fn ranker_prefers_higher_lexical_for_path_query() {
         let features = classify_query("src/lib.rs");
         let candidates = vec![
@@ -741,6 +848,105 @@ mod tests {
     }
 
     #[test]
+    fn broad_role_eligibility_is_monotone_when_primary_candidates_are_added() {
+        let strict = classify_query("explain value handling");
+        let mut broad = strict.clone();
+        broad.lexical_policy = crate::query_policy::LexicalAdmissionPolicy::BroadQuestionV1;
+        for source in [CandidateSource::Lexical, CandidateSource::Semantic] {
+            let non_primary = [
+                FileRole::Test,
+                FileRole::Benchmark,
+                FileRole::Generated,
+                FileRole::Vendor,
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, role)| {
+                let mut candidate = CandidateHit::with_source(
+                    format!("src/unit_{index}.rs"),
+                    Some(format!("operation_{index}")),
+                    0.8,
+                    source,
+                );
+                candidate.node_id = Some(index.to_string());
+                candidate.file_role = Some(role);
+                candidate
+            })
+            .collect::<Vec<_>>();
+            let mut isolated = non_primary.clone();
+            retain_primary_candidates_for_query(&broad, &mut isolated);
+            assert_eq!(isolated.len(), 4);
+            let mut mixed = non_primary.clone();
+            mixed.push(CandidateHit::with_source(
+                "src/primary.rs",
+                Some("primary".into()),
+                0.8,
+                source,
+            ));
+            retain_primary_candidates_for_query(&broad, &mut mixed);
+            assert_eq!(
+                mixed.len(),
+                5,
+                "broad eligibility cannot depend on other pool members"
+            );
+            for candidate in isolated {
+                assert!(
+                    mixed.iter().any(|row| row.node_id == candidate.node_id
+                        && row.file_role == candidate.file_role)
+                );
+            }
+            let mut legacy = non_primary;
+            legacy.push(CandidateHit::with_source(
+                "src/primary.rs",
+                Some("primary".into()),
+                0.8,
+                source,
+            ));
+            retain_primary_candidates_for_query(&strict, &mut legacy);
+            assert_eq!(
+                legacy.len(),
+                1,
+                "strict ordinary retrieval keeps its existing exclusion"
+            );
+            assert_eq!(legacy[0].file_path, "src/primary.rs");
+        }
+    }
+
+    #[test]
+    fn broad_eligibility_retains_effective_roles_without_changing_primary_scores() {
+        let strict = classify_query("explain value handling");
+        let mut broad = strict.clone();
+        broad.lexical_policy = crate::query_policy::LexicalAdmissionPolicy::BroadQuestionV1;
+        let mut nested = CandidateHit::with_source(
+            "src/value.rs",
+            Some("check_value".into()),
+            0.8,
+            CandidateSource::Lexical,
+        );
+        nested.file_role = Some(FileRole::Source);
+        nested.qualified_name = Some("crate::tests::check_value".into());
+        let mut eligible = vec![nested, CandidateHit::lexical_stub("src/primary.rs", 0.8)];
+        retain_primary_candidates_for_query(&broad, &mut eligible);
+        assert_eq!(eligible.len(), 2);
+        assert_eq!(eligible[0].file_role, Some(FileRole::Test));
+        let candidates = vec![
+            CandidateHit::lexical_stub("src/value.rs", 0.8),
+            CandidateHit::lexical_stub("src/primary.rs", 0.7),
+        ];
+        let strict_ranked = rank_candidates(&strict, candidates.clone());
+        let broad_ranked = rank_candidates(&broad, candidates);
+        assert_eq!(strict_ranked.len(), broad_ranked.len());
+        for (legacy, current) in strict_ranked.iter().zip(&broad_ranked) {
+            assert_eq!(legacy.file_path, current.file_path);
+            assert_eq!(legacy.score.to_bits(), current.score.to_bits());
+            assert_eq!(
+                current.rank_features.as_ref().unwrap().ranking_policy,
+                RANKING_POLICY_VERSION
+            );
+        }
+    }
+
+    #[test]
     fn ranker_excludes_non_primary_roles_from_an_ordinary_source_query() {
         let features = classify_query("explain request json output event processing");
         let semantic_test = CandidateHit::with_source(
@@ -773,6 +979,41 @@ mod tests {
                 .iter()
                 .all(|hit| hit.file_role != Some(FileRole::Test))
         );
+    }
+
+    #[test]
+    fn ranker_go_test_suffix_fallback_respects_requested_role() {
+        for (query, include_test) in [
+            ("explain event processor output", false),
+            ("event processor tests output", true),
+        ] {
+            let features = classify_query(query);
+            let test = CandidateHit::with_source(
+                "pkg/event_processor_test.go",
+                Some("event processor output".into()),
+                0.99,
+                CandidateSource::Semantic,
+            );
+            assert_eq!(test.file_role, None);
+            let production = CandidateHit::with_source(
+                "pkg/event_processor.go",
+                Some("event processor output".into()),
+                0.72,
+                CandidateSource::Lexical,
+            );
+            let ranked = rank_candidates(&features, vec![test, production]);
+            assert!(ranked.iter().any(|hit| {
+                hit.file_path == "pkg/event_processor.go" && hit.file_role == Some(FileRole::Source)
+            }));
+            assert_eq!(
+                ranked.iter().any(|hit| {
+                    hit.file_path == "pkg/event_processor_test.go"
+                        && hit.file_role == Some(FileRole::Test)
+                }),
+                include_test,
+                "{query}"
+            );
+        }
     }
 
     #[test]
@@ -1133,7 +1374,9 @@ mod tests {
         let ranked = rank_candidates(&features, vec![candidate]);
         let candidate = &ranked[0];
         let rank_features = candidate.rank_features.as_ref().expect("rank features");
-        let expected = 0.70
+        // All three rank-one lanes share a present-lane mean of one.
+        // NaturalLanguage's strongest configured lane contributes 1/2.75.
+        let expected = 0.70 * (1.0 / 2.75)
             + 0.15 * rank_features.scip_distance
             + 0.05 * rank_features.text_quality
             + 0.05 * rank_features.requested_role_agreement

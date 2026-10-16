@@ -30,7 +30,7 @@ pub(in crate::per_user_embedding) use operation::{ServerRequestDeadline, cancel_
 #[cfg(test)]
 pub(in crate::per_user_embedding) use response::{
     configure_server_operation_timeout, failure_response, protocol_error, success_response,
-    valid_cancel_token,
+    valid_cancel_token, write_anyhow_failure, write_engine_failure,
 };
 pub(in crate::per_user_embedding) use state::PerUserEmbeddingServerState;
 #[cfg(test)]

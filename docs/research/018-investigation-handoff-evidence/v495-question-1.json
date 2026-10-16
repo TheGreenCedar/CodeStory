@@ -1,0 +1,6 @@
+{
+  "question": "We're migrating a Go service that uses robfig/cron. Existing customers send five-field schedules such as \"5 * * * *\", and new customers want to send six-field schedules such as \"5 5 * * * *\". Both should mean the fifth minute of every hour, with the new form also selecting the fifth second. The default setup rejects the new form. A teammate says turning on the built-in seconds setting will accept both forms. Is that right in this version? Show a small scheduler configuration that accepts both forms and keeps named schedules such as \"@monthly\" working. Explain how the missing field is filled in and what happens to an input with four or seven fields. Another teammate wants the same parser to let customers omit the weekday field as well as the seconds field. Can we configure both omissions together, and what happens when we try? Ground the answer in the implementation and identify existing tests, including their actual assertions, that support the mixed-input behavior and the invalid configurations. Keep the library unchanged.",
+  "source_root": "<CRON_ROOT>",
+  "source_commit": "bc59245fe10efaed9d51b56900192527ed733435",
+  "case_id": "v495-question-1"
+}

@@ -688,6 +688,39 @@ mod tests {
         assert_eq!(error.kind(), kind, "the classification is preserved");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn starts_runtime_beyond_windows_max_path() {
+        use std::os::windows::ffi::OsStrExt;
+        use std::path::PathBuf;
+        use std::process::{Command, ExitCode};
+
+        let executable =
+            PathBuf::from(std::env::var_os("SystemRoot").expect("Windows system root"))
+                .join("System32")
+                .join("where.exe");
+        let expected = Command::new(&executable)
+            .args(std::env::args_os().skip(1))
+            .output()
+            .expect("start the short-path reference executable")
+            .status
+            .code()
+            .and_then(|code| u8::try_from(code).ok())
+            .expect("reference exit status fits the launcher status");
+        let temp = tempfile::tempdir().expect("temporary runtime root");
+        let directory = temp.path().join("a".repeat(120)).join("b".repeat(120));
+        fs::create_dir_all(&directory).expect("create the long runtime directory");
+        let runtime = directory.join("codestory-cli-runtime.exe");
+        fs::copy(executable, &runtime).expect("copy the reference executable");
+        assert!(runtime.as_os_str().encode_wide().count() > 260);
+        assert!(!runtime.as_os_str().to_string_lossy().starts_with(r"\\?\"));
+
+        assert_eq!(
+            super::execute_runtime(runtime).expect("start the long-path runtime"),
+            ExitCode::from(expected),
+        );
+    }
+
     #[test]
     fn hook_status_does_not_stage_a_build_tree_runtime() {
         let temp = tempfile::tempdir().expect("temporary runtime root");
@@ -910,7 +943,8 @@ fn execute_runtime(path: PathBuf) -> io::Result<ExitCode> {
         ));
     }
 
-    let mut child = Command::new(path)
+    // Canonical Windows paths use the extended-length form needed by CreateProcessW.
+    let mut child = Command::new(fs::canonicalize(path)?)
         .args(std::env::args_os().skip(1))
         .spawn()?;
     // Command cannot expose a suspended primary thread to resume later, so the

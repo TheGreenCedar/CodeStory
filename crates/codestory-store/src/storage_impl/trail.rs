@@ -62,7 +62,9 @@ pub(super) fn get_trail_bfs(
             let remaining_edges = max_edges.saturating_sub(result.edges.len());
             if remaining_edges == 0 {
                 result.truncated = true;
-                break;
+                // Keep queued neighbors without expanding them beyond the
+                // exhausted global edge budget.
+                continue;
             }
             let edge_fetch = get_edges_for_node_limited(
                 storage,
@@ -93,10 +95,6 @@ pub(super) fn get_trail_bfs(
                     result.depth_map.insert(neighbor_id, depth + 1);
                     queue.push_back((neighbor_id, depth + 1));
                 }
-            }
-
-            if result.truncated {
-                break;
             }
         }
     }
@@ -468,9 +466,25 @@ fn get_edges_for_node_limited(
             "e.source_node_id = ?1 OR e.target_node_id = ?1 OR e.resolved_source_node_id = ?1 OR e.resolved_target_node_id = ?1"
         }
     };
+    // Apply the safe resolution priority before either the streamed edge
+    // budget or BFS node budget. Signed hashed edge IDs carry no coverage
+    // priority. Certain resolution is never downgraded by the normalizer
+    // below; every other edge keeps its original deterministic ID order.
+    let neighbor_kind = match direction {
+        TrailDirection::Outgoing => "trail_target.kind",
+        TrailDirection::Incoming => "trail_source.kind",
+        TrailDirection::Both => {
+            "CASE WHEN COALESCE(e.resolved_source_node_id, e.source_node_id) = ?1 THEN trail_target.kind ELSE trail_source.kind END"
+        }
+    };
     let query = format!(
-        "{} WHERE {where_clause} ORDER BY e.id",
-        super::EDGE_SELECT_BASE
+        "{} LEFT JOIN node trail_source ON trail_source.id = COALESCE(e.resolved_source_node_id, e.source_node_id)
+         LEFT JOIN node trail_target ON trail_target.id = COALESCE(e.resolved_target_node_id, e.target_node_id)
+         WHERE ({where_clause})
+         ORDER BY CASE WHEN (e.certainty = 'certain' OR (e.certainty IS NULL AND e.confidence >= ?2))
+             AND ({neighbor_kind}) != {} THEN 0 ELSE 1 END, e.id",
+        super::EDGE_SELECT_BASE,
+        NodeKind::UNKNOWN as i32,
     );
     if edge_budget == Some(0) {
         return Ok(EdgeFetchResult {
@@ -482,7 +496,10 @@ fn get_edges_for_node_limited(
     let mut stmt = storage.conn.prepare(&query)?;
     let mut edges = Vec::new();
     let mut truncated = false;
-    let mut rows = stmt.query(params![node_id.0])?;
+    let mut rows = stmt.query(params![
+        node_id.0,
+        f64::from(ResolutionCertainty::CERTAIN_MIN)
+    ])?;
 
     while let Some(row) = rows.next()? {
         let mut edge = Storage::edge_from_row(row)?;

@@ -201,18 +201,18 @@ pub(super) fn validate_worker_output(
     invocation: &ProcessInvocation,
     executable_sha256: &str,
 ) -> Result<()> {
+    let boot_id = output.clock.qualification_boot_id()?;
     if output.schema_version != EMBEDDING_QUALIFICATION_WORKER_SCHEMA_VERSION
         || output.pid != invocation.pid
         || output.process_start_id != invocation.process_start_id
         || output.executable_sha256 != executable_sha256
         || output.project_identity_sha256 != invocation.project_identity_sha256
         || output.clock.domain != "awake_monotonic"
-        || output.clock.boot_id.is_empty()
         || output.started_ns > output.finished_ns
         || output.inclusive_clock_api.is_empty()
         || output.inclusive_started_ns > output.inclusive_finished_ns
-        || output.boot_id_started != output.clock.boot_id
-        || output.boot_id_finished != output.clock.boot_id
+        || output.boot_id_started != boot_id
+        || output.boot_id_finished != boot_id
         || (output.result.is_some() as u8
             + output.protocol_exchange.is_some() as u8
             + output.queue_operations.is_some() as u8
@@ -715,7 +715,7 @@ mod tests {
             clock: EmbeddingServerClockSnapshot {
                 domain: "awake_monotonic".into(),
                 api: "test".into(),
-                boot_id: "boot".into(),
+                boot_id: Some("boot".into()),
                 resolution_ns: 1,
             },
             started_ns: 1,

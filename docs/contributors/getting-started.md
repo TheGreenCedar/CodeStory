@@ -157,7 +157,9 @@ managed-release path.
 
 Read commands default to `--refresh none`. Use `--refresh incremental` when a
 read should refresh an existing cache. Reserve full refresh for an empty cache,
-schema change, diagnosed corruption, or an explicit proof lane. An explicit
+schema change, diagnosed corruption or parser correction, or an explicit proof
+lane. Parser fixes can require full refresh even when files are unchanged;
+follow the release notes for the affected language. An explicit
 incremental request never widens into a full refresh: when the live core lacks
 the required structural publication or needs a supported schema upgrade,
 CodeStory returns `full_refresh_required` before workspace discovery or

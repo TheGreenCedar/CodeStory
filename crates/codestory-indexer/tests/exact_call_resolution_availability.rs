@@ -131,7 +131,7 @@ fn python_decorator_reference_does_not_make_its_declaration_ambiguous() -> anyho
         .find(|node| {
             node.kind == NodeKind::FUNCTION
                 && node.serialized_name == "Workflow.run"
-                && node.start_line == Some(8)
+                && node.start_line == Some(7)
         })
         .expect("decorated run declaration");
     assert!(

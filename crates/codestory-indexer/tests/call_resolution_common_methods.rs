@@ -16997,6 +16997,328 @@ void orchestrate() {
 }
 
 #[test]
+fn test_rust_qualified_calls_preserve_target_scope_with_same_named_callers() -> anyhow::Result<()> {
+    type Declaration = (&'static str, u32, NodeKind);
+    struct Case {
+        name: &'static str,
+        files: &'static [(&'static str, &'static str)],
+        caller: Declaration,
+        call_line: u32,
+        token: &'static str,
+        target: Option<Declaration>,
+    }
+    let cases = [
+        Case {
+            name: "declared sibling module beats same-named wrapper",
+            files: &[
+                ("src/lib.rs", "mod resolution;\n"),
+                (
+                    "src/resolution/mod.rs",
+                    "mod worker;\nstruct Wrapper;\nimpl Wrapper {\n    fn target() {\n        worker::target();\n    }\n}\n",
+                ),
+                ("src/resolution/worker.rs", "pub(super) fn target() {}\n"),
+            ],
+            caller: ("src/resolution/mod.rs", 4, NodeKind::METHOD),
+            call_line: 5,
+            token: "target",
+            target: Some(("src/resolution/worker.rs", 1, NodeKind::FUNCTION)),
+        },
+        Case {
+            name: "nested module scope distinguishes same-name declarations",
+            files: &[(
+                "src/lib.rs",
+                "mod outer {\n    pub mod inner {\n        pub fn target() {}\n    }\n    pub fn target() {}\n}\nfn caller() {\n    crate::outer::inner::target();\n}\n",
+            )],
+            caller: ("src/lib.rs", 7, NodeKind::FUNCTION),
+            call_line: 8,
+            token: "target",
+            target: Some(("src/lib.rs", 3, NodeKind::FUNCTION)),
+        },
+        Case {
+            name: "missing module cannot select a unique bare function",
+            files: &[(
+                "src/lib.rs",
+                "fn target() {}\nfn caller() {\n    missing::target();\n}\n",
+            )],
+            caller: ("src/lib.rs", 2, NodeKind::FUNCTION),
+            call_line: 3,
+            token: "target",
+            target: None,
+        },
+        Case {
+            name: "true bare recursion retains its declaration",
+            files: &[("src/lib.rs", "fn recur() {\n    recur();\n}\n")],
+            caller: ("src/lib.rs", 1, NodeKind::FUNCTION),
+            call_line: 2,
+            token: "recur",
+            target: Some(("src/lib.rs", 1, NodeKind::FUNCTION)),
+        },
+        Case {
+            name: "Self associated recursion retains its owner",
+            files: &[(
+                "src/lib.rs",
+                "struct Wrapper;\nimpl Wrapper {\n    fn recur() {\n        Self::recur();\n    }\n}\n",
+            )],
+            caller: ("src/lib.rs", 3, NodeKind::METHOD),
+            call_line: 4,
+            token: "recur",
+            target: Some(("src/lib.rs", 3, NodeKind::METHOD)),
+        },
+        Case {
+            name: "explicit associated type call retains its method",
+            files: &[(
+                "src/lib.rs",
+                "struct Worker;\nimpl Worker {\n    fn target() {}\n}\nfn caller() {\n    Worker::target();\n}\n",
+            )],
+            caller: ("src/lib.rs", 5, NodeKind::FUNCTION),
+            call_line: 6,
+            token: "target",
+            target: Some(("src/lib.rs", 3, NodeKind::METHOD)),
+        },
+        Case {
+            name: "cfg siblings and glob imports preserve an explicit local target",
+            files: &[
+                (
+                    "src/lib.rs",
+                    "#[cfg(test)] thread_local! { static FLAG: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }\nmod resolution;\n",
+                ),
+                (
+                    "src/resolution/mod.rs",
+                    "mod worker;\n#[cfg(test)] use std::fmt::Debug;\nstruct Wrapper;\nimpl Wrapper {\n    fn target() {\n        worker::target();\n    }\n}\n",
+                ),
+                (
+                    "src/resolution/worker.rs",
+                    "use super::*;\npub(super) fn target() {}\n#[cfg(test)] mod tests {}\n",
+                ),
+            ],
+            caller: ("src/resolution/mod.rs", 5, NodeKind::METHOD),
+            call_line: 6,
+            token: "target",
+            target: Some(("src/resolution/worker.rs", 2, NodeKind::FUNCTION)),
+        },
+        Case {
+            name: "custom module paths cannot adopt an unrelated conventional file",
+            files: &[
+                (
+                    "src/lib.rs",
+                    "#[path = \"alternate.rs\"] mod worker;\nfn target() {}\nfn caller() {\n    worker::target();\n}\n",
+                ),
+                ("src/worker.rs", "pub fn target() {}\n"),
+                ("src/alternate.rs", "pub fn target() {}\n"),
+            ],
+            caller: ("src/lib.rs", 3, NodeKind::FUNCTION),
+            call_line: 4,
+            token: "target",
+            target: None,
+        },
+        Case {
+            name: "incomplete target source cannot supply a qualified call target",
+            files: &[
+                (
+                    "src/lib.rs",
+                    "mod worker;\nfn caller() {\n    worker::target();\n}\n",
+                ),
+                ("src/worker.rs", "pub fn target() {}\nfn broken( {\n"),
+            ],
+            caller: ("src/lib.rs", 2, NodeKind::FUNCTION),
+            call_line: 3,
+            token: "target",
+            target: None,
+        },
+    ];
+    for case in cases {
+        let (nodes, edges) = index_files(case.files)?;
+        let nodes_by_id = nodes
+            .iter()
+            .map(|node| (node.id, node))
+            .collect::<HashMap<_, _>>();
+        let declarations = |(path, line, kind): Declaration| {
+            nodes
+                .iter()
+                .filter(|node| {
+                    node.kind == kind
+                        && node.start_line == Some(line)
+                        && file_path_for_node(&nodes_by_id, node)
+                            .is_some_and(|file| file.replace('\\', "/").ends_with(path))
+                })
+                .collect::<Vec<_>>()
+        };
+        let callers = declarations(case.caller);
+        assert_eq!(
+            callers.len(),
+            1,
+            "{}: exact caller: {callers:#?}",
+            case.name
+        );
+        let caller = callers[0];
+        let expected_target = if let Some(target) = case.target {
+            let targets = declarations(target);
+            assert_eq!(
+                targets.len(),
+                1,
+                "{}: exact target: {targets:#?}",
+                case.name
+            );
+            Some(targets[0].id)
+        } else {
+            None
+        };
+        let calls = edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::CALL && edge.effective_source() == caller.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            calls.len(),
+            1,
+            "{}: one ordinary callsite: {:?}",
+            case.name,
+            describe_call_edges(&edges, &nodes)
+        );
+        let call = calls[0];
+        assert_eq!(call.line, Some(case.call_line), "{}", case.name);
+        let raw_target = nodes_by_id[&call.target];
+        assert_eq!(raw_target.kind, NodeKind::UNKNOWN, "{}", case.name);
+        assert_ne!(raw_target.id, caller.id, "{}: raw occurrence", case.name);
+        let source = case
+            .files
+            .iter()
+            .find(|(path, _)| *path == case.caller.0)
+            .unwrap()
+            .1;
+        assert_eq!(
+            snippet_for_node(source, raw_target),
+            Some(case.token),
+            "{}: terminal identifier source extent is preserved",
+            case.name
+        );
+        assert_eq!(
+            call.resolved_target,
+            expected_target,
+            "{}: qualified syntax must not become bare-name recursion or select another owner; caller={caller:#?}, raw={raw_target:#?}, edge={call:#?}, expected={:#?}",
+            case.name,
+            expected_target.and_then(|id| nodes_by_id.get(&id))
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_rust_qualified_call_rechecks_unchanged_caller_after_module_ownership_changes()
+-> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let root = dir.path();
+    let caller_path = root.join("src/lib.rs");
+    let worker_path = root.join("src/worker.rs");
+    let competing_path = root.join("src/worker/mod.rs");
+    let caller_source = "mod worker;\nfn caller() {\n    worker::target();\n}\n";
+    fs::create_dir_all(root.join("src/worker"))?;
+    fs::write(&caller_path, caller_source)?;
+    fs::write(&worker_path, "pub fn target() {}\n")?;
+    let mut storage = Storage::new_in_memory()?;
+    let indexer = WorkspaceIndexer::new(root.to_path_buf());
+    let events = EventBus::new();
+    let refresh = |storage: &mut Storage, files_to_index, files_to_remove| {
+        indexer.run_incremental(
+            storage,
+            &codestory_workspace::RefreshInfo {
+                mode: codestory_workspace::BuildMode::Incremental,
+                files_to_index,
+                files_to_remove,
+                existing_file_ids: HashMap::new(),
+            },
+            &events,
+            None,
+        )
+    };
+    refresh(
+        &mut storage,
+        vec![caller_path.clone(), worker_path.clone()],
+        vec![],
+    )?;
+    let nodes = storage.get_nodes()?;
+    let caller_file = storage
+        .get_files()?
+        .into_iter()
+        .find(|file| file.path == caller_path)
+        .unwrap();
+    let caller = nodes
+        .iter()
+        .find(|node| {
+            node.file_node_id == Some(NodeId(caller_file.id))
+                && node.kind == NodeKind::FUNCTION
+                && node.start_line == Some(2)
+        })
+        .unwrap()
+        .id;
+    let worker_file = storage
+        .get_files()?
+        .into_iter()
+        .find(|file| file.path == worker_path)
+        .unwrap();
+    let target = nodes
+        .iter()
+        .find(|node| {
+            node.file_node_id == Some(NodeId(worker_file.id))
+                && node.kind == NodeKind::FUNCTION
+                && node.start_line == Some(1)
+        })
+        .unwrap()
+        .id;
+    let calls = storage
+        .get_edges()?
+        .into_iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL && edge.source == caller)
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 1);
+    let original = &calls[0];
+    assert_eq!(
+        original.resolved_target,
+        Some(target),
+        "initial unique module owner"
+    );
+    let current_call = |storage: &Storage| -> anyhow::Result<Edge> {
+        let calls = storage
+            .get_edges()?
+            .into_iter()
+            .filter(|edge| edge.id == original.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            calls.len(),
+            1,
+            "the unchanged caller's raw CALL must remain present"
+        );
+        assert_eq!(
+            (calls[0].source, calls[0].target, calls[0].line),
+            (original.source, original.target, original.line)
+        );
+        Ok(calls.into_iter().next().unwrap())
+    };
+    fs::write(&competing_path, "pub fn target() {}\n")?;
+    refresh(&mut storage, vec![competing_path.clone()], vec![])?;
+    assert_eq!(fs::read_to_string(&caller_path)?, caller_source);
+    assert_eq!(
+        current_call(&storage)?.resolved_target,
+        None,
+        "an unchanged caller must lose its old target when two native files claim its declared module"
+    );
+    let competing_id = storage
+        .get_files()?
+        .into_iter()
+        .find(|file| file.path == competing_path)
+        .unwrap()
+        .id;
+    fs::remove_file(&competing_path)?;
+    refresh(&mut storage, vec![], vec![competing_id])?;
+    assert_eq!(fs::read_to_string(&caller_path)?, caller_source);
+    assert_eq!(
+        current_call(&storage)?.resolved_target,
+        Some(target),
+        "removing the competing owner must reconsider the unchanged caller"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_rust_parameter_receiver_call_resolves_to_declared_parameter_type() -> anyhow::Result<()> {
     let source = r#"
 struct OtherStorage;

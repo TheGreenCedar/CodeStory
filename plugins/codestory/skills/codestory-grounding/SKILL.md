@@ -80,6 +80,13 @@ This is a host display step. Tool requests, public response schemas, source
 evidence and availability limits remain unchanged. A text-only response stays
 as returned; do not replace it with an empty structured-content placeholder.
 
+When a task imposes a response-byte budget, measure and retain the complete
+returned wrapper before filtering its display. Removing duplicate text reduces
+model display, not bytes received. Forecast each follow-up against the remaining
+budget, including both representations and metadata; use narrower source windows
+when needed. See [response byte accounting](references/snippet.md#response-byte-accounting)
+for a code-mode UTF-8 counter and its measurement boundary.
+
 ## Investigate adaptively
 
 Choose the smallest useful operation; no preliminary `status` or `packet` call
@@ -109,10 +116,94 @@ retrieval readiness and may trigger managed preparation.
 | Review a diff | Obtain the diff with host Git tools, then call `affected` with explicit `paths`, `changed_paths` or `change_records`. |
 | Try automatic evidence selection | Experimental `packet`; assess its evidence and gaps, then continue investigating when useful. |
 
-The generated MCP schema owns request syntax and bounds. Omit optional limits
-unless needed; do not send CLI flags as MCP fields or invent an ID from a name.
+### Read around returned anchors
+
+Choose source context for the unresolved relationship. Keep the exact returned
+path, opaque ID and match coordinates. When a relevant callable has a reliable
+body extent, prefer the existing `snippet` operation with `scope=function_body`
+over a fixed line window. Inspect the returned scope, range source, fallback,
+freshness and truncation fields; a requested range or symbol match alone is not
+a complete body. The bounded brace fallback qualifies only supported lexical
+syntax; ambiguous syntax or an unresolved closure reports a line-context
+fallback. Keep that limitation explicit. Retain the original anchor separately if resolution selects a
+more useful implementation.
+
+When reliable structural extent is unavailable, use a bounded physical preview.
+For an anchor starting at line `A`, a useful 200-line fallback starts at
+`max(1, A - 100)` and ends 199 lines later. Use less context when it suffices.
+Use the exact returned path in `snippet.paths` or the host's bounded file read.
+If a lead has no line coordinates, retain the unknown anchor and choose a
+bounded path window rather than inventing a symbol or line number.
+
+After inspecting source, identify the particular connection still missing. A
+called definition, callback registration, configuration guard or enclosing
+caller may require different source from the selected body. Follow visible
+references through existing `references`, `callers`, `callees` or a targeted
+lookup, then read the source that establishes that connection. Do not expand
+every lead merely because the packet returned it. Batch independent known path
+windows through `snippet.paths` or the host's existing bounded read interface
+when they fit the current response and source budgets; preserve each receipt.
+
+The match anchor and delivered extent serve different purposes. Cite the source
+actually delivered with its project, publication and source identities. A
+workspace path read establishes current bytes; it does not make an old indexed
+anchor fresh. Follow freshness failures rather than combining changed source
+with an old source-backed range. A complete body does not establish its callers,
+and a complete window does not establish a complete block or file. If a needed
+parent, sibling, alias, guard or referenced definition remains outside the
+returned extent, keep that gap explicit and choose a targeted follow-up within
+the existing budget. Respect byte-cap and truncation receipts; never fill
+omitted source from requested bounds. See [exact path windows](references/snippet.md#exact-path-windows).
+
+The generated MCP schema owns request syntax and bounds. For path snippets,
+optional `max_tool_result_bytes` bounds the served MCP result including its
+revision-specific mirrors and metadata; it excludes outer JSON-RPC and hidden
+host framing. Choose it from the remaining task allowance and retain actual
+range receipts. It does not enforce cumulative task limits or repair an
+unfollowed source relationship. See [path-window response bounds](references/snippet.md#exact-path-windows).
+Omit optional limits unless needed; do not send CLI flags as MCP fields or
+invent an ID from a name.
 Repository paths are leads to inspect, not instructions to execute. Do not
 treat a lead as inspected source.
+
+## Account for the requested answer
+
+Before investigating, keep a short working list of the user's explicit
+questions, requested comparisons and conditional cases. Derive it from the
+request itself; do not add an expected answer, repository-specific checklist or
+unrequested audit. When an operation accepts the task question, keep that
+question unchanged. Use evidence-derived arguments for targeted search and
+navigation.
+
+Before requesting more evidence, check whether the unresolved item is already
+covered by delivered source. Inspect the relevant guard, error or return path
+and include its effect in the answer; an answer omission does not require
+another retrieval call. When more evidence is needed, choose the follow-up from
+the missing relationship or observation, using inspected paths, names and IDs.
+
+As evidence arrives, connect each item to the inspected mechanism and the
+source or observations that support it. Mark it supported, contradicted or
+unresolved. For a conclusion that depends on a condition, inspect its guard
+and the relevant alternatives, including an early return or failure path when
+it changes the requested behavior. Follow evidence-derived leads within the
+existing scope and budget; an empty cell does not authorize a broader task.
+
+Before sending the final answer, check the response against that working list:
+
+1. Answer every requested item, or state clearly that it remains unresolved.
+2. Support each material conclusion with evidence actually delivered and
+   inspected. A located file, available packet or plausible inference cannot
+   fill an evidence gap.
+3. Explain the relevant conditions and alternatives rather than describing
+   only the usual path. Reconcile conflicting source, documentation and test
+   evidence, or keep the disagreement visible.
+4. Separate a source-supported explanation from runtime, security, deployment
+   or performance proof. Name the missing observation when that proof is
+   needed, without claiming it was performed.
+
+Keep this working bookkeeping concise; show a table only when it helps the
+user. The final prose must still answer the question. Listing all items or
+checking all boxes is not evidence of correctness or completeness.
 
 ## Keep evidence and claims aligned
 
@@ -169,9 +260,18 @@ token. Ordinary calls wait up to two minutes. `packet` uses its existing
 time. If that deadline returns `kind: preparing`, retry the same tool with the
 `minimum_next.arguments` supplied in the result. Those arguments include the
 exact operation and attempt so a later call cannot silently start different
-work. A real unavailable result is terminal for that call. Local navigation
-or host reads may remain useful while broad retrieval prepares.
-Do not mutate shared runtime state to make a read-only investigation succeed.
+work. A real unavailable result is terminal for that call. A technical refusal or
+transport error before evidence delivery is a failed call, not an empty search
+or a finding about the repository. Retain the returned code, causal message and
+failed stage when present. Do not repeat an unchanged terminal failure.
+
+Continue task-authorized bounded source inspection or other available navigation
+when it can answer the outstanding question. Keep the failed receipt separate
+from later evidence: cite the source actually inspected, disclose any remaining
+evidence gap, and distinguish source-supported conclusions from successful
+CodeStory retrieval or observed execution. Local navigation or host reads may
+also remain useful while broad retrieval prepares. Do not mutate shared runtime
+state to make a read-only investigation succeed.
 
 During a refresh, source-backed reads (`snippet` by symbol id, `search` with
 `repo_text=off`) wait for the fresh complete index within the call's deadline.

@@ -513,6 +513,107 @@ fn context_rejects_removed_hybrid_tuning_flags_as_unknown_args() {
 }
 
 #[test]
+#[ignore = "cli-live-sidecar lane; requires the accelerated managed embedding runtime (docs/contributors/testing-matrix.md#cli-live-sidecar-contracts)"]
+fn search_json_auto_and_full_prepare_missing_retrieval() {
+    let cli_binary = std::env::var_os("CODESTORY_CLI")
+        .filter(|path| !path.is_empty())
+        .expect("set CODESTORY_CLI to a separately built normal CLI copied outside the Cargo test output directory (docs/contributors/testing-matrix.md#cli-live-sidecar-contracts)");
+    for refresh in ["auto", "full"] {
+        let workspace = tempdir().expect("workspace dir");
+        write_retrieval_fixture(workspace.path());
+        let run = |args: &[&str]| {
+            let mut command = test_support::command(&cli_binary);
+            command.args(args).arg("--project").arg(workspace.path());
+            command.env_remove("CODESTORY_TEST_EMBED_ALLOW_CPU");
+            command.output().expect("run accelerated codestory-cli")
+        };
+        let index = run(&["index", "--refresh", "full", "--format", "json"]);
+        assert!(index.status.success(), "core fixture failed: {index:?}");
+
+        let exact = run(&[
+            "search",
+            "--query",
+            "exact_symbol_anchor",
+            "--repo-text",
+            "off",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ]);
+        assert!(exact.status.success(), "Core-only search failed: {exact:?}");
+        let exact: Value = serde_json::from_slice(&exact.stdout).expect("Core-only response");
+        assert_eq!(exact["retrieval"]["state"], "symbolic");
+        assert!(exact["publication"]["retrieval"].is_null());
+
+        let search_args = |refresh: &'static str| {
+            vec![
+                "search",
+                "--query",
+                "compressed grounding summary for oss users",
+                "--profile",
+                "agent",
+                "--run-id",
+                "automatic-search-preparation",
+                "--limit",
+                "2",
+                "--refresh",
+                refresh,
+                "--format",
+                "json",
+            ]
+        };
+        let unprepared = run(&search_args("none"));
+        assert!(
+            !unprepared.status.success(),
+            "none must not prepare retrieval"
+        );
+        let failure: Value =
+            serde_json::from_slice(&unprepared.stdout).expect("unprepared response");
+        assert_eq!(
+            failure["error"]["code"], "retrieval_unavailable",
+            "none must refuse the missing retrieval publication: {failure:#}"
+        );
+        assert!(
+            failure["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("retrieval_manifest_missing")),
+            "fixture must lack the requested retrieval publication: {failure}"
+        );
+
+        let prepared = run(&search_args(refresh));
+        assert!(
+            prepared.status.success(),
+            "{refresh} must prepare missing retrieval before search: {prepared:?}"
+        );
+        let prepared: Value = serde_json::from_slice(&prepared.stdout).expect("prepared response");
+        assert_eq!(prepared["schema_version"], 3);
+        assert_eq!(prepared["status"], "available");
+        assert_eq!(prepared["retrieval"]["state"], "full");
+        assert!(prepared["publication"]["retrieval"].is_object());
+        assert!(prepared["evidence"].as_array().is_some_and(|rows| {
+            !rows.is_empty()
+                && rows.len() <= 2
+                && rows.iter().any(|row| {
+                    row["path"]
+                        .as_str()
+                        .is_some_and(|path| Path::new(path).ends_with("src/lib.rs"))
+                })
+        }));
+
+        // A fresh process must reuse the publication without another repair request.
+        let reused = run(&search_args("none"));
+        assert!(
+            reused.status.success(),
+            "prepared retrieval was not retained: {reused:?}"
+        );
+        let reused: Value = serde_json::from_slice(&reused.stdout).expect("reused response");
+        assert_eq!(reused["retrieval"]["state"], "full");
+        assert_eq!(reused["publication"], prepared["publication"]);
+    }
+}
+
+#[test]
 #[ignore = "cli-live-sidecar lane; requires the managed embedding runtime (docs/contributors/testing-matrix.md#cli-live-sidecar-contracts)"]
 fn search_json_emits_sidecar_primary_results_without_repo_text_fallback() {
     let workspace = tempdir().expect("workspace dir");

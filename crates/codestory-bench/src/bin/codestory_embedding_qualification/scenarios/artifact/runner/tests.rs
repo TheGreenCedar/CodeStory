@@ -429,7 +429,7 @@ fn span_test_output() -> (WorkerOutput, EmbeddingQualificationWorkerMeasurementS
         clock: EmbeddingServerClockSnapshot {
             domain: "awake_monotonic".into(),
             api: "test".into(),
-            boot_id: "boot".into(),
+            boot_id: Some("boot".into()),
             resolution_ns: 1,
         },
         started_ns: 100,
@@ -759,4 +759,18 @@ fn a_complete_but_malformed_event_line_still_fails_the_read() {
         published_control_events(&path).is_err(),
         "a malformed record the writer terminated is corruption even when it is last"
     );
+}
+
+#[test]
+fn measurement_span_rejects_uncollected_empty_or_changed_boot_provenance() {
+    let (mut output, span) = span_test_output();
+    for witness in [
+        None,
+        Some(String::new()),
+        Some(" ".into()),
+        Some("other-boot".into()),
+    ] {
+        output.clock.boot_id = witness;
+        assert!(measurement_span_interval(&output, &span).is_err());
+    }
 }

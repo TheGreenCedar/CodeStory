@@ -19,6 +19,7 @@ use crate::index::{query_fingerprint, sidecar_project_id_for_runtime};
 use crate::mode::{RetrievalDegradedMode, derive_degraded_mode, derive_descriptor_mode};
 use crate::planner::RetrievalStageKind;
 use crate::query_features::{QueryLookupMode, classify_query};
+use crate::query_policy::LexicalAdmissionPolicy;
 use crate::ranker::rank_candidates;
 use crate::retention::GenerationRetentionLease;
 use crate::sidecar::validate_strict_sidecar_readiness_for_runtime;
@@ -31,7 +32,7 @@ use codestory_store::{
 };
 use parking_lot::{Mutex, MutexGuard};
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -121,6 +122,7 @@ pub struct QueryRequest<'a> {
 
 #[derive(Debug, Clone)]
 pub struct QueryBatchItem<'a> {
+    pub lexical_policy: LexicalAdmissionPolicy,
     pub query: &'a str,
     pub budget_ms: Option<u64>,
 }
@@ -170,10 +172,107 @@ pub struct PinnedQuerySession {
     _generation_lease: GenerationRetentionLease,
     _embedding_residency: ProductEmbeddingResidencyLease,
     full_readiness_validated: Cell<bool>,
+    published_file_reads: RefCell<BTreeMap<String, PinnedPublishedFileRead>>,
     transaction_active: bool,
 }
 
+struct PinnedPublishedFileRead {
+    fence: crate::lexical_index::PublishedFileReadFence,
+    cancelled: Option<Arc<AtomicBool>>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PublishedFileSourceFenceError {
+    #[error("published file source validation cancelled")]
+    Cancelled,
+    #[error("published file source {path} changed after hydration: {source}")]
+    Changed {
+        path: String,
+        #[source]
+        source: anyhow::Error,
+    },
+}
+
+/// Whole-file original text authenticated against one pinned lexical publication
+/// and the current in-project source. Construction stays inside retrieval.
+pub struct PublishedFileSourceWitness {
+    path: String,
+    content: String,
+    source_sha256: String,
+    publication: RetrievalPublicationIdentity,
+}
+
+impl PublishedFileSourceWitness {
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+    pub fn source_sha256(&self) -> &str {
+        &self.source_sha256
+    }
+    pub fn publication(&self) -> &RetrievalPublicationIdentity {
+        &self.publication
+    }
+}
+
 impl PinnedQuerySession {
+    /// Runtime must authorize the exact sealed file receipt first. This method
+    /// performs no query and cannot be used during descriptor-only readiness.
+    pub fn read_published_file_source(
+        &self,
+        path: &str,
+        cancelled: Option<Arc<AtomicBool>>,
+    ) -> Result<Option<PublishedFileSourceWitness>> {
+        if !self.full_readiness_validated.get() {
+            bail!("published file source requires full readiness after sealed admission");
+        }
+        self.revalidate()?;
+        let generation = self
+            .manifest
+            .sidecar_generation
+            .as_deref()
+            .context("published file source generation is missing")?;
+        let input_hash = self
+            .manifest
+            .sidecar_input_hash
+            .as_deref()
+            .context("published file source input identity is missing")?;
+        let read_cancelled = cancelled.clone();
+        let source = crate::lexical_index::read_published_file_content(
+            &crate::lexical_index::shard_dir_for(&self.runtime.layout.lexical_data_dir, generation),
+            input_hash,
+            &self.project_root,
+            path,
+            1024 * 1024,
+            Arc::new(move || {
+                read_cancelled
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(Ordering::Acquire))
+            }),
+        )?;
+        self.revalidate()?;
+        Ok(source.map(|source| {
+            // A repeated read may authenticate the same bytes under a newer
+            // inode or alias. It cannot replace the operation's first epoch
+            // or detach its original cancellation scope.
+            self.published_file_reads
+                .borrow_mut()
+                .entry(source.path.clone())
+                .or_insert(PinnedPublishedFileRead {
+                    fence: source.read_fence,
+                    cancelled,
+                });
+            PublishedFileSourceWitness {
+                path: source.path,
+                content: source.content,
+                source_sha256: source.source_sha256,
+                publication: self.publication_identity.clone(),
+            }
+        }))
+    }
+
     pub fn begin(
         project_root: &Path,
         storage_path: &Path,
@@ -208,7 +307,8 @@ impl PinnedQuerySession {
         }
 
         let project_id = sidecar_project_id_for_runtime(project_root, runtime)?;
-        let generation_lease = GenerationRetentionLease::acquire_for_query(runtime, &project_id)?;
+        let mut generation_lease =
+            GenerationRetentionLease::acquire_for_query(runtime, &project_id)?;
         let publication_storage =
             Store::open_read_only(storage_path).context("open retrieval publication pointer")?;
         let bound_manifest = publication_storage
@@ -263,6 +363,28 @@ impl PinnedQuerySession {
             bail!("retrieval publication core binding does not match immutable core contents");
         }
 
+        let producer_runtime = crate::publication_scope::resolve_publication_runtime(
+            project_root,
+            &storage,
+            &manifest,
+            runtime,
+        )?;
+        generation_lease.retain_origin(runtime, &producer_runtime, &project_id)?;
+        let observed =
+            Store::open_read_only(storage_path)?.get_bound_retrieval_index_manifest(&project_id)?;
+        if observed.as_ref() != Some(&bound_manifest) {
+            return Err(RetrievalPublicationChanged::changed(
+                "resolve publication artifact origin",
+                &retrieval_publication_identity_from_bound(&bound_manifest)?,
+                observed
+                    .as_ref()
+                    .map(retrieval_publication_identity_from_bound)
+                    .transpose()?,
+            )
+            .into());
+        }
+        let runtime = &producer_runtime;
+
         // Acquire residency before strict readiness and keep it through candidate resolution.
         let embedding_residency = acquire_product_embedding_residency_for_runtime(runtime)
             .context("pin retrieval embedding engine")?;
@@ -286,6 +408,7 @@ impl PinnedQuerySession {
                 Some(&manifest),
                 Some(embedding_device.clone()),
             )?
+            .with_embedding_identity_pin(embedding_residency.identity().cloned())
             .with_core_candidate_context(project_root, Arc::clone(&storage)),
         );
 
@@ -304,6 +427,7 @@ impl PinnedQuerySession {
             _generation_lease: generation_lease,
             _embedding_residency: embedding_residency,
             full_readiness_validated: Cell::new(false),
+            published_file_reads: RefCell::new(BTreeMap::new()),
             transaction_active: true,
         };
         if validate_full_readiness {
@@ -361,6 +485,34 @@ impl PinnedQuerySession {
             Arc::new(AtomicBool::new(false)),
         );
         self.validate_full_readiness_with_context(&context)
+    }
+
+    /// Reuse completed admission without repeating the repository fingerprint.
+    /// Descriptor-only pins still require their ordinary deferred validation;
+    /// admitted pins must retain live engine and component health.
+    pub fn validate_primary_readiness_reuse(&self) -> Option<Result<()>> {
+        if !self.full_readiness_validated.get() {
+            return None;
+        }
+        Some((|| {
+            self.validate_full_readiness()?;
+            #[cfg(not(feature = "test-support"))]
+            self._embedding_residency.revalidate()?;
+            let (mode, degraded_reason) = resolve_batch_mode(
+                self.sidecars.as_ref(),
+                Some(&self.manifest),
+                &self.embedding_device,
+                &self.runtime,
+            );
+            if mode != RetrievalDegradedMode::Full {
+                bail!(
+                    "retrieval sidecar is mandatory; project is not in full mode (mode={}, reason={})",
+                    mode.as_str(),
+                    degraded_reason.as_deref().unwrap_or("unknown")
+                );
+            }
+            Ok(())
+        })())
     }
 
     fn validate_full_readiness_with_identity(
@@ -490,7 +642,14 @@ impl PinnedQuerySession {
         cancelled: Option<Arc<AtomicBool>>,
         cache: &mut RetrievalCache,
     ) -> Result<QueryResult> {
-        self.execute_packet_descriptors_with_cache_policy(query, budget_ms, cancelled, cache, true)
+        self.execute_packet_descriptors_with_cache_policy(
+            query,
+            budget_ms,
+            cancelled,
+            cache,
+            true,
+            LexicalAdmissionPolicy::StrictLiteralV1,
+        )
     }
 
     #[cfg(feature = "benchmark-support")]
@@ -501,7 +660,51 @@ impl PinnedQuerySession {
         cancelled: Option<Arc<AtomicBool>>,
         cache: &mut RetrievalCache,
     ) -> Result<QueryResult> {
-        self.execute_packet_descriptors_with_cache_policy(query, budget_ms, cancelled, cache, false)
+        self.execute_packet_descriptors_with_cache_policy(
+            query,
+            budget_ms,
+            cancelled,
+            cache,
+            false,
+            LexicalAdmissionPolicy::StrictLiteralV1,
+        )
+    }
+
+    pub fn execute_packet_descriptors_with_admission_policy(
+        &self,
+        query: &str,
+        lexical_policy: LexicalAdmissionPolicy,
+        budget_ms: Option<u64>,
+        cancelled: Option<Arc<AtomicBool>>,
+        cache: &mut RetrievalCache,
+    ) -> Result<QueryResult> {
+        self.execute_packet_descriptors_with_cache_policy(
+            query,
+            budget_ms,
+            cancelled,
+            cache,
+            true,
+            lexical_policy,
+        )
+    }
+
+    #[cfg(feature = "benchmark-support")]
+    pub fn execute_packet_descriptors_without_dense_semantic_for_benchmark_with_admission_policy(
+        &self,
+        query: &str,
+        lexical_policy: LexicalAdmissionPolicy,
+        budget_ms: Option<u64>,
+        cancelled: Option<Arc<AtomicBool>>,
+        cache: &mut RetrievalCache,
+    ) -> Result<QueryResult> {
+        self.execute_packet_descriptors_with_cache_policy(
+            query,
+            budget_ms,
+            cancelled,
+            cache,
+            false,
+            lexical_policy,
+        )
     }
 
     fn execute_packet_descriptors_with_cache_policy(
@@ -511,6 +714,7 @@ impl PinnedQuerySession {
         cancelled: Option<Arc<AtomicBool>>,
         cache: &mut RetrievalCache,
         include_dense_semantic: bool,
+        lexical_policy: LexicalAdmissionPolicy,
     ) -> Result<QueryResult> {
         let cancelled = cancelled.unwrap_or_else(cancellation_flag);
         if cancelled.load(Ordering::Acquire) {
@@ -526,12 +730,16 @@ impl PinnedQuerySession {
             mode_override: None,
         };
         let mut result = if include_dense_semantic {
-            executor.execute_packet_descriptors(query, budget_ms)?
+            executor.execute_packet_descriptors_with_lexical_policy(
+                query,
+                budget_ms,
+                lexical_policy,
+            )?
         } else {
             #[cfg(feature = "benchmark-support")]
             {
-                executor.execute_packet_descriptors_without_dense_semantic_for_benchmark(
-                    query, budget_ms,
+                executor.execute_packet_descriptors_without_dense_semantic_for_benchmark_with_lexical_policy(
+                    query, budget_ms, lexical_policy,
                 )?
             }
             #[cfg(not(feature = "benchmark-support"))]
@@ -774,6 +982,44 @@ impl PinnedQuerySession {
         }
         Ok(())
     }
+
+    /// The outer response owner calls this once after selection/measurement.
+    /// Publication checks alone do not cover lexical-only files absent from
+    /// Core. Verify their original successful epochs without SQL or decoding.
+    pub fn revalidate_after_response(&self) -> Result<()> {
+        self.revalidate()?;
+        let reads = self.published_file_reads.borrow();
+        if reads.is_empty() {
+            return Ok(());
+        }
+        for (path, read) in reads.iter() {
+            let is_cancelled = || {
+                read.cancelled
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(Ordering::Acquire))
+            };
+            if is_cancelled() {
+                return Err(PublishedFileSourceFenceError::Cancelled.into());
+            }
+            let verified = read.fence.revalidate(&self.project_root);
+            if is_cancelled() {
+                return Err(PublishedFileSourceFenceError::Cancelled.into());
+            }
+            verified.map_err(|source| PublishedFileSourceFenceError::Changed {
+                path: path.clone(),
+                source,
+            })?;
+        }
+        self.revalidate()?;
+        if reads.values().any(|read| {
+            read.cancelled
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Acquire))
+        }) {
+            return Err(PublishedFileSourceFenceError::Cancelled.into());
+        }
+        Ok(())
+    }
 }
 
 fn sanitize_packet_candidate_descriptors(candidates: &mut [CandidateHit]) {
@@ -861,9 +1107,18 @@ fn refresh_cached_query_result(
     if result.trace.cancel_reason.is_some() {
         return;
     }
-    let key = cache.key_for_manifest(manifest, query_fingerprint(&result.features.raw_query));
-    if cache.get(&key).is_some() {
-        cache.insert(key, result.hits.clone());
+    let key = cache.key_for_manifest(
+        manifest,
+        result
+            .features
+            .lexical_policy
+            .cache_fingerprint(query_fingerprint(&result.features.raw_query)),
+    );
+    if cache
+        .get_with_policy(&key, result.features.lexical_policy)
+        .is_some()
+    {
+        cache.insert_with_policy(key, result.hits.clone(), result.features.lexical_policy);
     }
 }
 
@@ -1008,17 +1263,28 @@ fn execute_strict_retrieval_query_batch_against_sidecars_with_payload(
             bail!("retrieval query batch cancelled during cache lookup");
         }
         if payload == CandidatePayloadMode::Full
-            && let Some(result) =
-                cached_batch_result(manifest.as_ref(), cache, query.query, mode, &cancelled)
+            && let Some(result) = cached_batch_result(
+                manifest.as_ref(),
+                cache,
+                query.query,
+                mode,
+                &cancelled,
+                query.lexical_policy,
+            )
         {
             results[index] = Some(result);
         } else {
-            misses.push((index, query.query.to_string(), query.budget_ms));
+            misses.push((
+                index,
+                query.query.to_string(),
+                query.budget_ms,
+                query.lexical_policy,
+            ));
         }
     }
 
     let (sidecars, prefetch_elapsed) = if payload == CandidatePayloadMode::Full {
-        prepare_batched_sidecars(sidecars, manifest.as_ref(), &misses, &cancelled)
+        prepare_batched_sidecars_with_policy(sidecars, manifest.as_ref(), &misses, &cancelled)
     } else {
         (sidecars, Duration::ZERO)
     };
@@ -1030,7 +1296,7 @@ fn execute_strict_retrieval_query_batch_against_sidecars_with_payload(
         }
         let wave_results = std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(wave.len());
-            for (index, query, budget_ms) in wave {
+            for (index, query, budget_ms, lexical_policy) in wave {
                 let manifest = manifest.clone();
                 let file_roles = Arc::clone(&file_roles);
                 let cancelled = Arc::clone(&cancelled);
@@ -1049,17 +1315,18 @@ fn execute_strict_retrieval_query_batch_against_sidecars_with_payload(
                     };
                     let result = match payload {
                         CandidatePayloadMode::Full => {
-                            executor.execute(query, Some(remaining_budget_ms))
+                            executor.execute_with_lexical_policy(query, Some(remaining_budget_ms), *lexical_policy)
                         }
                         CandidatePayloadMode::DescriptorOnly if include_dense_semantic => executor
-                            .execute_packet_descriptors(query, Some(remaining_budget_ms)),
+                            .execute_packet_descriptors_with_lexical_policy(query, Some(remaining_budget_ms), *lexical_policy),
                         CandidatePayloadMode::DescriptorOnly => {
                             #[cfg(feature = "benchmark-support")]
                             {
                                 executor
-                                    .execute_packet_descriptors_without_dense_semantic_for_benchmark(
+                                    .execute_packet_descriptors_without_dense_semantic_for_benchmark_with_lexical_policy(
                                         query,
                                         Some(remaining_budget_ms),
+                                        *lexical_policy,
                                     )
                             }
                             #[cfg(not(feature = "benchmark-support"))]
@@ -1103,26 +1370,46 @@ fn execute_strict_retrieval_query_batch_against_sidecars_with_payload(
         .collect()
 }
 
+#[cfg(test)]
 fn prepare_batched_sidecars(
     sidecars: Arc<dyn SidecarSearch>,
     manifest: Option<&RetrievalIndexManifest>,
     misses: &[(usize, String, Option<u64>)],
     cancelled: &Arc<AtomicBool>,
 ) -> (Arc<dyn SidecarSearch>, Duration) {
+    let misses = misses
+        .iter()
+        .map(|(index, query, budget)| {
+            (
+                *index,
+                query.clone(),
+                *budget,
+                LexicalAdmissionPolicy::StrictLiteralV1,
+            )
+        })
+        .collect::<Vec<_>>();
+    prepare_batched_sidecars_with_policy(sidecars, manifest, &misses, cancelled)
+}
+
+fn prepare_batched_sidecars_with_policy(
+    sidecars: Arc<dyn SidecarSearch>,
+    manifest: Option<&RetrievalIndexManifest>,
+    misses: &[(usize, String, Option<u64>, LexicalAdmissionPolicy)],
+    cancelled: &Arc<AtomicBool>,
+) -> (Arc<dyn SidecarSearch>, Duration) {
     let started = Instant::now();
     let mut seen = HashSet::new();
     let all_queries = misses
         .iter()
-        .map(|(_, query, _)| query)
-        .filter(|query| seen.insert((*query).clone()))
-        .cloned()
+        .map(|(_, query, _, policy)| (query.clone(), *policy))
+        .filter(|key| seen.insert(key.clone()))
         .collect::<Vec<_>>();
     if all_queries.len() < 2 || cancelled.load(Ordering::Acquire) {
         return (sidecars, Duration::ZERO);
     }
     let smallest_budget_ms = misses
         .iter()
-        .map(|(_, query, budget_ms)| effective_query_budget_ms(query, *budget_ms))
+        .map(|(_, query, budget_ms, _)| effective_query_budget_ms(query, *budget_ms))
         .min()
         .unwrap_or_default();
     if smallest_budget_ms == 0 {
@@ -1140,25 +1427,26 @@ fn prepare_batched_sidecars(
     let lexical_requests = all_queries
         .iter()
         .cloned()
-        .map(|query| (query, crate::planner::LEXICAL_FUSION_WINDOW))
+        .map(|(query, policy)| (query, crate::planner::LEXICAL_FUSION_WINDOW, policy))
         .collect::<Vec<_>>();
-    let prepared_lexical = match sidecars.lexical_search_batch(&lexical_requests, &context) {
-        Ok(Some(results))
-            if results.len() == all_queries.len() && context.check_cancelled().is_ok() =>
-        {
-            all_queries
-                .iter()
-                .cloned()
-                .zip(results)
-                .collect::<HashMap<_, _>>()
-        }
-        _ => HashMap::new(),
-    };
+    let prepared_lexical =
+        match sidecars.lexical_search_batch_with_policy(&lexical_requests, &context) {
+            Ok(Some(results))
+                if results.len() == all_queries.len() && context.check_cancelled().is_ok() =>
+            {
+                all_queries
+                    .iter()
+                    .cloned()
+                    .zip(results)
+                    .collect::<HashMap<_, _>>()
+            }
+            _ => HashMap::new(),
+        };
 
-    seen.clear();
+    let mut seen = HashSet::new();
     let semantic_queries = misses
         .iter()
-        .map(|(_, query, _)| query)
+        .map(|(_, query, _, _)| query)
         .filter(|query| {
             let features = classify_query(query);
             !(features.intent.standalone_path
@@ -1239,7 +1527,7 @@ fn max_descriptor_stage_elapsed_ms(results: &[QueryResult], kind: RetrievalStage
 
 struct PreparedBatchSidecars {
     inner: Arc<dyn SidecarSearch>,
-    prepared_lexical: HashMap<String, Vec<CandidateHit>>,
+    prepared_lexical: HashMap<(String, LexicalAdmissionPolicy), Vec<CandidateHit>>,
     prepared_semantic: HashMap<String, Vec<CandidateHit>>,
 }
 
@@ -1261,7 +1549,10 @@ impl SidecarSearch for PreparedBatchSidecars {
     }
 
     fn lexical_search(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>> {
-        if let Some(prepared) = self.prepared_lexical.get(query) {
+        if let Some(prepared) = self
+            .prepared_lexical
+            .get(&(query.to_string(), LexicalAdmissionPolicy::StrictLiteralV1))
+        {
             let mut hits = prepared.clone();
             hits.truncate(limit);
             return Ok(hits);
@@ -1276,7 +1567,10 @@ impl SidecarSearch for PreparedBatchSidecars {
         context: &SearchExecutionContext,
     ) -> Result<Vec<CandidateHit>> {
         context.check_cancelled()?;
-        let hits = if let Some(prepared) = self.prepared_lexical.get(query) {
+        let hits = if let Some(prepared) = self
+            .prepared_lexical
+            .get(&(query.to_string(), LexicalAdmissionPolicy::StrictLiteralV1))
+        {
             let mut hits = prepared.clone();
             hits.truncate(limit);
             hits
@@ -1341,6 +1635,25 @@ impl SidecarSearch for PreparedBatchSidecars {
     ) -> Result<Vec<CandidateHit>> {
         self.inner.scip_expand_with_context(anchors, limit, context)
     }
+    fn lexical_search_with_policy_context(
+        &self,
+        query: &str,
+        limit: usize,
+        policy: LexicalAdmissionPolicy,
+        context: &SearchExecutionContext,
+    ) -> Result<Vec<CandidateHit>> {
+        context.check_cancelled()?;
+        let hits = if let Some(prepared) = self.prepared_lexical.get(&(query.to_string(), policy)) {
+            let mut hits = prepared.clone();
+            hits.truncate(limit);
+            hits
+        } else {
+            self.inner
+                .lexical_search_with_policy_context(query, limit, policy, context)?
+        };
+        context.check_cancelled()?;
+        Ok(hits)
+    }
 }
 
 fn cached_batch_result(
@@ -1349,14 +1662,20 @@ fn cached_batch_result(
     query: &str,
     mode: RetrievalDegradedMode,
     cancelled: &AtomicBool,
+    lexical_policy: LexicalAdmissionPolicy,
 ) -> Option<QueryResult> {
     if cancelled.load(Ordering::Acquire) {
         return None;
     }
     let manifest = manifest?;
-    let features = classify_query(query);
-    let key = cache.key_for_manifest(manifest, query_fingerprint(&features.raw_query));
-    let hits = cache.get(&key)?.to_vec();
+    let mut features = classify_query(query);
+    let key = cache.key_for_manifest(
+        manifest,
+        lexical_policy.cache_fingerprint(query_fingerprint(&features.raw_query)),
+    );
+    let (executed_policy, hits) = cache.get_with_policy(&key, lexical_policy)?;
+    let hits = hits.to_vec();
+    features.lexical_policy = executed_policy;
     if cancelled.load(Ordering::Acquire) {
         return None;
     }
@@ -1387,9 +1706,19 @@ fn cache_completed_batch_result(
         return;
     }
     if let Some(manifest) = manifest {
-        let key = cache.key_for_manifest(manifest, query_fingerprint(&result.features.raw_query));
+        let key = cache.key_for_manifest(
+            manifest,
+            result
+                .features
+                .lexical_policy
+                .cache_fingerprint(query_fingerprint(&result.features.raw_query)),
+        );
         if !cancelled.load(Ordering::Acquire) {
-            cache.insert(key.clone(), result.hits.clone());
+            cache.insert_with_policy(
+                key.clone(),
+                result.hits.clone(),
+                result.features.lexical_policy,
+            );
             if cancelled.load(Ordering::Acquire) {
                 cache.remove(&key);
             }
@@ -1430,6 +1759,7 @@ fn retrieval_publication_identity_from_bound(
 ) -> Result<RetrievalPublicationIdentity> {
     let manifest = &bound.manifest;
     Ok(RetrievalPublicationIdentity {
+        artifact_scope: manifest.artifact_scope.clone(),
         core_generation_id: bound.core.generation_id.clone(),
         core_run_id: bound.core.run_id.clone(),
         sidecar_generation: manifest
@@ -1791,10 +2121,12 @@ mod tests {
         );
         let queries = [
             QueryBatchItem {
+                lexical_policy: crate::query_policy::LexicalAdmissionPolicy::StrictLiteralV1,
                 query: "locate service implementation",
                 budget_ms: Some(500),
             },
             QueryBatchItem {
+                lexical_policy: crate::query_policy::LexicalAdmissionPolicy::StrictLiteralV1,
                 query: "explain service implementation",
                 budget_ms: Some(500),
             },
@@ -1891,6 +2223,7 @@ mod tests {
 
     fn publication_identity(label: &str) -> RetrievalPublicationIdentity {
         RetrievalPublicationIdentity {
+            artifact_scope: None,
             core_generation_id: format!("core-{label}"),
             core_run_id: format!("run-{label}"),
             sidecar_generation: format!("sidecar-{label}"),
@@ -1919,6 +2252,110 @@ mod tests {
         assert_eq!(changed.expected(), &expected);
         assert_eq!(changed.observed(), Some(&observed));
         assert_eq!(changed.detail(), None);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn published_file_response_fence_preserves_first_epoch_and_cancellation_scope() {
+        use crate::test_support::{
+            env_lock, publish_complete_core_fixture, publish_zero_dense_pinned_query_fixture,
+        };
+        use codestory_store::{IndexPublicationMode, IndexPublicationRecord};
+
+        let _env = env_lock();
+        let project = TempDir::new().unwrap();
+        let storage_dir = TempDir::new().unwrap();
+        let cache = TempDir::new().unwrap();
+        let source_path = project.path().join("settings.ini");
+        let content = "enabled = true\n";
+        std::fs::write(&source_path, content).unwrap();
+        let storage_path = storage_dir.path().join("codestory.db");
+        let mut store = Store::open(&storage_path).unwrap();
+        publish_complete_core_fixture(
+            &mut store,
+            project.path(),
+            &IndexPublicationRecord {
+                generation: 1,
+                generation_id: "11111111-1111-4111-8111-111111111111".into(),
+                run_id: "published-file-fence".into(),
+                mode: IndexPublicationMode::Full,
+                published_at_epoch_ms: 1,
+            },
+        )
+        .unwrap();
+        drop(store);
+        let runtime = crate::config::with_test_cache_root(cache.path(), || {
+            SidecarRuntimeConfig::for_project_profile(
+                Some(project.path()),
+                crate::SidecarProfile::Local,
+            )
+        });
+        publish_zero_dense_pinned_query_fixture(project.path(), &storage_path, &runtime).unwrap();
+
+        let session = PinnedQuerySession::begin(project.path(), &storage_path, &runtime).unwrap();
+        // The source reader reuses an ordinary validated lexical publication;
+        // publishing a fixture and validating full readiness alone do not seal
+        // the lexical component contents for this process.
+        let coverage = crate::lexical_index::lexical_shard_coverage(
+            &session.runtime.layout.lexical_data_dir,
+            &session.publication_identity.sidecar_generation,
+            &session.publication_identity.sidecar_input_hash,
+        )
+        .expect("validate exact pinned lexical publication before its admitted source read");
+        assert!(coverage.complete());
+        assert_eq!(coverage.indexed_files, 1);
+        let original_flag = {
+            let flag = Arc::new(AtomicBool::new(false));
+            let source = session
+                .read_published_file_source("settings.ini", Some(Arc::clone(&flag)))
+                .unwrap()
+                .expect("published original source");
+            assert_eq!(source.path(), "settings.ini");
+            assert_eq!(source.publication(), session.publication_identity());
+            Arc::downgrade(&flag)
+        };
+        session.revalidate_after_response().unwrap();
+        session
+            .read_published_file_source("settings.ini", Some(Arc::new(AtomicBool::new(false))))
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.published_file_reads.borrow().len(), 1);
+        original_flag
+            .upgrade()
+            .expect("pin retains original cancellation after its dynamic scope ends")
+            .store(true, Ordering::Release);
+        let error = session.revalidate_after_response().unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<PublishedFileSourceFenceError>(),
+            Some(PublishedFileSourceFenceError::Cancelled)
+        ));
+        drop(session);
+
+        #[cfg(unix)]
+        {
+            let session =
+                PinnedQuerySession::begin(project.path(), &storage_path, &runtime).unwrap();
+            session
+                .read_published_file_source("settings.ini", None)
+                .unwrap()
+                .unwrap();
+            let replacement = project.path().join("replacement.ini");
+            std::fs::write(&replacement, content).unwrap();
+            std::fs::rename(replacement, &source_path).unwrap();
+            session
+                .read_published_file_source("settings.ini", None)
+                .unwrap()
+                .expect("same stored bytes may authenticate under a new native epoch");
+            assert_eq!(session.published_file_reads.borrow().len(), 1);
+            let error = session.revalidate_after_response().unwrap_err();
+            assert!(
+                matches!(
+                    error.downcast_ref::<PublishedFileSourceFenceError>(),
+                    Some(PublishedFileSourceFenceError::Changed { path, .. }) if path == "settings.ini"
+                ),
+                "a duplicate read cannot replace the first source epoch: {error:#}"
+            );
+        }
     }
 
     #[cfg(feature = "test-support")]
@@ -2157,6 +2594,7 @@ mod tests {
         assert_eq!(empty_observation, None);
 
         let queries = [QueryBatchItem {
+            lexical_policy: crate::query_policy::LexicalAdmissionPolicy::StrictLiteralV1,
             query: "visible",
             budget_ms: Some(500),
         }];
@@ -2300,6 +2738,33 @@ mod tests {
             "ordinary validation did not preserve the strict failure: {ordinary_error:#}"
         );
         assert!(!session.full_readiness_validated.get());
+
+        drop(session);
+        let writer = Store::open(&storage_path).expect("restore the owned fixture");
+        writer
+            .get_connection()
+            .execute("UPDATE file SET language = 'rust' WHERE id = 1", [])
+            .expect("restore the original file projection");
+        drop(writer);
+        let validated = PinnedQuerySession::begin(project.path(), &storage_path, &runtime)
+            .expect("the restored fixture admits full readiness");
+        assert!(validated.full_readiness_validated.get());
+        for (context, expected) in [
+            (
+                &expired,
+                "retrieval stopped: reason=deadline stage=deferred_full_readiness_entry",
+            ),
+            (
+                &cancelled,
+                "retrieval stopped: reason=request_cancelled stage=deferred_full_readiness_entry",
+            ),
+        ] {
+            let error = validated
+                .validate_full_readiness_with_context(context)
+                .expect_err("cached readiness must still honor deadline and cancellation");
+            assert_eq!(error.to_string(), expected);
+            assert!(validated.full_readiness_validated.get());
+        }
     }
 
     #[test]
@@ -2321,6 +2786,108 @@ mod tests {
         .expect("empty batch should short-circuit before storage setup");
 
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn mixed_policy_batch_prefetch_and_cache_keep_same_text_separate_in_both_orders() {
+        struct PolicyBatchSidecars {
+            batches: AtomicUsize,
+        }
+        impl SidecarSearch for PolicyBatchSidecars {
+            fn lexical_search(&self, _: &str, _: usize) -> Result<Vec<CandidateHit>> {
+                panic!("policy batch should prepare both lexical intents")
+            }
+            fn lexical_search_batch_with_policy(
+                &self,
+                queries: &[(String, usize, LexicalAdmissionPolicy)],
+                context: &SearchExecutionContext,
+            ) -> Result<Option<Vec<Vec<CandidateHit>>>> {
+                context.check_cancelled()?;
+                self.batches.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(queries.len(), 2);
+                assert_eq!(queries[0].0, queries[1].0);
+                assert_ne!(queries[0].2, queries[1].2);
+                Ok(Some(
+                    queries
+                        .iter()
+                        .map(|(query, _, policy)| {
+                            assert_eq!(query, "text empty `absent`");
+                            vec![CandidateHit::lexical_stub(
+                                if *policy == LexicalAdmissionPolicy::StrictLiteralV1 {
+                                    "src/strict.rs"
+                                } else {
+                                    "src/broad.rs"
+                                },
+                                1.0,
+                            )]
+                        })
+                        .collect(),
+                ))
+            }
+            fn semantic_search(&self, query: &str, _: usize) -> Result<Vec<CandidateHit>> {
+                assert_eq!(
+                    query, "text empty `absent`",
+                    "semantic input stays the complete raw question"
+                );
+                Ok(Vec::new())
+            }
+            fn scip_anchor(&self, _: &str, _: usize) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+            fn scip_expand(&self, _: &[CandidateHit], _: usize) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+        }
+        for order in [
+            [
+                LexicalAdmissionPolicy::StrictLiteralV1,
+                LexicalAdmissionPolicy::BroadQuestionV1,
+            ],
+            [
+                LexicalAdmissionPolicy::BroadQuestionV1,
+                LexicalAdmissionPolicy::StrictLiteralV1,
+            ],
+        ] {
+            let sidecars = Arc::new(PolicyBatchSidecars {
+                batches: AtomicUsize::new(0),
+            });
+            let mut cache = RetrievalCache::new();
+            let queries = order.map(|lexical_policy| QueryBatchItem {
+                query: "text empty `absent`",
+                budget_ms: Some(1_000),
+                lexical_policy,
+            });
+            for round in 0..2 {
+                let results = execute_strict_retrieval_query_batch_against_sidecars(
+                    sidecars.clone(),
+                    Some(manifest_for("testproj", "mixed-policy", 2)),
+                    Arc::new(HashMap::new()),
+                    cancellation_flag(),
+                    RetrievalDegradedMode::Full,
+                    &queries,
+                    &mut cache,
+                    2,
+                )
+                .expect("mixed policy batch");
+                for (result, policy) in results.iter().zip(order) {
+                    assert_eq!(result.features.lexical_policy, policy);
+                    assert_eq!(result.trace.cache_hit, round == 1);
+                    assert_eq!(
+                        result.hits[0].file_path,
+                        if policy == LexicalAdmissionPolicy::StrictLiteralV1 {
+                            "src/strict.rs"
+                        } else {
+                            "src/broad.rs"
+                        }
+                    );
+                }
+            }
+            assert_eq!(
+                sidecars.batches.load(Ordering::SeqCst),
+                1,
+                "second batch uses independent policy cache keys"
+            );
+        }
     }
 
     #[test]
@@ -2379,14 +2946,17 @@ mod tests {
         let manifest = manifest_for("testproj", "cafebabedeadbeef", 3);
         let queries = [
             QueryBatchItem {
+                lexical_policy: crate::query_policy::LexicalAdmissionPolicy::StrictLiteralV1,
                 query: "slow",
                 budget_ms: Some(500),
             },
             QueryBatchItem {
+                lexical_policy: crate::query_policy::LexicalAdmissionPolicy::StrictLiteralV1,
                 query: "fast",
                 budget_ms: Some(500),
             },
             QueryBatchItem {
+                lexical_policy: crate::query_policy::LexicalAdmissionPolicy::StrictLiteralV1,
                 query: "last",
                 budget_ms: Some(500),
             },
@@ -2469,10 +3039,12 @@ mod tests {
 
         let queries = [
             QueryBatchItem {
+                lexical_policy: crate::query_policy::LexicalAdmissionPolicy::StrictLiteralV1,
                 query: "alpha flow",
                 budget_ms: Some(500),
             },
             QueryBatchItem {
+                lexical_policy: crate::query_policy::LexicalAdmissionPolicy::StrictLiteralV1,
                 query: "beta flow",
                 budget_ms: Some(500),
             },
@@ -2557,10 +3129,12 @@ mod tests {
         });
         let queries = [
             QueryBatchItem {
+                lexical_policy: crate::query_policy::LexicalAdmissionPolicy::StrictLiteralV1,
                 query: "alpha flow",
                 budget_ms: Some(100),
             },
             QueryBatchItem {
+                lexical_policy: crate::query_policy::LexicalAdmissionPolicy::StrictLiteralV1,
                 query: "beta flow",
                 budget_ms: Some(100),
             },
@@ -2669,10 +3243,12 @@ mod tests {
         });
         let queries = [
             QueryBatchItem {
+                lexical_policy: crate::query_policy::LexicalAdmissionPolicy::StrictLiteralV1,
                 query: "alpha behavior",
                 budget_ms: Some(100),
             },
             QueryBatchItem {
+                lexical_policy: crate::query_policy::LexicalAdmissionPolicy::StrictLiteralV1,
                 query: "beta behavior",
                 budget_ms: Some(100),
             },
@@ -2934,6 +3510,7 @@ mod tests {
             vec![CandidateHit::lexical_stub("src/cached.rs", 1.0)],
         );
         let queries = [QueryBatchItem {
+            lexical_policy: crate::query_policy::LexicalAdmissionPolicy::StrictLiteralV1,
             query: "cached",
             budget_ms: Some(100),
         }];
@@ -2962,6 +3539,7 @@ mod tests {
             vec![CandidateHit::lexical_stub("src/cached.rs", 1.0)],
         );
         let queries = [QueryBatchItem {
+            lexical_policy: crate::query_policy::LexicalAdmissionPolicy::StrictLiteralV1,
             query: "cached",
             budget_ms: Some(100),
         }];
@@ -3075,6 +3653,7 @@ mod tests {
             let mut storage = Store::open(&storage_path).expect("open db");
             storage
                 .upsert_retrieval_index_manifest(&codestory_store::RetrievalIndexManifest {
+                    artifact_scope: None,
                     project_id,
                     lexical_version: crate::lexical_index::LEXICAL_INDEX_VERSION.into(),
                     semantic_generation: "codestory_legacy".into(),

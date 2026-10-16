@@ -584,7 +584,8 @@ impl CoreResetExclusion {
         let paths = owned_artifacts::derived_reset_held_lock_paths(logical_path);
         // Same order as indexing/promotion, then retention's acquisition fence.
         for path in &paths[..2] {
-            let file = open_regular_lock(path, true)?.expect("create returns a file");
+            let file = open_regular_lock(path, true, FileLockKind::Exclusive)?
+                .expect("create returns a file");
             acquire_with_deadline(
                 &file,
                 FileLockKind::Exclusive,
@@ -599,7 +600,7 @@ impl CoreResetExclusion {
             Err(error) => return Err(retention_error("inspect reset core root", error)),
             Ok(_) => require_direct_directory(layout.root())?,
         }
-        let acquisition = open_regular_lock(&paths[2], false)?.ok_or_else(|| {
+        let acquisition = open_regular_lock(&paths[2], false, FileLockKind::Exclusive)?.ok_or_else(|| {
             StorageError::Other("Derived reset requires a provisioned core acquisition lock; restore a compatible cache or stop older clients before manual recovery".into())
         })?;
         if !bounded_locks::try_acquire(&acquisition, FileLockKind::Exclusive)
@@ -671,7 +672,8 @@ pub(crate) fn provision_generation_locks(
     }
     require_direct_directory(layout.root())?;
     let acquisition = layout.root().join(CORE_ACQUISITION_FILE);
-    let file = open_regular_lock(&acquisition, true)?.expect("create returns a file");
+    let file = open_regular_lock(&acquisition, true, FileLockKind::Exclusive)?
+        .expect("create returns a file");
     file.sync_all()
         .map_err(|error| retention_error("sync acquisition lock", error))?;
     require_direct_directory(staged_directory)?;
@@ -1014,7 +1016,7 @@ fn acquire_acquisition(
     kind: FileLockKind,
     nonblocking: bool,
 ) -> Result<Option<CoreAcquisitionLock>, StorageError> {
-    let Some(file) = open_regular_lock(&acquisition_path(layout), false)? else {
+    let Some(file) = open_regular_lock(&acquisition_path(layout), false, kind)? else {
         return Ok(None);
     };
     if nonblocking {
@@ -1044,7 +1046,12 @@ fn acquire_generation_read_lease(
     let directory = database
         .parent()
         .ok_or_else(|| StorageError::Other("Core image has no generation directory".into()))?;
-    let Some(file) = open_regular_lock(&directory.join(CORE_LEASE_FILE), false)? else {
+    let Some(file) = open_regular_lock(
+        &directory.join(CORE_LEASE_FILE),
+        false,
+        FileLockKind::Shared,
+    )?
+    else {
         return Ok(None);
     };
     acquire_with_deadline(
@@ -1061,7 +1068,12 @@ fn try_acquire_generation_exclusive(database: &Path) -> Result<NamedLeaseTry, St
     let directory = database
         .parent()
         .ok_or_else(|| StorageError::Other("Core image has no generation directory".into()))?;
-    let Some(file) = open_regular_lock(&directory.join(CORE_LEASE_FILE), false)? else {
+    let Some(file) = open_regular_lock(
+        &directory.join(CORE_LEASE_FILE),
+        false,
+        FileLockKind::Exclusive,
+    )?
+    else {
         return Ok(NamedLeaseTry::Unprovisioned);
     };
     match bounded_locks::try_acquire(&file, FileLockKind::Exclusive) {
@@ -1082,9 +1094,18 @@ fn open_new_regular_lock(path: &Path) -> Result<File, StorageError> {
     Ok(file)
 }
 
-fn open_regular_lock(path: &Path, create: bool) -> Result<Option<File>, StorageError> {
+fn open_regular_lock(
+    path: &Path,
+    create: bool,
+    kind: FileLockKind,
+) -> Result<Option<File>, StorageError> {
     let mut options = OpenOptions::new();
-    options.read(true).write(true).create(create);
+    // Readers hold the same authenticated leases without requesting write access.
+    // Provisioning, reset and reclamation still require writable handles.
+    options
+        .read(true)
+        .write(kind == FileLockKind::Exclusive)
+        .create(create);
     no_follow(&mut options);
     let file = match options.open(path) {
         Ok(file) => file,
@@ -1297,6 +1318,94 @@ mod tests {
             )
             .expect("publish fixture pointer");
         (cache, logical, layout)
+    }
+
+    #[test]
+    fn shared_reader_handles_are_read_only_and_keep_exclusive_conflicts() {
+        use std::io::Write as _;
+
+        let (_cache, _logical, layout) = published_lock_fixture();
+        let path = acquisition_path(&layout);
+        let mut reader = open_regular_lock(&path, false, FileLockKind::Shared)
+            .unwrap()
+            .unwrap();
+        assert!(reader.write_all(b"unwanted write").is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"");
+        assert!(bounded_locks::try_acquire(&reader, FileLockKind::Shared).unwrap());
+        let second = acquire_acquisition(&layout, FileLockKind::Shared, true)
+            .unwrap()
+            .unwrap();
+        assert!(
+            acquire_acquisition(&layout, FileLockKind::Exclusive, true)
+                .unwrap()
+                .is_none()
+        );
+        bounded_locks::release(&reader).unwrap();
+        drop(reader);
+        assert!(
+            acquire_acquisition(&layout, FileLockKind::Exclusive, true)
+                .unwrap()
+                .is_none()
+        );
+        drop(second);
+        let writer = acquire_acquisition(&layout, FileLockKind::Exclusive, true)
+            .unwrap()
+            .unwrap();
+        drop(writer);
+        let mut writable = open_regular_lock(&path, false, FileLockKind::Exclusive)
+            .unwrap()
+            .unwrap();
+        writable.write_all(b"writer").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"writer");
+    }
+
+    #[test]
+    fn read_only_generation_lease_blocks_prune_until_last_reader_releases() {
+        let (_cache, _logical, layout) = published_lock_fixture();
+        let pointer_before = fs::read(layout.publication_path()).unwrap();
+        let first = pin_active_core(&layout).unwrap().unwrap();
+        let second = pin_exact_core(&first.path).unwrap().unwrap();
+        assert!(matches!(
+            try_acquire_generation_exclusive(&first.path).unwrap(),
+            NamedLeaseTry::Contended
+        ));
+        let database = first.path.clone();
+        drop(first);
+        assert!(matches!(
+            try_acquire_generation_exclusive(&database).unwrap(),
+            NamedLeaseTry::Contended
+        ));
+        drop(second);
+        assert!(matches!(
+            try_acquire_generation_exclusive(&database).unwrap(),
+            NamedLeaseTry::Held(_)
+        ));
+        assert_eq!(fs::read(layout.publication_path()).unwrap(), pointer_before);
+        assert_eq!(fs::read(database).unwrap(), b"candidate");
+    }
+
+    #[test]
+    fn shared_reader_does_not_create_missing_retention_lock() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("missing-lock");
+        assert!(
+            open_regular_lock(&path, false, FileLockKind::Shared)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_reader_refuses_symlink_retention_lock() {
+        let directory = tempdir().unwrap();
+        let target = directory.path().join("target");
+        let path = directory.path().join("lock-link");
+        fs::write(&target, b"unchanged").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(open_regular_lock(&path, false, FileLockKind::Shared).is_err());
+        assert_eq!(fs::read(target).unwrap(), b"unchanged");
     }
 
     #[test]

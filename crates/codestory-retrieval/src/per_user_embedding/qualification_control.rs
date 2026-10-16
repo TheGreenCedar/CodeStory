@@ -18,6 +18,8 @@ use uuid::Uuid;
 
 mod server;
 
+pub use server::validate_qualification_clock_gate;
+
 #[cfg(all(test, windows))]
 pub(super) use server::native_path_identity;
 #[cfg(test)]

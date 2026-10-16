@@ -38,6 +38,10 @@ pub fn run_per_user_embedding_server(config: PerUserEmbeddingServerConfig) -> Re
         bail!("embedding_server_listener_peer_proof_missing");
     }
     let clock = config.transport.clock();
+    let qualification = server_qualification_control_from_env()?;
+    if qualification.is_some() {
+        clock.snapshot().qualification_boot_id()?;
+    }
     let server_instance_id = Uuid::new_v4().to_string();
     let state = Arc::new(PerUserEmbeddingServerState {
         clock: Arc::clone(&clock),
@@ -69,7 +73,7 @@ pub fn run_per_user_embedding_server(config: PerUserEmbeddingServerConfig) -> Re
         last_work_ended_ns: AtomicU64::new(clock.now_ns()),
         event_sequence: AtomicU64::new(1),
         last_failure: Mutex::new(None),
-        qualification: server_qualification_control_from_env()?,
+        qualification,
     });
 
     let watchdog = spawn_server_watchdog(

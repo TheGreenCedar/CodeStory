@@ -657,3 +657,105 @@ fn qualification_restart_restores_the_last_durable_command_sequence() {
     .expect("qualification control remains enabled");
     assert_eq!(restarted.last_sequence.load(Ordering::Acquire), 7);
 }
+
+#[cfg(any(unix, windows))]
+#[test]
+fn missing_boot_provenance_refuses_qualification_before_command_or_evidence_effects() {
+    struct UnqualifiedClock(Option<String>);
+    impl AwakeMonotonicClock for UnqualifiedClock {
+        fn now_ns(&self) -> u64 {
+            1
+        }
+        fn sleep(&self, _: std::time::Duration) {}
+        fn snapshot(&self) -> super::super::EmbeddingServerClockSnapshot {
+            let mut clock = TestClock::new().snapshot();
+            clock.boot_id = self.0.clone();
+            clock
+        }
+    }
+    struct NoEffectsTransport;
+    impl EmbeddingServerTransport for NoEffectsTransport {
+        fn bind(
+            &self,
+        ) -> std::result::Result<EmbeddingServerBindOutcome, EmbeddingTransportFailure> {
+            panic!("no bind")
+        }
+        fn clock(&self) -> Arc<dyn AwakeMonotonicClock> {
+            panic!("no transport clock capture")
+        }
+        fn fail_stop(&self, _: &str) {
+            panic!("no command effects")
+        }
+    }
+    for witness in [None, Some(String::new()), Some(" ".into())] {
+        let (_temporary, control) = test_qualification_control();
+        let command_path = control
+            .directory
+            .join(format!("{}.command.json", control.nonce));
+        let event_path = control
+            .directory
+            .join(format!("{}.events.jsonl", control.nonce));
+        let command = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1, "sequence": 1, "nonce_sha256": hex_sha256(control.nonce.as_bytes()),
+            "action": "force_incompatible", "parameters": {"class": null},
+        })).expect("synthetic command");
+        write_private_command(&command_path, &command);
+        let mut state = test_server_state();
+        let unique = Arc::get_mut(&mut state).expect("fixture state");
+        unique.clock = Arc::new(UnqualifiedClock(witness));
+        unique.qualification = Some(control);
+        assert!(
+            super::super::qualification_control::poll_server_qualification_command(
+                &state,
+                &NoEffectsTransport
+            )
+            .is_err()
+        );
+        let control = state.qualification.as_ref().expect("fixture control");
+        assert!(!control.force_incompatible.load(Ordering::Acquire));
+        assert_eq!(control.last_sequence.load(Ordering::Acquire), 0);
+        assert_eq!(fs::read(&command_path).expect("command retained"), command);
+        assert_eq!(fs::metadata(&event_path).expect("event log").len(), 0);
+        assert!(
+            super::super::qualification_control::write_server_qualification_event(
+                control,
+                &state,
+                test_qualification_event()
+            )
+            .is_err()
+        );
+        assert!(
+            super::super::scheduler::publish_watchdog_fail_stop_marker(
+                control,
+                &state,
+                super::super::EmbeddingServerBudgets::current(),
+                1,
+                1
+            )
+            .is_err()
+        );
+        assert_eq!(fs::metadata(&event_path).expect("event log").len(), 0);
+        assert!(
+            !control
+                .directory
+                .join(
+                    super::super::embedding_qualification_watchdog_marker_filename(
+                        &control.nonce_sha256,
+                        &state.process.server_instance_id
+                    )
+                    .expect("marker name")
+                )
+                .exists()
+        );
+    }
+    let (_temporary, control) = test_qualification_control();
+    let state = test_server_state();
+    let mut event = test_qualification_event();
+    event.clock.boot_id = "other-synthetic-boot".into();
+    assert!(
+        super::super::qualification_control::write_server_qualification_event(
+            &control, &state, event
+        )
+        .is_err()
+    );
+}

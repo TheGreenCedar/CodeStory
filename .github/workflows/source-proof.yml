@@ -441,6 +441,9 @@ jobs:
         with:
           ref: ${{ needs.resolve.outputs.ref }}
 
+      - name: Reconstruct pinned native source
+        uses: ./.github/actions/native-source
+
       - uses: actions/setup-node@v5
         with:
           node-version: "24"
@@ -468,9 +471,8 @@ jobs:
         with:
           ref: ${{ needs.resolve.outputs.ref }}
 
-      - uses: actions/setup-python@v7.0.0
-        with:
-          python-version: "3.13"
+      - name: Reconstruct pinned native source
+        uses: ./.github/actions/native-source
 
       - name: Run packaged proof self-test
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '{0}'"
@@ -637,6 +639,9 @@ jobs:
         with:
           ref: ${{ needs.resolve.outputs.ref }}
 
+      - name: Reconstruct pinned native source
+        uses: ./.github/actions/native-source
+
       - name: Install Rust stable
         run: |
           rustup toolchain install stable --profile minimal --component clippy
@@ -694,6 +699,8 @@ jobs:
             --relevant-input crates/codestory-llama-sys/build.rs
             --relevant-input crates/codestory-llama-sys/model-contract.json
             --relevant-input scripts/prepare-embedded-model.mjs
+            --relevant-input vendor/llama-cpp-sys-2-patches/manifest.json
+            --relevant-input vendor/llama-cpp-sys-2-patches/0.1.151.patch
           )
           while IFS= read -r manifest; do
             relevant_inputs+=(--relevant-input "$manifest")
@@ -962,6 +969,9 @@ jobs:
           }
           "- Windows-native qualification harness contracts: ${elapsed} ms" |
             Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+      - name: Reconstruct pinned native source
+        uses: ./.github/actions/native-source
 
       - name: Install Rust stable
         shell: pwsh

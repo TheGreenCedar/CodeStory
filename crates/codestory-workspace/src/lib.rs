@@ -6358,7 +6358,8 @@ mod go_module_control_review {
     fn required_control_barriers_preserve_inventory_uncertainty() -> Result<()> {
         for case in ["excluded", "symlink", "directory", "oversized"] {
             let temp = tempdir()?;
-            let root = temp.path().join("repo");
+            let temp_root = temp.path().canonicalize()?;
+            let root = temp_root.join("repo");
             fs::create_dir_all(root.join("nested/pkg"))?;
             fs::write(root.join("go.mod"), "module example.com/root\n")?;
             fs::write(
@@ -6373,7 +6374,7 @@ mod go_module_control_review {
                     manifest.exclude_discovery_files([control.clone()]);
                 }
                 "symlink" => {
-                    let outside = temp.path().join("outside.mod");
+                    let outside = temp_root.join("outside.mod");
                     fs::write(&outside, "module example.com/nested\n")?;
                     symlink(outside, &control)?;
                 }

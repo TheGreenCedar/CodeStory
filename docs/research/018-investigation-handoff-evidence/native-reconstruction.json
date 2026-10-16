@@ -1,0 +1,24 @@
+{
+  "operation": "source archive reconstruction, not native execution",
+  "script_SHA256": "51a79517a6f80fc25923cbe06b101cfb6f451a8090464ebd05984db4571b0323",
+  "argv": [
+    [
+      "python3",
+      "scripts/bootstrap-research-native-vendor.py"
+    ],
+    [
+      "python3",
+      "scripts/bootstrap-research-native-vendor.py",
+      "--verify"
+    ]
+  ],
+  "exit_codes": [
+    0,
+    0
+  ],
+  "combined_tool_command_elapsed_seconds": 0.64320928,
+  "source_tree_SHA256": "2d24f6ebdd8eb5f979f6af989aef76d1a34a8d06077a0d3d0cfe2bfb65b1b5a1",
+  "source_tree_files": 1071,
+  "crate_download_executed": false,
+  "build_model_index_install_executed": false
+}

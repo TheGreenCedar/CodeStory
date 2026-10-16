@@ -189,6 +189,12 @@ that exact change and finish its focused checks, then advance the checked
 fast-forward into dev. Frozen acceptance binds the resulting stable dev head;
 accepting a PR first and then moving its base would invalidate that binding.
 
+The driver creates the freeze commit through a private Git index and verifies
+it in the existing clean checkout, then restores the original branch or
+detached head. It creates no additional worktree. If concurrent edits prevent
+restoration, it preserves them and reports the failure; inspect the checkout
+before resuming.
+
 Treat that generated head as a new candidate. Record its commit, tree, and
 freeze receipt. Re-run exact-head acceptance with
 `acceptance_phase=frozen_candidate`, bound to exact commit `F`. This acceptance

@@ -26,6 +26,12 @@ CLI flags. Every call requires `project` (absolute repository root).
 - When the user supplies an exact packet question, copy it verbatim into
   `question`, including its punctuation. Do not paraphrase or trim it, and use
   the same bytes for an offered continuation.
+- Apply an offered `packet_request_patch` by replacing each named field in the
+  original request, including empty arrays and null values. Those values clear
+  previous probes, options or optional generation fields; do not append them to
+  the previous selection. Keep the question, project, budget and latency budget
+  unchanged. Both the broad continuation and an evidence row's source-page
+  action use the same public `packet` operation.
 - Use the standard budget unless the task benefits from a smaller `compact`
   selection. The packet does not replace source inspection or decide when the
   investigation is complete.
@@ -66,7 +72,11 @@ CLI flags. Every call requires `project` (absolute repository root).
   cannot fit, packet returns the explicit `budget_exceeded` variant with no
   partial evidence. Diagnostics remain immutable and separately capability-
   addressed for ten minutes in the serving session.
-- CLI, HTTP, and MCP consumers use CodeStory publication
-  `schema_version=minimum_compatible_schema_version=3`. MCP protocol revision
+- CLI, HTTP, and MCP consumers use CodeStory publication stamp
+  `schema_version=minimum_compatible_schema_version=5`; the evidence payload
+  family remains `schema_version=3`. Search rows carry a nullable bounded
+  `display_name` for resolvable hits. It is presentation metadata, which may
+  name a file or structural node; it is not source text or a callable identity.
+  MCP protocol revision
   negotiation is separate: CodeStory supports `2024-11-05`, `2025-03-26`,
   `2025-06-18`, and `2025-11-25`, preferring the newest.

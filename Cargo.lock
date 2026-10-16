@@ -522,7 +522,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-agent"
-version = "0.17.7"
+version = "0.18.0"
 dependencies = [
  "codestory-contracts",
  "serde",
@@ -533,7 +533,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-bench"
-version = "0.17.7"
+version = "0.18.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -557,7 +557,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-cli"
-version = "0.17.7"
+version = "0.18.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -589,7 +589,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-contracts"
-version = "0.17.7"
+version = "0.18.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -608,13 +608,14 @@ dependencies = [
 
 [[package]]
 name = "codestory-indexer"
-version = "0.17.7"
+version = "0.18.0"
 dependencies = [
  "anyhow",
  "codestory-contracts",
  "codestory-store",
  "codestory-workspace",
  "crossbeam-channel",
+ "finl_unicode",
  "flate2",
  "ignore",
  "jsonc-parser",
@@ -653,7 +654,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-llama-sys"
-version = "0.17.7"
+version = "0.18.0"
 dependencies = [
  "codestory-contracts",
  "crossbeam-channel",
@@ -668,7 +669,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-retrieval"
-version = "0.17.7"
+version = "0.18.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -693,7 +694,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-runtime"
-version = "0.17.7"
+version = "0.18.0"
 dependencies = [
  "anyhow",
  "codestory-agent",
@@ -720,7 +721,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-store"
-version = "0.17.7"
+version = "0.18.0"
 dependencies = [
  "anyhow",
  "codestory-contracts",
@@ -740,7 +741,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-workspace"
-version = "0.17.7"
+version = "0.18.0"
 dependencies = [
  "anyhow",
  "codestory-contracts",
@@ -2906,8 +2907,6 @@ dependencies = [
 [[package]]
 name = "llama-cpp-sys-2"
 version = "0.1.151"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23c676b02f8f2bdd9d7df7bcca0bd176b27964440998e7aa31c6fe32552964d0"
 dependencies = [
  "bindgen",
  "cc",

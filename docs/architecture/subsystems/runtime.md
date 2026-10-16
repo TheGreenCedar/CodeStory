@@ -112,6 +112,17 @@ promotion to store. Retrieval generation construction remains retrieval-owned;
 the core replacement therefore makes broad retrieval stale until the existing
 retrieval index command publishes a matching generation.
 
+## Verified source inspection
+
+Function-body snippets qualify a bounded closure against the already verified
+source buffer before rendering an indexed extent. The Go lexical mode supports
+named `func` declarations and methods, division, raw backtick strings, and nested
+`interface`/`struct` signature types. Type/interface/variable anchors and
+body-less declarations remain line-context fallbacks; the scanner never borrows
+a later callable's body. A multiline result prefix ending in `interface` or
+`struct` before its opening brace remains unsupported and falls back explicitly.
+The existing scan/byte caps and other languages' ambiguity guards still apply.
+
 ## Extension rules
 
 - put reusable product workflows here and expose typed contract DTOs;

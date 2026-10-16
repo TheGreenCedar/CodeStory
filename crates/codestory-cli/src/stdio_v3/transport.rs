@@ -146,11 +146,7 @@ fn build_tool_result_for_surface_v3(
     root: &Value,
     surface: V3SurfaceSet,
 ) -> Result<Value, StdioV3InternalError> {
-    let modern_tools = super::catalog::tools_for_surface_v3(McpRevisionV3::June2025, surface);
-    let schema = modern_tools
-        .iter()
-        .find(|tool| tool.get("name").and_then(Value::as_str) == Some(tool_name))
-        .and_then(|tool| tool.get("outputSchema"))
+    let schema = super::catalog::modern_output_schema_v3(tool_name, surface)
         .ok_or_else(|| StdioV3InternalError::InvalidProjection(tool_name.to_string()))?;
     revision_native_tool_result_with_schema_v3(revision, root, schema)
 }
@@ -649,6 +645,22 @@ mod tests {
                     build_proof_tool_result_v3(*revision, &public).unwrap_or_else(|error| {
                         panic!("{disposition} {revision:?} tool result: {error:?}")
                     });
+                assert_eq!(
+                    build_tool_result_v3(
+                        *revision,
+                        crate::prove_call_path::PUBLIC_VERIFY_TOOL_NAME,
+                        public.as_value(),
+                    ),
+                    Ok(result.clone()),
+                    "canonical proof name must route to the proof surface",
+                );
+                assert_eq!(
+                    build_tool_result_v3(*revision, "prove_call_path", public.as_value()),
+                    Err(StdioV3InternalError::InvalidProjection(
+                        "prove_call_path".into()
+                    )),
+                    "retired proof name must remain rejected",
+                );
                 assert_eq!(result["isError"], false);
                 let text = result
                     .pointer("/content/0/text")
@@ -667,6 +679,75 @@ mod tests {
                 } else {
                     assert!(result.get("structuredContent").is_none());
                     assert!(result.get("_meta").is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tool_result_schema_reuse_preserves_catalog_outputs_and_errors() {
+        let preparing = json!({
+            "kind":"preparing", "state":"preparing", "retry_after_ms":250,
+            "minimum_next":{"kind":"retry_same_request","after_ms":250},
+            "operation":{"stage":"publication"}
+        });
+        let invalid = json!({"kind":"complete","evidence":"invalid"});
+        let proof = public_result(proof_root("unknown"));
+        let cases = [
+            ("packet", &preparing),
+            ("status", &preparing),
+            ("packet", &invalid),
+            (
+                crate::prove_call_path::PUBLIC_VERIFY_TOOL_NAME,
+                proof.as_value(),
+            ),
+            ("prove_call_path", &preparing),
+            ("unknown_tool", &preparing),
+        ];
+        for surface in [V3SurfaceSet::EvidenceOnly, V3SurfaceSet::WithProof] {
+            let tools =
+                super::super::catalog::tools_for_surface_v3(McpRevisionV3::June2025, surface);
+            for revision in McpRevisionV3::all() {
+                for (tool_name, root) in cases {
+                    let expected = tools
+                        .iter()
+                        .find(|tool| tool.get("name").and_then(Value::as_str) == Some(tool_name))
+                        .and_then(|tool| tool.get("outputSchema"))
+                        .ok_or_else(|| {
+                            StdioV3InternalError::InvalidProjection(tool_name.to_owned())
+                        })
+                        .and_then(|schema| {
+                            revision_native_tool_result_with_schema_v3(*revision, root, schema)
+                        });
+                    let actual =
+                        build_tool_result_for_surface_v3(*revision, tool_name, root, surface);
+                    assert_eq!(actual, expected, "{revision:?} {surface:?} {tool_name}");
+                    if let Ok(result) = actual {
+                        assert_eq!(
+                            crate::stdio_transport::v3_serialize_call_tool_result(&result).unwrap(),
+                            crate::stdio_transport::v3_serialize_call_tool_result(
+                                expected.as_ref().unwrap(),
+                            )
+                            .unwrap(),
+                        );
+                    }
+                }
+                assert_eq!(
+                    build_tool_result_for_surface_v3(
+                        *revision,
+                        "unknown_tool",
+                        &preparing,
+                        surface
+                    ),
+                    Err(StdioV3InternalError::InvalidProjection(
+                        "unknown_tool".into()
+                    )),
+                );
+                if revision.profile().structured_content {
+                    assert_eq!(
+                        build_tool_result_for_surface_v3(*revision, "packet", &invalid, surface),
+                        Err(StdioV3InternalError::OutputSchemaViolation),
+                    );
                 }
             }
         }
@@ -862,6 +943,25 @@ mod tests {
         for revision in McpRevisionV3::all() {
             let result = build_tool_result_v3(*revision, "packet", &projection)
                 .expect("revision-native packet result");
+            let mut missing_sufficiency = projection.clone();
+            missing_sufficiency
+                .as_object_mut()
+                .unwrap()
+                .remove("answer_sufficiency");
+            let mut invalid_evidence = projection.clone();
+            invalid_evidence["evidence"] = json!("invalid");
+            for invalid in [missing_sufficiency, invalid_evidence] {
+                let actual = build_tool_result_v3(*revision, "packet", &invalid);
+                if revision.profile().structured_content {
+                    assert_eq!(actual, Err(StdioV3InternalError::OutputSchemaViolation));
+                } else {
+                    assert_eq!(
+                        actual,
+                        revision_native_tool_result_unchecked_v3(*revision, &invalid),
+                        "legacy packet roots retain the unchecked native envelope",
+                    );
+                }
+            }
             let mirrored = result
                 .pointer("/content/0/text")
                 .and_then(Value::as_str)

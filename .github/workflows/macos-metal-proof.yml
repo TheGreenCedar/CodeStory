@@ -87,6 +87,10 @@ jobs:
           test "$(jq -r .status crates/codestory-llama-sys/per-user-embedding-server-constant-set.json)" = unfrozen
           test "$(jq -r .freeze_record crates/codestory-llama-sys/per-user-embedding-server-constant-set.json)" = null
 
+      - name: Reconstruct pinned native source
+        if: ${{ !inputs.use_packaged_cli_artifact }}
+        uses: ./.github/actions/native-source
+
       - name: Capture host evidence
         shell: bash
         run: |

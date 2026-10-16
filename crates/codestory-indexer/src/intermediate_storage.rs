@@ -11,6 +11,7 @@ use codestory_contracts::graph::{
 pub struct IntermediateStorage {
     pub files: Vec<codestory_store::FileInfo>,
     pub file_content_hashes: Vec<codestory_store::FileContentHash>,
+    pub file_extraction_identities: Vec<codestory_store::FileExtractionIdentity>,
     pub nodes: Vec<Node>,
     pub structural_unit_node_ids: Vec<NodeId>,
     pub structural_text_units: Vec<codestory_store::StructuralTextUnit>,
@@ -66,6 +67,8 @@ impl IntermediateStorage {
     pub fn merge(&mut self, other: IntermediateStorage) {
         self.files.extend(other.files);
         self.file_content_hashes.extend(other.file_content_hashes);
+        self.file_extraction_identities
+            .extend(other.file_extraction_identities);
         self.nodes.extend(other.nodes);
         self.structural_unit_node_ids
             .extend(other.structural_unit_node_ids);
@@ -88,6 +91,7 @@ impl IntermediateStorage {
     pub fn clear(&mut self) {
         self.files.clear();
         self.file_content_hashes.clear();
+        self.file_extraction_identities.clear();
         self.nodes.clear();
         self.structural_unit_node_ids.clear();
         self.structural_text_units.clear();

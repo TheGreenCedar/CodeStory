@@ -160,12 +160,15 @@ pub(in crate::per_user_embedding) fn serve_embedding_request(
         match handle.try_recv_with_completion() {
             Ok(Some(Ok(completion))) => {
                 let native_completion_sequence = completion.completion_sequence;
+                let snapshot = completion
+                    .verified_snapshot()
+                    .map_err(engine_error)?
+                    .clone();
                 let normalization_started = std::time::Instant::now();
                 let vectors = normalize_and_validate_vectors(completion.vectors)?;
                 let normalization_ns =
                     u64::try_from(normalization_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 let payload = encode_vectors(&vectors)?;
-                let snapshot = engine.snapshot().map_err(engine_error)?;
                 let identity = engine_identity(&state.process.server_instance_id, &snapshot)?;
                 if deadline.cancel_if_elapsed(state.clock.as_ref(), &context) {
                     let _ = handle.cancel();
@@ -259,6 +262,7 @@ fn record_qualification_completed_tokens(
         bail!("embedding_qualification_native_completion_sequence_missing");
     }
     let clock = state.clock.snapshot();
+    let boot_id = clock.qualification_boot_id()?.to_owned();
     write_server_qualification_event(
         control,
         state,
@@ -271,7 +275,7 @@ fn record_qualification_completed_tokens(
             clock: ServerQualificationEventClock {
                 domain: clock.domain,
                 api: clock.api,
-                boot_id: clock.boot_id,
+                boot_id,
                 observed_ns: state.clock.now_ns(),
             },
             snapshot: None,

@@ -9,10 +9,11 @@ use crate::agent::packet_budget::{
 #[cfg(feature = "benchmark-support")]
 use crate::agent::packet_candidate::BenchmarkPacketRetrievalProof;
 use crate::agent::packet_candidate::{
-    PacketProofSession, PacketSearchHit, install_packet_proof_session,
+    PacketProofSession, PacketSearchHit, install_packet_proof_session, packet_retrieval_queries,
 };
 use crate::agent::packet_compiler::{
-    apply_frozen_packet_compilation, drill_options_from_ids, freeze_packet_compilation,
+    apply_frozen_packet_compilation, commit_measured_packet_compilation,
+    prepare_packet_compilation, validate_requested_publication,
 };
 use crate::agent::packet_degradation::apply_packet_semantic_degradation_counters;
 use crate::agent::packet_evidence::decorate_citation_from_hit;
@@ -28,9 +29,10 @@ use crate::agent::packet_trace::merge_packet_initial_search_hits;
 use crate::agent::profiles::{ResolvedProfile, TrailPlan, resolve_profile};
 use crate::agent::retrieval_primary::{
     RETRIEVAL_VERSION_SIDECAR, SidecarPrimarySearchOutcome, maybe_run_retrieval_shadow,
-    preadmit_packet_descriptor_queries, sidecar_retrieval_blocks_nucleo_supplement,
+    preadmit_packet_descriptor_queries_with_policy, sidecar_query_rejection_error,
+    sidecar_request_stop_error, sidecar_retrieval_blocks_nucleo_supplement,
     sidecar_retrieval_primary_enabled, sidecar_retrieval_unavailable_error,
-    try_sidecar_primary_search,
+    try_sidecar_primary_search_with_policy,
 };
 use crate::agent::trace::{TraceRecorder, field};
 use crate::agent::trace_export;
@@ -53,6 +55,7 @@ use codestory_contracts::api::{
     TrailFilterOptionsDto,
 };
 use codestory_contracts::compilation::INTERIM_MAX_ADMITTED_CANDIDATES;
+use codestory_retrieval::LexicalAdmissionPolicy;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -152,12 +155,14 @@ pub(crate) fn agent_ask(
     controller: &AppController,
     req: AgentAskRequest,
 ) -> Result<AgentAnswerDto, ApiError> {
-    agent_ask_with_packet_hits(controller, req).map(|(answer, _)| answer)
+    agent_ask_with_packet_hits(controller, req, LexicalAdmissionPolicy::StrictLiteralV1)
+        .map(|(answer, _)| answer)
 }
 
 fn agent_ask_with_packet_hits(
     controller: &AppController,
     req: AgentAskRequest,
+    lexical_policy: LexicalAdmissionPolicy,
 ) -> Result<(AgentAnswerDto, Vec<PacketSearchHit>), ApiError> {
     let prompt = req.prompt.trim().to_string();
     if prompt.is_empty() {
@@ -180,6 +185,7 @@ fn agent_ask_with_packet_hits(
         ask_started_at,
         &resolved_profile,
         &mut trace,
+        lexical_policy,
     )?;
     let freshness = match controller.index_freshness() {
         Ok(freshness) => {
@@ -332,7 +338,35 @@ pub(crate) fn agent_packet(
     controller: &AppController,
     req: AgentPacketRequestDto,
 ) -> Result<AgentPacketDto, ApiError> {
-    agent_packet_with_session(controller, req, std::rc::Rc::new(PacketProofSession::new()))
+    agent_packet_with_session(
+        controller,
+        req,
+        std::rc::Rc::new(PacketProofSession::new()),
+        None,
+    )
+}
+
+pub(crate) type PacketRepresentationMeasure<'a> =
+    &'a mut dyn FnMut(
+        &AgentPacketDto,
+        Option<&crate::evidence_projection_v3::PacketRepresentationBaselineV1>,
+    ) -> Result<Option<usize>, ApiError>;
+
+type CallerRepresentationMeasure<'caller, 'measure> =
+    (&'caller str, PacketRepresentationMeasure<'measure>);
+
+pub(crate) fn agent_packet_for_representation(
+    controller: &AppController,
+    req: AgentPacketRequestDto,
+    caller: &str,
+    measure: PacketRepresentationMeasure<'_>,
+) -> Result<AgentPacketDto, ApiError> {
+    agent_packet_with_session(
+        controller,
+        req,
+        std::rc::Rc::new(PacketProofSession::new()),
+        Some((caller, measure)),
+    )
 }
 
 #[cfg(feature = "benchmark-support")]
@@ -352,7 +386,8 @@ pub(crate) fn agent_packet_for_benchmark(
     } else {
         PacketProofSession::without_dense_semantic_for_benchmark()
     });
-    let packet = agent_packet_with_session(controller, req, std::rc::Rc::clone(&proof_session))?;
+    let packet =
+        agent_packet_with_session(controller, req, std::rc::Rc::clone(&proof_session), None)?;
     Ok(BenchmarkPacketExecution {
         packet,
         retrieval_proof: proof_session.benchmark_retrieval_proof(),
@@ -363,7 +398,18 @@ fn agent_packet_with_session(
     controller: &AppController,
     req: AgentPacketRequestDto,
     proof_session: std::rc::Rc<PacketProofSession>,
+    representation_measure: Option<CallerRepresentationMeasure<'_, '_>>,
 ) -> Result<AgentPacketDto, ApiError> {
+    if representation_measure.is_none()
+        && req
+            .parent_packet_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("psr1:"))
+    {
+        return Err(ApiError::invalid_argument(
+            "Issued packet continuation requires its current public representation owner.",
+        ));
+    }
     let question = req.question.trim().to_string();
     if question.is_empty() {
         return Err(ApiError::invalid_argument("Question cannot be empty."));
@@ -372,6 +418,11 @@ fn agent_packet_with_session(
         .map_err(ApiError::invalid_argument)?;
     let project_root = controller.require_project_root()?;
     let project_id = codestory_workspace::project_identity_v3(&project_root).project_id;
+    let replay_enrollment =
+        super::packet_replay::PacketReplayEnrollment::for_request(&project_root, &req);
+    if replay_enrollment.is_some() {
+        proof_session.enable_replay_metadata();
+    }
     controller.begin_packet_retrieval();
     let _proof_session_guard = install_packet_proof_session(std::rc::Rc::clone(&proof_session));
     let packet_latency = PacketLatencyBudget::inherited_or_new(req.latency_budget_ms);
@@ -381,35 +432,34 @@ fn agent_packet_with_session(
             "packet option_ids require parent_packet_id for a generation-bound drill",
         ));
     }
-    let is_drill_continuation = req.parent_packet_id.is_some() || !req.option_ids.is_empty();
-    let mut probes = normalize_packet_probe_request(&req.probes);
-    for option in drill_options_from_ids(&req.option_ids) {
-        if let Some(path) = option.path {
-            probes.push(PacketProbeDto::ExactPath { path });
-        } else if let Some(symbol_id) = option.symbol_id {
-            probes.push(PacketProbeDto::SymbolId { id: symbol_id });
-        }
+    let is_drill_continuation = req.parent_packet_id.is_some()
+        || !req.option_ids.is_empty()
+        || req
+            .probes
+            .iter()
+            .any(|probe| matches!(probe, PacketProbeDto::Continuation { .. }));
+    validate_requested_publication(
+        controller,
+        &req,
+        crate::agent::retrieval_primary::active_pinned_retrieval_publication(controller).as_ref(),
+    )?;
+    if let Some((caller, _)) = representation_measure.as_ref()
+        && let Some(record) = super::packet_served_sources::load(controller, caller, &req)?
+    {
+        proof_session.protect_served_sources(record)?;
     }
+    let mut probes = normalize_packet_probe_request(&req.probes);
+    probes.extend(
+        crate::agent::packet_compiler::continuation_probes_from_options(&req, &project_id)?,
+    );
     let seed_plan = build_retrieval_seed_plan(&question, &probes);
     let probe_resolutions = resolve_packet_probes(controller, probes);
     let mut plan = build_packet_plan_from_seed_plan(&seed_plan, req.budget);
     plan.probe_resolutions = probe_resolutions;
-    let mut descriptor_queries = Vec::new();
-    for query in std::iter::once(seed_plan.generic_query.as_str())
-        .chain(seed_plan.free_queries.iter().map(String::as_str))
-    {
-        let query = query.trim();
-        if !query.is_empty()
-            && !descriptor_queries
-                .iter()
-                .any(|existing: &String| existing.eq_ignore_ascii_case(query))
-        {
-            descriptor_queries.push(query.to_string());
-        }
-    }
+    let descriptor_queries = packet_retrieval_queries(&plan);
     let descriptor_budget_ms =
         packet_remaining_for_handoff(controller, packet_latency, "descriptor admission")?;
-    preadmit_packet_descriptor_queries(
+    preadmit_packet_descriptor_queries_with_policy(
         controller,
         &descriptor_queries,
         Some(descriptor_budget_ms),
@@ -442,6 +492,7 @@ fn agent_packet_with_session(
             include_evidence: true,
             hybrid_weights: None,
         },
+        LexicalAdmissionPolicy::BroadQuestionV1,
     )?;
     if !initial_packet_hits.is_empty() {
         let selected = merge_packet_initial_search_hits(
@@ -524,15 +575,21 @@ fn agent_packet_with_session(
     if let Some(publication) = active_retrieval_publication.clone() {
         answer.retrieval_trace.retrieval_publication = Some(publication);
     }
-    let frozen_compilation = freeze_packet_compilation(
+    let prepared_compilation = prepare_packet_compilation(
         controller,
         &project_id,
         &plan.probe_resolutions,
         active_retrieval_publication.as_ref(),
         &proof_session,
+        Some(&req),
     )?;
-    answer.source_coverage = frozen_compilation.source_coverage.clone();
-    append_compiled_source_evidence(&mut answer, &frozen_compilation.product.support);
+    answer.source_coverage = prepared_compilation.source_coverage.clone();
+    if representation_measure.is_none() {
+        append_compiled_source_evidence(
+            &mut answer,
+            &prepared_compilation.default_product().support,
+        );
+    }
 
     let phase_started = Instant::now();
     let budget = apply_packet_budget(
@@ -565,7 +622,11 @@ fn agent_packet_with_session(
 
     let phase_started = Instant::now();
     let mut packet = AgentPacketDto {
-        packet_id: answer.answer_id.clone(),
+        packet_id: super::packet_served_sources::packet_request_id(
+            representation_measure.as_ref().map(|(caller, _)| *caller),
+            prepared_compilation.supports_served_source_record(),
+            &answer.answer_id,
+        ),
         question,
         plan,
         answer,
@@ -576,6 +637,90 @@ fn agent_packet_with_session(
         answer_sufficiency: Default::default(),
     };
     append_packet_non_trace_phase(&mut packet.answer, "packet_dto", phase_started);
+    if let Some((_caller, measure)) = representation_measure {
+        let mut replay = replay_enrollment.and_then(|enrollment| {
+            super::packet_replay::PacketReplayTrace::begin(
+                enrollment,
+                &req,
+                &prepared_compilation,
+                &packet,
+                proof_session.replay_descriptor_metadata(),
+            )
+        });
+        let mut full_proposal = None;
+        let mut accepted_proposal = None;
+        let frozen = prepared_compilation.select_for_representation_with_baseline(|prepared, product, baseline_product| {
+            check_packet_deadline(
+                controller,
+                packet_latency,
+                "public representation selection",
+            )?;
+            let mut candidate = packet.clone();
+            prepared.apply_proposal(&mut candidate, Some(&req), product);
+            append_compiled_source_evidence(&mut candidate.answer, &product.support);
+            let before_budget = replay.as_ref().map(|_| candidate.clone());
+            enforce_packet_output_budget(&project_root, &mut candidate);
+            if candidate.support != product.support {
+                return Err(ApiError::internal(
+                    "Presentation budget changed compiled source delivery.",
+                ));
+            }
+            let baseline = baseline_product.map(|product| {
+                let mut base = packet.clone();
+                prepared.apply_proposal(&mut base, Some(&req), product);
+                append_compiled_source_evidence(&mut base.answer, &product.support);
+                enforce_packet_output_budget(&project_root, &mut base);
+                if base.support != product.support {
+                    return Err(ApiError::internal("Baseline presentation changed compiled source delivery."));
+                }
+                Ok(crate::evidence_projection_v3::PacketRepresentationBaselineV1 {
+                    resolved_gap_witnesses: prepared.resolved_baseline_option_witnesses(&base, &candidate),
+                    added_source_units: candidate.support.iter().filter(|row| row.kind == codestory_contracts::api::SupportUnitKindDto::SourceRange && !base.support.contains(row)).cloned().collect(), packet: base,
+                })
+            }).transpose()?;
+            if baseline.as_ref().is_some_and(|binding| !prepared.retain_baseline_continuation_actions(&binding.packet, &mut candidate)) {
+                return Ok(None);
+            }
+            let measured = measure(&candidate, baseline.as_ref());
+            if let (Some(replay), Some(before)) = (replay.as_mut(), before_budget.as_ref()) {
+                replay.record(prepared, before, &candidate, &measured);
+            }
+            let result = measured?;
+            if full_proposal.is_none() {
+                full_proposal = Some(candidate.clone());
+            }
+            if result.is_some_and(|bytes| {
+                bytes <= codestory_contracts::compilation::PUBLIC_PACKET_SERIALIZED_MAX_BYTES
+            }) {
+                accepted_proposal = Some(candidate);
+            }
+            Ok(result)
+        });
+        let frozen = match frozen {
+            Ok(frozen) => frozen,
+            Err(error) => {
+                if let Some(replay) = replay {
+                    replay.finish(None, Some(format!("{error:?}")));
+                }
+                return Err(error);
+            }
+        };
+        packet = accepted_proposal
+            .or(full_proposal)
+            .ok_or_else(|| ApiError::internal("No representation proposal was measured."))?;
+        commit_measured_packet_compilation(&packet, frozen)?;
+        if let Some(replay) = replay {
+            replay.finish(Some(&packet), None);
+        }
+        // The selected immutable projection already includes diagnostics. A
+        // developer trace export must not mutate that measured public record.
+        if let Some(diagnostic) = trace_export::write_packet_step_trace_from_env(&packet.answer) {
+            tracing::debug!(diagnostic, "packet developer trace export");
+        }
+        return Ok(packet);
+    }
+    let product = prepared_compilation.default_product();
+    let frozen_compilation = prepared_compilation.into_frozen(product);
     apply_frozen_packet_compilation(&mut packet, Some(&req), frozen_compilation);
     enforce_packet_output_budget(&project_root, &mut packet);
 
@@ -591,11 +736,11 @@ fn agent_packet_with_session(
     Ok(packet)
 }
 
-fn packet_remaining_for_handoff(
+fn check_packet_deadline(
     controller: &AppController,
     packet_latency: PacketLatencyBudget,
     phase: &str,
-) -> Result<u32, ApiError> {
+) -> Result<(), ApiError> {
     if crate::services::active_public_operation_cancellation()
         .is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Acquire))
     {
@@ -604,9 +749,26 @@ fn packet_remaining_for_handoff(
             format!("request cancelled before packet {phase}"),
         ));
     }
-    packet_latency.remaining_for_handoff().ok_or_else(|| {
-        sidecar_retrieval_unavailable_error(
+    if packet_latency.exhausted() {
+        return Err(sidecar_request_stop_error(
             controller,
+            "deadline",
+            format!("packet latency budget exhausted before {phase}"),
+        ));
+    }
+    Ok(())
+}
+
+fn packet_remaining_for_handoff(
+    controller: &AppController,
+    packet_latency: PacketLatencyBudget,
+    phase: &str,
+) -> Result<u32, ApiError> {
+    check_packet_deadline(controller, packet_latency, phase)?;
+    packet_latency.remaining_for_handoff().ok_or_else(|| {
+        sidecar_request_stop_error(
+            controller,
+            "deadline",
             format!("packet latency budget exhausted before {phase}"),
         )
     })
@@ -798,7 +960,10 @@ fn order_packet_sections(sections: &mut [AgentResponseSectionDto]) {
 /// bytes are bounded by the descriptor reservation contract.
 const PACKET_SOURCE_MAX_TOTAL_BYTES: usize = 14_336;
 
-fn append_compiled_source_evidence(answer: &mut AgentAnswerDto, support: &[SupportUnitDto]) {
+pub(crate) fn append_compiled_source_evidence(
+    answer: &mut AgentAnswerDto,
+    support: &[SupportUnitDto],
+) {
     let mut rendered = String::new();
     for source in support
         .iter()
@@ -954,6 +1119,7 @@ fn execute_retrieval(
     ask_started_at: Instant,
     resolved_profile: &ResolvedProfile,
     trace: &mut TraceRecorder,
+    lexical_policy: LexicalAdmissionPolicy,
 ) -> Result<RetrievalBundle, ApiError> {
     let mut bundle = RetrievalBundle::default();
     let packet_compilation =
@@ -966,97 +1132,105 @@ fn execute_retrieval(
         .unwrap_or(DEFAULT_MAX_RESULTS)
         .clamp(1, resolved_profile.max_search_results) as usize;
 
-    let (mut scored_hits, hits, initial_packet_hits) =
-        match try_sidecar_primary_search(controller, prompt, max_results, req.latency_budget_ms) {
-            Some(SidecarPrimarySearchOutcome::Served {
-                hits,
-                packet_hits,
-                scored_hits,
-                shadow,
-            }) => {
-                trace.set_retrieval_shadow(shadow.clone());
-                trace.observe(format!(
-                    "retrieval_primary mode={} candidates={} resolved_hits={}",
-                    shadow.retrieval_mode,
-                    shadow.candidate_count,
-                    hits.len()
-                ));
-                let search_step = trace.start_step(
-                    AgentRetrievalStepKindDto::Search,
-                    vec![
-                        field("query_chars", prompt.len().to_string()),
-                        field("retrieval_path", "sidecar"),
-                    ],
-                );
-                trace.finish_ok_with_duration_ms(
-                    search_step,
-                    vec![
-                        field("hits", hits.len().to_string()),
-                        field("sidecar_candidates", shadow.candidate_count.to_string()),
-                        field(
-                            "sidecar_resolved_hits",
-                            shadow.resolved_hit_count.to_string(),
-                        ),
-                        field("accepted_hits", hits.len().to_string()),
-                        field("max_results", max_results.to_string()),
-                        field("repo_text", "off_initial"),
-                        field("mode", "packet_initial_sidecar_query"),
-                        field("sidecar_query_ms", shadow.retrieval_total_ms.to_string()),
-                    ],
-                    shadow.retrieval_total_ms,
-                );
-                let semantic_query_step = trace.start_step(
-                    AgentRetrievalStepKindDto::SemanticQueryEmbedding,
-                    vec![field("required", semantic_required.to_string())],
-                );
-                let semantic_candidates_step = trace.start_step(
-                    AgentRetrievalStepKindDto::SemanticCandidateRetrieval,
-                    vec![field("required", semantic_required.to_string())],
-                );
-                let hybrid_rerank_step = trace.start_step(
-                    AgentRetrievalStepKindDto::HybridRerank,
-                    vec![field("required", semantic_required.to_string())],
-                );
-                trace.finish_skipped(
-                    semantic_query_step,
-                    "Semantic embedding skipped on sidecar retrieval path.",
-                    Vec::new(),
-                );
-                trace.finish_skipped(
-                    semantic_candidates_step,
-                    "Semantic candidate scan skipped on sidecar retrieval path.",
-                    Vec::new(),
-                );
-                trace.finish_ok(
-                    hybrid_rerank_step,
-                    vec![field("ranked", hits.len().to_string())],
-                );
-                (scored_hits, hits, packet_hits)
-            }
-            Some(SidecarPrimarySearchOutcome::Rejected { shadow, reason }) => {
-                trace.set_retrieval_shadow(shadow);
-                trace.annotate_gap(format!(
-                    "retrieval_primary rejected=true fail_closed=true reason={reason}"
-                ));
-                return Err(sidecar_retrieval_unavailable_error(
-                    controller,
-                    format!("retrieval rejected query: {reason}"),
-                ));
-            }
-            Some(SidecarPrimarySearchOutcome::Unavailable { reason }) => {
-                trace.annotate_gap(format!(
-                    "retrieval_primary unavailable=true fail_closed=true reason={reason}"
-                ));
-                return Err(sidecar_retrieval_unavailable_error(controller, reason));
-            }
-            Some(SidecarPrimarySearchOutcome::Retryable { error }) => return Err(error),
-            None => {
-                return Err(sidecar_retrieval_unavailable_error(
-                    controller,
-                    "full retrieval is mandatory; legacy initial search is disabled",
-                ));
-            }
-        };
+    let (mut scored_hits, hits, initial_packet_hits) = match try_sidecar_primary_search_with_policy(
+        controller,
+        prompt,
+        max_results,
+        req.latency_budget_ms,
+        lexical_policy,
+    ) {
+        Some(SidecarPrimarySearchOutcome::Served {
+            hits,
+            packet_hits,
+            scored_hits,
+            shadow,
+        }) => {
+            trace.set_retrieval_shadow(shadow.clone());
+            trace.observe(format!(
+                "retrieval_primary mode={} candidates={} resolved_hits={}",
+                shadow.retrieval_mode,
+                shadow.candidate_count,
+                hits.len()
+            ));
+            let search_step = trace.start_step(
+                AgentRetrievalStepKindDto::Search,
+                vec![
+                    field("query_chars", prompt.len().to_string()),
+                    field("retrieval_path", "sidecar"),
+                ],
+            );
+            trace.finish_ok_with_duration_ms(
+                search_step,
+                vec![
+                    field("hits", hits.len().to_string()),
+                    field("sidecar_candidates", shadow.candidate_count.to_string()),
+                    field(
+                        "sidecar_resolved_hits",
+                        shadow.resolved_hit_count.to_string(),
+                    ),
+                    field("accepted_hits", hits.len().to_string()),
+                    field("max_results", max_results.to_string()),
+                    field("repo_text", "off_initial"),
+                    field("mode", "packet_initial_sidecar_query"),
+                    field("sidecar_query_ms", shadow.retrieval_total_ms.to_string()),
+                ],
+                shadow.retrieval_total_ms,
+            );
+            let semantic_query_step = trace.start_step(
+                AgentRetrievalStepKindDto::SemanticQueryEmbedding,
+                vec![field("required", semantic_required.to_string())],
+            );
+            let semantic_candidates_step = trace.start_step(
+                AgentRetrievalStepKindDto::SemanticCandidateRetrieval,
+                vec![field("required", semantic_required.to_string())],
+            );
+            let hybrid_rerank_step = trace.start_step(
+                AgentRetrievalStepKindDto::HybridRerank,
+                vec![field("required", semantic_required.to_string())],
+            );
+            trace.finish_skipped(
+                semantic_query_step,
+                "Semantic embedding skipped on sidecar retrieval path.",
+                Vec::new(),
+            );
+            trace.finish_skipped(
+                semantic_candidates_step,
+                "Semantic candidate scan skipped on sidecar retrieval path.",
+                Vec::new(),
+            );
+            trace.finish_ok(
+                hybrid_rerank_step,
+                vec![field("ranked", hits.len().to_string())],
+            );
+            (scored_hits, hits, packet_hits)
+        }
+        Some(SidecarPrimarySearchOutcome::Rejected { shadow, reason }) => {
+            let error = sidecar_query_rejection_error(
+                controller,
+                &shadow.retrieval_mode,
+                shadow.cancel_reason.as_deref(),
+                format!("retrieval rejected query: {reason}"),
+            );
+            trace.set_retrieval_shadow(shadow);
+            trace.annotate_gap(format!(
+                "retrieval_primary rejected=true fail_closed=true reason={reason}"
+            ));
+            return Err(error);
+        }
+        Some(SidecarPrimarySearchOutcome::Unavailable { reason }) => {
+            trace.annotate_gap(format!(
+                "retrieval_primary unavailable=true fail_closed=true reason={reason}"
+            ));
+            return Err(sidecar_retrieval_unavailable_error(controller, reason));
+        }
+        Some(SidecarPrimarySearchOutcome::Retryable { error }) => return Err(error),
+        None => {
+            return Err(sidecar_retrieval_unavailable_error(
+                controller,
+                "full retrieval is mandatory; legacy initial search is disabled",
+            ));
+        }
+    };
 
     let initial_hit_count = hits.len();
     let mut hits = hits;
@@ -2168,4 +2342,108 @@ fn merge_scored_hits(
     });
     merged.truncate(max_candidates);
     *into = merged;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packet_representation_uses_remaining_allowance_without_a_retrieval_reserve() {
+        let fixture = crate::services::activation_tests::ready_activation_fixture();
+        let controller = &fixture.runtime.controller;
+        let remaining = PacketLatencyBudget {
+            started_at: Instant::now(),
+            target_ms: 999,
+        };
+        check_packet_deadline(controller, remaining, "public representation selection")
+            .expect("local representation can use the last second of its allowance");
+        assert!(packet_remaining_for_handoff(controller, remaining, "initial retrieval").is_err());
+
+        let expired = PacketLatencyBudget {
+            started_at: Instant::now(),
+            target_ms: 0,
+        };
+        let error = check_packet_deadline(controller, expired, "public representation selection")
+            .expect_err("representation must still reject an expired allowance");
+        assert_eq!(error.code, "retrieval_unavailable");
+        assert_eq!(
+            error.details.unwrap().cause_code.as_deref(),
+            Some("deadline")
+        );
+    }
+
+    #[test]
+    fn packet_representation_cancellation_precedes_its_deadline() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let fixture = crate::services::activation_tests::ready_activation_fixture();
+        for target_ms in [999, 0] {
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let error = fixture
+                .runtime
+                .public_operation_service()
+                .run_with_cancel("packet", Arc::clone(&cancelled), || {
+                    cancelled.store(true, Ordering::Release);
+                    check_packet_deadline(
+                        &fixture.runtime.controller,
+                        PacketLatencyBudget {
+                            started_at: Instant::now(),
+                            target_ms,
+                        },
+                        "public representation selection",
+                    )
+                })
+                .expect_err("cancellation must win even before the actual deadline");
+            assert_eq!(error.code, "cancelled");
+            assert!(
+                error
+                    .message
+                    .contains("cancelled before packet public representation selection")
+            );
+        }
+    }
+
+    #[test]
+    fn exhausted_packet_handoff_preserves_phase_without_index_repair() {
+        let fixture = crate::services::activation_tests::ready_activation_fixture();
+        let budget = PacketLatencyBudget {
+            started_at: Instant::now() - std::time::Duration::from_millis(1_001),
+            target_ms: 1_000,
+        };
+        let error = packet_remaining_for_handoff(
+            &fixture.runtime.controller,
+            budget,
+            "descriptor admission",
+        )
+        .expect_err("an exhausted handoff must refuse before descriptor admission");
+        assert_eq!(error.code, "retrieval_unavailable");
+        assert!(
+            error
+                .message
+                .contains("packet latency budget exhausted before descriptor admission")
+        );
+        let details = error.details.as_ref().expect("typed packet budget cause");
+        assert!(
+            details.next_commands.is_empty()
+                && details.minimum_next.is_empty()
+                && details.full_repair.is_empty(),
+            "an exhausted handoff must not prescribe index repair: {error:?}"
+        );
+        assert_eq!(details.cause_code.as_deref(), Some("deadline"));
+        assert_eq!(details.failed_layer.as_deref(), Some("retrieval_query"));
+        assert_eq!(
+            details.project.as_deref(),
+            Some(
+                fixture
+                    .project
+                    .path()
+                    .to_str()
+                    .expect("fixture project path")
+            )
+        );
+    }
 }

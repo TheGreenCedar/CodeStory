@@ -3,6 +3,9 @@ name: rustdoc
 on:
   pull_request:
     paths:
+      - .github/actions/native-source/**
+      - scripts/bootstrap-research-native-vendor.py
+      - vendor/llama-cpp-sys-2-patches/**
       - Cargo.lock
       - Cargo.toml
       - crates/**
@@ -16,6 +19,9 @@ on:
       - main
       - dev/codestory-next
     paths:
+      - .github/actions/native-source/**
+      - scripts/bootstrap-research-native-vendor.py
+      - vendor/llama-cpp-sys-2-patches/**
       - Cargo.lock
       - Cargo.toml
       - crates/**
@@ -39,6 +45,9 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
+
+      - name: Reconstruct pinned native source
+        uses: ./.github/actions/native-source
 
       - name: Install Rust stable
         run: |
@@ -64,7 +73,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-rustdoc-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-workspace-doc-default-features-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-rustdoc-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-workspace-doc-default-features-${{ hashFiles('Cargo.lock', 'vendor/llama-cpp-sys-2-patches/**') }}
 
       - name: Deny rustdoc warnings
         env:

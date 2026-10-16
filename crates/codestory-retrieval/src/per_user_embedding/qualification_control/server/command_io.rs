@@ -249,6 +249,8 @@ pub(in crate::per_user_embedding) fn poll_server_qualification_command(
     let Some(control) = state.qualification.as_ref() else {
         return Ok(());
     };
+    // Refuse before consuming or acting on any qualification command.
+    state.clock.snapshot().qualification_boot_id()?;
     let Some(command_file) = read_server_qualification_command(control)? else {
         return Ok(());
     };
@@ -315,7 +317,10 @@ pub(in crate::per_user_embedding) fn poll_server_qualification_command(
                         ),
                         ("true_idle".into(), state.true_idle().to_string()),
                         ("clock_domain".into(), current.clock.domain.clone()),
-                        ("clock_boot_id".into(), current.clock.boot_id.clone()),
+                        (
+                            "clock_boot_id".into(),
+                            current.clock.qualification_boot_id()?.to_owned(),
+                        ),
                         (
                             "server_instance_id".into(),
                             current.process.server_instance_id.clone(),
@@ -368,10 +373,11 @@ pub(in crate::per_user_embedding) fn poll_server_qualification_command(
             server_event_sequence: state.event_sequence.load(Ordering::Acquire),
             clock: {
                 let clock = state.clock.snapshot();
+                let boot_id = clock.qualification_boot_id()?.to_owned();
                 ServerQualificationEventClock {
                     domain: clock.domain,
                     api: clock.api,
-                    boot_id: clock.boot_id,
+                    boot_id,
                     observed_ns: state.clock.now_ns(),
                 }
             },

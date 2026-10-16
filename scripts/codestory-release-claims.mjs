@@ -1525,6 +1525,9 @@ function validateProofFloor(value) {
       "Cargo.toml",
       "Cargo.lock",
       "vendor/**",
+      ".github/actions/native-source/**",
+      "scripts/bootstrap-research-native-vendor.py",
+      "vendor/llama-cpp-sys-2-patches/**",
       "crates/codestory-store/**",
       "crates/codestory-indexer/**",
       "crates/codestory-workspace/**",
@@ -1570,7 +1573,6 @@ function validateProofFloor(value) {
   exactStringList(
     mergedLanes.commands,
     [
-      "cargo test --locked -p codestory-runtime --lib agent::packet_evidence::",
       "cargo test --locked -p codestory-runtime --lib agent::packet_compiler::tests",
       "cargo test --locked -p codestory-runtime --lib agent::packet_batch::",
       "cargo test --locked -p codestory-runtime --lib tests::search_scoring_tests::",

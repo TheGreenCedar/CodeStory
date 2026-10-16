@@ -174,13 +174,15 @@ test("fail-open tool schemas are the generated canonical MCP catalog", async () 
       uriTemplate === "codestory://status{?project}"),
   );
   assert.ok(
-    catalog.resourceTemplates.every(({ uriTemplate }) => uriTemplate.endsWith("{?project}")),
+    catalog.resourceTemplates.every(({ uriTemplate }) =>
+      uriTemplate.endsWith("{?project}")
+      || uriTemplate === "codestory://symbols/root{?project,limit,cursor}"),
     "every advertised repository resource template must carry a project selector",
   );
   const snippet = catalog.tools.find(({ name }) => name === "snippet");
   assert.deepEqual(
     Object.keys(snippet.inputSchema.allOf[0].properties).sort(),
-    ["choose", "context", "end_line", "file_path", "function_body", "id", "line", "lines", "path", "paths", "project", "query", "resume_operation_attempt", "resume_operation_id", "scope", "start_line", "symbol_id"],
+    ["choose", "context", "end_line", "file_path", "function_body", "id", "line", "lines", "max_tool_result_bytes", "path", "paths", "project", "query", "resume_operation_attempt", "resume_operation_id", "scope", "start_line", "symbol_id"],
   );
 });
 
@@ -197,7 +199,8 @@ test("launcher wire contract matches the generated catalog read from the real CL
     preferredMcpProtocolVersion: launcherTest.managedCliMcpProtocolVersion,
     discoveryContracts: generatedCatalog.wireContract.discoveryContracts,
   });
-  assert.equal(catalog.wireContract.publicationStampSchemaVersion, 4);
+  assert.equal(catalog.wireContract.publicationStampSchemaVersion, 5);
+  assert.equal(catalog.wireContract.minimumCompatiblePublicationStampSchemaVersion, 5);
   assert.deepEqual(
     catalog.wireContract.supportedMcpProtocolVersions,
     ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"],
@@ -254,7 +257,7 @@ test("launcher classifies the runtime initialize contract fail-closed", () => {
 
   assert.equal(
     launcherTest.runtimeWireContractSkew(
-      stamped({ schema_version: 3, minimum_compatible_schema_version: 3 }),
+      stamped({ schema_version: 5, minimum_compatible_schema_version: 5 }),
       "2024-11-05",
     ),
     null,
@@ -267,13 +270,15 @@ test("launcher classifies the runtime initialize contract fail-closed", () => {
     "publication_stamp_legacy_v0",
     "a runtime that predates the stamp is legacy v0, not silently current",
   );
-  assert.equal(
-    launcherTest.runtimeWireContractSkew(stamped({ schema_version: 1 }), "2024-11-05"),
-    "publication_stamp_producer_too_old",
-  );
+  for (const older of [1, 3, 4]) {
+    assert.equal(
+      launcherTest.runtimeWireContractSkew(stamped({ schema_version: older }), "2024-11-05"),
+      "publication_stamp_producer_too_old",
+    );
+  }
   assert.equal(
     launcherTest.runtimeWireContractSkew(
-      stamped({ schema_version: 3, minimum_compatible_schema_version: 3 }),
+      stamped({ schema_version: 5, minimum_compatible_schema_version: 5 }),
       "2025-03-26",
     ),
     "protocol_version_skew",
@@ -305,9 +310,9 @@ test("v3 launcher state rejects old new and wrong-v3 runtime identities", () => 
     requested: "2025-06-18",
     negotiated: "2025-06-18",
     discoveryContractSha256: contracts["2025-06-18"],
-    publicationSchemaVersion: 4,
+    publicationSchemaVersion: 5,
   });
-  const response = (revision, digest, schemaVersion = 4) => ({
+  const response = (revision, digest, schemaVersion = 5) => ({
     jsonrpc: "2.0",
     id: "initialize",
     result: {
@@ -339,15 +344,17 @@ test("v3 launcher state rejects old new and wrong-v3 runtime identities", () => 
     ),
     "discovery_contract_skew",
   );
-  assert.equal(
-    launcherTest.v3RuntimeWireContractSkew(
-      response(session.negotiated, session.discoveryContractSha256, 3),
-      session,
-    ),
-    "publication_schema_skew",
-  );
+  for (const older of [3, 4]) {
+    assert.equal(
+      launcherTest.v3RuntimeWireContractSkew(
+        response(session.negotiated, session.discoveryContractSha256, older),
+        session,
+      ),
+      "publication_schema_skew",
+    );
+  }
   const tooNewMinimum = response(session.negotiated, session.discoveryContractSha256);
-  tooNewMinimum.result._meta.codestory_publication.minimum_compatible_schema_version = 5;
+  tooNewMinimum.result._meta.codestory_publication.minimum_compatible_schema_version = 6;
   assert.equal(
     launcherTest.v3RuntimeWireContractSkew(tooNewMinimum, session),
     "publication_stamp_producer_too_new",
@@ -518,7 +525,7 @@ test("handoff waits for child validation and retires answered legacy batch IDs",
           "process.stdin.setEncoding('utf8');",
           "process.stdin.on('data',(chunk)=>{input+=chunk;const lines=input.split(/\\r?\\n/u);input=lines.pop()||'';for(const line of lines){if(!line)continue;const frame=JSON.parse(line);",
           "if(Array.isArray(frame)){seen.push('batch');record('received');process.stdout.write(JSON.stringify([{jsonrpc:'2.0',id:'A',result:{ok:'A'}},{jsonrpc:'2.0',id:'B',result:{ok:'B'}}])+'\\n',()=>setTimeout(()=>process.exit(17),30));continue;}",
-          "if(frame.method==='initialize'){seen.push('initialize');setTimeout(()=>{record('before-validation');process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:frame.id,result:{protocolVersion:process.env.TEST_REVISION,_meta:{codestory_protocol:{discovery_contract_sha256:process.env.TEST_DIGEST},codestory_publication:{schema_version:4,minimum_compatible_schema_version:3}}}})+'\\n');},100);continue;}",
+          "if(frame.method==='initialize'){seen.push('initialize');setTimeout(()=>{record('before-validation');process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:frame.id,result:{protocolVersion:process.env.TEST_REVISION,_meta:{codestory_protocol:{discovery_contract_sha256:process.env.TEST_DIGEST},codestory_publication:{schema_version:5,minimum_compatible_schema_version:5}}}})+'\\n');},100);continue;}",
           "if(frame.method==='notifications/initialized'){seen.push('initialized');continue;}",
           "seen.push(String(frame.id));record('received');process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:frame.id,result:{ok:frame.id}})+'\\n');",
           "}});",
@@ -646,7 +653,7 @@ test("handoff fails pending calls when child initialize ends or rejects", async 
           serverInfo: { name: "fixture", version: "1" },
           _meta: {
             codestory_protocol: { discovery_contract_sha256: discoveryDigest(revision) },
-            codestory_publication: { schema_version: 4, minimum_compatible_schema_version: 3 },
+            codestory_publication: { schema_version: 5, minimum_compatible_schema_version: 5 },
           },
         },
       };
@@ -695,7 +702,7 @@ test("late events from a refused child cannot affect the retry handoff", () => {
       protocolVersion: revision,
       _meta: {
         codestory_protocol: { discovery_contract_sha256: discoveryDigest(revision) },
-        codestory_publication: { schema_version: 4, minimum_compatible_schema_version: 3 },
+        codestory_publication: { schema_version: 5, minimum_compatible_schema_version: 5 },
       },
     },
   };
@@ -1472,6 +1479,61 @@ function spawnLauncher(launcher, env, options = {}) {
   return { child, completed };
 }
 
+// Observe matching responses and drained child closure without losing the
+// causal failure to an unchecked array access on a busy host.
+function observeLauncherResponses(child) {
+  const responses = [];
+  let buffer = "";
+  let stderr = "";
+  let failure;
+  let closed;
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => { stderr = (stderr + chunk).slice(-4096); });
+  child.on("error", (error) => { failure = error; });
+  child.stdout.on("data", (chunk) => {
+    buffer += chunk;
+    const lines = buffer.split(/\r?\n/u);
+    buffer = lines.pop() || "";
+    try {
+      const parsed = lines.filter(Boolean).map((line) => JSON.parse(line));
+      assert.ok(parsed.every((entry) => entry !== null && typeof entry === "object" && !Array.isArray(entry)),
+        "malformed launcher JSON-RPC frame");
+      responses.push(...parsed);
+    } catch (error) {
+      failure = error;
+    }
+  });
+  const completed = new Promise((resolve) => child.once("close", (...result) => {
+    closed = result;
+    resolve(result);
+  }));
+  return {
+    responses,
+    completed,
+    async waitForResponse(id, redactPaths = [], timeoutMs = 10000) {
+      const deadline = Date.now() + timeoutMs;
+      const diagnostic = () => JSON.stringify({
+        response_id: id,
+        closed,
+        failure: failure?.message,
+        stderr: redactPaths.reduce((text, pathname) => text.replaceAll(pathname, "<fixture>"), stderr),
+      });
+      while (Date.now() < deadline) {
+        assert.equal(failure, undefined, diagnostic());
+        const response = responses.find((entry) => entry.id === id);
+        if (response) {
+          assert.equal(typeof response.result?.contents?.[0]?.text, "string", diagnostic());
+          return response;
+        }
+        assert.equal(closed, undefined, diagnostic());
+        await delay(10);
+      }
+      assert.fail(`timed out waiting for launcher response: ${diagnostic()}`);
+    },
+  };
+}
+
 async function waitForPath(pathname, timeoutMs = 10000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -1541,7 +1603,7 @@ async function writeWindowsCliShim(cliPath, source, { evalArgs = false } = {}) {
 async function writeFakeCli(cliPath) {
   const script = [
     "const fs=require('fs');const args=process.argv.slice(1);",
-    `if(process.env.CODESTORY_PLUGIN_PROVISIONING_PROBE==='1'&&args[0]==='serve'){let input='';process.stdin.on('data',chunk=>{input+=chunk;const newline=input.indexOf('\\n');if(newline<0)return;const request=JSON.parse(input.slice(0,newline));process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{protocolVersion:request.params.protocolVersion,capabilities:{},serverInfo:{name:'fixture',version:'1'},_meta:{codestory_protocol:{discovery_contract_sha256:${JSON.stringify(discoveryDigest())}},codestory_publication:{schema_version:Number(process.env.CODESTORY_TEST_STAMP_SCHEMA_VERSION||'4'),minimum_compatible_schema_version:3}}}})+'\\n',()=>process.exit(0))})}`,
+    `if(process.env.CODESTORY_PLUGIN_PROVISIONING_PROBE==='1'&&args[0]==='serve'){let input='';process.stdin.on('data',chunk=>{input+=chunk;const newline=input.indexOf('\\n');if(newline<0)return;const request=JSON.parse(input.slice(0,newline));process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{protocolVersion:request.params.protocolVersion,capabilities:{},serverInfo:{name:'fixture',version:'1'},_meta:{codestory_protocol:{discovery_contract_sha256:${JSON.stringify(discoveryDigest())}},codestory_publication:{schema_version:Number(process.env.CODESTORY_TEST_STAMP_SCHEMA_VERSION||'5'),minimum_compatible_schema_version:5}}}})+'\\n',()=>process.exit(0))})}`,
     "else if(args[0]==='--version'){if(process.env.CODESTORY_PLUGIN_PROVISIONING_PROBE==='1'&&process.env.CODESTORY_TEST_PROBE_LOG)fs.appendFileSync(process.env.CODESTORY_TEST_PROBE_LOG,'probe\\n');const delay=Number(process.env.CODESTORY_TEST_PROBE_DELAY_MS||0);if(delay>0)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,delay);console.log('codestory-cli '+(process.env.CODESTORY_PLUGIN_CLI_VERSION||process.env.TEST_CODESTORY_VERSION||'0.0.0'));process.exit(0)}",
     "else{fs.writeFileSync(process.env.TEST_OUT,JSON.stringify({source:process.env.CODESTORY_PLUGIN_CLI_SOURCE,path:process.env.CODESTORY_PLUGIN_CLI_PATH,sha256:process.env.CODESTORY_PLUGIN_CLI_SHA256,version:process.env.CODESTORY_PLUGIN_CLI_VERSION,warnings:process.env.CODESTORY_PLUGIN_CLI_WARNINGS,pluginRoot:process.env.CODESTORY_PLUGIN_ROOT,launchCwd:process.env.CODESTORY_PLUGIN_LAUNCH_CWD,runtimeCwd:process.env.CODESTORY_PLUGIN_RUNTIME_CWD,pluginCacheVersion:process.env.CODESTORY_PLUGIN_CACHE_VERSION,repoRef:process.env.CODESTORY_PLUGIN_CLI_REPO_REF,buildSource:process.env.CODESTORY_PLUGIN_CLI_BUILD_SOURCE,archiveSha256:process.env.CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256,retention:process.env.CODESTORY_PLUGIN_CLI_RETENTION,args}))}",
   ].join("");
@@ -1565,7 +1627,7 @@ async function writeLifecycleCli(cliPath) {
     "if(args[0]!=='serve')process.exit(2);",
     "let initialized=false;let notified=false;let input='';",
     "process.stdin.setEncoding('utf8');",
-    `const discoveryContracts=${JSON.stringify(generatedCatalog.wireContract.discoveryContracts)};process.stdin.on('data',chunk=>{input+=chunk;const lines=input.split(/\\r?\\n/u);input=lines.pop()||'';for(const line of lines){if(!line)continue;const request=JSON.parse(line);if(request.method==='initialize'){initialized=true;const revision=request.params.protocolVersion;process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{protocolVersion:revision,capabilities:{tools:{listChanged:false},resources:{listChanged:false},prompts:{listChanged:false}},serverInfo:{name:'fixture',version:'1'},_meta:{codestory_protocol:{discovery_contract_sha256:discoveryContracts[revision]},codestory_publication:{schema_version:Number(process.env.CODESTORY_TEST_STAMP_SCHEMA_VERSION||'4'),minimum_compatible_schema_version:3}}}})+'\\n')}else if(request.method==='notifications/initialized'){notified=true}else if(request.method==='tools/list'){if(!initialized||!notified)process.exit(42);fs.writeFileSync(process.env.TEST_OUT,JSON.stringify({initialized,notified,args}));process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{tools:[]}})+'\\n')}else if(request.method==='resources/list'){process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{resources:[]}})+'\\n',()=>process.exit(17))}}});`,
+    `const discoveryContracts=${JSON.stringify(generatedCatalog.wireContract.discoveryContracts)};process.stdin.on('data',chunk=>{input+=chunk;const lines=input.split(/\\r?\\n/u);input=lines.pop()||'';for(const line of lines){if(!line)continue;const request=JSON.parse(line);if(request.method==='initialize'){initialized=true;const revision=request.params.protocolVersion;process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{protocolVersion:revision,capabilities:{tools:{listChanged:false},resources:{listChanged:false},prompts:{listChanged:false}},serverInfo:{name:'fixture',version:'1'},_meta:{codestory_protocol:{discovery_contract_sha256:discoveryContracts[revision]},codestory_publication:{schema_version:Number(process.env.CODESTORY_TEST_STAMP_SCHEMA_VERSION||'5'),minimum_compatible_schema_version:5}}}})+'\\n')}else if(request.method==='notifications/initialized'){notified=true}else if(request.method==='tools/list'){if(!initialized||!notified)process.exit(42);fs.writeFileSync(process.env.TEST_OUT,JSON.stringify({initialized,notified,args}));process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{tools:[]}})+'\\n')}else if(request.method==='resources/list'){process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{resources:[]}})+'\\n',()=>process.exit(17))}}});`,
   ].join("");
   if (process.platform === "win32") {
     await writeWindowsCliShim(cliPath, script, { evalArgs: true });
@@ -3394,7 +3456,7 @@ test("managed cli staging uses direct executables and requires the exact MCP con
   assert.equal(spawnOptions.shell, false);
 });
 
-function compatibleProbeResult(stamp = { schema_version: 3, minimum_compatible_schema_version: 3 }) {
+function compatibleProbeResult(stamp = { schema_version: 5, minimum_compatible_schema_version: 5 }) {
   return {
     jsonrpc: "2.0",
     id: "managed-cli-staging",
@@ -3419,9 +3481,11 @@ test("managed cli staging refuses to stage a runtime whose publication stamp it 
     [{ schema_version: 0 }, "publication_stamp_legacy_v0"],
     [{ schema_version: "3" }, "publication_stamp_malformed"],
     [{ schema_version: 1 }, "publication_stamp_producer_too_old"],
-    [{ schema_version: 5 }, "publication_stamp_producer_too_new"],
+    [{ schema_version: 3 }, "publication_stamp_producer_too_old"],
+    [{ schema_version: 4 }, "publication_stamp_producer_too_old"],
+    [{ schema_version: 6 }, "publication_stamp_producer_too_new"],
     [
-      { schema_version: 4, minimum_compatible_schema_version: 5 },
+      { schema_version: 5, minimum_compatible_schema_version: 6 },
       "publication_stamp_producer_too_new",
     ],
   ];
@@ -4641,7 +4705,7 @@ test("projectless mcp hands off to stdio without active project state", async ()
         "      if (!line.trim()) continue;",
         "      const request = JSON.parse(line);",
       "      if (request.method === 'initialize') {",
-      `        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { protocolVersion: process.env.TEST_PROTOCOL_VERSION || ${JSON.stringify(preferredRevision)}, serverInfo: { name: 'codestory', version: '1' }, _meta: { codestory_protocol: { discovery_contract_sha256: ${JSON.stringify(discoveryDigest())} }, codestory_publication: { schema_version: Number(process.env.TEST_STAMP_SCHEMA_VERSION || '4'), minimum_compatible_schema_version: 3 } } } }) + '\\n');`,
+      `        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { protocolVersion: process.env.TEST_PROTOCOL_VERSION || ${JSON.stringify(preferredRevision)}, serverInfo: { name: 'codestory', version: '1' }, _meta: { codestory_protocol: { discovery_contract_sha256: ${JSON.stringify(discoveryDigest())} }, codestory_publication: { schema_version: Number(process.env.TEST_STAMP_SCHEMA_VERSION || '5'), minimum_compatible_schema_version: 5 } } } }) + '\\n');`,
       "      } else if (request.method === 'tools/list') {",
       "        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { tools: [{ name: 'ground' }] } }) + '\\n');",
       "      } else if (request.method === 'tools/call' && request.params && request.params.name === 'ground') {",
@@ -5125,8 +5189,8 @@ test("packaged initialize handshake carries the publication stamp the host reads
       "the packaged handshake must carry _meta.codestory_publication, not only _meta.codestory_protocol",
     );
     assert.deepEqual(stamp, {
-      schema_version: 4,
-      minimum_compatible_schema_version: 3,
+      schema_version: 5,
+      minimum_compatible_schema_version: 5,
       served_from: "contract_only",
       publication: null,
       core_publication: null,
@@ -5166,8 +5230,8 @@ test("packaged initialize handshake carries the publication stamp the host reads
 
     const stamp = failOpenResult._meta?.codestory_publication;
     assert.ok(stamp, "the fail-open handshake must carry the stamp too");
-    assert.equal(stamp.schema_version, 4);
-    assert.equal(stamp.minimum_compatible_schema_version, 3);
+    assert.equal(stamp.schema_version, 5);
+    assert.equal(stamp.minimum_compatible_schema_version, 5);
     assert.equal(stamp.served_from, "contract_only");
     assert.equal(launcherTest.publicationStampSkew(stamp), null);
     assert.equal(stamp.contract_runtime.cli_source, "managed_unavailable");
@@ -5227,7 +5291,7 @@ test("mcp launcher starts the multi-project stdio runtime through its bridge", a
         `            protocolVersion: process.env.TEST_PROTOCOL_VERSION || '2025-03-26',`,
         "            capabilities: {},",
         "            serverInfo: { name: 'codestory', version },",
-        `            _meta: { codestory_protocol: { discovery_contract_sha256: ${JSON.stringify(discoveryDigest("2025-03-26"))} }, codestory_publication: { schema_version: Number(process.env.TEST_STAMP_SCHEMA_VERSION || '4'), minimum_compatible_schema_version: 3 } },`,
+        `            _meta: { codestory_protocol: { discovery_contract_sha256: ${JSON.stringify(discoveryDigest("2025-03-26"))} }, codestory_publication: { schema_version: Number(process.env.TEST_STAMP_SCHEMA_VERSION || '5'), minimum_compatible_schema_version: 5 } },`,
         "          },",
         "        }));",
         "      } else if (request.method === 'tools/list') {",
@@ -5346,7 +5410,7 @@ test("CODESTORY_CLI override that publishes an unreadable wire contract is refus
         "    if (!line.trim()) continue;",
         "    const request = JSON.parse(line);",
         "    if (request.method === 'initialize') {",
-        `      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { protocolVersion: '2025-03-26', capabilities: {}, serverInfo: { name: 'codestory', version: '0' }, _meta: { codestory_protocol: { discovery_contract_sha256: ${JSON.stringify(discoveryDigest("2025-03-26"))} }, codestory_publication: { schema_version: 4, minimum_compatible_schema_version: 5 } } } }) + '\\n');`,
+        `      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { protocolVersion: '2025-03-26', capabilities: {}, serverInfo: { name: 'codestory', version: '0' }, _meta: { codestory_protocol: { discovery_contract_sha256: ${JSON.stringify(discoveryDigest("2025-03-26"))} }, codestory_publication: { schema_version: 5, minimum_compatible_schema_version: 6 } } } }) + '\\n');`,
         "    } else if (request.method === 'tools/call') {",
         // Answer in a later chunk so the reply lands after the launcher has
         // already refused this runtime: the relay must stay shut, not just
@@ -5567,22 +5631,10 @@ test("mcp launcher fails open when managed cli probe fails", async () => {
       },
       stdio: ["pipe", "pipe", "pipe"],
     });
-    const completed = once(child, "close");
-    let buffer = "";
-    const responses = [];
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      buffer += chunk;
-      const lines = buffer.split(/\r?\n/u);
-      buffer = lines.pop() || "";
-      responses.push(...lines.filter(Boolean).map((line) => JSON.parse(line)));
-    });
+    const { responses, completed, waitForResponse } = observeLauncherResponses(child);
     child.stdin.write(input);
-    const firstDeadline = Date.now() + 2000;
-    while (Date.now() < firstDeadline && responses.length === 0) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-    const firstReason = JSON.parse(responses[0].result.contents[0].text).degraded_reason;
+    const firstResponse = await waitForResponse("status", [dataDir]);
+    const firstReason = JSON.parse(firstResponse.result.contents[0].text).degraded_reason;
     assert.equal([
       "managed_cli_provisioning",
       "managed_cli_provision_failed:managed_cli_asset_fetch_failed",
@@ -5595,7 +5647,7 @@ test("mcp launcher fails open when managed cli probe fails", async () => {
     }
     const [exitCode] = await completed;
     assert.equal(exitCode, 0);
-    const response = responses.find((entry) => entry.id === "terminal") || responses[0];
+    const response = responses.find((entry) => entry.id === "terminal") || firstResponse;
     const status = JSON.parse(response.result.contents[0].text);
     assert.equal(
       status.readiness[0].reason,
@@ -8534,22 +8586,10 @@ test("mcp launcher keeps managed provision failures primary", async () => {
       },
       stdio: ["pipe", "pipe", "pipe"],
     });
-    const completed = once(child, "close");
-    let buffer = "";
-    const responses = [];
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      buffer += chunk;
-      const lines = buffer.split(/\r?\n/u);
-      buffer = lines.pop() || "";
-      responses.push(...lines.filter(Boolean).map((line) => JSON.parse(line)));
-    });
+    const { responses, completed, waitForResponse } = observeLauncherResponses(child);
     child.stdin.write(input);
-    const firstDeadline = Date.now() + 2000;
-    while (Date.now() < firstDeadline && responses.length === 0) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-    const first = JSON.parse(responses[0].result.contents[0].text);
+    const firstResponse = await waitForResponse(1, [dataDir, releaseDir]);
+    const first = JSON.parse(firstResponse.result.contents[0].text);
     if (first.degraded_reason === "managed_cli_provisioning") {
       await waitForPath(join(dataDir, ".codestory-mcp-runtime.json"));
       child.stdin.end(input.replace('"id":1', '"id":2'));
@@ -8557,7 +8597,7 @@ test("mcp launcher keeps managed provision failures primary", async () => {
       child.stdin.end();
     }
     assert.equal((await completed)[0], 0);
-    const response = responses.find((entry) => entry.id === 2) || responses[0];
+    const response = responses.find((entry) => entry.id === 2) || firstResponse;
     const status = JSON.parse(response.result.contents[0].text);
     assert.equal(status.degraded_reason, "managed_cli_provision_failed:managed_cli_asset_fetch_failed");
     assert.doesNotMatch(JSON.stringify(status), new RegExp(releaseDir.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u"));
@@ -8691,7 +8731,7 @@ async function writeNodeCli(binDir, source) {
     await writeWindowsCliShim(cliPath, source);
     return cliPath;
   }
-  await writeFile(cliPath, `#!/bin/sh\n${JSON.stringify(process.execPath)} ${JSON.stringify(scriptPath)} "$@"\n`, "utf8");
+  await writeFile(cliPath, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(scriptPath)} "$@"\n`, "utf8");
   await chmod(cliPath, 0o755);
   return cliPath;
 }

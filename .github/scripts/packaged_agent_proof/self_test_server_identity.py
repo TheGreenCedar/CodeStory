@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 
 from .foundation import ProofFailure, require
 from .native_contract_identity import (
     verify_engine_identities_against_manifest,
     verify_runtime_against_manifest,
 )
+from .qualification_artifact_snapshots import _validated_qualification_snapshot
 from .qualification_scenario_assertions import derive_scenario_assertions
 from .self_test_full_stack_types import FullStackFixture, ServerIdentityFixture
 from .server_engine_identity import engine_identity
@@ -79,7 +81,7 @@ def _shared_snapshot_test(
     measurement_protocol_sha256 = fixture.measurement_protocol_sha256
     snapshot_payload = {
         "embedding_server": {
-            "schema_version": 1,
+            "schema_version": 2,
             "event_sequence": 17,
             "lifecycle": "resident",
             "clock": {
@@ -90,7 +92,7 @@ def _shared_snapshot_test(
             },
             "protocol": {
                 "bootstrap_version": 1,
-                "schema_version": 1,
+                "schema_version": 2,
                 "protocol_sha256": protocol_sha256,
                 "constant_set_sha256": constant_set_sha256,
                 "measurement_protocol_sha256": measurement_protocol_sha256,
@@ -262,6 +264,112 @@ def _cold_election_tests(first_snapshot: dict) -> tuple[list[dict], dict]:
     return cold_process_observations, cold_transitions
 
 
+def _snapshot_contract_tests(
+    fixture: FullStackFixture, snapshot_payload: dict
+) -> None:
+    manifest = deepcopy(fixture.manifest)
+    snapshot = snapshot_payload["embedding_server"]
+    manifest["runtime_executable"]["sha256"] = snapshot["process"]["executable_sha256"]
+    contracts = {
+        field: snapshot["protocol"][field]
+        for field in (
+            "protocol_sha256",
+            "constant_set_sha256",
+            "measurement_protocol_sha256",
+        )
+    }
+    package = {
+        "executable_sha256": snapshot["process"]["executable_sha256"],
+        "release_version": manifest["release_version"],
+    }
+
+    def qualification(value: dict) -> dict:
+        return _validated_qualification_snapshot(
+            value, field="qualification snapshot", contracts=contracts, package=package
+        )
+
+    def rejected(callback, expected: str) -> None:
+        try:
+            callback()
+        except ProofFailure as error:
+            require(str(error) == expected, f"snapshot rejection changed: {error}")
+        else:
+            raise ProofFailure(f"snapshot mutation escaped: {expected}")
+
+    qualification(snapshot)
+    ordinary = deepcopy(snapshot_payload)
+    ordinary["embedding_server"]["clock"]["boot_id"] = None
+    observed = server_snapshot(ordinary, manifest, require_resident=True)
+    require(observed["clock"]["boot_id"] is None, "ordinary boot witness was invented")
+    rejected(
+        lambda: qualification(ordinary["embedding_server"]),
+        "qualification snapshot.clock.boot_id must be a non-empty string",
+    )
+    for witness in ("", " ", False):
+        hostile = deepcopy(snapshot_payload)
+        hostile["embedding_server"]["clock"]["boot_id"] = witness
+        rejected(
+            lambda: server_snapshot(hostile, manifest, require_resident=True),
+            "embedding_server.clock.boot_id must be a non-empty string",
+        )
+        rejected(
+            lambda: qualification(hostile["embedding_server"]),
+            "qualification snapshot.clock.boot_id must be a non-empty string",
+        )
+    missing_boot = deepcopy(ordinary)
+    del missing_boot["embedding_server"]["clock"]["boot_id"]
+    rejected(
+        lambda: server_snapshot(missing_boot, manifest, require_resident=True),
+        "embedding_server.clock omitted boot_id",
+    )
+    rejected(
+        lambda: qualification(missing_boot["embedding_server"]),
+        "qualification snapshot.clock fields differ from the contract; "
+        "missing=['boot_id'], unknown=[]",
+    )
+    for group, field, versions, runtime_error, qualification_error in (
+        (
+            None, "schema_version", (1, 3, True, None),
+            "embedding_server snapshot schema is unsupported",
+            "qualification snapshot schema is unsupported",
+        ),
+        (
+            "protocol", "schema_version", (1, 3, True, None),
+            "embedding_server protocol version is unsupported",
+            "qualification snapshot.protocol schema is unsupported",
+        ),
+        (
+            "protocol", "bootstrap_version", (2, True, None),
+            "embedding_server bootstrap version is unsupported",
+            "qualification snapshot.protocol bootstrap version is unsupported",
+        ),
+    ):
+        for version in versions:
+            hostile = deepcopy(snapshot_payload)
+            owner = hostile["embedding_server"]
+            if group is not None:
+                owner = owner[group]
+            owner[field] = version
+            rejected(
+                lambda: server_snapshot(hostile, manifest, require_resident=True),
+                runtime_error,
+            )
+            rejected(
+                lambda: qualification(hostile["embedding_server"]), qualification_error
+            )
+    for field in contracts:
+        hostile = deepcopy(snapshot_payload)
+        hostile["embedding_server"]["protocol"][field] = "f" * 64
+        rejected(
+            lambda: server_snapshot(hostile, manifest, require_resident=True),
+            f"runtime embedding server {field} does not match the package manifest",
+        )
+        rejected(
+            lambda: qualification(hostile["embedding_server"]),
+            f"qualification snapshot.protocol.{field} is stale",
+        )
+
+
 def _cold_split_test(
     process_observations: list[dict],
     transitions: dict,
@@ -313,6 +421,7 @@ def run_server_identity_self_tests(
 ) -> ServerIdentityFixture:
     valid = _engine_runtime_test(fixture)
     snapshot_payload, first_snapshot, shared = _shared_snapshot_test(fixture)
+    _snapshot_contract_tests(fixture, snapshot_payload)
     process_observations, transitions = _cold_election_tests(first_snapshot)
     _cold_split_test(process_observations, transitions)
     return ServerIdentityFixture(
