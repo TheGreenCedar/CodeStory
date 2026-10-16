@@ -424,7 +424,9 @@ mod tests {
         );
         assert_eq!(INTERIM_SOURCE_ROW_UPPER_BOUND, 512);
         assert_eq!(INTERIM_SOURCE_CONTINUATION_UPPER_BOUND, 4 * 1024);
-        assert!(INTERIM_SOURCE_CONTINUATION_UPPER_BOUND <= INTERIM_MAX_ADMITTED_SOURCE_BYTES);
+        const {
+            assert!(INTERIM_SOURCE_CONTINUATION_UPPER_BOUND <= INTERIM_MAX_ADMITTED_SOURCE_BYTES);
+        }
     }
 
     #[test]
