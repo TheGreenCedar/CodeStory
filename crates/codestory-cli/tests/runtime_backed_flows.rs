@@ -1255,7 +1255,7 @@ fn republish_projections_cli_uses_stored_core_after_all_source_is_removed() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
             .expect("read migrated schema"),
-        36
+        37
     );
     assert_eq!(
         connection

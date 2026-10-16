@@ -87,15 +87,15 @@ occurrence element=UNKNOWN:numberIn@90 kind=DEFINITION span=90:2-90:10
 occurrence element=UNKNOWN:run@97 kind=DEFINITION span=97:7-97:10
 occurrence element=UNKNOWN:sameInRow@56 kind=DEFINITION span=56:4-56:13
 occurrence element=UNKNOWN:stringOut@91 kind=DEFINITION span=91:2-91:11
-access node=METHOD:ArtificialPlayer.minMax@72 kind=Public
-access node=METHOD:ArtificialPlayer.turn@79 kind=Public
-access node=METHOD:Field.makeMove@50 kind=Public
-access node=METHOD:Field.opponent@29 kind=Public
-access node=METHOD:Field.sameInRow@39 kind=Public
-access node=METHOD:GameObject.announce@22 kind=Public
-access node=METHOD:HumanPlayer.turn@66 kind=Public
-access node=METHOD:Player.turn@61 kind=Public
-access node=METHOD:TicTacToe.run@88 kind=Public
+access node=METHOD:ArtificialPlayer.minMax@72 kind=Private
+access node=METHOD:ArtificialPlayer.turn@79 kind=Private
+access node=METHOD:Field.makeMove@50 kind=Private
+access node=METHOD:Field.opponent@29 kind=Private
+access node=METHOD:Field.sameInRow@39 kind=Private
+access node=METHOD:GameObject.announce@22 kind=Private
+access node=METHOD:HumanPlayer.turn@66 kind=Private
+access node=METHOD:Player.turn@61 kind=Private
+access node=METHOD:TicTacToe.run@88 kind=Private
 callable_state CallableProjectionState { file_id: 7318852721560449636, symbol_key: "13:main", node_id: NodeId(-7701807741696418100), signature_hash: -4671339478033693080, normalized_signature: Some("shape:-8097269470219391812"), body_hash: 7649160330512063217, start_line: 95, end_line: 98 }
 callable_state CallableProjectionState { file_id: 7318852721560449636, symbol_key: "13:numberIn", node_id: NodeId(-5458843576889243136), signature_hash: 2477812878330356949, normalized_signature: Some("outline:-1795207361013140379"), body_hash: 7819804390695130296, start_line: 8, end_line: 10 }
 callable_state CallableProjectionState { file_id: 7318852721560449636, symbol_key: "13:numberOut", node_id: NodeId(8650796649741548235), signature_hash: -1579019679195996938, normalized_signature: Some("shape:6494744104446376511"), body_hash: -1765998790294634499, start_line: 12, end_line: 14 }

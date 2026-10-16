@@ -40,6 +40,29 @@ pub fn test_state_root() -> PathBuf {
     test_root().join("codestory-state")
 }
 
+/// Admit graph-assisted queries against the fixture's real core publication.
+/// Deterministic vectors exercise readiness and resolution, not model quality.
+pub fn publish_agent_query_fixture(project: &std::path::Path, cache: &std::path::Path) {
+    let project = std::fs::canonicalize(project).expect("canonical fixture project");
+    let process_cache = test_state_root().join("stdio-cache");
+    std::fs::create_dir_all(&process_cache).expect("isolated retrieval cache");
+    let process_cache = std::fs::canonicalize(process_cache).expect("canonical retrieval cache");
+    let mut runtime = codestory_retrieval::with_test_cache_root(&process_cache, || {
+        codestory_retrieval::SidecarRuntimeConfig::for_project_profile(
+            Some(&project),
+            codestory_retrieval::SidecarProfile::Agent,
+        )
+    });
+    // Match the calling suites' CODESTORY_TEST_EMBED_ALLOW_CPU process setting.
+    runtime.embedding.allow_cpu = true;
+    codestory_retrieval::test_support::publish_deterministic_dense_pinned_query_fixture(
+        &project,
+        &cache.join("codestory.db"),
+        &runtime,
+    )
+    .expect("publish agent query fixture");
+}
+
 pub fn os_user_root() -> PathBuf {
     test_root().join("os-user")
 }

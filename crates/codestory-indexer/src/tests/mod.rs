@@ -8086,10 +8086,11 @@ struct RemovalScopeFixture {
 }
 
 fn seed_removal_scope_fixture(storage: &mut Storage, root: &Path) -> Result<RemovalScopeFixture> {
-    let caller_path = root.join("caller.rs");
-    let preferred_path = root.join("preferred.rs");
-    let fallback_path = root.join("fallback.rs");
-    let untouched_path = root.join("untouched.rs");
+    // Stored-graph scoping does not fabricate Rust's source/cache identity.
+    let caller_path = root.join("caller.js");
+    let preferred_path = root.join("preferred.js");
+    let fallback_path = root.join("fallback.js");
+    let untouched_path = root.join("untouched.js");
 
     let file_ids = [
         &caller_path,
@@ -8115,7 +8116,7 @@ fn seed_removal_scope_fixture(storage: &mut Storage, root: &Path) -> Result<Remo
         storage.insert_file(&codestory_store::FileInfo {
             id: *file_id,
             path: path.clone(),
-            language: "rust".to_string(),
+            language: "javascript".to_string(),
             modification_time: 1,
             indexed: true,
             complete: true,
@@ -8281,10 +8282,10 @@ fn removal_affected_callers_join_an_already_scoped_incremental_run() -> Result<(
     let fixture = seed_removal_scope_fixture(&mut storage, dir.path())?;
     // A real file is scheduled for indexing, so the run is scoped to it and
     // would otherwise never look at the removal's caller file.
-    let scheduled = dir.path().join("scheduled.rs");
+    let scheduled = dir.path().join("scheduled.js");
     std::fs::write(
         &scheduled,
-        "pub fn scheduled_symbol() { shared_target(); }\n",
+        "function scheduled_symbol() { shared_target(); }\n",
     )?;
 
     let plan = codestory_workspace::RefreshExecutionPlan {

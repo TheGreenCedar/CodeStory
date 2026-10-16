@@ -1595,8 +1595,19 @@ fn semantic_graph_context_keeps_normalized_paths_once_per_file() {
         second_function_node.clone(),
     ];
     let semantic_nodes = vec![&function_node, &second_function_node];
-    let context =
-        SemanticDocGraphContext::build(&storage, &semantic_nodes, &nodes).expect("context");
+    let (file_paths, file_read_paths) = crate::semantic_projection::semantic_file_table_path_maps(
+        storage.get_files().expect("files"),
+        Some(Path::new(r"C:\work\nvm")),
+    );
+    let context = SemanticDocGraphContext::build_for_scope(
+        &storage,
+        &semantic_nodes,
+        &nodes,
+        SemanticDocScope::DurableSymbols,
+        file_paths,
+        file_read_paths,
+    )
+    .expect("context");
 
     assert_eq!(context.file_paths.len(), 1);
     assert_eq!(context.file_read_paths.len(), 1);
@@ -10384,10 +10395,20 @@ struct EmptyPlanShortCircuitFixture {
 }
 
 fn publish_empty_plan_short_circuit_baseline() -> EmptyPlanShortCircuitFixture {
+    publish_empty_plan_short_circuit_baseline_for_source(
+        "lib.rs",
+        "pub fn steady_state() -> i32 { 1 }\n",
+    )
+}
+
+fn publish_empty_plan_short_circuit_baseline_for_source(
+    filename: &str,
+    source: &str,
+) -> EmptyPlanShortCircuitFixture {
     let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = tempdir().expect("workspace dir");
-    let source_path = workspace.path().join("lib.rs");
-    fs::write(&source_path, "pub fn steady_state() -> i32 { 1 }\n").expect("write baseline source");
+    let source_path = workspace.path().join(filename);
+    fs::write(&source_path, source).expect("write baseline source");
     let storage_path = workspace.path().join(".cache").join("codestory.db");
     let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
@@ -10918,15 +10939,19 @@ fn incremental_refresh_republishes_when_the_source_policy_byte_cap_changes() {
 
 #[test]
 fn incremental_refresh_refuses_an_empty_plan_over_a_stored_coverage_gap() {
-    let fixture = publish_empty_plan_short_circuit_baseline();
+    let fixture = publish_empty_plan_short_circuit_baseline_for_source(
+        "lib.js",
+        "function steady_state() { return 1; }\n",
+    );
     // An indexed file published without verified content and without completion
     // is a stored `CollectorFailure` gap. It does not schedule any work, so only
     // the coverage check stands between it and a successful refresh.
     mutate_published_core(&fixture.storage_path, |storage| {
         storage
             .get_connection()
-            .execute_batch(
-                "UPDATE file SET complete = 0, content_hash = NULL WHERE path LIKE '%lib.rs';",
+            .execute(
+                "UPDATE file SET complete = 0, content_hash = NULL WHERE path = ?1",
+                [fixture.source_path.to_string_lossy().as_ref()],
             )
             .expect("stage a stored coverage gap");
     });
