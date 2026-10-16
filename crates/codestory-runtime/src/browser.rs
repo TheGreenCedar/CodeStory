@@ -340,13 +340,7 @@ impl ReadOnlyBrowserService {
         >| {
             // A later refused or failed preview cannot reuse an earlier capacity frame.
             measured_floor_refusal = None;
-            let product = capture.project(
-                caller_id,
-                &req,
-                packet,
-                &reserved,
-                &mut *measure,
-            )?;
+            let product = capture.project(caller_id, &req, packet, &reserved, &mut *measure)?;
             if issued_record.is_none() {
                 issued_record = Some(crate::agent::packet_served_sources::load(
                     &self.controller,

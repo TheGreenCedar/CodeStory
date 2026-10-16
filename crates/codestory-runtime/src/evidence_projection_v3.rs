@@ -22,9 +22,10 @@ use sha2::{Digest, Sha256};
 use crate::{
     agent::{
         packet_execution_record_v3::{
-            CapturedPacketPublicationV3, FinalizedDiagnosticSourceRowV3, FinalizedPacketExecutionInputV3,
-            PacketRequestFingerprintV3, build_packet_execution_record_v3,
-            build_packet_execution_record_v3_with_id, capture_packet_publication_v3,
+            CapturedPacketPublicationV3, FinalizedDiagnosticSourceRowV3,
+            FinalizedPacketExecutionInputV3, PacketRequestFingerprintV3,
+            build_packet_execution_record_v3, build_packet_execution_record_v3_with_id,
+            capture_packet_publication_v3,
         },
         packet_projection_v3::{
             DiagnosticArtifactBuildV3, FinalizedContextProjectionInputV3,
@@ -303,7 +304,8 @@ pub fn project_packet_v3_with_identity(
     reserved: &PacketProjectionIdentityV3,
     measure: impl FnMut(&PacketProjectionV3Dto) -> Result<usize, ()>,
 ) -> Result<PacketEvidenceProductV3, codestory_contracts::api::ApiError> {
-    PacketRepresentationCaptureV3::new(service)?.project(caller_id, request, packet, reserved, measure)
+    PacketRepresentationCaptureV3::new(service)?
+        .project(caller_id, request, packet, reserved, measure)
 }
 
 /// All unserved proposals share one full identity observation under their actual owner.
@@ -2312,50 +2314,56 @@ mod tests {
                 packet.answer.retrieval_trace.retrieval_publication =
                     service.active_publication().unwrap().retrieval_publication;
                 let expected = capture_packet_publication_v3(&service).unwrap();
-                let (capture, walks) = with_repository_metadata_tree_traversal_count_for_test(|| {
-                    with_repository_metadata_observation_limit_for_test(1, || {
-                        let capture = PacketRepresentationCaptureV3::new(&service).unwrap();
-                        assert_eq!(capture.publication, expected);
-                        for count in 0..3 {
-                            packet.support = (0..count)
-                                .map(|index| {
-                                    let mut row = support_unit(SupportUnitKindDto::SymbolLocation);
-                                    row.id = format!("symbol:node:{index}");
-                                    row.symbol_id = Some(index.to_string());
-                                    row.path = Some("lib.rs".into());
-                                    row.start_line = Some(1);
-                                    row
-                                })
-                                .collect();
-                            let product = capture
-                                .project("test", &request, &packet, &reserved, |p| {
-                                    serde_json::to_vec(p).map(|v| v.len()).map_err(|_| ())
-                                })
-                                .unwrap();
-                            assert_eq!(product.diagnostics.project_identity, before.project_id);
-                            assert_eq!(product.diagnostics.packet_id, reserved.0);
-                            assert!(matches!(
-                                product.projection,
-                                PacketProjectionV3Dto::Complete { .. }
-                            ));
-                        }
-                        capture
-                    })
-                });
+                let (capture, walks) =
+                    with_repository_metadata_tree_traversal_count_for_test(|| {
+                        with_repository_metadata_observation_limit_for_test(1, || {
+                            let capture = PacketRepresentationCaptureV3::new(&service).unwrap();
+                            assert_eq!(capture.publication, expected);
+                            for count in 0..3 {
+                                packet.support = (0..count)
+                                    .map(|index| {
+                                        let mut row =
+                                            support_unit(SupportUnitKindDto::SymbolLocation);
+                                        row.id = format!("symbol:node:{index}");
+                                        row.symbol_id = Some(index.to_string());
+                                        row.path = Some("lib.rs".into());
+                                        row.start_line = Some(1);
+                                        row
+                                    })
+                                    .collect();
+                                let product = capture
+                                    .project("test", &request, &packet, &reserved, |p| {
+                                        serde_json::to_vec(p).map(|v| v.len()).map_err(|_| ())
+                                    })
+                                    .unwrap();
+                                assert_eq!(product.diagnostics.project_identity, before.project_id);
+                                assert_eq!(product.diagnostics.packet_id, reserved.0);
+                                assert!(matches!(
+                                    product.projection,
+                                    PacketProjectionV3Dto::Complete { .. }
+                                ));
+                            }
+                            capture
+                        })
+                    });
                 assert!(
                     walks > 0,
                     "the real Git observation must exercise the expensive reader"
                 );
-                other_service.run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
-                    assert_eq!(
-                        capture
-                            .project("test", &request, &packet, &reserved, |_| Ok(0))
-                            .unwrap_err()
-                            .code,
-                        "publication_changed"
-                    );
-                    Ok(())
-                })?;
+                other_service.run_with_cancel(
+                    "packet",
+                    Arc::new(AtomicBool::new(false)),
+                    || {
+                        assert_eq!(
+                            capture
+                                .project("test", &request, &packet, &reserved, |_| Ok(0))
+                                .unwrap_err()
+                                .code,
+                            "publication_changed"
+                        );
+                        Ok(())
+                    },
+                )?;
                 capture.check_owner()?;
                 Ok(capture)
             })
@@ -2447,8 +2455,11 @@ mod tests {
                             if cancel {
                                 cancelled.store(true, std::sync::atomic::Ordering::Release);
                             } else {
-                                fs::write(project.path().join("lib.rs"), "// changed packet source\n")
-                                    .unwrap();
+                                fs::write(
+                                    project.path().join("lib.rs"),
+                                    "// changed packet source\n",
+                                )
+                                .unwrap();
                             }
                             serde_json::to_vec(p).map(|v| v.len()).map_err(|_| ())
                         },
