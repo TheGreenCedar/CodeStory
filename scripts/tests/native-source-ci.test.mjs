@@ -20,14 +20,17 @@ const consumers = {
   'notifier-parity.yml': ['parity-macos-fsevents', 'parity-windows-rdcw', 'parity-linux-wsl-inotify'],
 };
 
-test('native source reconstruction provisions Python before interpreter discovery', () => {
+test('native source reconstruction provisions non-Mac Python and uses the existing Mac interpreter', () => {
   const { runs } = parse(fs.readFileSync(path.join(root, action, 'action.yml'), 'utf8'));
   const setup = runs.steps.findIndex(step => step.uses?.startsWith('actions/setup-python@'));
   const bootstrap = runs.steps.findIndex(step => step.run?.includes('bootstrap-research-native-vendor.py'));
   assert.ok(setup >= 0 && setup < bootstrap, 'Python must be available before the bootstrap shell starts');
   assert.equal(runs.steps[setup].with['python-version'], '3.13');
-  assert.equal(runs.steps[setup].if, undefined);
+  assert.equal(runs.steps[setup].if, "runner.os != 'macOS'");
+  assert.deepEqual(runs.steps[setup].env, { PSExecutionPolicyPreference: 'Bypass' });
   assert.equal(runs.steps[setup]['continue-on-error'], undefined);
+  assert.equal(runs.steps[bootstrap].if, undefined);
+  assert.equal(runs.steps[bootstrap]['continue-on-error'], undefined);
 });
 
 test('every workspace Cargo job prepares pinned native source before its first Cargo consumer', () => {
