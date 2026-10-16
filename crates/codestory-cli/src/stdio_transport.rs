@@ -17127,24 +17127,40 @@ version = "0.11.20"
     /// lock is held, so a read runs against a refresh that is genuinely in
     /// flight instead of one parked before it started.
     struct MidIndexingHold {
+        storage_path: PathBuf,
         gate: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        entered: Arc<tokio::sync::Notify>,
     }
 
     impl MidIndexingHold {
         fn arm(storage_path: &Path) -> Self {
             let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
-            let expected = storage_path.to_path_buf();
+            let entered = Arc::new(tokio::sync::Notify::new());
             let hook_gate = Arc::clone(&gate);
-            codestory_runtime::set_mid_indexing_test_hook(Some(Arc::new(move |path: &Path| {
-                if path == expected.as_path() {
+            let hook_entered = Arc::clone(&entered);
+            codestory_runtime::set_mid_indexing_test_hook(
+                storage_path,
+                Some(Arc::new(move |_path: &Path| {
                     let (released, changed) = &*hook_gate;
                     let mut released = released.lock().expect("mid-index gate");
+                    hook_entered.notify_one();
                     while !*released {
                         released = changed.wait(released).expect("mid-index gate");
                     }
-                }
-            })));
-            Self { gate }
+                })),
+            )
+            .expect("register owned mid-index hook");
+            Self {
+                storage_path: storage_path.to_path_buf(),
+                gate,
+                entered,
+            }
+        }
+
+        async fn wait_until_entered(&self) {
+            tokio::time::timeout(Duration::from_secs(30), self.entered.notified())
+                .await
+                .expect("indexing worker did not enter its owned hold");
         }
     }
 
@@ -17153,7 +17169,8 @@ version = "0.11.20"
             let (released, changed) = &*self.gate;
             *released.lock().expect("mid-index gate") = true;
             changed.notify_all();
-            codestory_runtime::set_mid_indexing_test_hook(None);
+            codestory_runtime::set_mid_indexing_test_hook(&self.storage_path, None)
+                .expect("remove owned mid-index hook");
         }
     }
 
@@ -17318,7 +17335,15 @@ version = "0.11.20"
             Some(&json!("fresh")),
             "a warm read with no refresh in flight reports fresh: {ground}"
         );
-        json!({"ground": result.clone(), "node_id": node_id})
+        let core_generation_id = ground
+            .pointer("/result/_meta/codestory_publication/core_publication/generation_id")
+            .and_then(serde_json::Value::as_str)
+            .expect("warm response core generation");
+        json!({
+            "ground": result.clone(),
+            "node_id": node_id,
+            "core_generation_id": core_generation_id,
+        })
     }
 
     #[tokio::test]
@@ -17337,6 +17362,14 @@ version = "0.11.20"
         // that is genuinely in flight, not one parked before indexing.
         let _hold = MidIndexingHold::arm(&fixture.storage_path);
 
+        fixture
+            .send_call(
+                "start-held-refresh",
+                "ground",
+                json!({"project": fixture.project_root, "budget": "balanced"}),
+            )
+            .await;
+        _hold.wait_until_entered().await;
         fixture
             .send_call(
                 "refresh-ground",
@@ -17378,9 +17411,10 @@ version = "0.11.20"
             live_stdio_fixture(&[("lib.rs", "pub fn source_anchor() -> u32 { 1 }\n")]).await;
         let warm = warm_fixture_and_symbol_id(&mut fixture, "source_anchor").await;
         let node_id = warm["node_id"].as_str().expect("symbol id").to_string();
-        let retained_generation = warm["ground"]["_meta"]
-            .get("codestory_publication")
-            .cloned();
+        let retained_generation = warm["core_generation_id"]
+            .as_str()
+            .expect("retained core generation")
+            .to_string();
         std::fs::write(
             fixture.project_root.join("lib.rs"),
             "pub fn source_anchor() -> u32 { 2 }\npub fn appended_marker() {}\n",
@@ -17395,6 +17429,7 @@ version = "0.11.20"
                 json!({"project": fixture.project_root, "id": node_id}),
             )
             .await;
+        _hold.wait_until_entered().await;
         let pending = fixture
             .collect_frames_for("held-snippet", Duration::from_secs(6))
             .await;
@@ -17408,9 +17443,13 @@ version = "0.11.20"
             .read_response("held-snippet", Duration::from_secs(60))
             .await;
         let snippet = &response["result"]["structuredContent"];
+        let source = snippet["snippet"].as_str().unwrap_or_else(|| {
+            panic!("snippet must serve after the refresh completes: {response}")
+        });
         assert!(
-            snippet["snippet"].as_str().is_some(),
-            "snippet must serve after the refresh completes: {response}"
+            source.contains("pub fn source_anchor() -> u32 { 2 }")
+                && source.contains("pub fn appended_marker()"),
+            "snippet must contain the changed source, not retained bytes: {response}"
         );
         let meta = &response["result"]["_meta"]["codestory_publication"];
         assert_eq!(
@@ -17423,7 +17462,13 @@ version = "0.11.20"
             json!("complete_publication"),
             "{response}"
         );
-        let _ = retained_generation;
+        assert_ne!(
+            meta["core_publication"]["generation_id"]
+                .as_str()
+                .expect("fresh core generation"),
+            retained_generation,
+            "snippet must bind the refreshed core generation: {response}"
+        );
     }
 
     #[tokio::test]
@@ -17544,6 +17589,7 @@ version = "0.11.20"
                 }),
             )
             .await;
+        _hold.wait_until_entered().await;
         let pending = fixture
             .collect_frames_for("held-exact", Duration::from_secs(6))
             .await;
@@ -17582,6 +17628,7 @@ version = "0.11.20"
                 }),
             )
             .await;
+        _hold.wait_until_entered().await;
         let pending = fixture
             .collect_frames_for("held-packet", Duration::from_secs(6))
             .await;

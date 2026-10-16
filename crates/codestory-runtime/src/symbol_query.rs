@@ -624,6 +624,24 @@ fn type_hit_line_quality(project_root: Option<&Path>, query: &str, hit: &SearchH
     if expected_name.is_empty() {
         return 1;
     }
+    if hit.origin == SearchHitOrigin::IndexedSymbol
+        && Path::new(path).extension().is_some_and(|ext| ext == "go")
+    {
+        // Go has no forward type declarations; the name after `type` owns the declaration.
+        let mut declaration = trimmed.split_whitespace();
+        if declaration.next() != Some("type") {
+            return 0;
+        }
+        let Some(name) = declaration.next() else {
+            return 0;
+        };
+        let name = name.split('[').next().unwrap_or(name);
+        return if normalize_symbol_query(name) == expected_name {
+            2
+        } else {
+            0
+        };
+    }
     let tokens = trimmed
         .split(|ch: char| ch.is_whitespace() || ch == ':' || ch == ';' || ch == '{')
         .map(|token| token.trim_matches(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')))
@@ -1644,6 +1662,131 @@ mod tests {
             hits.first().map(|hit| &hit.node_id),
             Some(&external.node_id)
         );
+    }
+
+    #[test]
+    fn exact_type_queries_prefer_standalone_go_declarations_over_labels() {
+        let temp = tempdir().expect("create temp dir");
+        std::fs::write(
+            temp.path().join("labels.json"),
+            "{\"accesspolicy\": \"Policy\"}\n",
+        )
+        .expect("write label");
+        let label = hit_at_path_line(
+            "label",
+            "accesspolicy",
+            NodeKind::ANNOTATION,
+            0.95,
+            "labels.json",
+            1,
+        );
+
+        for source in [
+            "type AccessPolicy struct { Enabled bool }\n",
+            "type AccessPolicy interface { Allowed() bool }\n",
+            "type AccessPolicy bool\n",
+            "type AccessPolicy[T any] struct { Value T }\n",
+        ] {
+            std::fs::write(temp.path().join("types.go"), source).expect("write Go declaration");
+            // The Go type_spec rule emits STRUCT for each of these declarations.
+            let declaration = hit_at_path_line(
+                "declaration",
+                "AccessPolicy",
+                NodeKind::STRUCT,
+                0.40,
+                "types.go",
+                1,
+            );
+            let mut hits = [label.clone(), declaration.clone()];
+            hits.sort_by(|left, right| {
+                compare_search_hits_with_project_root_for_test(
+                    Some(temp.path()),
+                    "AccessPolicy",
+                    left,
+                    right,
+                )
+            });
+
+            assert_eq!(hits[0].node_id, declaration.node_id, "source: {source}");
+        }
+    }
+
+    #[test]
+    fn go_type_definition_ranking_preserves_source_and_identity_guards() {
+        let temp = tempdir().expect("create temp dir");
+        std::fs::write(
+            temp.path().join("labels.json"),
+            "{\"accesspolicy\": \"Policy\"}\n",
+        )
+        .expect("write label");
+        let label = hit_at_path_line(
+            "label",
+            "accesspolicy",
+            NodeKind::ANNOTATION,
+            0.95,
+            "labels.json",
+            1,
+        );
+
+        for (source, path, origin) in [
+            (
+                "type AccessPolicyExtra struct {}\n",
+                "types.go",
+                SearchHitOrigin::IndexedSymbol,
+            ),
+            (
+                "type Other struct { AccessPolicy int }\n",
+                "types.go",
+                SearchHitOrigin::IndexedSymbol,
+            ),
+            (
+                "var item AccessPolicy\n",
+                "types.go",
+                SearchHitOrigin::IndexedSymbol,
+            ),
+            (
+                "type Other = AccessPolicy\n",
+                "types.go",
+                SearchHitOrigin::IndexedSymbol,
+            ),
+            (
+                "type (\nAccessPolicy struct {}\nOther struct {}\n)\n",
+                "types.go",
+                SearchHitOrigin::IndexedSymbol,
+            ),
+            (
+                "type AccessPolicy struct {}\n",
+                "types.txt",
+                SearchHitOrigin::IndexedSymbol,
+            ),
+            (
+                "type AccessPolicy struct {}\n",
+                "types.go",
+                SearchHitOrigin::TextMatch,
+            ),
+            ("", "missing.go", SearchHitOrigin::IndexedSymbol),
+        ] {
+            if !source.is_empty() {
+                std::fs::write(temp.path().join(path), source).expect("write source control");
+            }
+            let mut candidate =
+                hit_at_path_line("candidate", "AccessPolicy", NodeKind::STRUCT, 0.40, path, 1);
+            candidate.origin = origin;
+            let mut hits = [candidate, label.clone()];
+            hits.sort_by(|left, right| {
+                compare_search_hits_with_project_root_for_test(
+                    Some(temp.path()),
+                    "AccessPolicy",
+                    left,
+                    right,
+                )
+            });
+
+            assert_eq!(
+                hits[0].node_id, label.node_id,
+                "path: {path}, source: {source}"
+            );
+        }
     }
 
     #[test]
