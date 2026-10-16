@@ -5111,13 +5111,17 @@ pub(crate) mod activation_tests {
         let project = tempfile::tempdir().expect("project");
         let cache = tempfile::tempdir().expect("cache");
         let storage_path = cache.path().join("codestory.db");
-        let source = project.path().join("lib.rs");
+        let source = project.path().join("anchor.go");
         fs::write(
             &source,
-            "pub fn indexed_anchor() {}\npub fn invoke_anchor() { indexed_anchor(); }\n\
-             #[cfg(test)] mod tests { #[test] fn invoke_anchor_test() { super::indexed_anchor(); } }\n",
+            "package fixture\nfunc indexed_anchor() {}\nfunc invoke_anchor() { indexed_anchor() }\n",
         )
-        .expect("write indexed-name fixture");
+        .expect("write production caller fixture");
+        fs::write(
+            project.path().join("anchor_test.go"),
+            "package fixture\nfunc invoke_anchor_test() { indexed_anchor() }\n",
+        )
+        .expect("write path-classified test caller fixture");
         {
             let seed = crate::test_runtime_with_owned_cache_root(process_cache.path());
             seed.project_service()
@@ -5129,13 +5133,48 @@ pub(crate) mod activation_tests {
             seed.index_service()
                 .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
                 .expect("publish complete Core");
+            let storage = seed
+                .controller
+                .open_storage_read_only()
+                .expect("published Core");
+            let nodes = storage.get_nodes().expect("indexed fixture nodes");
+            let declaration = |name| {
+                nodes
+                    .iter()
+                    .find(|node| {
+                        node.kind == codestory_contracts::graph::NodeKind::FUNCTION
+                            && node.serialized_name == name
+                    })
+                    .expect("indexed fixture function")
+            };
+            let anchor = declaration("indexed_anchor");
+            let test_caller = declaration("invoke_anchor_test");
+            assert!(
+                nodes
+                    .iter()
+                    .any(|node| Some(node.id) == test_caller.file_node_id
+                        && node.serialized_name.ends_with("anchor_test.go")),
+                "the caller role must come from a classified test path"
+            );
+            assert!(
+                storage
+                    .get_edges()
+                    .expect("indexed fixture edges")
+                    .iter()
+                    .any(
+                        |edge| edge.kind == codestory_contracts::graph::EdgeKind::CALL
+                            && edge.effective_endpoints() == (test_caller.id, anchor.id)
+                    ),
+                "fixture must contain a resolved test-to-anchor CALL before admission checks"
+            );
         }
         let retrieval_pointer =
             codestory_store::CorePublicationLayout::from_storage_path(&storage_path)
                 .expect("Core layout")
                 .retrieval_publication_path();
         if retrieval_pointer.exists() {
-            fs::remove_file(&retrieval_pointer).expect("remove fixture retrieval publication pointer");
+            fs::remove_file(&retrieval_pointer)
+                .expect("remove fixture retrieval publication pointer");
         }
         assert!(!retrieval_pointer.exists());
         let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
@@ -5241,7 +5280,8 @@ pub(crate) mod activation_tests {
             .run_with_cancel("resolution", Arc::new(AtomicBool::new(true)), || Ok(()))
             .expect_err("pre-cancelled name navigation must refuse");
         assert_eq!(cancelled.code, "cancelled");
-        fs::write(&source, "pub fn replacement_anchor() {}\n").expect("change indexed source");
+        fs::write(&source, "package fixture\nfunc replacement_anchor() {}\n")
+            .expect("change indexed source");
         let stale = browser
             .resolve_target(query, None)
             .expect_err("stale name navigation must not serve historical Core");
