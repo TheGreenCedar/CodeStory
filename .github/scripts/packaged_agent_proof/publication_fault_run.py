@@ -58,11 +58,7 @@ def _start_fault_candidate(
             "action": "pause_before_manifest_commit",
         },
     )
-    fixture.source_file.write_text(
-        fixture.baseline_source
-        + "// publication qualification candidate source change\n",
-        encoding="utf-8",
-    )
+    # Change the retrieval generation without invalidating its pinned Core source.
     fixture.lexical_file.write_text(
         "# Publication qualification candidate\n",
         encoding="utf-8",
@@ -163,24 +159,10 @@ def _run_fault(
             awaited="the publication hook pause_before_manifest_commit event",
             producer=candidate_producer,
         )
-        # This control's residency comes from the candidate itself: it embedded
-        # the mutated fixture on its way to the manifest fence, so the server's
-        # idle window restarted during that work. Re-establishing residency here
-        # would put an extra admitted request inside the fault window this step
-        # exists to observe, so it is deliberately not done.
-        #
-        # That is a judgement, not a bound. Nothing here measures the interval
-        # between the candidate's last embed and the fence, and on a host where
-        # one packaged CLI invocation costs the better part of a minute it is
-        # not comfortably inside the 60s budget. The residual risk is accepted
-        # rather than hidden: the control budget turns it into a fast, named
-        # timeout instead of the half hour of anonymous silence that made this
-        # class of failure so expensive to diagnose.
-        #
-        # The pinned predecessor is reported as state, never as cause: sequence
-        # 2's whole purpose is to end that server, so its exit proves nothing
-        # about this wait. Only the candidate process -- which nothing replaces
-        # -- can fail it.
+        # The candidate holds a residency lease but may reuse dense vectors.
+        # Do not add an embedding request inside this publication fault window.
+        # Sequence 2 deliberately ends the pinned server, so only the unchanged
+        # candidate process can fail this wait; the predecessor is observational.
         crash_event = send_server_qualification_control(
             private_root,
             nonce,
