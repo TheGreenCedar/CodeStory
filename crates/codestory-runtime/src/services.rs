@@ -3089,7 +3089,7 @@ pub struct ActivePublicOperationPublication {
 }
 
 /// Read-only identities already captured by the current pinned attempt.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivePacketRepresentationContextV3 {
     pub publication: ActivePublicOperationPublication,
     pub operation_id: String,

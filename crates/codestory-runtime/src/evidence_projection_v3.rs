@@ -22,9 +22,9 @@ use sha2::{Digest, Sha256};
 use crate::{
     agent::{
         packet_execution_record_v3::{
-            FinalizedDiagnosticSourceRowV3, FinalizedPacketExecutionInputV3,
+            CapturedPacketPublicationV3, FinalizedDiagnosticSourceRowV3, FinalizedPacketExecutionInputV3,
             PacketRequestFingerprintV3, build_packet_execution_record_v3,
-            build_packet_execution_record_v3_with_id,
+            build_packet_execution_record_v3_with_id, capture_packet_publication_v3,
         },
         packet_projection_v3::{
             DiagnosticArtifactBuildV3, FinalizedContextProjectionInputV3,
@@ -33,7 +33,7 @@ use crate::{
             finalize_packet_projection_v3, packet_budget_exceeded_projection_v3,
         },
     },
-    services::PublicOperationService,
+    services::{ActivePacketRepresentationContextV3, PublicOperationService},
 };
 
 /// Immutable bytes and identities the transport needs to mint one capability.
@@ -303,14 +303,73 @@ pub fn project_packet_v3_with_identity(
     reserved: &PacketProjectionIdentityV3,
     measure: impl FnMut(&PacketProjectionV3Dto) -> Result<usize, ()>,
 ) -> Result<PacketEvidenceProductV3, codestory_contracts::api::ApiError> {
-    project_packet_v3_using_record_builder(
-        &service.active_project_identity_v3()?.project_id,
-        caller_id,
-        request,
-        packet,
-        measure,
-        |input| build_packet_execution_record_v3_with_id(service, input, &reserved.0),
-    )
+    PacketRepresentationCaptureV3::new(service)?.project(caller_id, request, packet, reserved, measure)
+}
+
+/// All unserved proposals share one full identity observation under their actual owner.
+pub(crate) struct PacketRepresentationCaptureV3<'a> {
+    service: &'a PublicOperationService,
+    owner: ActivePacketRepresentationContextV3,
+    publication: CapturedPacketPublicationV3,
+}
+
+impl<'a> PacketRepresentationCaptureV3<'a> {
+    pub(crate) fn new(
+        service: &'a PublicOperationService,
+    ) -> Result<Self, codestory_contracts::api::ApiError> {
+        let owner = service
+            .active_packet_representation_context_v3()
+            .ok_or_else(|| {
+                codestory_contracts::api::ApiError::internal(
+                    "Representation capture requires the actual fresh packet owner.",
+                )
+            })?;
+        let publication = capture_packet_publication_v3(service)
+            .map_err(|error| projection_error("packet publication", error))?;
+        let capture = Self {
+            service,
+            owner,
+            publication,
+        };
+        capture.check_owner()?;
+        Ok(capture)
+    }
+
+    fn check_owner(&self) -> Result<(), codestory_contracts::api::ApiError> {
+        if self
+            .service
+            .active_packet_representation_context_v3()
+            .as_ref()
+            != Some(&self.owner)
+        {
+            return Err(codestory_contracts::api::ApiError::new(
+                "publication_changed",
+                "packet representation owner changed after identity capture",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn project(
+        &self,
+        caller_id: &str,
+        request: &AgentPacketRequestDto,
+        packet: &AgentPacketDto,
+        reserved: &PacketProjectionIdentityV3,
+        measure: impl FnMut(&PacketProjectionV3Dto) -> Result<usize, ()>,
+    ) -> Result<PacketEvidenceProductV3, codestory_contracts::api::ApiError> {
+        self.check_owner()?;
+        let product = project_packet_v3_using_record_builder(
+            self.publication.project_id(),
+            caller_id,
+            request,
+            packet,
+            measure,
+            |input| build_packet_execution_record_v3_with_id(&self.publication, input, &reserved.0),
+        )?;
+        self.check_owner()?;
+        Ok(product)
+    }
 }
 
 fn project_packet_v3_using_record_builder(
@@ -2182,6 +2241,231 @@ mod tests {
             manifest.sidecar_generation.as_deref(),
         );
         (controller, service)
+    }
+
+    fn packet_identity_fixture() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        crate::AppController,
+        PublicOperationService,
+    ) {
+        use crate::test_support::git;
+        let project = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        git(project.path(), &["init", "-q"]);
+        git(project.path(), &["config", "user.name", "CodeStory Tests"]);
+        git(
+            project.path(),
+            &["config", "user.email", "test@example.invalid"],
+        );
+        git(
+            project.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.com/packet/identity.git",
+            ],
+        );
+        git(project.path(), &["commit", "--allow-empty", "-qm", "empty"]);
+        fs::write(
+            project.path().join("lib.rs"),
+            "// packet identity fixture\n",
+        )
+        .unwrap();
+        git(project.path(), &["add", "lib.rs"]);
+        git(project.path(), &["commit", "-qm", "source"]);
+        let storage = cache.path().join("core.db");
+        let controller = crate::AppController::new_with_owned_cache_root(cache.path());
+        controller
+            .open_project_summary_with_storage_path(project.path().into(), storage.clone())
+            .unwrap();
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .unwrap();
+        drop(controller);
+        let (controller, service) =
+            full_projection_fixture_services(project.path(), &storage, cache.path());
+        (project, cache, controller, service)
+    }
+
+    #[test]
+    fn packet_representation_capture_observes_git_once_and_rejects_other_owners() {
+        use codestory_workspace::{
+            with_repository_metadata_observation_limit_for_test,
+            with_repository_metadata_tree_traversal_count_for_test,
+        };
+        let (project, _cache, _controller, service) = packet_identity_fixture();
+        let (_other_project, _other_cache, _other_controller, other_service) =
+            packet_identity_fixture();
+        let before = service.active_project_identity_v3().unwrap();
+        let other = other_service.active_project_identity_v3().unwrap();
+        assert!(before.portable_reuse_eligible);
+        assert_eq!(before.project_id, other.project_id);
+        assert_ne!(before.workspace_id, other.workspace_id);
+        let request: AgentPacketRequestDto =
+            serde_json::from_value(json!({"question":"inspect"})).unwrap();
+        let reserved = PacketProjectionIdentityV3::new();
+        let mut packet = continuation_progress_packet();
+        let capture = service
+            .run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
+                packet.answer.retrieval_trace.retrieval_publication =
+                    service.active_publication().unwrap().retrieval_publication;
+                let expected = capture_packet_publication_v3(&service).unwrap();
+                let (capture, walks) = with_repository_metadata_tree_traversal_count_for_test(|| {
+                    with_repository_metadata_observation_limit_for_test(1, || {
+                        let capture = PacketRepresentationCaptureV3::new(&service).unwrap();
+                        assert_eq!(capture.publication, expected);
+                        for count in 0..3 {
+                            packet.support = (0..count)
+                                .map(|index| {
+                                    let mut row = support_unit(SupportUnitKindDto::SymbolLocation);
+                                    row.id = format!("symbol:node:{index}");
+                                    row.symbol_id = Some(index.to_string());
+                                    row.path = Some("lib.rs".into());
+                                    row.start_line = Some(1);
+                                    row
+                                })
+                                .collect();
+                            let product = capture
+                                .project("test", &request, &packet, &reserved, |p| {
+                                    serde_json::to_vec(p).map(|v| v.len()).map_err(|_| ())
+                                })
+                                .unwrap();
+                            assert_eq!(product.diagnostics.project_identity, before.project_id);
+                            assert_eq!(product.diagnostics.packet_id, reserved.0);
+                            assert!(matches!(
+                                product.projection,
+                                PacketProjectionV3Dto::Complete { .. }
+                            ));
+                        }
+                        capture
+                    })
+                });
+                assert!(
+                    walks > 0,
+                    "the real Git observation must exercise the expensive reader"
+                );
+                other_service.run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
+                    assert_eq!(
+                        capture
+                            .project("test", &request, &packet, &reserved, |_| Ok(0))
+                            .unwrap_err()
+                            .code,
+                        "publication_changed"
+                    );
+                    Ok(())
+                })?;
+                capture.check_owner()?;
+                Ok(capture)
+            })
+            .unwrap()
+            .value;
+        assert_eq!(
+            capture
+                .project("test", &request, &packet, &reserved, |_| Ok(0))
+                .unwrap_err()
+                .code,
+            "publication_changed"
+        );
+        service
+            .run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
+                assert_eq!(
+                    capture
+                        .project("test", &request, &packet, &reserved, |_| Ok(0))
+                        .unwrap_err()
+                        .code,
+                    "publication_changed"
+                );
+                let next = PacketRepresentationCaptureV3::new(&service)?;
+                assert_eq!(next.publication, capture.publication);
+                Ok(())
+            })
+            .unwrap();
+
+        // Only HEAD moves: indexed source and the index inventory remain unchanged.
+        crate::test_support::git(project.path(), &["reset", "--soft", "HEAD^"]);
+        let after = service.active_project_identity_v3().unwrap();
+        assert_eq!(before.project_id, after.project_id);
+        assert_eq!(before.workspace_id, after.workspace_id);
+        assert!(!after.portable_reuse_eligible);
+        assert_ne!(before.artifact_scope_id, after.artifact_scope_id);
+        assert_eq!(
+            service
+                .run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || Ok(()))
+                .unwrap_err()
+                .code,
+            "retrieval_unavailable"
+        );
+        let (_dirty_controller, dirty_service) = full_projection_fixture_services(
+            project.path(),
+            &_cache.path().join("core.db"),
+            _cache.path(),
+        );
+        dirty_service
+            .run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
+                assert_eq!(
+                    capture
+                        .project("test", &request, &packet, &reserved, |_| Ok(0))
+                        .unwrap_err()
+                        .code,
+                    "publication_changed"
+                );
+                let expected = capture_packet_publication_v3(&dirty_service).unwrap();
+                let next = PacketRepresentationCaptureV3::new(&dirty_service)?;
+                assert_eq!(next.publication, expected);
+                assert_ne!(
+                    next.publication, capture.publication,
+                    "the next operation must recapture portability"
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn packet_representation_capture_preserves_cancellation_and_source_fences() {
+        for cancel in [false, true] {
+            let (project, _cache, _controller, service) = packet_identity_fixture();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let request: AgentPacketRequestDto =
+                serde_json::from_value(json!({"question":"inspect"})).unwrap();
+            let mut builds = 0;
+            let error = service
+                .run_with_cancel("packet", cancelled.clone(), || {
+                    builds += 1;
+                    let mut packet = continuation_progress_packet();
+                    packet.answer.retrieval_trace.retrieval_publication =
+                        service.active_publication().unwrap().retrieval_publication;
+                    let capture = PacketRepresentationCaptureV3::new(&service)?;
+                    capture.project(
+                        "test",
+                        &request,
+                        &packet,
+                        &PacketProjectionIdentityV3::new(),
+                        |p| {
+                            if cancel {
+                                cancelled.store(true, std::sync::atomic::Ordering::Release);
+                            } else {
+                                fs::write(project.path().join("lib.rs"), "// changed packet source\n")
+                                    .unwrap();
+                            }
+                            serde_json::to_vec(p).map(|v| v.len()).map_err(|_| ())
+                        },
+                    )
+                })
+                .unwrap_err();
+            assert_eq!(builds, 1);
+            assert_eq!(
+                error.code,
+                if cancel {
+                    "cancelled"
+                } else {
+                    "project_unavailable"
+                },
+                "{error:?}"
+            );
+        }
     }
 
     fn indexed_full_search_fixture_with_files(
