@@ -4,6 +4,8 @@ runs:
   using: composite
   steps:
     - uses: actions/setup-python@v7.0.0
+      # The macOS installer requires /Users/runner; protected Macs already provide Python.
+      if: runner.os != 'macOS'
       env:
         PSExecutionPolicyPreference: Bypass
       with:
