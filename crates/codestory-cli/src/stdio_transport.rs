@@ -9229,7 +9229,7 @@ mod tests {
         let selected = json!({"params": {"arguments": {"query": "arbitrary free query"}}});
         assert_eq!(
             stdio_tool_read_class("symbol", &selected).activation_goal(),
-            codestory_runtime::ActivationGoal::Full
+            codestory_runtime::ActivationGoal::CoreOnly
         );
         assert_eq!(
             stdio_tool_read_class("snippet", &selected).activation_goal(),
