@@ -299,7 +299,6 @@ fn stale_rust_extraction_replaces_old_macro_duplicates_even_with_current_cached_
         start_col: Some(4),
         end_line: Some(3),
         end_col: Some(10),
-        ..Node::default()
     })?;
     let legacy_revision = "rust-callable-declaration-v3";
     assert_ne!(
