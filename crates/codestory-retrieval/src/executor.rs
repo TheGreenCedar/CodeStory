@@ -199,7 +199,7 @@ impl<'a> QueryExecutor<'a> {
     ///
     /// Full publication health is still required. This changes one retrieval
     /// lane for measurement; it is unavailable to product builds.
-    #[cfg(feature = "benchmark-support")]
+    #[cfg(all(test, feature = "benchmark-support"))]
     pub(crate) fn execute_packet_descriptors_without_dense_semantic_for_benchmark(
         &mut self,
         query: &str,

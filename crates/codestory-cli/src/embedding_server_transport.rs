@@ -300,7 +300,7 @@ impl NativeEmbeddingClientTransport {
 
         let generation = self
             .next_spawn_generation
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1)
             })
             .map_err(|_| anyhow::anyhow!("embedding_server_spawn_generation_exhausted"))?;

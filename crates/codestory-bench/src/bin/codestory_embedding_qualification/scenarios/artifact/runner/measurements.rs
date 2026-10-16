@@ -1142,6 +1142,7 @@ mod constant_calibration_tests {
             execution_device_names: Vec::new(),
             execution_backend_names: Vec::new(),
             execution_observation_source: "test".into(),
+            completed_operator_counts: Default::default(),
             encode_count: 0,
             execution_node_count: 0,
             resident_accelerator_tensor_count: 0,
