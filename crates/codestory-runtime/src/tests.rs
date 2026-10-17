@@ -4935,6 +4935,121 @@ fn stable_parser_partial_extraction_is_fresh_without_claiming_complete_coverage(
     }
 }
 
+#[test]
+fn invalid_utf8_parser_extraction_is_fresh_without_exact_source_hydration() {
+    let _env = hybrid_test_env();
+    let workspace = tempdir().expect("workspace");
+    let inputs: [(&str, &[u8]); 4] = [
+        (
+            "comment.rs",
+            b"// invalid: \x80\npub fn lossy_anchor() -> i32 { 1 }\n",
+        ),
+        ("broken.rs", b"// invalid: \x80\npub fn broken( {\n"),
+        (
+            "comment.py",
+            b"# invalid: \x80\ndef lossy_anchor():\n    return 1\n",
+        ),
+        ("broken.py", b"# invalid: \x80\ndef broken(\n"),
+    ];
+    for (name, source) in inputs {
+        fs::write(workspace.path().join(name), source).expect("source");
+    }
+    fs::write(
+        workspace.path().join("healthy.rs"),
+        "pub fn healthy_utf8_anchor() {}\n",
+    )
+    .expect("healthy source");
+    let storage_path = workspace.path().join(".cache/codestory.db");
+    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open project");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("publish verified partial sources");
+    for iteration in 0..2 {
+        let storage = Storage::open(&storage_path).expect("storage");
+        let manifest = WorkspaceManifest::open_with_storage_owned_exclusions(
+            workspace.path().to_path_buf(),
+            &storage_path,
+        )
+        .expect("manifest");
+        let freshness = index_freshness_from_storage(workspace.path(), &manifest, &storage);
+        assert_eq!(
+            freshness.status,
+            IndexFreshnessStatusDto::Fresh,
+            "{iteration}: {freshness:?}"
+        );
+        for (name, _) in inputs {
+            let file = storage
+                .get_file_by_path(&workspace.path().join(name))
+                .expect("file")
+                .expect("partial");
+            assert!(file.indexed && !file.complete, "{name}: {file:?}");
+            let revision =
+                codestory_indexer::current_file_extraction_revision(&file.language).unwrap();
+            assert!(
+                storage
+                    .files_with_extraction_revision_mismatch(&file.language, revision)
+                    .expect("revision")
+                    .is_empty()
+            );
+            assert!(
+                !storage
+                    .file_extraction_identity_matches(file.id, &file.language, revision)
+                    .expect("complete reuse")
+            );
+            assert!(
+                crate::search_evidence::verified_file_checked(
+                    &storage,
+                    Some(workspace.path()),
+                    &file
+                )
+                .is_err(),
+                "{name}: lossy graph is not exact hydrated source"
+            );
+        }
+        let result = controller
+            .search_results(SearchRequest {
+                query: "healthy_utf8_anchor".into(),
+                repo_text: SearchRepoTextMode::Off,
+                limit_per_source: 3,
+                expand_search_plan: false,
+                hybrid_weights: None,
+                hybrid_limits: None,
+            })
+            .expect("unrelated healthy search must not loop refreshing lossy source");
+        assert!(
+            result.hits.iter().any(
+                |hit| hit.display_name == "healthy_utf8_anchor" && hit.source_excerpt.is_some()
+            )
+        );
+        if iteration == 0 {
+            let (name, source) = inputs[0];
+            let replacement = source
+                .iter()
+                .map(|byte| if *byte == 0x80 { 0x81 } else { *byte })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                String::from_utf8_lossy(source),
+                String::from_utf8_lossy(&replacement)
+            );
+            fs::write(workspace.path().join(name), replacement).expect("raw source drift");
+            assert_eq!(
+                index_freshness_from_storage(workspace.path(), &manifest, &storage).status,
+                IndexFreshnessStatusDto::Stale
+            );
+            drop(storage);
+            controller
+                .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+                .expect("refresh different raw identity");
+        }
+    }
+}
+
 /// CAP-1b: the production path from a citation's path to an exclusion row.
 ///
 /// The unit tests for the cap set `source_coverage` directly, so they never

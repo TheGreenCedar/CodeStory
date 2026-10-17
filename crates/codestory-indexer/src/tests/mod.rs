@@ -1954,6 +1954,139 @@ fn parser_partial_incremental_refresh_retains_current_extraction_identity() -> R
     Ok(())
 }
 
+#[test]
+fn invalid_utf8_parser_extraction_keeps_raw_identity_and_incomplete_cache_limits() -> Result<()> {
+    for (name, language, source) in [
+        (
+            "comment.rs",
+            "rust",
+            b"// invalid: \x80\npub fn lossy_anchor() -> i32 { 1 }\n".as_slice(),
+        ),
+        (
+            "broken.rs",
+            "rust",
+            b"// invalid: \x80\npub fn lossy_anchor() -> i32 { 1 }\npub fn broken( {\n".as_slice(),
+        ),
+        (
+            "comment.py",
+            "python",
+            b"# invalid: \x80\ndef lossy_anchor():\n    return helper()\ndef helper():\n    return 1\n".as_slice(),
+        ),
+        (
+            "broken.py",
+            "python",
+            b"# invalid: \x80\ndef lossy_anchor():\n    return 1\n\ndef broken(\n".as_slice(),
+        ),
+    ] {
+        let dir = tempdir()?;
+        let path = dir.path().join(name);
+        std::fs::write(&path, source)?;
+        let refresh = codestory_workspace::RefreshInfo {
+            mode: codestory_workspace::BuildMode::Incremental,
+            files_to_index: vec![path.clone()],
+            files_to_remove: Vec::new(),
+            existing_file_ids: HashMap::new(),
+        };
+        let mut storage = Storage::new_in_memory()?;
+        let indexer = WorkspaceIndexer::new(dir.path().to_path_buf());
+        let revision = current_file_extraction_revision(language).expect("revision");
+        indexer.run_incremental(&mut storage, &refresh, &EventBus::new(), None)?;
+        let file = storage.get_file_by_path(&path)?.unwrap();
+        assert!(
+            file.indexed && !file.complete,
+            "lossy replacement text must not certify complete source: {name}: {file:?}"
+        );
+        assert_eq!(
+            storage.get_file_content_hash(file.id)?,
+            Some(source_content_hash(source))
+        );
+        assert!(
+            storage
+                .files_with_extraction_revision_mismatch(language, revision)?
+                .is_empty(),
+            "{name}: actual raw extraction must record its producer"
+        );
+        assert!(!storage.file_extraction_identity_matches(file.id, language, revision)?);
+        assert!(storage.get_errors(None)?.is_empty());
+        let entry = storage
+            .get_index_artifact_cache_entries()?
+            .pop()
+            .expect("real cold cache artifact");
+        let mut artifact = decode_index_artifact(&entry.artifact_blob)?;
+        assert!(artifact.files.iter().all(|file| !file.complete));
+        assert!(artifact.call_resolution_inputs.is_empty());
+        if name == "comment.py" {
+            let (_, calls, _) = index_file_with_resolution_inputs(
+                &path, &String::from_utf8_lossy(source), &source_content_hash(source),
+                &get_language_for_ext("py").expect("Python"), None, None,
+            )?;
+            assert!(!calls.is_empty(), "the actual extractor must produce a call before lossy proof inputs are cleared");
+        }
+        let metadata = artifact
+            .resolution_file
+            .as_ref()
+            .expect("installed language metadata");
+        assert!(!metadata.complete && !metadata.lookup_input_complete);
+        assert_eq!(metadata.source_sha256, source_content_hash(source));
+        if name.starts_with("comment") {
+            // The prior producer marked a syntactically valid lossy view complete,
+            // while already disabling its lookup proof. Its raw-key cache remains readable.
+            for file in &mut artifact.files {
+                file.complete = true;
+            }
+            artifact.resolution_file.as_mut().unwrap().complete = true;
+            storage.get_connection().execute(
+                "UPDATE index_artifact_cache SET artifact_blob = ?1",
+                [encode_index_artifact(&artifact)?],
+            )?;
+        }
+        let warm = indexer.run_incremental(&mut storage, &refresh, &EventBus::new(), None)?;
+        assert_eq!(
+            warm.parser_artifact_cache.hits, 1,
+            "{name}: exercise verified artifact replay"
+        );
+        assert!(
+            !storage.get_file_by_path(&path)?.unwrap().complete,
+            "{name}: warm legacy cache must not restore complete eligibility"
+        );
+        assert!(
+            storage
+                .files_with_extraction_revision_mismatch(language, revision)?
+                .is_empty()
+        );
+        assert!(!storage.file_extraction_identity_matches(file.id, language, revision)?);
+        let replacement = source
+            .iter()
+            .map(|byte| if *byte == 0x80 { 0x81 } else { *byte })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            String::from_utf8_lossy(source),
+            String::from_utf8_lossy(&replacement)
+        );
+        assert_ne!(
+            source_content_hash(source),
+            source_content_hash(&replacement)
+        );
+        std::fs::write(&path, &replacement)?;
+        let changed = indexer.run_incremental(&mut storage, &refresh, &EventBus::new(), None)?;
+        assert_eq!(
+            changed.parser_artifact_cache.misses, 1,
+            "{name}: equal lossy text must not reuse raw identity"
+        );
+        assert_eq!(
+            storage.get_file_content_hash(file.id)?,
+            Some(source_content_hash(&replacement))
+        );
+        assert!(
+            storage
+                .files_with_extraction_revision_mismatch(language, revision)?
+                .is_empty()
+        );
+        assert!(!storage.get_file_by_path(&path)?.unwrap().complete);
+    }
+    Ok(())
+}
+
 /// `LineOffsets` replaced `source.lines().nth()` in the visibility classifier,
 /// so any disagreement with `str::lines()` silently changes the projected
 /// access of a member — no panic, no error row, just a different graph. This

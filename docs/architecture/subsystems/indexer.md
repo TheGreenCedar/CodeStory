@@ -72,6 +72,10 @@ producer identity while remaining incomplete; the identity certifies neither
 complete coverage nor inherited-graph cache reuse. Missing or outdated producer
 identity still selects the file for refresh. For complete projections, a revision
 mismatch forces replacement before equality-based reuse.
+Parser-backed invalid UTF-8 retains the existing lossy graph view only as
+incomplete navigation. Raw-source/producer identity can remain current, but
+complete cache reuse, Exact lookup inputs and exact source hydration stay
+unavailable, including when cached replacement text parses without errors.
 
 ## What Gets Flushed
 
