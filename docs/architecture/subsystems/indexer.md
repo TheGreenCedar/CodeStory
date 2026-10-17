@@ -66,9 +66,12 @@ callers for argument expressions; canonical declarations, including one-line
 functions, remain eligible owners.
 Parser body metadata joins the outer declaration coordinates to the proper
 execution-body range. Successful verified extraction and current cache replay
-record the Python extraction revision with the file's source hash; incomplete
-extraction cannot certify an inherited projection. A revision mismatch forces
-file projection replacement before equality-based reuse.
+record the Python or Rust extraction revision with the file's source hash.
+Indexed, hash-verified parser-partial files with no file-level error retain this
+producer identity while remaining incomplete; the identity certifies neither
+complete coverage nor inherited-graph cache reuse. Missing or outdated producer
+identity still selects the file for refresh. For complete projections, a revision
+mismatch forces replacement before equality-based reuse.
 
 ## What Gets Flushed
 

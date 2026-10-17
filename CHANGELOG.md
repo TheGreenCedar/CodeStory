@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Source-backed search and navigation stay available after indexing unchanged, partially parsed Rust or Python files, while coverage continues to report the parsing gap.
+
 - Structural source indexing and retrieval accept BOM-marked UTF-16 text, including PowerShell files, while keeping source verification tied to the original bytes.
 
 - Agent guidance can display caller results once when whole-number JSON formatting differs, preserving original text and metadata.

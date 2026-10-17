@@ -4852,6 +4852,89 @@ fn a_partially_parsed_file_is_reported_incomplete_not_indexed() {
     );
 }
 
+#[test]
+fn stable_parser_partial_extraction_is_fresh_without_claiming_complete_coverage() {
+    let _env = hybrid_test_env();
+    let workspace = tempdir().expect("workspace");
+    for (name, source) in [
+        (
+            "partial.rs",
+            "pub fn retained_partial_anchor() -> i32 { 1 }\npub fn broken( {\n",
+        ),
+        (
+            "partial.py",
+            "def retained_python_anchor():\n    return 1\n\ndef broken(\n",
+        ),
+    ] {
+        fs::write(workspace.path().join(name), source).expect("partial source");
+    }
+    let storage_path = workspace.path().join(".cache/codestory.db");
+    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open project");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("publish verified partial source");
+    let storage = Storage::open(&storage_path).expect("storage");
+    for name in ["partial.rs", "partial.py"] {
+        let file = storage
+            .get_file_by_path(&workspace.path().join(name))
+            .expect("file")
+            .expect("indexed partial file");
+        assert!(
+            file.indexed && !file.complete,
+            "fixture must remain parser-partial: {file:?}"
+        );
+    }
+    assert!(storage.get_errors(None).expect("errors").is_empty());
+    let manifest = WorkspaceManifest::open_with_storage_owned_exclusions(
+        workspace.path().to_path_buf(),
+        &storage_path,
+    )
+    .expect("workspace manifest");
+    let freshness = index_freshness_from_storage(workspace.path(), &manifest, &storage);
+    assert_eq!(
+        freshness.status,
+        IndexFreshnessStatusDto::Fresh,
+        "byte-identical published parser-partial source must converge: {freshness:?}"
+    );
+    assert_eq!(freshness.changed_file_count, 0);
+    let observations = crate::agent::packet_compiler::observe_admitted_source_coverage(
+        &controller,
+        &storage,
+        &["partial.rs".into(), "partial.py".into()],
+    );
+    assert_eq!(observations.len(), 2);
+    assert!(observations.iter().all(|row| row.status
+        == codestory_contracts::api::SourceCoverageStatusDto::Incomplete
+        && row.reason == Some(codestory_contracts::graph::FileCoverageReason::ParserPartial)));
+    assert!(
+        crate::agent::packet_coverage::PacketCoverageInput::from_observations(&observations)
+            .blocks_packet_availability()
+    );
+    for query in ["retained_partial_anchor", "retained_python_anchor"] {
+        let results = controller
+            .search_results(SearchRequest {
+                query: query.into(),
+                repo_text: SearchRepoTextMode::Off,
+                limit_per_source: 3,
+                expand_search_plan: false,
+                hybrid_weights: None,
+                hybrid_limits: None,
+            })
+            .expect("fresh partial source admits core-only search");
+        assert!(
+            results.hits.iter().any(|hit| hit.display_name == query),
+            "{query}: {:?}",
+            results.hits
+        );
+    }
+}
+
 /// CAP-1b: the production path from a citation's path to an exclusion row.
 ///
 /// The unit tests for the cap set `source_coverage` directly, so they never

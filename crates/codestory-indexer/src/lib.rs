@@ -1560,7 +1560,8 @@ impl<'a> ProjectionWriter<'a> {
                 local_storage
                     .nodes
                     .retain(|node| node.id != NodeId(file_id));
-                local_storage.file_extraction_identities.clear();
+                // Verified parser-partial extraction still records its source
+                // and producer; it does not certify the inherited graph complete.
                 self.stats.graph_projection_changed = true;
             } else {
                 let cleanup_started = Instant::now();
@@ -4390,7 +4391,13 @@ pub fn current_file_extraction_revision(language: &str) -> Option<&'static str> 
 
 fn add_current_file_extraction_identities(storage: &mut IntermediateStorage) {
     for file in &storage.files {
-        if !file.indexed || !file.complete {
+        if !file.indexed
+            || !file.complete
+                && storage
+                    .errors
+                    .iter()
+                    .any(|error| error.file_id == Some(NodeId(file.id)))
+        {
             continue;
         }
         let Some(revision) = current_file_extraction_revision(&file.language) else {

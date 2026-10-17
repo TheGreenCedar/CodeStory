@@ -154,8 +154,10 @@ file/hash/graph projection and are removed with the file. Migration creates no
 identity for legacy projections. The existing schema compatibility fence
 requires one full rebuild for an older Core; later same-schema revision
 mismatches select only affected files through normal refresh planning. Python
-and Rust require this identity, including files with no callables. Status and
-doctor only observe incompatible or outdated state, and failed or cancelled
+and Rust require this identity, including files with no callables. Indexed,
+hash-verified parser-partial files with no file-level error can retain producer
+identity without becoming complete; cache reuse still requires a complete file.
+Status and doctor only observe incompatible or outdated state, and failed or cancelled
 staged work leaves the previous published generation available.
 
 Legacy promotion journals record candidate and rollback structural identities.
