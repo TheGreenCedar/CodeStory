@@ -2634,6 +2634,55 @@ fn corrupt_or_incompatible_structural_cache_recollects_and_changed_bytes_replace
 }
 
 #[test]
+fn encoded_structural_source_drift_rejects_equal_text_with_changed_raw_encoding() -> Result<()> {
+    let dir = tempdir()?;
+    let path = dir.path().join("commands.ps1");
+    let source = "function Invoke-Thing { Write-Output 'é🦀' }\r\n";
+    let encode = |little: bool| {
+        let mut bytes = if little {
+            vec![0xff, 0xfe]
+        } else {
+            vec![0xfe, 0xff]
+        };
+        for unit in source.encode_utf16() {
+            bytes.extend(if little {
+                unit.to_le_bytes()
+            } else {
+                unit.to_be_bytes()
+            });
+        }
+        bytes
+    };
+    let original = encode(true);
+    std::fs::write(&path, &original)?;
+    let modified = std::fs::metadata(&path)?.modified()?;
+    let prepared = PreparedStructuralInput {
+        full_path: path.clone(),
+        role_classification_path: PathBuf::from("commands.ps1"),
+        artifact_cache_path: Some(PathBuf::from("commands.ps1")),
+        artifact_cache_key: Some("test-original".into()),
+        source: source.into(),
+        content_hash: source_content_hash(&original),
+    };
+    std::fs::write(&path, encode(false))?;
+    std::fs::File::options()
+        .write(true)
+        .open(&path)?
+        .set_times(std::fs::FileTimes::new().set_modified(modified))?;
+    let result = WorkspaceIndexer::new(dir.path().to_path_buf())
+        .execute_prepared_structural_index(&prepared);
+    assert!(result.local_storage.structural_text_units.is_empty());
+    assert!(result.local_storage.structural_text_projections.is_empty());
+    assert!(result.local_storage.structural_text_cache_writes.is_empty());
+    assert!(!result.local_storage.files[0].complete);
+    assert_eq!(
+        result.local_storage.errors[0].coverage_reason,
+        Some(FileCoverageReason::SourceChanged)
+    );
+    Ok(())
+}
+
+#[test]
 fn structural_source_drift_discards_units_and_cache_write_even_with_restored_mtime() -> Result<()> {
     let dir = tempdir()?;
     let path = dir.path().join("schema.sql");
@@ -6599,6 +6648,46 @@ function render() {
         }),
         "expected JSX prop usage recovery to link render() to label"
     );
+    Ok(())
+}
+
+#[test]
+fn encoded_openapi_source_keeps_endpoint_coordinates_and_original_hash() -> Result<()> {
+    let dir = tempdir()?;
+    let path = dir.path().join("openapi.json");
+    let text = r#"{
+  "openapi": "3.1.0", "paths": {"/café": {"get": {"operationId": "readItem"}}}
+}"#;
+    let indexer = WorkspaceIndexer::new(dir.path().to_path_buf());
+    for little in [true, false] {
+        let mut bytes = if little {
+            vec![0xff, 0xfe]
+        } else {
+            vec![0xfe, 0xff]
+        };
+        for unit in text.encode_utf16() {
+            bytes.extend(if little {
+                unit.to_le_bytes()
+            } else {
+                unit.to_be_bytes()
+            });
+        }
+        std::fs::write(&path, &bytes)?;
+        let result = indexer
+            .prepare_openapi_schema_work(&path)
+            .map_err(|_| anyhow!("encoded OpenAPI refused"))?
+            .unwrap();
+        assert_eq!(
+            result.file_content_hashes[0].content_hash,
+            source_content_hash(&bytes)
+        );
+        assert!(
+            result
+                .nodes
+                .iter()
+                .any(|node| node.kind == NodeKind::FUNCTION && node.serialized_name == "GET /café")
+        );
+    }
     Ok(())
 }
 

@@ -773,20 +773,21 @@ fn read_source_line(project_root: Option<&Path>, path: &str, line: u32) -> Optio
         raw_path
     };
 
-    let contents = fs::read_to_string(candidate)
+    let bytes = fs::read(candidate)
         .or_else(|_| {
             #[cfg(windows)]
             {
                 path.strip_prefix(r"\\?\")
-                    .map(fs::read_to_string)
-                    .unwrap_or_else(|| fs::read_to_string(path))
+                    .map(fs::read)
+                    .unwrap_or_else(|| fs::read(path))
             }
             #[cfg(not(windows))]
             {
-                fs::read_to_string(path)
+                fs::read(path)
             }
         })
         .ok()?;
+    let contents = codestory_contracts::source_text::decode_source_text(candidate, &bytes).ok()?;
     contents
         .lines()
         .nth(line.saturating_sub(1) as usize)

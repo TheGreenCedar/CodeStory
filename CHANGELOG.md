@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Structural source indexing and retrieval accept BOM-marked UTF-16 text, including PowerShell files, while keeping source verification tied to the original bytes.
+
 - Agent guidance can display caller results once when whole-number JSON formatting differs, preserving original text and metadata.
 
 - Symbol-name navigation uses the current Core index without preparing search, so symbol details, callers and trails remain available without broad retrieval.

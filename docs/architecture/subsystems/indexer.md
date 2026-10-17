@@ -104,7 +104,7 @@ setup, and commit time without treating them as additive phases.
 
 The twelve structural unit collector families emit source-range-only evidence
 without claiming parser-backed graph resolution. Finalization slices the exact
-UTF-8 source span and records the collector producer, evidence tier, resolution
+decoded UTF-8 source span and records the collector producer, evidence tier, resolution
 status, language, kind, file role, descriptor version, source hash, and span.
 The content identity is stable for an equivalent descriptor and exact source
 slice; placement identity additionally includes file and node identity.
@@ -130,8 +130,14 @@ files are capped at 1 MiB and 2,048 units, both carried on `SourceIndexPolicy`
 rather than compiled into the collector, so an operator override reaches them and
 an exclusion names the bound that refused it. A bound failure rejects the whole
 file instead of publishing a truncated projection. Structural cache identity
-v2 invalidates pre-limit artifacts, and cache hits enforce the same unit cap.
-Invalid UTF-8/binary bytes, malformed format syntax, and unreadable sources
+remains v4: unchanged admitted UTF-8 artifacts remain reusable, and cache hits
+enforce the same unit cap.
+Structural text accepts UTF-8 and strict BOM-marked UTF-16LE/BE. UTF-16 BOMs
+select byte order and are omitted from decoded coordinates; UTF-8 BOM handling
+is unchanged. Native hashes and cache keys cover original bytes, so equal text
+in different encodings is different source. Both raw and decoded bytes obey the
+source cap. Unpaired surrogates, odd payloads, bare UTF-16 BOMs, decoded binary
+controls, unknown encodings, malformed format syntax, and unreadable sources
 retain distinct coverage reasons and do not create reusable structural cache
 entries.
 

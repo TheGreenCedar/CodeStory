@@ -8734,6 +8734,95 @@ fn full_and_incremental_publications_advance_one_durable_generation() {
 }
 
 #[test]
+fn encoded_structural_generations_bind_raw_bytes_reuse_cache_and_preserve_publication() {
+    use sha2::{Digest, Sha256};
+    let process_cache = tempfile::tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let path = workspace.path().join("commands.ps1");
+    let text = "# café 🦀\r\nfunction Invoke-Thing {\r\n  Write-Output 'é🦀'\r\n}\r\n";
+    let encode = |little: bool| {
+        let mut bytes = if little {
+            vec![0xff, 0xfe]
+        } else {
+            vec![0xfe, 0xff]
+        };
+        for unit in text.encode_utf16() {
+            bytes.extend(if little {
+                unit.to_le_bytes()
+            } else {
+                unit.to_be_bytes()
+            });
+        }
+        bytes
+    };
+    let storage_path = workspace.path().join(".cache/codestory.db");
+    fs::write(&path, encode(true)).unwrap();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .unwrap();
+    let first = controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .unwrap();
+    assert_eq!(first.structural_artifact_cache.unwrap().misses, 1);
+    let stable = controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .unwrap();
+    assert_eq!(stable.structural_artifact_cache.unwrap().hits, 1);
+    let previous = structural_live_identity(&storage_path);
+    let store = Store::open_read_only(&storage_path).unwrap();
+    let mut files = store.get_files().unwrap();
+    assert_eq!(files.len(), 1);
+    let file = files.pop().unwrap();
+    assert_eq!(file.path.file_name().unwrap(), "commands.ps1");
+    let source =
+        crate::search_evidence::verified_file_checked(&store, Some(workspace.path()), &file)
+            .unwrap();
+    assert_eq!(source.content, text);
+    assert_eq!(
+        source.content_sha256,
+        format!("{:x}", Sha256::digest(encode(true)))
+    );
+    let (_, windows) = controller
+        .path_source_windows("commands.ps1", &[(2, 3)], 1024)
+        .unwrap();
+    let window = windows[0].render("commands.ps1".into(), 2, 3, 1024);
+    assert!(window.snippet.contains("Invoke-Thing"));
+    assert!(window.snippet.contains("é🦀"));
+    fs::write(&path, encode(false)).unwrap();
+    assert!(matches!(
+        crate::search_evidence::verified_file_checked(&store, Some(workspace.path()), &file),
+        Err(crate::search_evidence::VerifiedFileError::Stale)
+    ));
+    drop(store);
+    let changed = controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .unwrap();
+    assert_eq!(changed.structural_artifact_cache.unwrap().misses, 1);
+    assert_ne!(
+        structural_live_identity(&storage_path).cache_rows,
+        previous.cache_rows
+    );
+    let retained = structural_live_identity(&storage_path);
+    for invalid in [
+        vec![0xff, 0xfe, 0x41],
+        vec![0xfe, 0xff, 0xd8, 0x00],
+        vec![0xff, 0xfe, 0, 0],
+    ] {
+        fs::write(&path, invalid).unwrap();
+        let error = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .unwrap_err();
+        assert_eq!(error.code, "source_binary");
+        assert_eq!(structural_live_identity(&storage_path), retained);
+        assert_no_staged_publication_artifacts(&storage_path);
+    }
+}
+
+#[test]
 fn structural_full_generations_reuse_unchanged_cache_and_preserve_previous_on_invalid_input() {
     let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = tempdir().expect("workspace dir");

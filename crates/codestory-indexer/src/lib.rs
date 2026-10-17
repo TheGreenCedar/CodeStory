@@ -3683,7 +3683,7 @@ impl WorkspaceIndexer {
             )
         })?;
         let content_hash = source_content_hash(&bytes);
-        let source = structural::decode_structural_source(bytes).map_err(|error| {
+        let source = structural::decode_structural_source(&bytes).map_err(|error| {
             incomplete_file_storage(
                 &full_path,
                 None,
@@ -3699,9 +3699,30 @@ impl WorkspaceIndexer {
                 },
             )
         })?;
+        if bytes.len() as u64 > self.structural_source_byte_cap
+            || source.len() as u64 > self.structural_source_byte_cap
+        {
+            return Err(incomplete_file_storage(
+                &full_path,
+                None,
+                language,
+                codestory_contracts::graph::ErrorInfo {
+                    message: format!(
+                        "Structural source {:?} exceeds the {} byte raw or decoded source limit",
+                        path, self.structural_source_byte_cap
+                    ),
+                    file_id: None,
+                    line: None,
+                    column: None,
+                    is_fatal: false,
+                    index_step: codestory_contracts::graph::IndexStep::Indexing,
+                    coverage_reason: Some(FileCoverageReason::Oversized),
+                },
+            ));
+        }
         let artifact_cache_path = index_artifact_cache_path(root, &full_path);
         let artifact_cache_key = artifact_cache_path.as_ref().and_then(|cache_path| {
-            build_structural_artifact_cache_key(cache_path, source.as_bytes(), producer)
+            build_structural_artifact_cache_key(cache_path, &bytes, producer)
         });
         stats.structural_artifact_cache.record_lookup();
         let prepared_input = || PreparedStructuralInput {
@@ -3942,7 +3963,7 @@ impl WorkspaceIndexer {
             }
         };
         let content_hash = source_content_hash(&bytes);
-        let source = match structural::decode_structural_source(bytes) {
+        let source = match structural::decode_structural_source(&bytes) {
             Ok(source) => source,
             Err(_) if structural::is_structural_candidate_path(full_path) => return Ok(None),
             Err(error) => {
@@ -3962,6 +3983,27 @@ impl WorkspaceIndexer {
                 ));
             }
         };
+        if bytes.len() as u64 > self.structural_source_byte_cap
+            || source.len() as u64 > self.structural_source_byte_cap
+        {
+            return Err(incomplete_file_storage(
+                full_path,
+                None,
+                "openapi",
+                codestory_contracts::graph::ErrorInfo {
+                    message: format!(
+                        "OpenAPI source {:?} exceeds the {} byte raw or decoded source limit",
+                        full_path, self.structural_source_byte_cap
+                    ),
+                    file_id: None,
+                    line: None,
+                    column: None,
+                    is_fatal: false,
+                    index_step: codestory_contracts::graph::IndexStep::Collection,
+                    coverage_reason: Some(FileCoverageReason::Oversized),
+                },
+            ));
+        }
         let mut projected = index_openapi_schema_file(full_path, &source).map_err(|error| {
             incomplete_file_storage(
                 full_path,
