@@ -1872,6 +1872,221 @@ fn parser_partial_append_lf_reuses_the_equivalent_graph_projection() -> Result<(
     Ok(())
 }
 
+#[test]
+fn parser_partial_incremental_refresh_retains_current_extraction_identity() -> Result<()> {
+    for (name, language, source) in [
+        (
+            "partial.rs",
+            "rust",
+            "pub fn retained_partial_anchor() -> i32 { 1 }\npub fn broken( {\n",
+        ),
+        (
+            "partial.py",
+            "python",
+            "def retained_python_anchor():\n    return 1\n\ndef broken(\n",
+        ),
+    ] {
+        let dir = tempdir()?;
+        let path = dir.path().join(name);
+        std::fs::write(&path, source)?;
+        let refresh = codestory_workspace::RefreshInfo {
+            mode: codestory_workspace::BuildMode::Incremental,
+            files_to_index: vec![path.clone()],
+            files_to_remove: Vec::new(),
+            existing_file_ids: HashMap::new(),
+        };
+        let mut storage = Storage::new_in_memory()?;
+        let indexer = WorkspaceIndexer::new(dir.path().to_path_buf());
+        let revision = current_file_extraction_revision(language).expect("revision");
+        indexer.run_incremental(&mut storage, &refresh, &EventBus::new(), None)?;
+        let file = storage.get_file_by_path(&path)?.expect("partial file");
+        assert!(file.indexed && !file.complete, "{name}: {file:?}");
+        assert!(storage.get_errors(None)?.is_empty());
+        assert!(
+            storage
+                .files_with_extraction_revision_mismatch(language, revision)?
+                .is_empty(),
+            "{name}: first partial extraction must record current producer"
+        );
+        assert!(
+            !storage.file_extraction_identity_matches(file.id, language, revision)?,
+            "partial identity must not certify complete cache reuse"
+        );
+        // Existing partial projections take the incremental preservation branch.
+        // Neither a metadata-only refresh nor an equal-graph LF edit may erase the stamp.
+        for replacement in [source.to_string(), format!("{source}\n")] {
+            std::fs::write(&path, &replacement)?;
+            indexer.run_incremental(&mut storage, &refresh, &EventBus::new(), None)?;
+            assert!(!storage.get_file_by_path(&path)?.unwrap().complete);
+            assert_eq!(
+                storage.get_file_content_hash(file.id)?.as_deref(),
+                Some(source_content_hash(replacement.as_bytes()).as_str())
+            );
+            assert!(
+                storage
+                    .files_with_extraction_revision_mismatch(language, revision)?
+                    .is_empty(),
+                "{name}: incremental partial stamp lost"
+            );
+        }
+        for obsolete in [Some("obsolete-revision"), None] {
+            if let Some(obsolete) = obsolete {
+                storage.get_connection().execute("UPDATE file_extraction_identity SET extraction_revision = ?1 WHERE file_id = ?2", rusqlite::params![obsolete, file.id])?;
+            } else {
+                storage.get_connection().execute(
+                    "DELETE FROM file_extraction_identity WHERE file_id = ?1",
+                    [file.id],
+                )?;
+            }
+            assert_eq!(
+                storage.files_with_extraction_revision_mismatch(language, revision)?,
+                vec![file.id]
+            );
+            indexer.run_incremental(&mut storage, &refresh, &EventBus::new(), None)?;
+            assert!(
+                storage
+                    .files_with_extraction_revision_mismatch(language, revision)?
+                    .is_empty(),
+                "{name}: real refresh must converge after {obsolete:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn invalid_utf8_parser_extraction_keeps_raw_identity_and_incomplete_cache_limits() -> Result<()> {
+    for (name, language, source) in [
+        (
+            "comment.rs",
+            "rust",
+            b"// invalid: \x80\npub fn lossy_anchor() -> i32 { 1 }\n".as_slice(),
+        ),
+        (
+            "broken.rs",
+            "rust",
+            b"// invalid: \x80\npub fn lossy_anchor() -> i32 { 1 }\npub fn broken( {\n".as_slice(),
+        ),
+        (
+            "comment.py",
+            "python",
+            b"# invalid: \x80\ndef lossy_anchor():\n    return helper()\ndef helper():\n    return 1\n".as_slice(),
+        ),
+        (
+            "broken.py",
+            "python",
+            b"# invalid: \x80\ndef lossy_anchor():\n    return 1\n\ndef broken(\n".as_slice(),
+        ),
+    ] {
+        let dir = tempdir()?;
+        let path = dir.path().join(name);
+        std::fs::write(&path, source)?;
+        let refresh = codestory_workspace::RefreshInfo {
+            mode: codestory_workspace::BuildMode::Incremental,
+            files_to_index: vec![path.clone()],
+            files_to_remove: Vec::new(),
+            existing_file_ids: HashMap::new(),
+        };
+        let mut storage = Storage::new_in_memory()?;
+        let indexer = WorkspaceIndexer::new(dir.path().to_path_buf());
+        let revision = current_file_extraction_revision(language).expect("revision");
+        indexer.run_incremental(&mut storage, &refresh, &EventBus::new(), None)?;
+        let file = storage.get_file_by_path(&path)?.unwrap();
+        assert!(
+            file.indexed && !file.complete,
+            "lossy replacement text must not certify complete source: {name}: {file:?}"
+        );
+        assert_eq!(
+            storage.get_file_content_hash(file.id)?,
+            Some(source_content_hash(source))
+        );
+        assert!(
+            storage
+                .files_with_extraction_revision_mismatch(language, revision)?
+                .is_empty(),
+            "{name}: actual raw extraction must record its producer"
+        );
+        assert!(!storage.file_extraction_identity_matches(file.id, language, revision)?);
+        assert!(storage.get_errors(None)?.is_empty());
+        let entry = storage
+            .get_index_artifact_cache_entries()?
+            .pop()
+            .expect("real cold cache artifact");
+        let mut artifact = decode_index_artifact(&entry.artifact_blob)?;
+        assert!(artifact.files.iter().all(|file| !file.complete));
+        assert!(artifact.call_resolution_inputs.is_empty());
+        if name == "comment.py" {
+            let (_, calls, _) = index_file_with_resolution_inputs(
+                &path, &String::from_utf8_lossy(source), &source_content_hash(source),
+                &get_language_for_ext("py").expect("Python"), None, None,
+            )?;
+            assert!(!calls.is_empty(), "the actual extractor must produce a call before lossy proof inputs are cleared");
+        }
+        let metadata = artifact
+            .resolution_file
+            .as_ref()
+            .expect("installed language metadata");
+        assert!(!metadata.complete && !metadata.lookup_input_complete);
+        assert_eq!(metadata.source_sha256, source_content_hash(source));
+        if name.starts_with("comment") {
+            // The prior producer marked a syntactically valid lossy view complete,
+            // while already disabling its lookup proof. Its raw-key cache remains readable.
+            for file in &mut artifact.files {
+                file.complete = true;
+            }
+            artifact.resolution_file.as_mut().unwrap().complete = true;
+            storage.get_connection().execute(
+                "UPDATE index_artifact_cache SET artifact_blob = ?1",
+                [encode_index_artifact(&artifact)?],
+            )?;
+        }
+        let warm = indexer.run_incremental(&mut storage, &refresh, &EventBus::new(), None)?;
+        assert_eq!(
+            warm.parser_artifact_cache.hits, 1,
+            "{name}: exercise verified artifact replay"
+        );
+        assert!(
+            !storage.get_file_by_path(&path)?.unwrap().complete,
+            "{name}: warm legacy cache must not restore complete eligibility"
+        );
+        assert!(
+            storage
+                .files_with_extraction_revision_mismatch(language, revision)?
+                .is_empty()
+        );
+        assert!(!storage.file_extraction_identity_matches(file.id, language, revision)?);
+        let replacement = source
+            .iter()
+            .map(|byte| if *byte == 0x80 { 0x81 } else { *byte })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            String::from_utf8_lossy(source),
+            String::from_utf8_lossy(&replacement)
+        );
+        assert_ne!(
+            source_content_hash(source),
+            source_content_hash(&replacement)
+        );
+        std::fs::write(&path, &replacement)?;
+        let changed = indexer.run_incremental(&mut storage, &refresh, &EventBus::new(), None)?;
+        assert_eq!(
+            changed.parser_artifact_cache.misses, 1,
+            "{name}: equal lossy text must not reuse raw identity"
+        );
+        assert_eq!(
+            storage.get_file_content_hash(file.id)?,
+            Some(source_content_hash(&replacement))
+        );
+        assert!(
+            storage
+                .files_with_extraction_revision_mismatch(language, revision)?
+                .is_empty()
+        );
+        assert!(!storage.get_file_by_path(&path)?.unwrap().complete);
+    }
+    Ok(())
+}
+
 /// `LineOffsets` replaced `source.lines().nth()` in the visibility classifier,
 /// so any disagreement with `str::lines()` silently changes the projected
 /// access of a member — no panic, no error row, just a different graph. This
@@ -1996,6 +2211,7 @@ fn parser_result_changed_with_restored_mtime_is_incomplete_and_not_cached() -> R
 
     assert!(result.cache_write.is_none());
     assert!(result.local_storage.file_content_hashes.is_empty());
+    assert!(result.local_storage.file_extraction_identities.is_empty());
     assert_eq!(result.local_storage.files.len(), 1);
     assert!(!result.local_storage.files[0].complete);
     assert!(result.local_storage.errors.iter().any(|error| {
@@ -2629,6 +2845,55 @@ fn corrupt_or_incompatible_structural_cache_recollects_and_changed_bytes_replace
             .get_nodes()?
             .iter()
             .all(|node| node.serialized_name != "build")
+    );
+    Ok(())
+}
+
+#[test]
+fn encoded_structural_source_drift_rejects_equal_text_with_changed_raw_encoding() -> Result<()> {
+    let dir = tempdir()?;
+    let path = dir.path().join("commands.ps1");
+    let source = "function Invoke-Thing { Write-Output 'é🦀' }\r\n";
+    let encode = |little: bool| {
+        let mut bytes = if little {
+            vec![0xff, 0xfe]
+        } else {
+            vec![0xfe, 0xff]
+        };
+        for unit in source.encode_utf16() {
+            bytes.extend(if little {
+                unit.to_le_bytes()
+            } else {
+                unit.to_be_bytes()
+            });
+        }
+        bytes
+    };
+    let original = encode(true);
+    std::fs::write(&path, &original)?;
+    let modified = std::fs::metadata(&path)?.modified()?;
+    let prepared = PreparedStructuralInput {
+        full_path: path.clone(),
+        role_classification_path: PathBuf::from("commands.ps1"),
+        artifact_cache_path: Some(PathBuf::from("commands.ps1")),
+        artifact_cache_key: Some("test-original".into()),
+        source: source.into(),
+        content_hash: source_content_hash(&original),
+    };
+    std::fs::write(&path, encode(false))?;
+    std::fs::File::options()
+        .write(true)
+        .open(&path)?
+        .set_times(std::fs::FileTimes::new().set_modified(modified))?;
+    let result = WorkspaceIndexer::new(dir.path().to_path_buf())
+        .execute_prepared_structural_index(&prepared);
+    assert!(result.local_storage.structural_text_units.is_empty());
+    assert!(result.local_storage.structural_text_projections.is_empty());
+    assert!(result.local_storage.structural_text_cache_writes.is_empty());
+    assert!(!result.local_storage.files[0].complete);
+    assert_eq!(
+        result.local_storage.errors[0].coverage_reason,
+        Some(FileCoverageReason::SourceChanged)
     );
     Ok(())
 }
@@ -6599,6 +6864,46 @@ function render() {
         }),
         "expected JSX prop usage recovery to link render() to label"
     );
+    Ok(())
+}
+
+#[test]
+fn encoded_openapi_source_keeps_endpoint_coordinates_and_original_hash() -> Result<()> {
+    let dir = tempdir()?;
+    let path = dir.path().join("openapi.json");
+    let text = r#"{
+  "openapi": "3.1.0", "paths": {"/café": {"get": {"operationId": "readItem"}}}
+}"#;
+    let indexer = WorkspaceIndexer::new(dir.path().to_path_buf());
+    for little in [true, false] {
+        let mut bytes = if little {
+            vec![0xff, 0xfe]
+        } else {
+            vec![0xfe, 0xff]
+        };
+        for unit in text.encode_utf16() {
+            bytes.extend(if little {
+                unit.to_le_bytes()
+            } else {
+                unit.to_be_bytes()
+            });
+        }
+        std::fs::write(&path, &bytes)?;
+        let result = indexer
+            .prepare_openapi_schema_work(&path)
+            .map_err(|_| anyhow!("encoded OpenAPI refused"))?
+            .unwrap();
+        assert_eq!(
+            result.file_content_hashes[0].content_hash,
+            source_content_hash(&bytes)
+        );
+        assert!(
+            result
+                .nodes
+                .iter()
+                .any(|node| node.kind == NodeKind::FUNCTION && node.serialized_name == "GET /café")
+        );
+    }
     Ok(())
 }
 

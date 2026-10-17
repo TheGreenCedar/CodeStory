@@ -68,11 +68,12 @@ struct IndexingCompletion {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-type MidIndexingTestHook = Option<std::sync::Arc<dyn Fn(&Path) + Send + Sync>>;
+type MidIndexingTestHook = std::sync::Arc<dyn Fn(&Path) + Send + Sync>;
 
 #[cfg(any(test, feature = "test-support"))]
-static MID_INDEXING_TEST_HOOK: std::sync::RwLock<MidIndexingTestHook> =
-    std::sync::RwLock::new(None);
+static MID_INDEXING_TEST_HOOKS: std::sync::LazyLock<
+    std::sync::RwLock<std::collections::HashMap<PathBuf, MidIndexingTestHook>>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
 
 /// Run `hook` while an indexing worker owns the writer lock with
 /// `is_indexing` set, so a test can hold a refresh genuinely in flight while
@@ -80,18 +81,31 @@ static MID_INDEXING_TEST_HOOK: std::sync::RwLock<MidIndexingTestHook> =
 /// shared test binary only parks the run it armed for.
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
-pub fn set_mid_indexing_test_hook(hook: MidIndexingTestHook) {
-    *MID_INDEXING_TEST_HOOK
+pub fn set_mid_indexing_test_hook(
+    storage_path: &Path,
+    hook: Option<MidIndexingTestHook>,
+) -> Result<(), &'static str> {
+    let mut hooks = MID_INDEXING_TEST_HOOKS
         .write()
-        .expect("mid-indexing test hook lock") = hook;
+        .expect("mid-indexing test hook lock");
+    if let Some(hook) = hook {
+        if hooks.contains_key(storage_path) {
+            return Err("mid-indexing test hook already registered for storage path");
+        }
+        hooks.insert(storage_path.to_path_buf(), hook);
+    } else {
+        hooks.remove(storage_path);
+    }
+    Ok(())
 }
 
 #[cfg(any(test, feature = "test-support"))]
 fn run_mid_indexing_test_hook(storage_path: &Path) {
-    let hook = MID_INDEXING_TEST_HOOK
+    let hook = MID_INDEXING_TEST_HOOKS
         .read()
         .expect("mid-indexing test hook lock")
-        .clone();
+        .get(storage_path)
+        .cloned();
     if let Some(hook) = hook {
         hook(storage_path);
     }
@@ -99,6 +113,85 @@ fn run_mid_indexing_test_hook(storage_path: &Path) {
 
 #[cfg(not(any(test, feature = "test-support")))]
 fn run_mid_indexing_test_hook(_storage_path: &Path) {}
+
+#[cfg(test)]
+mod mid_indexing_hook_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn mid_indexing_hook_cleanup_preserves_other_storage_paths() {
+        let fixture = tempfile::tempdir().expect("owned hook paths");
+        let path_a = fixture.path().join("a.db");
+        let path_b = fixture.path().join("b.db");
+        let entered_a = Arc::new(AtomicUsize::new(0));
+        let observed_a = Arc::clone(&entered_a);
+        let expected_a = path_a.clone();
+        set_mid_indexing_test_hook(
+            &path_a,
+            Some(Arc::new(move |path| {
+                if path == expected_a.as_path() {
+                    observed_a.fetch_add(1, Ordering::SeqCst);
+                }
+            })),
+        )
+        .expect("register A");
+
+        let entered_b = Arc::new(AtomicUsize::new(0));
+        let observed_b = Arc::clone(&entered_b);
+        let expected_b = path_b.clone();
+        set_mid_indexing_test_hook(
+            &path_b,
+            Some(Arc::new(move |path| {
+                if path == expected_b.as_path() {
+                    observed_b.fetch_add(1, Ordering::SeqCst);
+                }
+            })),
+        )
+        .expect("register B");
+        set_mid_indexing_test_hook(&path_b, None).expect("remove B");
+
+        run_mid_indexing_test_hook(&path_a);
+        run_mid_indexing_test_hook(&path_b);
+        set_mid_indexing_test_hook(&path_a, None).expect("remove A");
+        assert_eq!(
+            entered_a.load(Ordering::SeqCst),
+            1,
+            "arming and dropping B must not remove A before its entry"
+        );
+        assert_eq!(entered_b.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn duplicate_mid_indexing_hook_keeps_the_owner_and_registry_usable() {
+        let fixture = tempfile::tempdir().expect("owned hook path");
+        let path = fixture.path().join("core.db");
+        let entries = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&entries);
+        set_mid_indexing_test_hook(
+            &path,
+            Some(Arc::new(move |_| {
+                observed.fetch_add(1, Ordering::SeqCst);
+            })),
+        )
+        .expect("register owner");
+
+        let duplicate = set_mid_indexing_test_hook(&path, Some(Arc::new(|_| {})));
+        run_mid_indexing_test_hook(&path);
+        set_mid_indexing_test_hook(&path, None).expect("remove owner after rejected registration");
+
+        assert!(
+            duplicate.is_err(),
+            "duplicate registration must be rejected"
+        );
+        assert_eq!(
+            entries.load(Ordering::SeqCst),
+            1,
+            "original owner must remain"
+        );
+    }
+}
 
 /// Extension for the spawned-process writer-hold marker: while
 /// `<storage>.index-writer-hold` exists, a run that already owns the writer

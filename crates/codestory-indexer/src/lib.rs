@@ -1560,7 +1560,8 @@ impl<'a> ProjectionWriter<'a> {
                 local_storage
                     .nodes
                     .retain(|node| node.id != NodeId(file_id));
-                local_storage.file_extraction_identities.clear();
+                // Verified parser-partial extraction still records its source
+                // and producer; it does not certify the inherited graph complete.
                 self.stats.graph_projection_changed = true;
             } else {
                 let cleanup_started = Instant::now();
@@ -3467,6 +3468,9 @@ impl WorkspaceIndexer {
                         language_config.language_name,
                         flags,
                     );
+                    if !source_utf8_exact {
+                        mark_non_utf8_parser_artifact_incomplete(&mut artifact, &content_hash);
+                    }
                     verify_cached_artifact_source(
                         &mut artifact,
                         &full_path,
@@ -3545,9 +3549,7 @@ impl WorkspaceIndexer {
                                 content_hash,
                             });
                     }
-                    if source_utf8_exact {
-                        add_current_file_extraction_identities(&mut local_storage);
-                    }
+                    add_current_file_extraction_identities(&mut local_storage);
                     Ok(PreparedIndexWork::Immediate(local_storage))
                 }
                 Ok(_) | Err(_) => {
@@ -3683,7 +3685,7 @@ impl WorkspaceIndexer {
             )
         })?;
         let content_hash = source_content_hash(&bytes);
-        let source = structural::decode_structural_source(bytes).map_err(|error| {
+        let source = structural::decode_structural_source(&bytes).map_err(|error| {
             incomplete_file_storage(
                 &full_path,
                 None,
@@ -3699,9 +3701,30 @@ impl WorkspaceIndexer {
                 },
             )
         })?;
+        if bytes.len() as u64 > self.structural_source_byte_cap
+            || source.len() as u64 > self.structural_source_byte_cap
+        {
+            return Err(incomplete_file_storage(
+                &full_path,
+                None,
+                language,
+                codestory_contracts::graph::ErrorInfo {
+                    message: format!(
+                        "Structural source {:?} exceeds the {} byte raw or decoded source limit",
+                        path, self.structural_source_byte_cap
+                    ),
+                    file_id: None,
+                    line: None,
+                    column: None,
+                    is_fatal: false,
+                    index_step: codestory_contracts::graph::IndexStep::Indexing,
+                    coverage_reason: Some(FileCoverageReason::Oversized),
+                },
+            ));
+        }
         let artifact_cache_path = index_artifact_cache_path(root, &full_path);
         let artifact_cache_key = artifact_cache_path.as_ref().and_then(|cache_path| {
-            build_structural_artifact_cache_key(cache_path, source.as_bytes(), producer)
+            build_structural_artifact_cache_key(cache_path, &bytes, producer)
         });
         stats.structural_artifact_cache.record_lookup();
         let prepared_input = || PreparedStructuralInput {
@@ -3942,7 +3965,7 @@ impl WorkspaceIndexer {
             }
         };
         let content_hash = source_content_hash(&bytes);
-        let source = match structural::decode_structural_source(bytes) {
+        let source = match structural::decode_structural_source(&bytes) {
             Ok(source) => source,
             Err(_) if structural::is_structural_candidate_path(full_path) => return Ok(None),
             Err(error) => {
@@ -3962,6 +3985,27 @@ impl WorkspaceIndexer {
                 ));
             }
         };
+        if bytes.len() as u64 > self.structural_source_byte_cap
+            || source.len() as u64 > self.structural_source_byte_cap
+        {
+            return Err(incomplete_file_storage(
+                full_path,
+                None,
+                "openapi",
+                codestory_contracts::graph::ErrorInfo {
+                    message: format!(
+                        "OpenAPI source {:?} exceeds the {} byte raw or decoded source limit",
+                        full_path, self.structural_source_byte_cap
+                    ),
+                    file_id: None,
+                    line: None,
+                    column: None,
+                    is_fatal: false,
+                    index_step: codestory_contracts::graph::IndexStep::Collection,
+                    coverage_reason: Some(FileCoverageReason::Oversized),
+                },
+            ));
+        }
         let mut projected = index_openapi_schema_file(full_path, &source).map_err(|error| {
             incomplete_file_storage(
                 full_path,
@@ -4024,22 +4068,21 @@ impl WorkspaceIndexer {
             };
 
         match index_result {
-            Ok((mut index_result, mut call_resolution_inputs, mut resolution_file)) => {
+            Ok((mut index_result, call_resolution_inputs, resolution_file)) => {
                 if let Some(file_info) = index_result.files.first_mut() {
                     file_info.modification_time = modification_time;
                 }
-                if !prepared_input.source_utf8_exact {
-                    call_resolution_inputs.clear();
-                    if let Some(file) = resolution_file.as_mut() {
-                        file.source_sha256 = prepared_input.content_hash.clone();
-                        file.lookup_input_complete = false;
-                    }
-                }
-                let artifact = CachedIndexArtifact::from_index_result_with_resolution_inputs(
+                let mut artifact = CachedIndexArtifact::from_index_result_with_resolution_inputs(
                     index_result,
                     call_resolution_inputs,
                     resolution_file,
                 );
+                if !prepared_input.source_utf8_exact {
+                    mark_non_utf8_parser_artifact_incomplete(
+                        &mut artifact,
+                        &prepared_input.content_hash,
+                    );
+                }
                 let cache_write = prepared_input
                     .artifact_cache_path
                     .as_ref()
@@ -4062,9 +4105,7 @@ impl WorkspaceIndexer {
                             content_hash: prepared_input.content_hash.clone(),
                         });
                 }
-                if prepared_input.source_utf8_exact {
-                    add_current_file_extraction_identities(&mut local_storage);
-                }
+                add_current_file_extraction_identities(&mut local_storage);
                 PreparedIndexJobResult {
                     local_storage,
                     cache_write,
@@ -4346,9 +4387,28 @@ pub fn current_file_extraction_revision(language: &str) -> Option<&'static str> 
     }
 }
 
+// Lossy parser views can provide partial navigation, never exact source or complete reuse.
+fn mark_non_utf8_parser_artifact_incomplete(artifact: &mut CachedIndexArtifact, raw_hash: &str) {
+    for file in &mut artifact.files {
+        file.complete = false;
+    }
+    artifact.call_resolution_inputs.clear();
+    if let Some(file) = artifact.resolution_file.as_mut() {
+        file.complete = false;
+        file.source_sha256 = raw_hash.to_string();
+        file.lookup_input_complete = false;
+    }
+}
+
 fn add_current_file_extraction_identities(storage: &mut IntermediateStorage) {
     for file in &storage.files {
-        if !file.indexed || !file.complete {
+        if !file.indexed
+            || !file.complete
+                && storage
+                    .errors
+                    .iter()
+                    .any(|error| error.file_id == Some(NodeId(file.id)))
+        {
             continue;
         }
         let Some(revision) = current_file_extraction_revision(&file.language) else {

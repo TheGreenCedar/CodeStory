@@ -4852,6 +4852,204 @@ fn a_partially_parsed_file_is_reported_incomplete_not_indexed() {
     );
 }
 
+#[test]
+fn stable_parser_partial_extraction_is_fresh_without_claiming_complete_coverage() {
+    let _env = hybrid_test_env();
+    let workspace = tempdir().expect("workspace");
+    for (name, source) in [
+        (
+            "partial.rs",
+            "pub fn retained_partial_anchor() -> i32 { 1 }\npub fn broken( {\n",
+        ),
+        (
+            "partial.py",
+            "def retained_python_anchor():\n    return 1\n\ndef broken(\n",
+        ),
+    ] {
+        fs::write(workspace.path().join(name), source).expect("partial source");
+    }
+    let storage_path = workspace.path().join(".cache/codestory.db");
+    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open project");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("publish verified partial source");
+    let storage = Storage::open(&storage_path).expect("storage");
+    for name in ["partial.rs", "partial.py"] {
+        let file = storage
+            .get_file_by_path(&workspace.path().join(name))
+            .expect("file")
+            .expect("indexed partial file");
+        assert!(
+            file.indexed && !file.complete,
+            "fixture must remain parser-partial: {file:?}"
+        );
+    }
+    assert!(storage.get_errors(None).expect("errors").is_empty());
+    let manifest = WorkspaceManifest::open_with_storage_owned_exclusions(
+        workspace.path().to_path_buf(),
+        &storage_path,
+    )
+    .expect("workspace manifest");
+    let freshness = index_freshness_from_storage(workspace.path(), &manifest, &storage);
+    assert_eq!(
+        freshness.status,
+        IndexFreshnessStatusDto::Fresh,
+        "byte-identical published parser-partial source must converge: {freshness:?}"
+    );
+    assert_eq!(freshness.changed_file_count, 0);
+    let observations = crate::agent::packet_compiler::observe_admitted_source_coverage(
+        &controller,
+        &storage,
+        &["partial.rs".into(), "partial.py".into()],
+    );
+    assert_eq!(observations.len(), 2);
+    assert!(observations.iter().all(|row| row.status
+        == codestory_contracts::api::SourceCoverageStatusDto::Incomplete
+        && row.reason == Some(codestory_contracts::graph::FileCoverageReason::ParserPartial)));
+    assert!(
+        crate::agent::packet_coverage::PacketCoverageInput::from_observations(&observations)
+            .blocks_packet_availability()
+    );
+    for query in ["retained_partial_anchor", "retained_python_anchor"] {
+        let results = controller
+            .search_results(SearchRequest {
+                query: query.into(),
+                repo_text: SearchRepoTextMode::Off,
+                limit_per_source: 3,
+                expand_search_plan: false,
+                hybrid_weights: None,
+                hybrid_limits: None,
+            })
+            .expect("fresh partial source admits core-only search");
+        assert!(
+            results.hits.iter().any(|hit| hit.display_name == query),
+            "{query}: {:?}",
+            results.hits
+        );
+    }
+}
+
+#[test]
+fn invalid_utf8_parser_extraction_is_fresh_without_exact_source_hydration() {
+    let _env = hybrid_test_env();
+    let workspace = tempdir().expect("workspace");
+    let inputs: [(&str, &[u8]); 4] = [
+        (
+            "comment.rs",
+            b"// invalid: \x80\npub fn lossy_anchor() -> i32 { 1 }\n",
+        ),
+        ("broken.rs", b"// invalid: \x80\npub fn broken( {\n"),
+        (
+            "comment.py",
+            b"# invalid: \x80\ndef lossy_anchor():\n    return 1\n",
+        ),
+        ("broken.py", b"# invalid: \x80\ndef broken(\n"),
+    ];
+    for (name, source) in inputs {
+        fs::write(workspace.path().join(name), source).expect("source");
+    }
+    fs::write(
+        workspace.path().join("healthy.rs"),
+        "pub fn healthy_utf8_anchor() {}\n",
+    )
+    .expect("healthy source");
+    let storage_path = workspace.path().join(".cache/codestory.db");
+    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open project");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("publish verified partial sources");
+    for iteration in 0..2 {
+        let storage = Storage::open(&storage_path).expect("storage");
+        let manifest = WorkspaceManifest::open_with_storage_owned_exclusions(
+            workspace.path().to_path_buf(),
+            &storage_path,
+        )
+        .expect("manifest");
+        let freshness = index_freshness_from_storage(workspace.path(), &manifest, &storage);
+        assert_eq!(
+            freshness.status,
+            IndexFreshnessStatusDto::Fresh,
+            "{iteration}: {freshness:?}"
+        );
+        for (name, _) in inputs {
+            let file = storage
+                .get_file_by_path(&workspace.path().join(name))
+                .expect("file")
+                .expect("partial");
+            assert!(file.indexed && !file.complete, "{name}: {file:?}");
+            let revision =
+                codestory_indexer::current_file_extraction_revision(&file.language).unwrap();
+            assert!(
+                storage
+                    .files_with_extraction_revision_mismatch(&file.language, revision)
+                    .expect("revision")
+                    .is_empty()
+            );
+            assert!(
+                !storage
+                    .file_extraction_identity_matches(file.id, &file.language, revision)
+                    .expect("complete reuse")
+            );
+            assert!(
+                crate::search_evidence::verified_file_checked(
+                    &storage,
+                    Some(workspace.path()),
+                    &file
+                )
+                .is_err(),
+                "{name}: lossy graph is not exact hydrated source"
+            );
+        }
+        let result = controller
+            .search_results(SearchRequest {
+                query: "healthy_utf8_anchor".into(),
+                repo_text: SearchRepoTextMode::Off,
+                limit_per_source: 3,
+                expand_search_plan: false,
+                hybrid_weights: None,
+                hybrid_limits: None,
+            })
+            .expect("unrelated healthy search must not loop refreshing lossy source");
+        assert!(
+            result.hits.iter().any(
+                |hit| hit.display_name == "healthy_utf8_anchor" && hit.source_excerpt.is_some()
+            )
+        );
+        if iteration == 0 {
+            let (name, source) = inputs[0];
+            let replacement = source
+                .iter()
+                .map(|byte| if *byte == 0x80 { 0x81 } else { *byte })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                String::from_utf8_lossy(source),
+                String::from_utf8_lossy(&replacement)
+            );
+            fs::write(workspace.path().join(name), replacement).expect("raw source drift");
+            assert_eq!(
+                index_freshness_from_storage(workspace.path(), &manifest, &storage).status,
+                IndexFreshnessStatusDto::Stale
+            );
+            drop(storage);
+            controller
+                .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+                .expect("refresh different raw identity");
+        }
+    }
+}
+
 /// CAP-1b: the production path from a citation's path to an exclusion row.
 ///
 /// The unit tests for the cap set `source_coverage` directly, so they never
@@ -8731,6 +8929,95 @@ fn full_and_incremental_publications_advance_one_durable_generation() {
     assert_ne!(third.generation_id, second.generation_id);
     assert_ne!(third.run_id, second.run_id);
     assert!(third.published_at_epoch_ms >= second.published_at_epoch_ms);
+}
+
+#[test]
+fn encoded_structural_generations_bind_raw_bytes_reuse_cache_and_preserve_publication() {
+    use sha2::{Digest, Sha256};
+    let process_cache = tempfile::tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let path = workspace.path().join("commands.ps1");
+    let text = "# café 🦀\r\nfunction Invoke-Thing {\r\n  Write-Output 'é🦀'\r\n}\r\n";
+    let encode = |little: bool| {
+        let mut bytes = if little {
+            vec![0xff, 0xfe]
+        } else {
+            vec![0xfe, 0xff]
+        };
+        for unit in text.encode_utf16() {
+            bytes.extend(if little {
+                unit.to_le_bytes()
+            } else {
+                unit.to_be_bytes()
+            });
+        }
+        bytes
+    };
+    let storage_path = workspace.path().join(".cache/codestory.db");
+    fs::write(&path, encode(true)).unwrap();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .unwrap();
+    let first = controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .unwrap();
+    assert_eq!(first.structural_artifact_cache.unwrap().misses, 1);
+    let stable = controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .unwrap();
+    assert_eq!(stable.structural_artifact_cache.unwrap().hits, 1);
+    let previous = structural_live_identity(&storage_path);
+    let store = Store::open_read_only(&storage_path).unwrap();
+    let mut files = store.get_files().unwrap();
+    assert_eq!(files.len(), 1);
+    let file = files.pop().unwrap();
+    assert_eq!(file.path.file_name().unwrap(), "commands.ps1");
+    let source =
+        crate::search_evidence::verified_file_checked(&store, Some(workspace.path()), &file)
+            .unwrap();
+    assert_eq!(source.content, text);
+    assert_eq!(
+        source.content_sha256,
+        format!("{:x}", Sha256::digest(encode(true)))
+    );
+    let (_, windows) = controller
+        .path_source_windows("commands.ps1", &[(2, 3)], 1024)
+        .unwrap();
+    let window = windows[0].render("commands.ps1".into(), 2, 3, 1024);
+    assert!(window.snippet.contains("Invoke-Thing"));
+    assert!(window.snippet.contains("é🦀"));
+    fs::write(&path, encode(false)).unwrap();
+    assert!(matches!(
+        crate::search_evidence::verified_file_checked(&store, Some(workspace.path()), &file),
+        Err(crate::search_evidence::VerifiedFileError::Stale)
+    ));
+    drop(store);
+    let changed = controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .unwrap();
+    assert_eq!(changed.structural_artifact_cache.unwrap().misses, 1);
+    assert_ne!(
+        structural_live_identity(&storage_path).cache_rows,
+        previous.cache_rows
+    );
+    let retained = structural_live_identity(&storage_path);
+    for invalid in [
+        vec![0xff, 0xfe, 0x41],
+        vec![0xfe, 0xff, 0xd8, 0x00],
+        vec![0xff, 0xfe, 0, 0],
+    ] {
+        fs::write(&path, invalid).unwrap();
+        let error = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .unwrap_err();
+        assert_eq!(error.code, "source_binary");
+        assert_eq!(structural_live_identity(&storage_path), retained);
+        assert_no_staged_publication_artifacts(&storage_path);
+    }
 }
 
 #[test]

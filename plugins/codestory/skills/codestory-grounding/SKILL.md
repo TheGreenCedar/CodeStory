@@ -1,6 +1,6 @@
 ---
 name: codestory-grounding
-description: Use when discovering repository structure, tracing relationships, analyzing change impact, or validating CodeStory retrieval or an installed plugin through the CodeStory plugin MCP. Skip only for bounded inspection or editing of named files that does not require those operations.
+description: Use when discovering repository structure, tracing relationships, analyzing change impact, or validating CodeStory retrieval or an installed plugin through the CodeStory plugin MCP. Skip only for bounded inspection or editing of named files that does not require those operations. If tool discovery is needed in code mode, inspect a known operation's complete declaration by exact name or print names only before selecting complete declarations. Use this skill's lossless result-display example, retaining distinct content and metadata.
 ---
 
 # CodeStory Grounding
@@ -49,28 +49,49 @@ Some hosts expose both `content` and `structuredContent` (or
 same JSON payload into the model context twice.
 
 Use one complete representation while retaining every other returned field.
-This example removes only plain text blocks that exactly match the serialized structured
-payload. Different spacing, key ordering or numeric spelling leaves the text
-in place; parsing it first could discard precision that only the text retains. Distinct text, annotations, images,
-resources, error flags and metadata stay intact. Keep the original result for
-programmatic use.
+This example removes plain text that exactly matches the structured payload.
+If the complete spellings differ only by safe integral `.0` number tokens,
+it keeps the original text and drops the structured mirror instead. Strings,
+key order, spacing, distinct numbers, annotations and other fields stay intact.
+Syntax validation discards its parsed value; only the complete lexical match
+permits removal. Uncertain matches keep both, and the original result remains
+available for programmatic use.
 
 After a CodeStory call returns `result`, the following works in a code-mode
 cell with a `text` output helper:
 
 ```javascript
 function withoutDuplicateJsonText(result) {
-  const payload = result?.structuredContent ?? result?.structured_content;
+  const key = result?.structuredContent != null ? 'structuredContent' : 'structured_content';
+  const payload = result?.[key];
   if (payload === undefined || !Array.isArray(result?.content)) return result;
-  const serialized = JSON.stringify(payload);
-  const content = result.content.filter(part => {
-    if (part?.type !== 'text' || Object.keys(part).some(key => !['type', 'text'].includes(key))) return true;
-    return part.text !== serialized;
+  let lossyNumber = false;
+  const serialized = JSON.stringify(payload, (_, value) => {
+    if (typeof value === 'number' && (!Number.isFinite(value) || Object.is(value, -0))) lossyNumber = true;
+    return value;
   });
-  if (content.length === result.content.length) return result;
+  if (lossyNumber || typeof serialized !== 'string') return result;
+  const plain = part => part?.type === 'text' && typeof part.text === 'string'
+    && Object.keys(part).every(key => ['type', 'text'].includes(key));
+  const content = result.content.filter(part => !plain(part) || part.text !== serialized);
   const displayed = { ...result };
-  if (content.length) displayed.content = content;
-  else delete displayed.content;
+  if (content.length !== result.content.length) {
+    if (content.length) displayed.content = content;
+    else delete displayed.content;
+    return displayed;
+  }
+  if ('structuredContent' in result && 'structured_content' in result) return result;
+  const integralSpelling = text => {
+    try { JSON.parse(text); } catch { return null; }
+    return text.replace(
+      /"(?:\\[\s\S]|[^"\\])*"|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/g,
+      token => /^-?(?:0|[1-9]\d*)\.0$/.test(token)
+        && Number.isSafeInteger(Number(token)) && !Object.is(Number(token), -0)
+        ? token.slice(0, -2) : token
+    );
+  };
+  if (!result.content.some(part => plain(part) && integralSpelling(part.text) === serialized)) return result;
+  delete displayed[key];
   return displayed;
 }
 text(withoutDuplicateJsonText(result));

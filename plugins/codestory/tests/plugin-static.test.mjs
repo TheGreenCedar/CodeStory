@@ -2040,6 +2040,98 @@ test("agent-facing guidance keeps embedding lifecycle internal", async () => {
   }
 });
 
+test("grounding display helper preserves hostile JSON and removes safe spelling mirrors", async () => {
+  const skill = await readFile(join(pluginRoot, "skills", "codestory-grounding", "SKILL.md"), "utf8");
+  const example = [...skill.matchAll(/```javascript\n([\s\S]*?)```/gu)]
+    .find(([, code]) => code.includes("structuredContent"));
+  assert.ok(example, "execute the shipped result-display example");
+  const run = new Function("result", "text", example[1]);
+  const display = (result) => {
+    let shown;
+    run(result, (value) => { shown = value; });
+    return shown;
+  };
+  const witness = {
+    structuredContent: { layout: { height: 165 } },
+    content: [{ type: "text", text: '{"layout":{"height":165.0}}' }],
+    isError: false,
+    _meta: { publication: "pinned" },
+  };
+  const shown = display(witness);
+  assert.equal(shown.structuredContent, undefined, "safe .0 mirror keeps its original text");
+  assert.equal(shown.content, witness.content);
+  assert.equal(shown._meta, witness._meta);
+  assert.equal(shown.isError, false);
+  assert.equal(witness.structuredContent.layout.height, 165, "do not mutate the original result");
+
+  for (const [payload, text, removeStructured] of [
+    [{ n: -165 }, '{"n":-165.0}', true],
+    [{ n: 0 }, '{"n":0.0}', true],
+    [{ n: Number.MAX_SAFE_INTEGER }, '{"n":9007199254740991.0}', true],
+    [{ n: -Number.MAX_SAFE_INTEGER }, '{"n":-9007199254740991.0}', true],
+    [{ n: 165, confidence: 0.95 }, '{"n":165.0,"confidence":0.95}', true],
+    [{ n: 9007199254740992 }, '{"n":9007199254740993}', false],
+    [{ n: 9007199254740992 }, '{"n":9007199254740992.0}', false],
+    [{ n: 0 }, '{"n":-0.0}', false],
+    [{ n: 1.5 }, '{"n":1.50}', false],
+    [{ n: 1.5 }, '{"n":1.0.5}', false],
+    [{ n: 15 }, '{"n":1.05}', false],
+    [{ n: 165 }, '{"n":1.65e2}', false],
+    [{ n: 165 }, '{"n":165.0e0}', false],
+    [{ n: 165 }, '{"n":165.00}', false],
+    [{ n: 165 }, '{"n":165,"n":165.0}', false],
+    [{ n: 165, a: 1 }, '{"a":1,"n":165.0}', false],
+    [{ n: 165 }, '{ "n":165.0}', false],
+    [{ n: 165 }, '{"n":165.0.0}', false],
+    [{ s: "165", n: 165 }, '{"s":"165.0","n":165.0}', false],
+    [{ s: 'quoted "165.0" \\ path', n: 165 }, JSON.stringify({ s: 'quoted "165.0" \\ path', n: 165 }).replace('"n":165', '"n":165.0'), true],
+    [{ "165.0": 165 }, '{"165.0":165.0}', true],
+  ]) {
+    const result = { structuredContent: payload, content: [{ type: "text", text }] };
+    const before = JSON.stringify(result);
+    const rendered = display(result);
+    if (removeStructured) {
+      assert.equal(rendered.structuredContent, undefined, text);
+      assert.equal(rendered.content, result.content, text);
+    } else {
+      assert.equal(rendered, result, text);
+    }
+    assert.equal(JSON.stringify(result), before, "original result stays unchanged");
+  }
+  for (const value of ['165.0', 'quoted "165.0"', "\\165.0\\", "line\n165.0", "\ud800165.0"]) {
+    const result = { structuredContent: { value, n: 165 },
+      content: [{ type: "text", text: JSON.stringify({ value, n: 165 }).replace('"n":165', '"n":165.0') }] };
+    const rendered = display(result);
+    assert.equal(rendered.structuredContent, undefined);
+    assert.equal(rendered.content, result.content, "string tokens retain exact original bytes");
+  }
+  for (const n of [-0, NaN, Infinity, -Infinity]) {
+    const result = { structuredContent: { n }, content: [{ type: "text", text: JSON.stringify({ n }) }] };
+    assert.equal(display(result), result, "lossy structured numbers retain both representations");
+  }
+  const exact = { structuredContent: { n: 165 }, content: [{ type: "text", text: '{"n":165}' }] };
+  assert.equal(display(exact).content, undefined, "retain existing exact-mirror behavior");
+  const textOnly = { content: witness.content, isError: true };
+  assert.equal(display(textOnly), textOnly);
+  const annotated = { ...witness, content: [{ ...witness.content[0], annotations: { audience: ["assistant"] } }] };
+  assert.equal(display(annotated), annotated);
+  const parts = [...witness.content, { type: "text", text: "distinct note" },
+    { type: "image", data: "image", mimeType: "image/png" },
+    { type: "resource", resource: { uri: "example://source", text: "source" } }];
+  const multipart = { ...witness, content: parts, extra: "keep", isError: true };
+  const multipartDisplay = display(multipart);
+  assert.equal(multipartDisplay.content, parts);
+  assert.equal(multipartDisplay.extra, "keep");
+  assert.equal(multipartDisplay.isError, true);
+  const snake = { structured_content: witness.structuredContent, content: witness.content };
+  assert.equal(display(snake).structured_content, undefined);
+  assert.equal(display(snake).content, witness.content);
+  for (const payload of [{ distinct: true }, witness.structuredContent]) {
+    const aliases = { ...witness, structured_content: payload };
+    assert.equal(display(aliases), aliases, "multiple aliases keep the exact fallback");
+  }
+});
+
 test("skill teaches MCP catalog arguments, not Clap flags", async () => {
   const skill = await readFile(
     join(pluginRoot, "skills", "codestory-grounding", "SKILL.md"),

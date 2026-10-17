@@ -80,3 +80,4 @@ codestory-retrieval = { workspace = true, features = ["test-support"] }
 codestory-runtime = { workspace = true, features = ["test-support"] }
 rusqlite = { workspace = true }
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }

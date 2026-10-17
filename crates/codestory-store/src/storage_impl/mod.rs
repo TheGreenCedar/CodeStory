@@ -3124,7 +3124,8 @@ pub struct FileContentHash {
     pub content_hash: String,
 }
 
-/// Successful extraction identity, committed with the exact file projection.
+/// Verified source and extraction producer, committed with the file projection.
+/// Parser-partial identity does not certify complete coverage or cache reuse.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileExtractionIdentity {
     pub file_id: i64,
@@ -9028,7 +9029,13 @@ impl Storage {
             let file = batch.files.iter().find(|file| file.id == identity.file_id);
             if !extraction_file_ids.insert(identity.file_id)
                 || !file.is_some_and(|file| {
-                    file.indexed && file.complete && file.language == identity.language
+                    file.indexed
+                        && file.language == identity.language
+                        && (file.complete
+                            || !batch
+                                .file_errors
+                                .iter()
+                                .any(|error| error.file_id == Some(NodeId(identity.file_id))))
                 })
                 || file_content_hashes.get(&identity.file_id).copied()
                     != Some(identity.source_content_hash.as_str())
@@ -9040,7 +9047,7 @@ impl Storage {
                 || identity.extraction_revision.trim().is_empty()
             {
                 return Err(StorageError::Other(format!(
-                    "extraction identity {} does not describe a complete verified file projection",
+                    "extraction identity {} does not describe a verified error-free file extraction",
                     identity.file_id
                 )));
             }

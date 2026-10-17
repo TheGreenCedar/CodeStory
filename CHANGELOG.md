@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Source-backed search and navigation stay available after indexing unchanged, partially parsed Rust or Python files, while coverage continues to report the parsing gap.
+
+- Structural source indexing and retrieval accept BOM-marked UTF-16 text, including PowerShell files, while keeping source verification tied to the original bytes.
+
+- Agent guidance can display caller results once when whole-number JSON formatting differs, preserving original text and metadata.
+
+- Symbol-name navigation uses the current Core index without preparing search, so symbol details, callers and trails remain available without broad retrieval.
+
+- Symbol search ranks standalone Go type declarations ahead of incidental matches with the same name, making definitions easier to find among configuration labels and references.
+
 ## 0.18.0
 
 - Packets reuse one repository identity snapshot while selecting a response, avoiding repeated Git status scans within the same request.
