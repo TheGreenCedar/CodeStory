@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Fresh sessions can receive a compact repository map from an existing index, with verified file locations and visible coverage limits.
+- Fresh sessions can receive a compact repository map from an existing index, with verified file locations and visible coverage limits. Warm startup maps arrive as navigation data; the full skill remains available by explicit invocation, with its exact path in fallback guidance.
 
 - Grounding maps show production package layouts before repeating roots from the same subsystem.
 

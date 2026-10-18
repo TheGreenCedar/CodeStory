@@ -2349,7 +2349,7 @@ test("plugin metadata maps skill and direct stdio server", async () => {
   assert.match(agentMetadata, /dependencies:\s*\r?\n\s+tools:/u);
   assert.match(agentMetadata, /type: "mcp"/u);
   assert.match(agentMetadata, /value: "codestory"/u);
-  assert.match(agentMetadata, /allow_implicit_invocation: true/u);
+  assert.match(agentMetadata, /allow_implicit_invocation: false/u);
   assert.match(agentMetadata, /read and follow the loaded codestory-grounding skill/isu);
   assert.match(agentMetadata, /sole source of truth/isu);
   assert.match(agentMetadata, /adds no parallel instructions/isu);
@@ -7845,7 +7845,7 @@ test("startup hook records active project without runtime bootstrap", async () =
     const context = output.hookSpecificOutput.additionalContext;
     assert.equal(output.systemMessage, "CODESTORY:BACKGROUND");
     assert.match(context, /CODESTORY GROUNDING AVAILABLE/u);
-    assert.match(context, /read and follow the loaded codestory-grounding skill/u);
+    assert.ok(context.includes(JSON.stringify(join(pluginRoot, "skills", "codestory-grounding", "SKILL.md"))));
     assert.match(context, /sole source of truth/u);
     assert.match(context, /adds no parallel instructions/u);
     assert.doesNotMatch(context, /Strict routing|Call status|tool_search|prove_call_path/u);
@@ -9207,7 +9207,7 @@ test("fresh startup map uses only explicit cwd and preserves static fallback", a
     const baseline = runCodexHook({ hook_event_name: "SessionStart", source: "resume", cwd: repoRoot }, env).hookSpecificOutput.additionalContext;
     const output = runCodexHook({ hook_event_name: "SessionStart", source: "startup", cwd: repoRoot }, env);
     assert.deepEqual(JSON.parse(await readFile(marker, "utf8")), ["internal-session-context", "--project", repoRoot]);
-    assert.equal(output.hookSpecificOutput.additionalContext, `${baseline}\n\nRepository map: source-verified, as-of publication test`);
+    assert.equal(output.hookSpecificOutput.additionalContext, "Repository map: source-verified, as-of publication test");
     await rm(marker);
     for (const input of [
       { hook_event_name: "SessionStart", source: "resume", cwd: repoRoot },
@@ -9236,7 +9236,9 @@ test("startup map receipt, child failures and UTF-8 bounds fail open", async () 
     const cli = await writeNodeCli(binDir, `process.stdout.write(JSON.stringify({schema_version:1,status:"ready",context:"verified receipt map"}));`);
     const receipt = join(dataDir, ".codestory-mcp-runtime.json");
     await writeFile(receipt, JSON.stringify({ path:cli, sha256:createHash("sha256").update(await readFile(cli)).digest("hex") }));
-    assert.equal(runCodexHook(input, env).hookSpecificOutput.additionalContext, `${baseline}\n\nverified receipt map`);
+    assert.equal(runCodexHook(input, env).hookSpecificOutput.additionalContext, "verified receipt map");
+    const exactCapCli = await writeNodeCli(binDir, `process.stdout.write(JSON.stringify({schema_version:1,status:"ready",context:"é".repeat(1792)}));`);
+    assert.equal(runCodexHook(input, { ...env, CODESTORY_CLI: exactCapCli }).hookSpecificOutput.additionalContext, "é".repeat(1792));
     await writeFile(receipt, JSON.stringify({ path:cli, sha256:"0".repeat(64) }));
     assert.equal(runCodexHook(input, env).hookSpecificOutput.additionalContext, baseline);
     assert.equal(runCodexHook({ ...input, cwd: `${repoRoot}\u0000invalid` }, { ...env, CODESTORY_CLI: cli }).hookSpecificOutput.additionalContext, baseline);
@@ -9259,6 +9261,38 @@ test("startup map receipt, child failures and UTF-8 bounds fail open", async () 
   }
 });
 
+test("fallback skill paths stay quoted and whole within the hook byte bound", async () => {
+  const root = await mkdtemp(join(tmpdir(), "codestory-hook-skill-path-"));
+  const hook = join(pluginRoot, "hooks", "codestory-activate.cjs");
+  const wrapper = join(root, "virtual-hook.cjs");
+  try {
+    // A virtual module filename exercises native paths longer than this host's
+    // filesystem permits, without a production hook or a partial fake path.
+    for (const [packageRoot, fits] of [
+      [join(root, 'plugin "水"\nfolder'), true],
+      [join(root, "é".repeat(2200)), false],
+    ]) {
+      const skillPath = join(packageRoot, "skills", "codestory-grounding", "SKILL.md");
+      await writeFile(wrapper, `const fs=require('node:fs'),Module=require('node:module');
+const filename=${JSON.stringify(join(packageRoot, "hooks", "codestory-activate.cjs"))};
+const loaded=new Module(filename);loaded.filename=filename;
+loaded.require=Module.createRequire(${JSON.stringify(hook)});
+loaded._compile(fs.readFileSync(${JSON.stringify(hook)},'utf8'),filename);`);
+      const context = runHookProcess(wrapper, { hook_event_name: "SessionStart", source: "resume" }, {
+        PLUGIN_DATA: root, PATH: "",
+      }).hookSpecificOutput.additionalContext;
+      assert.ok(Buffer.byteLength(context, "utf8") <= 4096);
+      if (fits) {
+        assert.ok(context.includes(JSON.stringify(skillPath)), "fallback must retain the exact installed path with JSON quoting");
+      } else {
+        assert.equal(context.includes(JSON.stringify(skillPath).slice(0, 100)), false, "never publish a clipped path");
+      }
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("session hooks inject one bounded contract and prompt hooks stay silent", async () => {
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-reinject-"));
   const longCwd = `C:\\${"very-long-directory\\".repeat(200)}repo`;
@@ -9270,8 +9304,8 @@ test("session hooks inject one bounded contract and prompt hooks stay silent", a
         cwd: longCwd,
       }, { PLUGIN_DATA: dataDir, PATH: "" });
       const context = output.hookSpecificOutput.additionalContext;
-      assert.ok(context.length <= 900, `hook output was ${context.length} characters`);
-      assert.match(context, /read and follow the loaded codestory-grounding skill/u);
+      assert.ok(Buffer.byteLength(context, "utf8") <= 4096, `hook output was ${Buffer.byteLength(context, "utf8")} bytes`);
+      assert.ok(context.includes(JSON.stringify(join(pluginRoot, "skills", "codestory-grounding", "SKILL.md"))));
       assert.match(context, /sole source of truth/u);
       assert.match(context, /adds no parallel instructions/u);
       assert.doesNotMatch(context, /status first|poll status/u);
@@ -9735,7 +9769,7 @@ test("Cursor sessionStart emits the Cursor additional_context contract", async (
       );
       assert.deepEqual(Object.keys(output), ["additional_context"]);
       assert.match(output.additional_context, /CODESTORY GROUNDING AVAILABLE/u);
-      assert.match(output.additional_context, /read and follow the loaded codestory-grounding skill/u);
+      assert.ok(output.additional_context.includes(JSON.stringify(join(pluginRoot, "skills", "codestory-grounding", "SKILL.md"))));
     }
     const state = JSON.parse(await readFile(join(dataDir, ".codestory-active"), "utf8"));
     assert.equal(state.cwd, repoRoot);

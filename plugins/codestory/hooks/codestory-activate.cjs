@@ -13,7 +13,7 @@ const { spawnSync } = require('child_process');
 const SESSION_CONTEXT = [
   'CODESTORY GROUNDING AVAILABLE',
   '',
-  'For repository work, read and follow the loaded codestory-grounding skill. It is the sole source of truth for CodeStory tool routing and evidence boundaries; this hook adds no parallel instructions.',
+  `For repository work, read and follow the canonical CodeStory skill at ${JSON.stringify(path.join(__dirname, '..', 'skills', 'codestory-grounding', 'SKILL.md'))}. It is the sole source of truth for CodeStory tool routing and evidence boundaries; this hook adds no parallel instructions.`,
 ].join('\n');
 
 function readHookInput() {
@@ -31,7 +31,9 @@ function readHookInput() {
 }
 
 function contextFor(event) {
-  return event === 'SessionStart' || event === 'sessionStart' ? SESSION_CONTEXT : null;
+  if (event !== 'SessionStart' && event !== 'sessionStart') return null;
+  return Buffer.byteLength(SESSION_CONTEXT, 'utf8') <= 4096 ? SESSION_CONTEXT
+    : 'CODESTORY GROUNDING AVAILABLE\n\nThe canonical skill path exceeds the hook context limit; no path was emitted. Locate the installed codestory-grounding skill before using CodeStory.';
 }
 
 function startupContext(input, context) {
@@ -48,8 +50,7 @@ function startupContext(input, context) {
     if (output?.schema_version !== 1 || output?.status !== 'ready'
         || typeof output.context !== 'string' || !output.context.trim()
         || Buffer.byteLength(output.context, 'utf8') > 3584) return context;
-    const combined = `${context}\n\n${output.context}`;
-    return Buffer.byteLength(combined, 'utf8') <= 4096 ? combined : context;
+    return output.context;
   } catch { return context; }
 }
 

@@ -5,7 +5,7 @@ pieces: a small Node launcher packaged with the plugin and the matching native
 CodeStory executable. The launcher owns installation compatibility. The native
 process owns every product operation.
 
-The canonical grounding skill remains implicitly discoverable. Its `SKILL.md`
+The canonical grounding skill is available through explicit invocation. Its `SKILL.md`
 keeps common request and evidence limits; the complete manual lives beside it
 in `GUIDE.md`, preserving its relative reference links. Consult that guide for
 needed unfamiliar or complex detail, not as a prerequisite for known operations.
@@ -14,7 +14,8 @@ Tool requests, runtime behavior and validation are unchanged.
 ## Startup navigation
 
 On an explicit fresh `SessionStart` (`source: startup`), the activation hook may
-append a small repository map from the existing compatible complete core. It
+return a small repository map from the existing compatible complete core as
+data alone, without a skill-reading reminder or preloaded skill body. It
 passes only the absolute hook `cwd` to the verified existing CLI; active-state
 records never choose a project. The hidden command pins one immutable core,
 reuses strict grounding selection, groups selected roots by native file
@@ -23,11 +24,13 @@ under the captured source-index byte policy. Selection remains as of that
 publication, even when emitted files match current content. Error counts,
 orientation uncertainty, source gaps and omitted groups remain visible.
 
-The map contains at most 12 whole file groups and fits with the unchanged static
-hook guidance within 4096 UTF-8 bytes. The child has a two-second deadline and
+The map contains at most 12 whole file groups within 3584 UTF-8 bytes. Hook
+context remains bounded to 4096 UTF-8 bytes. The child has a two-second deadline and
 never indexes, repairs, provisions or attaches retrieval. A missing or unusable
-core, invalid child result or timeout leaves the static guidance unchanged.
-Resume, clear and compact events keep the existing static behavior. Runtime
+core, invalid child result or timeout returns guidance with the canonical
+packaged skill's absolute path; resume, clear and compact events use that same
+fallback. Paths are JSON-quoted and never truncated; a path that cannot fit is
+reported unavailable rather than clipped. Runtime
 receipts verify the CLI hash; explicit executable overrides retain their
 existing operator-controlled contract.
 
