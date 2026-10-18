@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Grounding maps show production package layouts before repeating roots from the same subsystem.
+
 - Symbol search recognizes generic type definitions and keeps them ahead of incidental same-name matches.
 
 - Symbol search finds JavaScript and TypeScript classes and functions through verified named public exports, while keeping their original names and source locations. Export/import witness locations explain the match; unsupported or ambiguous bindings remain explicit.

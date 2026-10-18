@@ -456,7 +456,7 @@ fn grounding_root_architecture_band(
             }
             match structural_path_rank(role, relative_path) {
                 0 | 1 => 1,
-                2 => 2,
+                _ if relative_path.is_some() => 2,
                 _ => 3,
             }
         }
@@ -2242,94 +2242,190 @@ mod tests {
 
     #[test]
     fn production_architecture_breadth_does_not_require_a_novel_symbol_name() {
-        let root = Path::new("/repo");
-        let record = |node_id, file_id, name: String, path: &str, kind| GroundingNodeRecord {
-            node: Node {
-                id: CoreNodeId(node_id),
-                kind,
-                serialized_name: name.clone(),
-                file_node_id: Some(CoreNodeId(file_id)),
-                start_line: Some(node_id as u32),
-                ..Default::default()
-            },
-            display_name: name,
-            file_path: Some(root.join(path)),
-        };
-        let mut records = (0..8_i64)
-            .map(|index| {
-                record(
-                    100 + index,
-                    10,
-                    if index == 0 {
-                        "Common".to_string()
-                    } else {
-                        format!("A{index}")
-                    },
-                    "apps/alpha/src/main.ts",
+        for (alpha_path, beta_path, alpha_language, beta_language, beta_role, beta_kind) in [
+            (
+                "launch.py",
+                "alpine/domain.py",
+                "python",
+                "python",
+                FileRole::Source,
+                NodeKind::CLASS,
+            ),
+            (
+                "main.go",
+                "violet/domain.go",
+                "go",
+                "go",
+                FileRole::Source,
+                NodeKind::STRUCT,
+            ),
+            (
+                "top.rs",
+                "quartz_pkg/deep/logic.rs",
+                "rust",
+                "rust",
+                FileRole::Source,
+                NodeKind::STRUCT,
+            ),
+            (
+                "launch.ts",
+                "harbor/deep/worker.ts",
+                "typescript",
+                "typescript",
+                FileRole::Entrypoint,
+                NodeKind::FUNCTION,
+            ),
+            (
+                "launch.ts",
+                "harbor/settings.toml",
+                "typescript",
+                "toml",
+                FileRole::Source,
+                NodeKind::ANNOTATION,
+            ),
+            (
+                "apps/alpha/src/main.ts",
+                "crates/beta/src/lib.rs",
+                "typescript",
+                "rust",
+                FileRole::Source,
+                NodeKind::STRUCT,
+            ),
+        ] {
+            let root = Path::new("/repo");
+            let record = |node_id, file_id, name: String, path: &str, kind| GroundingNodeRecord {
+                node: Node {
+                    id: CoreNodeId(node_id),
+                    kind,
+                    serialized_name: name.clone(),
+                    file_node_id: Some(CoreNodeId(file_id)),
+                    start_line: Some(node_id as u32),
+                    ..Default::default()
+                },
+                display_name: name,
+                file_path: Some(root.join(path)),
+            };
+            let mut records = (0..8_i64)
+                .map(|index| {
+                    record(
+                        100 + index,
+                        10,
+                        if index == 0 {
+                            "Common".to_string()
+                        } else {
+                            format!("A{index}")
+                        },
+                        alpha_path,
+                        NodeKind::FUNCTION,
+                    )
+                })
+                .collect::<Vec<_>>();
+            records.push(record(200, 20, "Common".to_string(), beta_path, beta_kind));
+            for (id, file_id, name, path, kind) in [
+                (
+                    300,
+                    30,
+                    "\"./foreign.js\"",
+                    "harbor/imports.ts",
+                    NodeKind::MODULE,
+                ),
+                (
+                    400,
+                    40,
+                    "ToolRoot",
+                    "tools/auxiliary.py",
                     NodeKind::FUNCTION,
-                )
-            })
-            .collect::<Vec<_>>();
-        records.push(record(
-            200,
-            20,
-            "Common".to_string(),
-            "crates/beta/src/lib.rs",
-            NodeKind::STRUCT,
-        ));
-        let file_roles = [(10, FileRole::Entrypoint), (20, FileRole::Source)]
+                ),
+                (500, 50, "TestRoot", "harbor/checks.py", NodeKind::CLASS),
+                (600, 60, "VendorRoot", "harbor/supply.py", NodeKind::CLASS),
+                (
+                    700,
+                    70,
+                    "GeneratedRoot",
+                    "harbor/derived.py",
+                    NodeKind::CLASS,
+                ),
+                (
+                    800,
+                    80,
+                    "BenchmarkRoot",
+                    "harbor/measure.py",
+                    NodeKind::CLASS,
+                ),
+            ] {
+                records.push(record(id, file_id, name.to_string(), path, kind));
+            }
+            let file_roles = [
+                (10, FileRole::Entrypoint),
+                (20, beta_role),
+                (30, FileRole::Source),
+                (40, FileRole::Source),
+                (50, FileRole::Test),
+                (60, FileRole::Vendor),
+                (70, FileRole::Generated),
+                (80, FileRole::Benchmark),
+            ]
             .into_iter()
             .collect::<HashMap<_, _>>();
-        let file_languages = [(10, "typescript"), (20, "rust")]
+            let file_languages = [
+                (10, alpha_language),
+                (20, beta_language),
+                (30, "typescript"),
+                (40, "python"),
+                (50, "python"),
+                (60, "python"),
+                (70, "python"),
+                (80, "python"),
+            ]
             .into_iter()
             .map(|(id, language)| (id, language.to_string()))
             .collect::<HashMap<_, _>>();
-        let degrees = (0..8_i64)
-            .map(|index| {
-                (
-                    CoreNodeId(100 + index),
+            let degrees = (0..8_i64)
+                .map(|index| {
+                    (
+                        CoreNodeId(100 + index),
+                        CallDegrees {
+                            production_in_calls: 0,
+                            out_calls: 3,
+                        },
+                    )
+                })
+                .chain([(
+                    CoreNodeId(400),
                     CallDegrees {
                         production_in_calls: 0,
-                        out_calls: 3,
+                        out_calls: 6,
                     },
-                )
-            })
-            .collect::<HashMap<_, _>>();
-
-        let ordered = diversify_grounding_root_records(
-            records,
-            root,
-            &file_roles,
-            &file_languages,
-            &degrees,
-            &HashMap::new(),
-        );
-        let first_two = ordered
-            .iter()
-            .take(2)
-            .map(|candidate| {
-                (
-                    candidate.display_name.as_str(),
-                    grounding_root_subsystem_key(root, candidate, &file_languages),
-                )
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(first_two[0].0, "Common");
-        assert_eq!(first_two[1].0, "Common");
-        assert_ne!(first_two[0].1, first_two[1].1);
-        assert_eq!(ordered[0].node.id, CoreNodeId(100));
-        assert_eq!(ordered[1].node.id, CoreNodeId(200));
-        assert_eq!(
-            ordered
-                .iter()
-                .take(8)
-                .map(|candidate| { grounding_root_subsystem_key(root, candidate, &file_languages) })
-                .collect::<HashSet<_>>()
-                .len(),
-            2,
-            "strict grounding must represent both subsystems before repeating alpha"
-        );
+                )])
+                .collect::<HashMap<_, _>>();
+            let ordered = diversify_grounding_root_records(
+                records,
+                root,
+                &file_roles,
+                &file_languages,
+                &degrees,
+                &HashMap::new(),
+            );
+            assert_eq!(ordered[0].node.id, CoreNodeId(100), "{beta_path}");
+            assert_eq!(
+                ordered[1].node.id,
+                CoreNodeId(200),
+                "package layout must join production breadth before repeated roots: {beta_path}"
+            );
+            assert_eq!(grounding_root_terminal_name(&ordered[0]), "common");
+            assert_eq!(grounding_root_terminal_name(&ordered[1]), "common");
+            assert_ne!(
+                grounding_root_subsystem_key(root, &ordered[0], &file_languages),
+                grounding_root_subsystem_key(root, &ordered[1], &file_languages),
+            );
+            assert!(
+                ordered.iter().take(9).all(|candidate| matches!(
+                    candidate.node.file_node_id,
+                    Some(CoreNodeId(10 | 20))
+                )),
+                "imports, tooling and secondary roles must stay deferred: {beta_path}"
+            );
+        }
     }
 
     #[test]
@@ -3329,13 +3425,19 @@ mod tests {
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
-        let manifest = temp.path().join("Cargo.toml");
+        let manifest = temp.path().join("lattice_pkg/Cargo.toml");
+        std::fs::create_dir_all(manifest.parent().expect("manifest parent"))
+            .expect("create package directory");
         std::fs::write(&manifest, "[package]\nname = \"demo\"\n").expect("write manifest");
 
         {
             let mut storage = Storage::open(&db_path).expect("open storage");
-            let projected = codestory_indexer::structural::index_structural_file(&manifest)
+            let mut projected = codestory_indexer::structural::index_structural_file(&manifest)
                 .expect("collect manifest");
+            // A fallback Source role must not upgrade persisted structural evidence.
+            for file in &mut projected.files {
+                file.file_role = FileRole::Source;
+            }
             storage
                 .projections()
                 .flush_projection_batch(codestory_store::ProjectionBatch {
@@ -3353,6 +3455,24 @@ mod tests {
                     file_errors: &[],
                 })
                 .expect("insert verified manifest projection");
+            let source = temp.path().join("cedar_pkg/unit.rs");
+            std::fs::create_dir_all(source.parent().expect("source parent"))
+                .expect("create source package");
+            std::fs::write(&source, "struct ProductionBoundary;\n").expect("write source");
+            insert_file_node(
+                &mut storage,
+                9_000_001,
+                &source,
+                Node {
+                    id: CoreNodeId(9_000_002),
+                    kind: NodeKind::STRUCT,
+                    serialized_name: "ProductionBoundary".to_string(),
+                    file_node_id: Some(CoreNodeId(9_000_001)),
+                    start_line: Some(1),
+                    ..Default::default()
+                },
+            )
+            .expect("insert typed source beside metadata");
         }
 
         let controller = AppController::new_with_owned_cache_root(process_cache.path());
@@ -3362,6 +3482,12 @@ mod tests {
         let snapshot = controller
             .grounding_snapshot(GroundingBudgetDto::Balanced)
             .expect("grounding snapshot");
+        let typed = snapshot
+            .root_symbols
+            .iter()
+            .find(|symbol| symbol.label.starts_with("ProductionBoundary @ "))
+            .expect("typed package root");
+        assert_eq!(typed.evidence_tier, None);
         let symbol = snapshot
             .files
             .iter()
