@@ -2161,14 +2161,12 @@ fn grounding_indexable_predicate(alias: &str) -> String {
     // Missing occurrences remain unknown; exclude only explicit reference-only IDs.
     format!(
         "{alias}.kind NOT IN ({}, {}, {})
-         AND (NOT EXISTS (
-                 SELECT 1 FROM occurrence reference
-                 WHERE reference.element_id = {alias}.id AND reference.kind = {reference_kind}
-             ) OR EXISTS (
-                 SELECT 1 FROM occurrence authority
-                 WHERE authority.element_id = {alias}.id
-                   AND authority.kind IN ({definition_kind}, {declaration_kind})
-             ))",
+         AND {alias}.id NOT IN (
+             SELECT element_id FROM occurrence WHERE kind = {reference_kind}
+             EXCEPT
+             SELECT element_id FROM occurrence
+             WHERE kind IN ({definition_kind}, {declaration_kind})
+         )",
         NodeKind::FILE as i32,
         NodeKind::UNKNOWN as i32,
         NodeKind::BUILTIN_TYPE as i32,

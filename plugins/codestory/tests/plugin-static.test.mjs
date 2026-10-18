@@ -1474,14 +1474,28 @@ test("fail-open handoff shutdown is bounded for a child that ignores stdin and S
     return true;
   };
 
-  launcherTest.shutdownHandoffChild(child, {
-    handoffTerminationGraceMs: 1,
-    handoffForceKillGraceMs: 1,
-  });
-  await delay(25);
+  let deadline;
+  const closed = Promise.race([
+    once(child, "close"),
+    new Promise((_, reject) => {
+      // The fake child has no process handle to keep unref'ed shutdown timers alive.
+      deadline = setTimeout(() => reject(new Error("handoff child did not close")), 5000);
+    }),
+  ]);
+  try {
+    launcherTest.shutdownHandoffChild(child, {
+      handoffTerminationGraceMs: 1,
+      handoffForceKillGraceMs: 1,
+    });
+    // A delayed first stage schedules the force-kill timer after an old fixed wait is due.
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+    await closed;
 
-  assert.equal(child.stdin.writableEnded, true);
-  assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
+    assert.equal(child.stdin.writableEnded, true);
+    assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
+  } finally {
+    clearTimeout(deadline);
+  }
 });
 
 test("fail-open handoff converts child stdin failure into a bounded request error", async () => {
