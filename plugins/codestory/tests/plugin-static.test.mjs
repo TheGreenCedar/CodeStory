@@ -7794,7 +7794,7 @@ test("startup hook records active project without runtime bootstrap", async () =
 
   try {
     // A callable sentinel distinguishes the passive command from hidden
-    // readiness/index/provision work. Invalid child output keeps static guidance.
+    // readiness/index/provision work. Invalid child output keeps static text.
     const sentinelCli = join(
       dataDir,
       process.platform === "win32" ? "codestory-cli.exe" : "codestory-cli",
@@ -7845,6 +7845,10 @@ test("startup hook records active project without runtime bootstrap", async () =
     const context = output.hookSpecificOutput.additionalContext;
     assert.equal(output.systemMessage, "CODESTORY:BACKGROUND");
     assert.match(context, /CODESTORY GROUNDING AVAILABLE/u);
+    assert.match(context, /read and follow the loaded codestory-grounding skill/u);
+    assert.match(context, /sole source of truth/u);
+    assert.match(context, /adds no parallel instructions/u);
+    assert.doesNotMatch(context, /Strict routing|Call status|tool_search|prove_call_path/u);
     assert.doesNotMatch(context, /HOOK MCP BRIDGE/u);
     assert.doesNotMatch(context, /managed_bootstrap/u);
     assert.doesNotMatch(context, /mcp_resources_exposed/u);
@@ -9193,100 +9197,6 @@ function runCodexHook(input, env) {
   return runHookProcess(join(pluginRoot, "hooks", "codestory-activate.cjs"), input, env);
 }
 
-test("startup delivers the complete canonical skill independently of map availability", async () => {
-  const dataDir = await mkdtemp(join(tmpdir(), "codestory-startup-skill-"));
-  const skillPath = join(pluginRoot, "skills", "codestory-grounding", "SKILL.md");
-  try {
-    const body = await readFile(skillPath, "utf8");
-    const output = runCodexHook({ hook_event_name: "SessionStart", source: "startup", cwd: repoRoot }, {
-      PLUGIN_DATA: dataDir, CODESTORY_CLI: join(dataDir, "missing-cli"), PATH: "",
-    }).hookSpecificOutput.additionalContext;
-    assert.ok(output.endsWith(body), "startup must deliver the complete, unchanged canonical skill");
-    assert.equal(output.indexOf(body), output.lastIndexOf(body));
-    assert.ok(output.includes(JSON.stringify(skillPath)), "relative references need the actual skill source path");
-    assert.ok(Buffer.byteLength(output, "utf8") <= 8192);
-  } finally {
-    await rm(dataDir, { recursive: true, force: true });
-  }
-});
-
-test("startup skill admission preserves whole UTF-8 bodies and fails open within bounds", async () => {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "codestory-startup-skill-bounds-")));
-  const hookDir = join(root, "hooks");
-  const skillDir = join(root, "skills", "codestory-grounding");
-  const skillPath = join(skillDir, "SKILL.md");
-  const hookPath = join(hookDir, "codestory-activate.cjs");
-  const dataDir = join(root, "data");
-  const input = { hook_event_name: "SessionStart", source: "startup", cwd: repoRoot };
-  const env = { PLUGIN_DATA: dataDir, CODESTORY_CLI: join(root, "missing-cli"), CODESTORY_PLUGIN_CLI_PATH: "", PATH: "" };
-  try {
-    await mkdir(hookDir, { recursive: true });
-    await mkdir(skillDir, { recursive: true });
-    for (const name of ["codestory-activate.cjs", "codestory-runtime.cjs"]) {
-      await copyFile(join(pluginRoot, "hooks", name), join(hookDir, name));
-    }
-    const fallback = runHookProcess(hookPath, { ...input, source: "resume" }, env).hookSpecificOutput.additionalContext;
-    const whole = Buffer.from('\uFEFF---\r\nname: example\r\n---\r\nUnicode: café 水\r\n[Reference](references/local.md)\r\n', "utf8");
-    for (const [name, bytes, accepted] of [
-      ["CRLF, Unicode and BOM", whole, true],
-      ["exact UTF-8 cap", Buffer.from("é".repeat(2048)), true],
-      ["cap plus one", Buffer.alloc(4097, 120), false],
-      ["invalid UTF-8", Buffer.from([0xc3, 0x28]), false],
-      ["empty", Buffer.alloc(0), false],
-      ["whitespace", Buffer.from(" \r\n\t"), false],
-      ["missing", null, false],
-    ]) {
-      await rm(skillPath, { force: true });
-      if (bytes !== null) await writeFile(skillPath, bytes);
-      const context = runHookProcess(hookPath, input, env).hookSpecificOutput.additionalContext;
-      if (accepted) {
-        assert.ok(context.endsWith(bytes.toString("utf8")), name);
-        assert.ok(context.includes(JSON.stringify(skillPath)), name);
-        assert.ok(Buffer.byteLength(context) <= 8192, name);
-      } else {
-        assert.equal(context, fallback, name);
-      }
-    }
-    await mkdir(skillPath);
-    assert.equal(runHookProcess(hookPath, input, env).hookSpecificOutput.additionalContext, fallback);
-    await rm(skillPath, { recursive: true });
-    if (process.platform !== "win32") {
-      const target = join(root, "other-skill.md");
-      await writeFile(target, whole);
-      await symlink(target, skillPath);
-      assert.equal(runHookProcess(hookPath, input, env).hookSpecificOutput.additionalContext, fallback);
-      await rm(skillPath);
-    }
-
-    // A stale size observation cannot permit an unbounded read of a growing file.
-    await writeFile(skillPath, Buffer.alloc(32768, 120));
-    const preload = join(root, "size-observation.cjs");
-    const readReceipt = join(root, "read.json");
-    await writeFile(preload, `const fs=require('fs');
-const lstat=fs.lstatSync, fstat=fs.fstatSync, open=fs.openSync, read=fs.readSync;
-let skillFd;
-fs.openSync=(...args)=>{const fd=open(...args);if(args[0]===${JSON.stringify(skillPath)})skillFd=fd;return fd;};
-fs.lstatSync=(...args)=>{const s=lstat(...args);if(args[0]===${JSON.stringify(skillPath)})s.size=1;return s;};
-fs.fstatSync=(...args)=>{const s=fstat(...args);if(args[0]===skillFd)s.size=1;return s;};
-let total=0,max=0;
-fs.readSync=(...args)=>{if(args[0]!==skillFd)return read(...args);if(process.env.TEST_READ_FAILURE==='1')throw new Error('unreadable skill');max=Math.max(max,args[3]);const n=read(...args);total+=n;fs.writeFileSync(${JSON.stringify(readReceipt)},JSON.stringify({total,max}));return n;};`);
-    assert.equal(runHookProcess(hookPath, input, { ...env, NODE_OPTIONS: `--require=${preload}` }).hookSpecificOutput.additionalContext, fallback);
-    assert.deepEqual(JSON.parse(await readFile(readReceipt, "utf8")), { total: 4097, max: 4097 });
-    assert.equal(runHookProcess(hookPath, input, { ...env, NODE_OPTIONS: `--require=${preload}`, TEST_READ_FAILURE: "1" }).hookSpecificOutput.additionalContext, fallback);
-
-    await writeFile(skillPath, Buffer.from("é".repeat(2048)));
-    const cli = await writeNodeCli(root, `process.stdout.write(JSON.stringify({schema_version:1,status:"ready",context:"m".repeat(3584)}));`);
-    const skillOnly = runHookProcess(hookPath, input, env).hookSpecificOutput.additionalContext;
-    const combined = runHookProcess(hookPath, input, { ...env, CODESTORY_CLI: cli }).hookSpecificOutput.additionalContext;
-    assert.equal(combined, `${skillOnly}\n\n${"m".repeat(3584)}`);
-    assert.ok(Buffer.byteLength(combined, "utf8") <= 8192);
-    await rm(skillPath);
-    assert.equal(runHookProcess(hookPath, input, { ...env, CODESTORY_CLI: cli }).hookSpecificOutput.additionalContext, `${fallback}\n\n${"m".repeat(3584)}`);
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
 test("fresh startup map uses only explicit cwd and preserves static fallback", async () => {
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-startup-map-"));
   const binDir = await mkdtemp(join(tmpdir(), "codestory-startup-bin-"));
@@ -9295,10 +9205,9 @@ test("fresh startup map uses only explicit cwd and preserves static fallback", a
     const cli = await writeNodeCli(binDir, `require("fs").writeFileSync(process.env.TEST_MARKER, JSON.stringify(process.argv.slice(2))); process.stdout.write(JSON.stringify({schema_version:1,status:"ready",context:"Repository map: source-verified, as-of publication test"}));`);
     const env = { PLUGIN_DATA: dataDir, CODESTORY_CLI: cli, TEST_MARKER: marker, PATH: "" };
     const baseline = runCodexHook({ hook_event_name: "SessionStart", source: "resume", cwd: repoRoot }, env).hookSpecificOutput.additionalContext;
-    const skillOnly = runCodexHook({ hook_event_name: "SessionStart", source: "startup", cwd: repoRoot }, { ...env, CODESTORY_CLI: join(dataDir, "missing-cli") }).hookSpecificOutput.additionalContext;
     const output = runCodexHook({ hook_event_name: "SessionStart", source: "startup", cwd: repoRoot }, env);
     assert.deepEqual(JSON.parse(await readFile(marker, "utf8")), ["internal-session-context", "--project", repoRoot]);
-    assert.equal(output.hookSpecificOutput.additionalContext, `${skillOnly}\n\nRepository map: source-verified, as-of publication test`);
+    assert.equal(output.hookSpecificOutput.additionalContext, `${baseline}\n\nRepository map: source-verified, as-of publication test`);
     await rm(marker);
     for (const input of [
       { hook_event_name: "SessionStart", source: "resume", cwd: repoRoot },
@@ -9323,7 +9232,7 @@ test("startup map receipt, child failures and UTF-8 bounds fail open", async () 
   try {
     const env = { PLUGIN_DATA: dataDir, CODESTORY_CLI: "", CODESTORY_PLUGIN_CLI_PATH: "", PATH: "" };
     const input = { hook_event_name: "SessionStart", source: "startup", cwd: repoRoot };
-    const baseline = runCodexHook(input, env).hookSpecificOutput.additionalContext;
+    const baseline = runCodexHook({ ...input, source: "resume" }, env).hookSpecificOutput.additionalContext;
     const cli = await writeNodeCli(binDir, `process.stdout.write(JSON.stringify({schema_version:1,status:"ready",context:"verified receipt map"}));`);
     const receipt = join(dataDir, ".codestory-mcp-runtime.json");
     await writeFile(receipt, JSON.stringify({ path:cli, sha256:createHash("sha256").update(await readFile(cli)).digest("hex") }));

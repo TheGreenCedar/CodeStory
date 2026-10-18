@@ -13,14 +13,9 @@ Tool requests, runtime behavior and validation are unchanged.
 
 ## Startup navigation
 
-On an explicit fresh `SessionStart` (`source: startup`) with an absolute `cwd`,
-the activation hook delivers the complete canonical `SKILL.md`, framed with its
-installed source path so relative references remain usable. It reads at most
-4097 bytes and accepts only a nonempty regular file with valid UTF-8 within
-4096 bytes; failed admission keeps the existing static reminder. Skill delivery
-does not require a CLI or index. The hook may then append a small repository
-map from the existing compatible complete core. It passes only the absolute
-hook `cwd` to the verified existing CLI; active-state
+On an explicit fresh `SessionStart` (`source: startup`), the activation hook may
+append a small repository map from the existing compatible complete core. It
+passes only the absolute hook `cwd` to the verified existing CLI; active-state
 records never choose a project. The hidden command pins one immutable core,
 reuses strict grounding selection, groups selected roots by native file
 identity, and verifies only those selected files against indexed raw hashes
@@ -28,11 +23,10 @@ under the captured source-index byte policy. Selection remains as of that
 publication, even when emitted files match current content. Error counts,
 orientation uncertainty, source gaps and omitted groups remain visible.
 
-The map contains at most 12 whole file groups within 3584 UTF-8 bytes. The
-complete startup context fits within 8192 UTF-8 bytes; neither skill nor map is
-truncated to fit. The child has a two-second deadline and never indexes, repairs,
-provisions or attaches retrieval. A missing or unusable core, invalid child
-result or timeout leaves the skill or fallback reminder unchanged.
+The map contains at most 12 whole file groups and fits with the unchanged static
+hook guidance within 4096 UTF-8 bytes. The child has a two-second deadline and
+never indexes, repairs, provisions or attaches retrieval. A missing or unusable
+core, invalid child result or timeout leaves the static guidance unchanged.
 Resume, clear and compact events keep the existing static behavior. Runtime
 receipts verify the CLI hash; explicit executable overrides retain their
 existing operator-controlled contract.

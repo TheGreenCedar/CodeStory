@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Fresh-session hooks can deliver the canonical CodeStory skill and a compact repository map from an existing index, with verified file locations and visible coverage limits.
+- Fresh sessions can receive a compact repository map from an existing index, with verified file locations and visible coverage limits.
 
 - Grounding maps show production package layouts before repeating roots from the same subsystem.
 
