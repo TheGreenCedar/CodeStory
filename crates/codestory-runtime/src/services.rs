@@ -10996,6 +10996,128 @@ pub(crate) mod activation_tests {
     }
 
     #[test]
+    fn outdated_reference_occurrences_refresh_unchanged_parser_files_and_keep_old_publication() {
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("owned runtime cache");
+        let storage_path = project.path().join("cache/codestory.db");
+        let sources = [
+            (
+                "owner.py",
+                "class Owner:\n    @external\n    def worker(self):\n        return 1\n",
+            ),
+            (
+                "owner.go",
+                "package owner\nfunc helper() {}\nfunc worker() { helper() }\n",
+            ),
+        ];
+        for (name, source) in sources {
+            fs::write(project.path().join(name), source).unwrap();
+        }
+        let runtime = crate::test_runtime_with_owned_cache_root(cache.path());
+        runtime
+            .project_service()
+            .open_project_summary_with_storage_path(
+                project.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .unwrap();
+        runtime
+            .index_service()
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .unwrap();
+        let original = Store::open(&storage_path).unwrap();
+        assert!(
+            original
+                .get_occurrences()
+                .unwrap()
+                .iter()
+                .any(|occ| occ.kind == codestory_contracts::graph::OccurrenceKind::REFERENCE)
+        );
+        drop(original);
+        // Emulate a prior producer with identical source bytes; current parser cache
+        // entries remain available to prove that the refresh still replaces rows.
+        mutate_active_generation_sql(
+            &storage_path,
+            "UPDATE occurrence SET kind = 0 WHERE kind = 1; UPDATE file_extraction_identity SET extraction_revision = 'previous-occurrence-producer';",
+        );
+        let old_database = codestory_store::resolve_core_database_path(&storage_path).unwrap();
+        let old_bytes = fs::read(&old_database).unwrap();
+        let observed = runtime
+            .project_service()
+            .inspect_project_summary_with_storage_path(
+                project.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            observed.freshness.as_ref().unwrap().changed_file_count,
+            2,
+            "Python and previously unversioned Go must both be scheduled"
+        );
+        assert_eq!(
+            observed.freshness.as_ref().unwrap().status,
+            IndexFreshnessStatusDto::Stale
+        );
+        runtime
+            .index_service()
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .unwrap();
+        assert_ne!(
+            codestory_store::resolve_core_database_path(&storage_path).unwrap(),
+            old_database
+        );
+        assert_eq!(
+            fs::read(&old_database).unwrap(),
+            old_bytes,
+            "the pinned old publication is not rewritten"
+        );
+        let current = Store::open(&storage_path).unwrap();
+        let python = current
+            .get_file_by_path(&project.path().join("owner.py"))
+            .unwrap()
+            .unwrap();
+        let references = current
+            .get_occurrences_for_file(codestory_contracts::graph::NodeId(python.id))
+            .unwrap();
+        assert!(references.iter().any(|occ| occ.location.start_line == 2
+            && occ.kind == codestory_contracts::graph::OccurrenceKind::REFERENCE));
+        assert!(!references.iter().any(|occ| occ.location.start_line == 2
+            && occ.location.start_col == 6
+            && occ.kind == codestory_contracts::graph::OccurrenceKind::DEFINITION));
+        for (name, source) in sources {
+            assert_eq!(
+                fs::read(project.path().join(name)).unwrap(),
+                source.as_bytes()
+            );
+            let file = current
+                .get_file_by_path(&project.path().join(name))
+                .unwrap()
+                .unwrap();
+            assert!(
+                current
+                    .file_extraction_identity_matches(
+                        file.id,
+                        &file.language,
+                        codestory_indexer::current_file_extraction_revision(&file.language)
+                            .unwrap()
+                    )
+                    .unwrap()
+            );
+        }
+        drop(current);
+        let fresh = runtime
+            .project_service()
+            .inspect_project_summary_with_storage_path(project.path().to_path_buf(), storage_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fresh.freshness.unwrap().status,
+            IndexFreshnessStatusDto::Fresh
+        );
+    }
+
+    #[test]
     fn newer_core_schema_refuses_observation_and_automatic_rebuild() {
         let project = tempfile::tempdir().expect("project");
         let cache = tempfile::tempdir().expect("owned cache");

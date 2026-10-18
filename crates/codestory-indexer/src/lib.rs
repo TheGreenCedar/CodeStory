@@ -82,6 +82,13 @@ fn go_method_identity_work() -> usize {
     GO_METHOD_IDENTITY_WORK.with(std::cell::Cell::get)
 }
 
+// Occurrence roles are shared producer data; retain each language's local revision too.
+macro_rules! extraction_revision {
+    ($local:literal) => {
+        concat!("canonical-reference-occurrences-v1;", $local)
+    };
+}
+
 mod cache;
 pub mod cancellation;
 pub mod compilation_database;
@@ -4384,8 +4391,11 @@ pub fn current_file_extraction_revision(language: &str) -> Option<&'static str> 
     match language {
         "python" => Some(languages::python::CALLABLE_DECLARATION_REVISION),
         "rust" => Some(languages::rust::CALLABLE_DECLARATION_REVISION),
-        "javascript" => Some("explicit-named-public-exports-v2"),
-        "typescript" | "tsx" => Some("explicit-named-public-exports-v3"),
+        "javascript" => Some(extraction_revision!("explicit-named-public-exports-v2")),
+        "typescript" | "tsx" => Some(extraction_revision!("explicit-named-public-exports-v3")),
+        _ if languages::extraction_for_language(language).is_some() => {
+            Some(extraction_revision!(""))
+        }
         _ => None,
     }
 }
@@ -11387,13 +11397,12 @@ fn definition_occurrences(
         if let (Some(start_line), Some(start_col), Some(end_line), Some(end_col)) =
             (node.start_line, node.start_col, node.end_line, node.end_col)
         {
-            let kind = if matches!(
-                canonical_roles.get(&node.id),
-                Some(CanonicalNodeRole::Declaration | CanonicalNodeRole::ForwardDeclaration)
-            ) {
-                codestory_contracts::graph::OccurrenceKind::DECLARATION
-            } else {
-                codestory_contracts::graph::OccurrenceKind::DEFINITION
+            let kind = match canonical_roles.get(&node.id) {
+                Some(CanonicalNodeRole::Reference) => OccurrenceKind::REFERENCE,
+                Some(CanonicalNodeRole::Declaration | CanonicalNodeRole::ForwardDeclaration) => {
+                    OccurrenceKind::DECLARATION
+                }
+                _ => OccurrenceKind::DEFINITION,
             };
             occurrences.push(Occurrence {
                 element_id: node.id.0,

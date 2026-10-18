@@ -70,10 +70,18 @@ pub(super) fn mark_extraction_revision_mismatches(
     store: &Store,
     stored_files: &mut [codestory_contracts::workspace::StoredFileState],
 ) -> Result<(), ApiError> {
-    for language in ["python", "rust", "javascript", "typescript", "tsx"] {
-        if let Some(revision) = codestory_indexer::current_file_extraction_revision(language) {
+    let languages = store
+        .get_files()
+        .map_err(|error| {
+            ApiError::internal(format!("Failed to read extraction languages: {error}"))
+        })?
+        .into_iter()
+        .map(|file| file.language)
+        .collect::<std::collections::BTreeSet<_>>();
+    for language in languages {
+        if let Some(revision) = codestory_indexer::current_file_extraction_revision(&language) {
             let outdated = store
-                .files_with_extraction_revision_mismatch(language, revision)
+                .files_with_extraction_revision_mismatch(&language, revision)
                 .map_err(|error| {
                     ApiError::internal(format!("Failed to read extraction identities: {error}"))
                 })?
@@ -533,6 +541,16 @@ mod extraction_identity_tests {
                 line_count: 1,
                 file_role: FileRole::Source,
             },
+            FileInfo {
+                id: 7,
+                path: PathBuf::from("page.html"),
+                language: "html".into(),
+                modification_time: 0,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: FileRole::Source,
+            },
         ];
         let hashes = [
             FileContentHash {
@@ -558,6 +576,10 @@ mod extraction_identity_tests {
             FileContentHash {
                 file_id: 6,
                 content_hash: "a".repeat(64),
+            },
+            FileContentHash {
+                file_id: 7,
+                content_hash: "b".repeat(64),
             },
         ];
         let flush = |store: &mut Store, identities: &[FileExtractionIdentity]| {
@@ -589,7 +611,7 @@ mod extraction_identity_tests {
                 .collect::<HashSet<_>>()
         };
         flush(&mut store, &[]);
-        assert_eq!(retry_ids(&store), HashSet::from([1, 2, 4, 5, 6]));
+        assert_eq!(retry_ids(&store), HashSet::from([1, 2, 3, 4, 5, 6]));
         let identities = [
             FileExtractionIdentity {
                 file_id: 1,
@@ -606,6 +628,14 @@ mod extraction_identity_tests {
                 extraction_revision: codestory_indexer::current_file_extraction_revision("rust")
                     .unwrap()
                     .to_string(),
+            },
+            FileExtractionIdentity {
+                file_id: 3,
+                language: "go".into(),
+                source_content_hash: hashes[2].content_hash.clone(),
+                extraction_revision: codestory_indexer::current_file_extraction_revision("go")
+                    .unwrap()
+                    .into(),
             },
             FileExtractionIdentity {
                 file_id: 4,
@@ -641,7 +671,8 @@ mod extraction_identity_tests {
         let mut previous = identities.clone();
         for identity in &mut previous {
             if matches!(identity.file_id, 4 | 5 | 6) {
-                identity.extraction_revision = "explicit-named-public-exports-v2".into();
+                identity.extraction_revision =
+                    "canonical-reference-occurrences-v1;explicit-named-public-exports-v2".into();
             }
         }
         flush(&mut store, &previous);

@@ -2158,11 +2158,23 @@ fn grounding_trimmed_name_expr(alias: &str) -> String {
 }
 
 fn grounding_indexable_predicate(alias: &str) -> String {
+    // Missing occurrences remain unknown; exclude only explicit reference-only IDs.
     format!(
-        "{alias}.kind NOT IN ({}, {}, {})",
+        "{alias}.kind NOT IN ({}, {}, {})
+         AND (NOT EXISTS (
+                 SELECT 1 FROM occurrence reference
+                 WHERE reference.element_id = {alias}.id AND reference.kind = {reference_kind}
+             ) OR EXISTS (
+                 SELECT 1 FROM occurrence authority
+                 WHERE authority.element_id = {alias}.id
+                   AND authority.kind IN ({definition_kind}, {declaration_kind})
+             ))",
         NodeKind::FILE as i32,
         NodeKind::UNKNOWN as i32,
-        NodeKind::BUILTIN_TYPE as i32
+        NodeKind::BUILTIN_TYPE as i32,
+        reference_kind = OccurrenceKind::REFERENCE as i32,
+        definition_kind = OccurrenceKind::DEFINITION as i32,
+        declaration_kind = OccurrenceKind::DECLARATION as i32,
     )
 }
 
@@ -15144,6 +15156,73 @@ fn is_common_unqualified_call_name(name: &str) -> bool {
 #[cfg(test)]
 mod grounding_snapshot_fast_path_tests {
     use super::*;
+
+    #[test]
+    fn grounding_excludes_explicit_reference_only_nodes_and_keeps_unknown_or_mixed_authority()
+    -> Result<(), StorageError> {
+        let mut storage = Storage::new_in_memory()?;
+        insert_grounding_test_file(
+            &mut storage,
+            10,
+            "source.rs",
+            &[
+                (101, NodeKind::FUNCTION, "external_callable", 1),
+                (102, NodeKind::CLASS, "ExternalType", 2),
+                (103, NodeKind::FUNCTION, "local_callable", 3),
+                (104, NodeKind::CLASS, "DeclaredType", 4),
+                (105, NodeKind::MODULE, "synthetic_navigation", 5),
+            ],
+        )?;
+        let occurrences = [
+            (101, OccurrenceKind::REFERENCE),
+            (102, OccurrenceKind::REFERENCE),
+            (103, OccurrenceKind::DEFINITION),
+            (103, OccurrenceKind::REFERENCE),
+            (104, OccurrenceKind::DECLARATION),
+            (104, OccurrenceKind::REFERENCE),
+        ]
+        .into_iter()
+        .map(|(id, kind)| Occurrence {
+            element_id: id,
+            kind,
+            location: codestory_contracts::graph::SourceLocation {
+                file_node_id: NodeId(10),
+                start_line: 1,
+                start_col: 1,
+                end_line: 1,
+                end_col: 2,
+            },
+        })
+        .collect::<Vec<_>>();
+        storage.insert_occurrences_batch(&occurrences)?;
+        for snapshot in [false, true] {
+            if snapshot {
+                storage.refresh_grounding_snapshots()?;
+            }
+            let expected = HashSet::from([NodeId(103), NodeId(104), NodeId(105)]);
+            for records in [
+                storage.get_grounding_root_symbol_candidates(20, 0)?,
+                storage.get_grounding_root_symbols_for_files(&[10], 20)?,
+                storage.get_grounding_top_symbols_for_files(&[10], 20)?,
+            ] {
+                assert_eq!(
+                    records
+                        .into_iter()
+                        .map(|r| r.node.id)
+                        .collect::<HashSet<_>>(),
+                    expected,
+                    "reference-only exclusion must agree for roots and file rows ({snapshot})"
+                );
+            }
+            assert_eq!(storage.get_grounding_file_summaries()?[0].symbol_count, 3);
+            assert_eq!(
+                storage.get_occurrences_for_node(NodeId(101))?.len(),
+                1,
+                "reference graph evidence is retained"
+            );
+        }
+        Ok(())
+    }
 
     fn insert_grounding_test_file(
         storage: &mut Storage,

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Grounding maps stop treating known decorator and inherited-type references as local declarations. Existing parser indexes rebuild once on their next refresh.
+
 - Explicit symbol-summary generation works on current indexes and refreshes summaries when the selected model changes.
 
 - Fresh sessions can receive a compact repository map from an existing index, with verified file locations and visible coverage limits. Warm startup maps arrive as navigation data; the full skill remains available by explicit invocation, with its exact path in fallback guidance.

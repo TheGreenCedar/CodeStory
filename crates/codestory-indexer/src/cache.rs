@@ -1155,6 +1155,14 @@ mod tests {
             mix_str(&mut previous, config.language_name);
             mix_str(&mut previous, config.graph_query);
             mix_optional_str(&mut previous, config.tags_query);
+            // Hold the shared occurrence revision fixed when testing the older
+            // language-local callable-envelope change.
+            if !matches!(config.language_name, "python" | "rust")
+                && let Some(revision) =
+                    crate::current_file_extraction_revision(config.language_name)
+            {
+                mix_str(&mut previous, revision);
+            }
             if matches!(
                 config.language_name,
                 "c" | "cpp" | "javascript" | "typescript"
