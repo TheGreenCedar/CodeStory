@@ -8168,61 +8168,69 @@ mod tests {
     #[test]
     fn encoded_contained_source_alias_uses_admitted_logical_route() {
         use std::os::unix::fs::symlink;
-        let cache = tempfile::tempdir().unwrap();
-        let project = tempfile::tempdir().unwrap();
-        let logical = project.path().join("commands.ps1");
-        let target = project.path().join("data.bin");
-        let text = "function Invoke-Thing {\r\n  Write-Output 'é🦀'\r\n}\r\n";
-        let mut bytes = vec![0xff, 0xfe];
-        for unit in text.encode_utf16() {
-            bytes.extend(unit.to_le_bytes());
+        for (logical_name, target_name) in [
+            ("commands.ps1", "data.bin"),
+            ("zcommands.ps1", "aaa-data.bin"),
+        ] {
+            let cache = tempfile::tempdir().unwrap();
+            let project = tempfile::tempdir().unwrap();
+            let logical = project.path().join(logical_name);
+            let target = project.path().join(target_name);
+            let text = "function Invoke-Thing {\r\n  Write-Output 'é🦀'\r\n}\r\n";
+            let mut bytes = vec![0xff, 0xfe];
+            for unit in text.encode_utf16() {
+                bytes.extend(unit.to_le_bytes());
+            }
+            std::fs::write(&target, &bytes).unwrap();
+            symlink(target_name, &logical).unwrap();
+            let storage_path = project.path().join(".cache/codestory.db");
+            let controller = AppController::new_with_owned_cache_root(cache.path());
+            controller
+                .open_project_summary_with_storage_path(
+                    project.path().to_path_buf(),
+                    storage_path.clone(),
+                )
+                .unwrap();
+            controller
+                .run_indexing_blocking_without_runtime_refresh(
+                    codestory_contracts::api::IndexMode::Full,
+                )
+                .unwrap();
+            let storage = Store::open_read_only(&storage_path).unwrap();
+            let file = storage
+                .get_file_by_path(&logical)
+                .unwrap()
+                .expect("full indexing admits the selected contained structural alias");
+            assert!(file.indexed && file.complete);
+            let verified = crate::search_evidence::verified_file_checked(
+                &storage,
+                Some(project.path()),
+                &file,
+            )
+            .expect("logical source route has complete pinned decoded text");
+            assert_eq!(verified.content, text);
+            let admission = PacketAdmissionReceiptV1 {
+                packet_ordinal: 0,
+                stable_identity: format!("path:{logical_name}"),
+                score_version: "test".into(),
+                reserved_source_bytes: INTERIM_SOURCE_ROW_UPPER_BOUND as u32,
+                origin: PacketAdmissionOriginV1::Retrieval,
+            };
+            let packet = hydrate_admitted_file_source(&controller, &storage, &admission, &file);
+            let windows = controller.path_source_windows(logical_name, &[(2, 2)], 1024);
+            assert!(
+                packet.is_ok() && windows.is_ok(),
+                "admitted alias must retain decoder route; packet={packet:?}; windows_error={:?}",
+                windows.as_ref().err()
+            );
+            assert!(packet.unwrap().source.contains("é🦀"));
+            assert!(
+                windows.unwrap().1[0]
+                    .render(logical_name.into(), 2, 2, 1024)
+                    .snippet
+                    .contains("é🦀")
+            );
         }
-        std::fs::write(&target, &bytes).unwrap();
-        symlink("data.bin", &logical).unwrap();
-        let storage_path = project.path().join(".cache/codestory.db");
-        let controller = AppController::new_with_owned_cache_root(cache.path());
-        controller
-            .open_project_summary_with_storage_path(
-                project.path().to_path_buf(),
-                storage_path.clone(),
-            )
-            .unwrap();
-        controller
-            .run_indexing_blocking_without_runtime_refresh(
-                codestory_contracts::api::IndexMode::Full,
-            )
-            .unwrap();
-        let storage = Store::open_read_only(&storage_path).unwrap();
-        let file = storage
-            .get_file_by_path(&logical)
-            .unwrap()
-            .expect("full indexing admits the selected contained structural alias");
-        assert!(file.indexed && file.complete);
-        let verified =
-            crate::search_evidence::verified_file_checked(&storage, Some(project.path()), &file)
-                .expect("logical source route has complete pinned decoded text");
-        assert_eq!(verified.content, text);
-        let admission = PacketAdmissionReceiptV1 {
-            packet_ordinal: 0,
-            stable_identity: "path:commands.ps1".into(),
-            score_version: "test".into(),
-            reserved_source_bytes: INTERIM_SOURCE_ROW_UPPER_BOUND as u32,
-            origin: PacketAdmissionOriginV1::Retrieval,
-        };
-        let packet = hydrate_admitted_file_source(&controller, &storage, &admission, &file);
-        let windows = controller.path_source_windows("commands.ps1", &[(2, 2)], 1024);
-        assert!(
-            packet.is_ok() && windows.is_ok(),
-            "admitted alias must retain decoder route; packet={packet:?}; windows_error={:?}",
-            windows.as_ref().err()
-        );
-        assert!(packet.unwrap().source.contains("é🦀"));
-        assert!(
-            windows.unwrap().1[0]
-                .render("commands.ps1".into(), 2, 2, 1024)
-                .snippet
-                .contains("é🦀")
-        );
     }
 
     #[test]

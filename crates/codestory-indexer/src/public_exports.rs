@@ -134,15 +134,13 @@ fn module_writes(node: SyntaxNode<'_>, source: &str, writes: &mut HashSet<String
     if matches!(
         node.kind(),
         "assignment_expression" | "augmented_assignment_expression" | "update_expression"
-    ) {
-        if let Some(left) = node
-            .child_by_field_name("left")
-            .or_else(|| node.child_by_field_name("argument"))
-            && left.kind() == "identifier"
-            && let Some(name) = text(left, source)
-        {
-            writes.insert(name.to_string());
-        }
+    ) && let Some(left) = node
+        .child_by_field_name("left")
+        .or_else(|| node.child_by_field_name("argument"))
+        && left.kind() == "identifier"
+        && let Some(name) = text(left, source)
+    {
+        writes.insert(name.to_string());
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {

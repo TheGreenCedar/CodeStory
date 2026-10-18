@@ -662,7 +662,7 @@ fn type_hit_line_quality(project_root: Option<&Path>, query: &str, hit: &SearchH
         };
     }
     let tokens = trimmed
-        .split(|ch: char| ch.is_whitespace() || ch == ':' || ch == ';' || ch == '{')
+        .split(|ch: char| ch.is_whitespace() || matches!(ch, ':' | ';' | '{' | '<' | '(' | '['))
         .map(|token| token.trim_matches(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')))
         .filter(|token| !token.is_empty())
         .collect::<Vec<_>>();
@@ -1807,6 +1807,91 @@ mod tests {
                 "path: {path}, source: {source}"
             );
         }
+    }
+
+    #[test]
+    fn type_declaration_name_boundaries_preserve_definition_guards() {
+        let temp = tempdir().unwrap();
+        let cases = [
+            (
+                "owner.ts",
+                "export class _Painter<Input = string, Output = string> {",
+                NodeKind::CLASS,
+                2,
+            ),
+            (
+                "owner.java",
+                "class _Painter<T extends Base> {",
+                NodeKind::CLASS,
+                2,
+            ),
+            ("owner.rs", "pub struct _Painter<T> {", NodeKind::STRUCT, 2),
+            (
+                "owner.ts",
+                "export interface _Painter<T> {",
+                NodeKind::INTERFACE,
+                2,
+            ),
+            ("owner.py", "class _Painter(Base):", NodeKind::CLASS, 2),
+            ("owner.py", "class _Painter[T](Base):", NodeKind::CLASS, 2),
+            (
+                "owner.kt",
+                "class _Painter(value: Int) : Base(value) {",
+                NodeKind::CLASS,
+                2,
+            ),
+            (
+                "owner.cpp",
+                "class _Painter: public Base {",
+                NodeKind::CLASS,
+                2,
+            ),
+            ("owner.cpp", "class _Painter<T>;", NodeKind::CLASS, 0),
+            ("owner.cpp", "class _Painter;", NodeKind::CLASS, 0),
+            ("owner.ts", "class _PainterExtra<T> {", NodeKind::CLASS, 0),
+            ("owner.ts", "class Other<_Painter> {", NodeKind::CLASS, 0),
+            (
+                "owner.ts",
+                "import { _Painter } from './owner';",
+                NodeKind::CLASS,
+                0,
+            ),
+            (
+                "owner.ts",
+                "export { _Painter } from './owner';",
+                NodeKind::CLASS,
+                0,
+            ),
+            (
+                "owner.ts",
+                "const object = new _Painter<string>();",
+                NodeKind::CLASS,
+                0,
+            ),
+            (
+                "owner.go",
+                "type _Painter[T any] struct { Value T }",
+                NodeKind::STRUCT,
+                2,
+            ),
+            ("owner.go", "type Other = _Painter", NodeKind::STRUCT, 0),
+        ];
+        let mut failures = Vec::new();
+        for (path, source, kind, expected) in cases {
+            std::fs::write(temp.path().join(path), source).unwrap();
+            let candidate = hit_at_path_line("owner", "_Painter", kind, 0.1, path, 1);
+            let actual = type_hit_line_quality(Some(temp.path()), "_Painter", &candidate);
+            eprintln!(
+                "type-name boundary {path}: {source:?}: expected={expected}, actual={actual}"
+            );
+            if actual != expected {
+                failures.push(source);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "type declaration boundary failures: {failures:?}"
+        );
     }
 
     #[test]

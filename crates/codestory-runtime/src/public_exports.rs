@@ -224,7 +224,18 @@ mod tests {
     #[test]
     fn public_export_merge_preserves_unrelated_full_candidate_order_and_identity() {
         let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("owner.ts"), "class _Painter {}\n").unwrap();
+        std::fs::write(
+            root.path().join("owner.ts"),
+            "export class _Painter<Input = string, Output = string> {}\n",
+        )
+        .unwrap();
+        for path in ["callbacks.ts", "callbacks2.ts"] {
+            std::fs::write(
+                root.path().join(path),
+                "function painter(token: string) {}\n",
+            )
+            .unwrap();
+        }
         let hit = |id: &str, name: &str, kind: &str, path: &str, score: f32| -> SearchHit {
             serde_json::from_value(serde_json::json!({"node_id":id,"display_name":name,"kind":kind,
                 "file_path":root.path().join(path),"line":1,"score":score,"origin":"indexed_symbol","resolvable":true})).unwrap()
@@ -234,7 +245,18 @@ mod tests {
         let owner = hit("owner", "_Painter", "CLASS", "owner.ts", 0.1);
         // Deliberately preserve the producer's b-before-a order rather than
         // recomputing the full candidate list with the core comparator.
-        let mut hits = vec![b.clone(), a.clone(), owner.clone()];
+        let mut ordinary = vec![b.clone(), a.clone()];
+        ordinary.extend((0..10).map(|index| {
+            hit(
+                &format!("callback-{index}"),
+                "painter",
+                "FUNCTION",
+                "callbacks.ts",
+                0.95,
+            )
+        }));
+        let mut hits = ordinary.clone();
+        hits.push(owner.clone());
         let evidence = SearchPublicExportEvidence {
             matches: vec![SearchPublicExportMatch {
                 node_id: owner.node_id.clone(),
@@ -254,8 +276,11 @@ mod tests {
         AppController::rank_public_exports(root.path(), "Painter", &mut hits, &evidence);
         assert_eq!(
             hits.iter().map(|hit| &hit.node_id).collect::<Vec<_>>(),
-            vec![&owner.node_id, &b.node_id, &a.node_id]
+            std::iter::once(&owner.node_id)
+                .chain(ordinary.iter().map(|hit| &hit.node_id))
+                .collect::<Vec<_>>()
         );
+        assert_eq!(hits.len(), 13);
         assert_eq!(hits[0].display_name, "_Painter");
         assert_eq!(hits[0].file_path, owner.file_path);
         AppController::annotate_public_exports("Painter", &mut hits, &evidence);

@@ -2,13 +2,15 @@
 
 ## Unreleased
 
+- Symbol search recognizes generic type definitions and keeps them ahead of incidental same-name matches.
+
 - Symbol search finds JavaScript and TypeScript classes and functions through verified named public exports, while keeping their original names and source locations. Export/import witness locations explain the match; unsupported or ambiguous bindings remain explicit.
 
 - TypeScript and TSX files parse type-only star exports, allowing independent named exports beside them to remain searchable. Type-only exports do not become value aliases.
 
 - Source-backed search and navigation stay available after indexing unchanged, partially parsed Rust or Python files, while coverage continues to report the parsing gap.
 
-- Structural source indexing and retrieval accept BOM-marked UTF-16 text, including PowerShell files, while keeping source verification tied to the original bytes.
+- Structural source indexing and retrieval accept BOM-marked UTF-16 text, including PowerShell files, while keeping source verification tied to the original bytes. Contained aliases with supported file types remain indexable when an unsupported filename is discovered first.
 
 - Agent guidance can display caller results once when whole-number JSON formatting differs, preserving original text and metadata.
 

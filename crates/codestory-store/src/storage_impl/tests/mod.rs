@@ -1426,6 +1426,7 @@ fn historical_complete_publication_observation_is_bounded_and_nonmutating() {
         34,
         35,
         36,
+        FILE_EXTRACTION_IDENTITY_SCHEMA_VERSION,
         SCHEMA_VERSION,
         SCHEMA_VERSION + 1,
         INCOMPLETE_INCREMENTAL_SCHEMA_VERSION,
@@ -1444,7 +1445,7 @@ fn historical_complete_publication_observation_is_bounded_and_nonmutating() {
         }
         let before = durable_sqlite_state(&path);
         let observed = Storage::observe_complete_index_publication(&path);
-        if (32..=FILE_EXTRACTION_IDENTITY_SCHEMA_VERSION).contains(&version) {
+        if (32..=SCHEMA_VERSION).contains(&version) {
             assert_eq!(observed.unwrap(), Some(publication.clone()));
         } else {
             assert!(
