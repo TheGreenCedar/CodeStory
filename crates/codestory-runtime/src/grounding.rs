@@ -1003,11 +1003,61 @@ fn recommended_grounding_queries(
     recommended
 }
 
+/// Passive startup navigation, selected as of one immutable core publication.
+/// No source bodies or claim of repository-wide current completeness.
+#[derive(Debug, serde::Serialize)]
+pub struct SessionMapSnapshot {
+    pub project_root: String,
+    pub workspace_id: String,
+    pub generation_id: String,
+    pub run_id: String,
+    pub published_at_epoch_ms: i64,
+    pub stats: StorageStatsDto,
+    pub orientation: GroundingOrientationDto,
+    pub selected_groups: usize,
+    pub selected_roots: usize,
+    pub omitted_groups: usize,
+    pub gaps: Vec<String>,
+    pub rows: Vec<SessionMapRow>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct SessionMapRow {
+    pub path: String,
+    pub file_id: i64,
+    pub content_sha256: String,
+    pub roots: Vec<SessionMapSymbol>,
+    pub symbols: Vec<SessionMapSymbol>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct SessionMapSymbol {
+    pub id: NodeId,
+    pub name: String,
+    pub kind: NodeKind,
+    pub line: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_tier: Option<PacketEvidenceTierDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_producer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution_status: Option<PacketEvidenceResolutionDto>,
+}
+
 impl AppController {
     pub fn grounding_snapshot(
         &self,
         budget: GroundingBudgetDto,
     ) -> Result<GroundingSnapshotDto, ApiError> {
+        self.grounding_snapshot_selected(budget, true)
+            .map(|(snapshot, _)| snapshot)
+    }
+
+    fn grounding_snapshot_selected(
+        &self,
+        budget: GroundingBudgetDto,
+        observe_retrieval: bool,
+    ) -> Result<(GroundingSnapshotDto, Vec<i64>), ApiError> {
         self.ensure_graph_only_read_state("Grounding")?;
         let root = self.require_project_root()?;
         let storage = self.open_storage_read_only()?;
@@ -1242,6 +1292,10 @@ impl AppController {
             structural_units: &structural_units,
         };
 
+        let selected_file_ids = selected_coverages
+            .iter()
+            .map(|coverage| coverage.file.id)
+            .collect();
         for coverage in selected_coverages {
             let mut symbols = Vec::with_capacity(coverage.represented_symbol_count as usize);
             if let Some(records) = file_nodes_by_id.get(&coverage.file.id) {
@@ -1326,8 +1380,11 @@ impl AppController {
         }
 
         let total_file_count = dto_stats.file_count;
-        let retrieval =
-            retrieval_state_from_storage_for_runtime(&storage, &root, &self.runtime_config).ok();
+        let retrieval = observe_retrieval
+            .then(|| {
+                retrieval_state_from_storage_for_runtime(&storage, &root, &self.runtime_config).ok()
+            })
+            .flatten();
         if let Some(state) = retrieval.as_ref() {
             let mode = match state.mode {
                 codestory_contracts::api::RetrievalModeDto::Hybrid => "hybrid",
@@ -1357,31 +1414,239 @@ impl AppController {
             notes.push(retrieval_note);
         }
 
-        Ok(GroundingSnapshotDto {
-            root: root.to_string_lossy().to_string(),
-            budget,
-            generated_at_epoch_ms: current_epoch_ms(),
-            stats: dto_stats,
-            retrieval,
-            coverage: codestory_contracts::api::GroundingCoverageDto {
-                total_files: total_file_count,
-                represented_files: (file_digests.len().min(u32::MAX as usize) as u32)
-                    .saturating_add(bucketed_files)
-                    .min(total_file_count),
-                total_symbols: file_digests
-                    .iter()
-                    .map(|file| file.symbol_count)
-                    .sum::<u32>()
-                    .saturating_add(bucketed_symbols),
-                represented_symbols,
-                compressed_files,
+        Ok((
+            GroundingSnapshotDto {
+                root: root.to_string_lossy().to_string(),
+                budget,
+                generated_at_epoch_ms: current_epoch_ms(),
+                stats: dto_stats,
+                retrieval,
+                coverage: codestory_contracts::api::GroundingCoverageDto {
+                    total_files: total_file_count,
+                    represented_files: (file_digests.len().min(u32::MAX as usize) as u32)
+                        .saturating_add(bucketed_files)
+                        .min(total_file_count),
+                    total_symbols: file_digests
+                        .iter()
+                        .map(|file| file.symbol_count)
+                        .sum::<u32>()
+                        .saturating_add(bucketed_symbols),
+                    represented_symbols,
+                    compressed_files,
+                },
+                orientation,
+                root_symbols,
+                files: file_digests,
+                coverage_buckets,
+                notes,
+                recommended_queries,
             },
-            orientation,
-            root_symbols,
-            files: file_digests,
-            coverage_buckets,
-            notes,
-            recommended_queries,
+            selected_file_ids,
+        ))
+    }
+
+    pub(crate) fn passive_session_map_at(
+        &self,
+        root: std::path::PathBuf,
+        storage_path: std::path::PathBuf,
+    ) -> Result<SessionMapSnapshot, ApiError> {
+        if !root.is_absolute() || !storage_path.is_absolute() {
+            return Err(ApiError::invalid_argument(
+                "Passive map requires absolute project and storage paths",
+            ));
+        }
+        self.bind_project_paths_for_refresh(root.clone(), storage_path)?;
+        self.with_complete_core_snapshot(|publication| {
+            let (snapshot, file_ids) =
+                self.grounding_snapshot_selected(GroundingBudgetDto::Strict, false)?;
+            let storage = self.open_storage_read_only()?;
+            let mut groups: Vec<(
+                codestory_workspace::WorkspacePathIdentity,
+                FileInfo,
+                SessionMapRow,
+            )> = Vec::new();
+            let mut gaps = Vec::new();
+            let mut omitted_groups = 0;
+            let mut root_file_ids = Vec::new();
+            for symbol in &snapshot.root_symbols {
+                let node = storage
+                    .get_node(symbol.id.to_core()?)
+                    .map_err(|e| ApiError::internal(e.to_string()))?;
+                match node
+                    .as_ref()
+                    .and_then(crate::controller_files::source_file_id)
+                {
+                    Some(id) => root_file_ids.push(id.0),
+                    None => gaps.push(format!(
+                        "root_id={}: no indexed source file for {}",
+                        symbol.id.0, symbol.label
+                    )),
+                }
+            }
+            let mut seen_ids = HashSet::new();
+            let mut group_for_file_id = HashMap::new();
+            for file_id in root_file_ids.into_iter().chain(file_ids.iter().copied()) {
+                if !seen_ids.insert(file_id) {
+                    continue;
+                }
+                let Some(file) = storage
+                    .get_file_by_id(file_id)
+                    .map_err(|e| ApiError::internal(e.to_string()))?
+                else {
+                    gaps.push(format!("file_id={file_id}: indexed file unavailable"));
+                    continue;
+                };
+                let Some(indexed_hash) = storage
+                    .get_file_content_hash(file_id)
+                    .map_err(|e| ApiError::internal(e.to_string()))?
+                    .filter(|hash| !hash.is_empty())
+                else {
+                    gaps.push(format!(
+                        "file_id={file_id}: indexed content hash unavailable"
+                    ));
+                    continue;
+                };
+                let resolution =
+                    codestory_workspace::resolve_project_relative_path(&root, &file.path);
+                let Ok(codestory_workspace::ProjectRelativePathResolution::Existing {
+                    absolute,
+                    relative,
+                    ..
+                }) = resolution
+                else {
+                    gaps.push(format!("file_id={file_id}: missing or outside project"));
+                    continue;
+                };
+                let Some(path) = relative.to_str() else {
+                    gaps.push(format!(
+                        "file_id={file_id}: path not representable as UTF-8"
+                    ));
+                    continue;
+                };
+                let handle =
+                    crate::controller_files::open_regular_source_file_with(&absolute, |path| {
+                        std::fs::File::open(path)
+                    });
+                let Ok(handle) = handle else {
+                    gaps.push(format!("file_id={file_id}: source not regular/readable"));
+                    continue;
+                };
+                let identity = codestory_workspace::workspace_file_identity(&handle)
+                    .map_err(|e| ApiError::internal(e.to_string()))?;
+                if let Some(index) = groups.iter().position(|(id, _, _)| id == &identity) {
+                    // Current native identity alone cannot certify this member's
+                    // old indexed symbols. Every association retains its own hash.
+                    if groups[index].2.content_sha256 == indexed_hash {
+                        group_for_file_id.insert(file_id, index);
+                    } else {
+                        gaps.push(format!(
+                            "file_id={file_id}: indexed content differs from native group"
+                        ));
+                    }
+                    continue;
+                }
+                if groups.len() == 12 {
+                    omitted_groups += 1;
+                    continue;
+                }
+                group_for_file_id.insert(file_id, groups.len());
+                groups.push((
+                    identity,
+                    file,
+                    SessionMapRow {
+                        path: path.replace(std::path::MAIN_SEPARATOR, "/"),
+                        file_id,
+                        content_sha256: indexed_hash,
+                        roots: Vec::new(),
+                        symbols: Vec::new(),
+                    },
+                ));
+            }
+            // Match source-owned stable IDs, never parse display labels or path spellings.
+            for (is_root, symbol) in snapshot.root_symbols.iter().map(|s| (true, s)).chain(
+                snapshot
+                    .files
+                    .iter()
+                    .flat_map(|f| f.symbols.iter().map(|s| (false, s))),
+            ) {
+                let node = storage
+                    .get_node(symbol.id.to_core()?)
+                    .map_err(|e| ApiError::internal(e.to_string()))?;
+                let Some(node) = node else {
+                    gaps.push(format!(
+                        "symbol_id={}: indexed symbol unavailable",
+                        symbol.id.0
+                    ));
+                    continue;
+                };
+                let Some(file_id) = crate::controller_files::source_file_id(&node) else {
+                    if !is_root {
+                        gaps.push(format!("symbol_id={}: no indexed source file", symbol.id.0));
+                    }
+                    continue;
+                };
+                let Some(index) = group_for_file_id.get(&file_id.0) else {
+                    continue;
+                };
+                let row = &mut groups[*index].2;
+                let symbol = SessionMapSymbol {
+                    id: symbol.id.clone(),
+                    name: node_display_name(&node),
+                    kind: symbol.kind,
+                    line: symbol.line,
+                    evidence_tier: symbol.evidence_tier,
+                    evidence_producer: symbol.evidence_producer.clone(),
+                    resolution_status: symbol.resolution_status,
+                };
+                if is_root {
+                    row.roots.push(symbol);
+                } else if !row.roots.iter().any(|root| root.id == symbol.id) {
+                    row.symbols.push(symbol);
+                }
+            }
+            let selected_groups = groups.len();
+            let mut rows = Vec::new();
+            for (identity, file, mut row) in groups {
+                let cap = self.source_index_policy.effective_byte_cap(&row.path);
+                match crate::search_evidence::verified_file_bounded(&storage, &root, &file, cap) {
+                    Ok(source)
+                        if codestory_workspace::workspace_path_identity(&source.path)
+                            .ok()
+                            .as_ref()
+                            == Some(&identity) =>
+                    {
+                        row.content_sha256 = source.content_sha256;
+                        rows.push(row);
+                    }
+                    Ok(_) => gaps.push(format!("file_id={}: native identity changed", file.id)),
+                    Err(crate::search_evidence::VerifiedFileError::Stale) => gaps.push(format!(
+                        "file_id={}: content changed since publication",
+                        file.id
+                    )),
+                    Err(_) => gaps.push(format!(
+                        "file_id={}: source unavailable or exceeds source policy",
+                        file.id
+                    )),
+                }
+            }
+            let project_root = root
+                .to_str()
+                .ok_or_else(|| ApiError::invalid_argument("Project path is not UTF-8"))?
+                .to_owned();
+            Ok(SessionMapSnapshot {
+                workspace_id: codestory_workspace::workspace_id_v3_for_root(&root),
+                project_root,
+                generation_id: publication.generation_id.clone(),
+                run_id: publication.run_id.clone(),
+                published_at_epoch_ms: publication.published_at_epoch_ms,
+                stats: snapshot.stats,
+                orientation: snapshot.orientation,
+                selected_groups,
+                selected_roots: snapshot.root_symbols.len(),
+                omitted_groups,
+                gaps,
+                rows,
+            })
         })
     }
 

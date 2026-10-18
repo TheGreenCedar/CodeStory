@@ -7793,20 +7793,18 @@ test("startup hook records active project without runtime bootstrap", async () =
   const hookPath = join(pluginRoot, "hooks", "codestory-activate.cjs");
 
   try {
-    // A nonexistent CODESTORY_CLI cannot distinguish "hook never invoked the
-    // CLI" from "invocation failed to spawn". Install a callable sentinel that
-    // records every invocation, prove it reachable with a direct call, then
-    // require the hook run to leave no record.
+    // A callable sentinel distinguishes the passive command from hidden
+    // readiness/index/provision work. Invalid child output keeps static text.
     const sentinelCli = join(
       dataDir,
       process.platform === "win32" ? "codestory-cli.exe" : "codestory-cli",
     );
     const sentinelMarker = join(dataDir, "cli-invocations.txt");
     const sentinelScript =
-      "require('node:fs').appendFileSync(process.env.CODESTORY_TEST_HOOK_SENTINEL,'invoked\\n');" +
+      "require('node:fs').appendFileSync(process.env.CODESTORY_TEST_HOOK_SENTINEL,JSON.stringify(process.argv.slice(1))+'\\n');" +
       "console.log('codestory-cli sentinel')";
     if (process.platform === "win32") {
-      await writeWindowsCliShim(sentinelCli, sentinelScript);
+      await writeWindowsCliShim(sentinelCli, sentinelScript, { evalArgs: true });
     } else {
       await writeFile(
         sentinelCli,
@@ -7820,7 +7818,7 @@ test("startup hook records active project without runtime bootstrap", async () =
       encoding: "utf8",
     });
     assert.equal(control.status, 0, control.stderr);
-    assert.equal(await readFile(sentinelMarker, "utf8"), "invoked\n");
+    assert.deepEqual(JSON.parse((await readFile(sentinelMarker, "utf8")).trim()), ["--version"]);
     await rm(sentinelMarker);
 
     const result = spawnSync(process.execPath, [hookPath], {
@@ -7841,11 +7839,8 @@ test("startup hook records active project without runtime bootstrap", async () =
     });
 
     assert.equal(result.status, 0, result.stderr);
-    assert.equal(
-      fs.existsSync(sentinelMarker),
-      false,
-      "startup hook must not invoke the CLI",
-    );
+    assert.deepEqual(JSON.parse((await readFile(sentinelMarker, "utf8")).trim()),
+      ["internal-session-context", "--project", repoRoot]);
     const output = JSON.parse(result.stdout);
     const context = output.hookSpecificOutput.additionalContext;
     assert.equal(output.systemMessage, "CODESTORY:BACKGROUND");
@@ -9201,6 +9196,68 @@ function runHookProcess(script, input, env) {
 function runCodexHook(input, env) {
   return runHookProcess(join(pluginRoot, "hooks", "codestory-activate.cjs"), input, env);
 }
+
+test("fresh startup map uses only explicit cwd and preserves static fallback", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-startup-map-"));
+  const binDir = await mkdtemp(join(tmpdir(), "codestory-startup-bin-"));
+  const marker = join(dataDir, "called.json");
+  try {
+    const cli = await writeNodeCli(binDir, `require("fs").writeFileSync(process.env.TEST_MARKER, JSON.stringify(process.argv.slice(2))); process.stdout.write(JSON.stringify({schema_version:1,status:"ready",context:"Repository map: source-verified, as-of publication test"}));`);
+    const env = { PLUGIN_DATA: dataDir, CODESTORY_CLI: cli, TEST_MARKER: marker, PATH: "" };
+    const baseline = runCodexHook({ hook_event_name: "SessionStart", source: "resume", cwd: repoRoot }, env).hookSpecificOutput.additionalContext;
+    const output = runCodexHook({ hook_event_name: "SessionStart", source: "startup", cwd: repoRoot }, env);
+    assert.deepEqual(JSON.parse(await readFile(marker, "utf8")), ["internal-session-context", "--project", repoRoot]);
+    assert.equal(output.hookSpecificOutput.additionalContext, `${baseline}\n\nRepository map: source-verified, as-of publication test`);
+    await rm(marker);
+    for (const input of [
+      { hook_event_name: "SessionStart", source: "resume", cwd: repoRoot },
+      { hook_event_name: "SessionStart", source: "compact", cwd: repoRoot },
+      { hook_event_name: "SessionStart", source: "startup", cwd: "relative" },
+      { hook_event_name: "SessionStart", source: "startup" },
+      { source: "startup", cwd: repoRoot },
+      { hook_event_name: "SessionStart", cwd: repoRoot },
+    ]) {
+      assert.equal(runCodexHook(input, env).hookSpecificOutput.additionalContext, baseline);
+      await assert.rejects(readFile(marker, "utf8"), /ENOENT/u);
+    }
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(binDir, { recursive: true, force: true });
+  }
+});
+
+test("startup map receipt, child failures and UTF-8 bounds fail open", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-startup-fallback-"));
+  const binDir = await mkdtemp(join(tmpdir(), "codestory-startup-fallback-bin-"));
+  try {
+    const env = { PLUGIN_DATA: dataDir, CODESTORY_CLI: "", CODESTORY_PLUGIN_CLI_PATH: "", PATH: "" };
+    const input = { hook_event_name: "SessionStart", source: "startup", cwd: repoRoot };
+    const baseline = runCodexHook({ ...input, source: "resume" }, env).hookSpecificOutput.additionalContext;
+    const cli = await writeNodeCli(binDir, `process.stdout.write(JSON.stringify({schema_version:1,status:"ready",context:"verified receipt map"}));`);
+    const receipt = join(dataDir, ".codestory-mcp-runtime.json");
+    await writeFile(receipt, JSON.stringify({ path:cli, sha256:createHash("sha256").update(await readFile(cli)).digest("hex") }));
+    assert.equal(runCodexHook(input, env).hookSpecificOutput.additionalContext, `${baseline}\n\nverified receipt map`);
+    await writeFile(receipt, JSON.stringify({ path:cli, sha256:"0".repeat(64) }));
+    assert.equal(runCodexHook(input, env).hookSpecificOutput.additionalContext, baseline);
+    assert.equal(runCodexHook({ ...input, cwd: `${repoRoot}\u0000invalid` }, { ...env, CODESTORY_CLI: cli }).hookSpecificOutput.additionalContext, baseline);
+    for (const program of [
+      `process.exit(2);`,
+      `process.stdout.write("not json");`,
+      `process.stdout.write(JSON.stringify({schema_version:1,status:"unavailable"}));`,
+      `process.stdout.write(JSON.stringify({schema_version:1,status:"ready",context:"é".repeat(1800)}));`,
+      `process.stdout.write("x".repeat(20000));`,
+      `setTimeout(() => {}, 10000);`,
+    ]) {
+      const cli = await writeNodeCli(binDir, program);
+      const start = Date.now();
+      assert.equal(runCodexHook(input, { ...env, CODESTORY_CLI: cli }).hookSpecificOutput.additionalContext, baseline);
+      assert.ok(Date.now() - start < 5000, "startup child must be bounded");
+    }
+  } finally {
+    await rm(dataDir, { recursive:true, force:true });
+    await rm(binDir, { recursive:true, force:true });
+  }
+});
 
 test("session hooks inject one bounded contract and prompt hooks stay silent", async () => {
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-reinject-"));

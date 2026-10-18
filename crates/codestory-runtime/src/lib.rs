@@ -403,6 +403,7 @@ mod graph_builders;
 mod graph_canonical;
 mod graph_dto;
 mod grounding;
+pub use grounding::{SessionMapRow, SessionMapSnapshot, SessionMapSymbol};
 mod mermaid;
 mod path_identity;
 mod path_resolution;

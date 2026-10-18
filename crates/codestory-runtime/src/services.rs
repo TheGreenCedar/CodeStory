@@ -4436,6 +4436,15 @@ impl GroundingService {
         Self { controller }
     }
 
+    /// Attach only an existing complete core; no readiness, refresh, or retrieval.
+    pub fn passive_session_map_at(
+        &self,
+        root: PathBuf,
+        storage_path: PathBuf,
+    ) -> Result<crate::SessionMapSnapshot, ApiError> {
+        self.controller.passive_session_map_at(root, storage_path)
+    }
+
     pub fn grounding_snapshot(
         &self,
         budget: GroundingBudgetDto,
@@ -5098,6 +5107,366 @@ pub(crate) mod activation_tests {
         );
 
         (project, cache, storage_path, retrieval_pointer)
+    }
+
+    #[test]
+    fn passive_session_map_is_pinned_bounded_and_verifies_selected_sources_only() {
+        let (project, cache, storage_path, retrieval_pointer) =
+            complete_core_without_retrieval_pointer_fixture();
+        let process_cache = tempfile::tempdir().unwrap();
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
+        let before = fs::read(
+            codestory_store::CorePublicationLayout::from_storage_path(&storage_path)
+                .unwrap()
+                .publication_path(),
+        )
+        .ok();
+        let map = runtime
+            .grounding_service()
+            .passive_session_map_at(project.path().to_path_buf(), storage_path.clone())
+            .unwrap();
+        assert_eq!(map.rows.len(), 1);
+        assert_eq!(map.rows[0].path, "fixture.rs");
+        assert!(
+            map.rows[0]
+                .roots
+                .iter()
+                .any(|s| s.name == "retained_core_fixture")
+        );
+        assert_eq!(map.rows[0].content_sha256.len(), 64);
+        assert!(
+            map.gaps.iter().all(|gap| gap.starts_with("root_id=")),
+            "unbound graph roots must remain explicit: {:?}",
+            map.gaps
+        );
+        assert!(!retrieval_pointer.exists());
+        assert_eq!(
+            before,
+            fs::read(
+                codestory_store::CorePublicationLayout::from_storage_path(&storage_path)
+                    .unwrap()
+                    .publication_path()
+            )
+            .ok()
+        );
+        // Unindexed siblings never enter the fixed selected-file verification set.
+        fs::write(
+            project.path().join("unselected.rs"),
+            "fn not_in_publication() {}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            runtime
+                .grounding_service()
+                .passive_session_map_at(project.path().to_path_buf(), storage_path.clone())
+                .unwrap()
+                .rows
+                .len(),
+            1
+        );
+        // Same-length drift is not certified by old index metadata.
+        fs::write(
+            project.path().join("fixture.rs"),
+            "pub fn changed__core_fixture() {}\n",
+        )
+        .unwrap();
+        let stale = runtime
+            .grounding_service()
+            .passive_session_map_at(project.path().to_path_buf(), storage_path.clone())
+            .unwrap();
+        assert!(stale.rows.is_empty());
+        assert!(stale.gaps.iter().any(|s| s.contains("content changed")));
+        // A previously tiny file cannot cause unbounded allocation at startup.
+        fs::write(project.path().join("fixture.rs"), vec![b'x'; 2_000_001]).unwrap();
+        let grown = runtime
+            .grounding_service()
+            .passive_session_map_at(project.path().to_path_buf(), storage_path.clone())
+            .unwrap();
+        assert!(grown.rows.is_empty());
+        assert!(
+            grown
+                .gaps
+                .iter()
+                .any(|s| s.contains("exceeds source policy"))
+        );
+        fs::remove_file(project.path().join("fixture.rs")).unwrap();
+        assert!(
+            runtime
+                .grounding_service()
+                .passive_session_map_at(project.path().to_path_buf(), storage_path.clone())
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+        let absent = cache.path().join("absent").join("codestory.db");
+        assert!(
+            runtime
+                .grounding_service()
+                .passive_session_map_at(project.path().to_path_buf(), absent.clone())
+                .is_err()
+        );
+        assert!(!absent.parent().unwrap().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn passive_session_map_groups_native_aliases_without_rewriting_unix_paths() {
+        use std::os::unix::fs::symlink;
+        let (project, _cache, storage_path, _) = complete_core_without_retrieval_pointer_fixture();
+        let literal = project.path().join("part\\leaf.rs");
+        fs::write(&literal, "pub fn literal_leaf() {}\n").unwrap();
+        fs::create_dir(project.path().join("part")).unwrap();
+        fs::write(
+            project.path().join("part/leaf.rs"),
+            "pub fn separate_leaf() {}\n",
+        )
+        .unwrap();
+        symlink(
+            project.path().join("fixture.rs"),
+            project.path().join("alias.rs"),
+        )
+        .unwrap();
+        let process_cache = tempfile::tempdir().unwrap();
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
+        runtime
+            .grounding_service()
+            .controller
+            .bind_project_paths_for_refresh(project.path().to_path_buf(), storage_path.clone())
+            .unwrap();
+        runtime
+            .index_service()
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .unwrap();
+        let map = runtime
+            .grounding_service()
+            .passive_session_map_at(project.path().to_path_buf(), storage_path.clone())
+            .unwrap();
+        let source_names = map
+            .rows
+            .iter()
+            .flat_map(|r| r.roots.iter().chain(&r.symbols))
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(source_names.contains(&"literal_leaf"));
+        assert!(source_names.contains(&"separate_leaf"));
+        assert_eq!(
+            map.rows.len(),
+            3,
+            "contained alias must occupy only one native group"
+        );
+        assert!(map.rows.iter().any(|r| r.path == "part/leaf.rs"));
+        assert!(map.rows.iter().any(|r| r.path == "part\\leaf.rs"));
+        let selected = runtime
+            .grounding_service()
+            .controller
+            .with_complete_core_snapshot(|_| {
+                runtime
+                    .grounding_service()
+                    .grounding_snapshot(GroundingBudgetDto::Strict)
+            })
+            .unwrap();
+        let storage = runtime
+            .grounding_service()
+            .controller
+            .open_storage_read_only()
+            .unwrap();
+        let selected_ids = selected
+            .root_symbols
+            .iter()
+            .filter(|s| {
+                storage
+                    .get_node(s.id.to_core().unwrap())
+                    .unwrap()
+                    .as_ref()
+                    .and_then(crate::controller_files::source_file_id)
+                    .is_some()
+            })
+            .map(|s| s.id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            map.gaps.len(),
+            selected.root_symbols.len() - selected_ids.len(),
+            "unbound graph roots stay explicit gaps"
+        );
+        let map_ids = map
+            .rows
+            .iter()
+            .flat_map(|r| &r.roots)
+            .map(|s| s.id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            map_ids, selected_ids,
+            "grouping must preserve every selected root"
+        );
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(
+            outside.path().join("outside.rs"),
+            "pub fn literal_leaf() {}\n",
+        )
+        .unwrap();
+        fs::remove_file(&literal).unwrap();
+        symlink(outside.path().join("outside.rs"), &literal).unwrap();
+        let escaped = runtime
+            .grounding_service()
+            .passive_session_map_at(project.path().to_path_buf(), storage_path)
+            .unwrap();
+        assert!(escaped.gaps.iter().any(|g| g.contains("outside project")));
+        assert!(
+            !escaped
+                .rows
+                .iter()
+                .flat_map(|r| r.roots.iter().chain(&r.symbols))
+                .any(|s| s.name == "literal_leaf")
+        );
+        assert!(
+            escaped
+                .rows
+                .iter()
+                .flat_map(|r| r.roots.iter().chain(&r.symbols))
+                .any(|s| s.name == "separate_leaf")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn passive_session_map_keeps_each_alias_members_indexed_content_authority() {
+        use std::os::unix::fs::symlink;
+        // Distinct indexed files may later acquire one native identity. Equal
+        // bytes are a valid coalescing control; drift or missing authority is not.
+        for link in ["hardlink", "symlink"] {
+            for authority in ["different", "equal", "missing"] {
+                let project = tempfile::tempdir().unwrap();
+                let cache = tempfile::tempdir().unwrap();
+                let process_cache = tempfile::tempdir().unwrap();
+                let storage_path = cache.path().join("codestory.db");
+                let a = project.path().join("a.rs");
+                let b = project.path().join("b.rs");
+                let first = "pub fn alpha_entry() {}\n";
+                fs::write(&a, first).unwrap();
+                fs::write(
+                    &b,
+                    if authority == "equal" {
+                        first
+                    } else {
+                        "pub fn beta_entry() {}\n"
+                    },
+                )
+                .unwrap();
+                let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
+                runtime
+                    .project_service()
+                    .open_project_summary_with_storage_path(
+                        project.path().to_path_buf(),
+                        storage_path.clone(),
+                    )
+                    .unwrap();
+                runtime
+                    .index_service()
+                    .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+                    .unwrap();
+                let before = runtime
+                    .grounding_service()
+                    .passive_session_map_at(project.path().to_path_buf(), storage_path.clone())
+                    .unwrap();
+                assert_eq!(
+                    before.rows.len(),
+                    2,
+                    "{link}/{authority}: both source identities must be observed before coalescing"
+                );
+                let b_row = before.rows.iter().find(|row| row.path == "b.rs").unwrap();
+                let b_ids = b_row
+                    .roots
+                    .iter()
+                    .chain(&b_row.symbols)
+                    .map(|symbol| symbol.id.clone())
+                    .collect::<std::collections::HashSet<_>>();
+                assert!(
+                    !b_ids.is_empty(),
+                    "fixture must expose b's own indexed symbol"
+                );
+                let before_ids = before
+                    .rows
+                    .iter()
+                    .flat_map(|row| row.roots.iter().chain(&row.symbols))
+                    .map(|s| s.id.clone())
+                    .collect::<std::collections::HashSet<_>>();
+                if authority == "missing" {
+                    mutate_active_generation_sql(
+                        &storage_path,
+                        &format!(
+                            "UPDATE file SET content_hash = NULL WHERE id = {};",
+                            b_row.file_id
+                        ),
+                    );
+                }
+                fs::remove_file(&b).unwrap();
+                if link == "hardlink" {
+                    fs::hard_link(&a, &b).unwrap();
+                } else {
+                    symlink(&a, &b).unwrap();
+                }
+                let publication = fs::read(
+                    codestory_store::CorePublicationLayout::from_storage_path(&storage_path)
+                        .unwrap()
+                        .publication_path(),
+                )
+                .unwrap();
+                let after = runtime
+                    .grounding_service()
+                    .passive_session_map_at(project.path().to_path_buf(), storage_path.clone())
+                    .unwrap();
+                assert_eq!(after.generation_id, before.generation_id);
+                assert_eq!(after.run_id, before.run_id);
+                assert_eq!(
+                    after.rows.len(),
+                    1,
+                    "{link}/{authority}: one current native group"
+                );
+                let after_ids = after
+                    .rows
+                    .iter()
+                    .flat_map(|row| row.roots.iter().chain(&row.symbols))
+                    .map(|s| s.id.clone())
+                    .collect::<std::collections::HashSet<_>>();
+                if authority == "equal" {
+                    assert_eq!(
+                        after_ids, before_ids,
+                        "{link}: matching indexed raw hashes must preserve every alias symbol"
+                    );
+                    assert!(
+                        !after.gaps.iter().any(|gap| gap.starts_with("file_id=")),
+                        "{link}: valid alias was refused: {:?}",
+                        after.gaps
+                    );
+                } else {
+                    assert!(
+                        after_ids.is_disjoint(&b_ids),
+                        "{link}/{authority}: stale alias symbols were certified by another member's hash"
+                    );
+                    assert!(
+                        after.rows[0]
+                            .roots
+                            .iter()
+                            .any(|symbol| symbol.name == "alpha_entry")
+                    );
+                    assert!(
+                        after.gaps.iter().any(|gap| gap
+                            .starts_with(&format!("file_id={}: indexed content", b_row.file_id))),
+                        "{link}/{authority}: missing authority gap: {:?}",
+                        after.gaps
+                    );
+                }
+                assert_eq!(
+                    publication,
+                    fs::read(
+                        codestory_store::CorePublicationLayout::from_storage_path(&storage_path)
+                            .unwrap()
+                            .publication_path()
+                    )
+                    .unwrap()
+                );
+            }
+        }
     }
 
     #[test]

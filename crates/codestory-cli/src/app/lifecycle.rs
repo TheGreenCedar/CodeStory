@@ -23,7 +23,8 @@ pub(super) fn embedding_client_transport_mode(
         Command::Retrieval(args::RetrievalCommand {
             action: args::RetrievalAction::Status(_),
         }) => Some(embedding_server_transport::ClientTransportMode::ObserveOnly),
-        Command::InternalEmbeddingServer => None,
+        // The passive hook never installs a retrieval client, even observe-only.
+        Command::InternalSessionContext(_) | Command::InternalEmbeddingServer => None,
         // This is deliberately an allowlist for attested observe-only capture. New commands retain
         // fresh exact executable identity unless their transport behavior is reviewed explicitly.
         _ => Some(embedding_server_transport::ClientTransportMode::SpawnCapable),

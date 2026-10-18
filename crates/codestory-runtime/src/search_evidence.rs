@@ -188,6 +188,26 @@ pub(crate) fn verified_file_checked(
     project_root: Option<&Path>,
     file: &FileInfo,
 ) -> Result<VerifiedSourceFile, VerifiedFileError> {
+    verified_file_read(storage, project_root, file, None)
+}
+
+/// Startup reads are bounded by the captured source-index policy, including a
+/// cap+1 sentinel if the opened file grows after its metadata check.
+pub(crate) fn verified_file_bounded(
+    storage: &Store,
+    project_root: &Path,
+    file: &FileInfo,
+    maximum_bytes: u64,
+) -> Result<VerifiedSourceFile, VerifiedFileError> {
+    verified_file_read(storage, Some(project_root), file, Some(maximum_bytes))
+}
+
+fn verified_file_read(
+    storage: &Store,
+    project_root: Option<&Path>,
+    file: &FileInfo,
+    maximum_bytes: Option<u64>,
+) -> Result<VerifiedSourceFile, VerifiedFileError> {
     let expected_hash = storage
         .get_file_content_hash(file.id)
         .ok()
@@ -202,7 +222,23 @@ pub(crate) fn verified_file_checked(
     };
     #[cfg(test)]
     VERIFIED_SOURCE_READS.with(|count| count.set(count.get() + 1));
-    let bytes = std::fs::read(read_path).map_err(|_| VerifiedFileError::Unavailable)?;
+    let bytes = if let Some(cap) = maximum_bytes {
+        let source = crate::controller_files::open_regular_source_file_with(&read_path, |path| {
+            std::fs::File::open(path)
+        })
+        .map_err(|_| VerifiedFileError::Unavailable)?;
+        if source
+            .metadata()
+            .map_err(|_| VerifiedFileError::Unavailable)?
+            .len()
+            > cap
+        {
+            return Err(VerifiedFileError::Unavailable);
+        }
+        bounded_source_bytes(source, cap).map_err(|_| VerifiedFileError::Unavailable)?
+    } else {
+        std::fs::read(read_path).map_err(|_| VerifiedFileError::Unavailable)?
+    };
     if format!("{:x}", Sha256::digest(&bytes)) != expected_hash {
         return Err(VerifiedFileError::Stale);
     }
@@ -212,6 +248,30 @@ pub(crate) fn verified_file_checked(
         content_sha256: expected_hash,
         path,
     })
+}
+
+fn bounded_source_bytes(reader: impl std::io::Read, cap: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    reader.take(cap.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > cap {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "source exceeds byte policy",
+        ));
+    }
+    Ok(bytes)
+}
+
+#[test]
+fn bounded_source_read_refuses_growth_with_one_sentinel_byte() {
+    let mut source = std::io::Cursor::new(vec![b'x'; 100]);
+    assert!(bounded_source_bytes(&mut source, 10).is_err());
+    assert_eq!(source.position(), 11);
+    assert_eq!(
+        bounded_source_bytes(std::io::Cursor::new(b"123"), 3).unwrap(),
+        b"123"
+    );
 }
 
 /// Read a registered file from disk only when its bytes still hash to the

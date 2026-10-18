@@ -832,6 +832,43 @@ fn resolve_target_with(
     }
 }
 
+/// Existing-core hook observation: capture ordinary config without repository
+/// inspection, readiness, or any retrieval transport attachment.
+pub(crate) fn passive_session_map(project: &Path) -> Result<codestory_runtime::SessionMapSnapshot> {
+    if !project.is_absolute() {
+        bail!("Session context requires an absolute project path");
+    }
+    let root = canonicalize_project_root(project)?;
+    let startup = crate::config::process_startup_config();
+    if let Some(message) = crate::config::sensitive_project_root_message(&root, &startup) {
+        bail!("{message}");
+    }
+    let config = crate::config::load_config_with_startup(&root, &startup)
+        .map_err(|e| map_api_error(e.into_api_error()))?;
+    let process_cache = canonicalize_configuration_path(
+        startup
+            .stdio_cache_root
+            .as_deref()
+            .unwrap_or_else(|| startup.sidecar_defaults.cache_root()),
+    )?;
+    let cache = cache_root_for_project_in(&root, config.cache_dir.as_deref(), &process_cache)?;
+    let storage = canonicalize_configuration_path(&cache.join("codestory.db"))?;
+    let sidecar = RuntimeRetrievalConfig::for_project_profile_with_process_defaults(
+        None,
+        RuntimeRetrievalProfile::Local,
+        None,
+        &startup.sidecar_defaults.with_cache_root(process_cache),
+        &config.runtime_overrides(),
+    );
+    Runtime::new_with_process_config(RuntimeProcessConfig::new_with_retrieval_config(
+        sidecar,
+        startup.source_index_policy,
+    ))
+    .grounding_service()
+    .passive_session_map_at(root, storage)
+    .map_err(map_api_error)
+}
+
 /// Canonicalize a project argument before deriving cache identity.
 pub(crate) fn canonicalize_project_root(project: &Path) -> Result<PathBuf> {
     let project = if project.is_absolute() {

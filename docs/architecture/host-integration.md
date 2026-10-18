@@ -11,6 +11,26 @@ in `GUIDE.md`, preserving its relative reference links. Consult that guide for
 needed unfamiliar or complex detail, not as a prerequisite for known operations.
 Tool requests, runtime behavior and validation are unchanged.
 
+## Startup navigation
+
+On an explicit fresh `SessionStart` (`source: startup`), the activation hook may
+append a small repository map from the existing compatible complete core. It
+passes only the absolute hook `cwd` to the verified existing CLI; active-state
+records never choose a project. The hidden command pins one immutable core,
+reuses strict grounding selection, groups selected roots by native file
+identity, and verifies only those selected files against indexed raw hashes
+under the captured source-index byte policy. Selection remains as of that
+publication, even when emitted files match current content. Error counts,
+orientation uncertainty, source gaps and omitted groups remain visible.
+
+The map contains at most 12 whole file groups and fits with the unchanged static
+hook guidance within 4096 UTF-8 bytes. The child has a two-second deadline and
+never indexes, repairs, provisions or attaches retrieval. A missing or unusable
+core, invalid child result or timeout leaves the static guidance unchanged.
+Resume, clear and compact events keep the existing static behavior. Runtime
+receipts verify the CLI hash; explicit executable overrides retain their
+existing operator-controlled contract.
+
 ## Installed lifecycle
 
 ```mermaid

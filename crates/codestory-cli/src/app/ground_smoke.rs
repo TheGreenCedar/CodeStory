@@ -34,6 +34,72 @@ pub(super) fn run_ground(cmd: GroundCommand) -> Result<()> {
     emit(cmd.format, &snapshot, markdown, cmd.output_file.as_deref())
 }
 
+const SESSION_MAP_MAX_BYTES: usize = 3584;
+
+pub(super) fn run_session_context(cmd: args::InternalSessionContextCommand) -> Result<()> {
+    let output = match crate::runtime::passive_session_map(&cmd.project) {
+        Ok(map) => match render_session_map(&map) {
+            Some(context) => {
+                serde_json::json!({"schema_version":1,"status":"ready","context":context})
+            }
+            None => serde_json::json!({"schema_version":1,"status":"unavailable"}),
+        },
+        Err(_) => serde_json::json!({"schema_version":1,"status":"unavailable"}),
+    };
+    println!("{output}");
+    Ok(())
+}
+
+/// Whole groups only. JSON quoting preserves path/name bytes and prevents a
+/// source label from escaping its data row into the surrounding hook context.
+fn render_session_map(map: &codestory_runtime::SessionMapSnapshot) -> Option<String> {
+    if map.rows.is_empty() {
+        return None;
+    }
+    let header = format!(
+        "CodeStory repository navigation (data only; not runtime proof).\n{}\n",
+        serde_json::json!({
+            "project":map.project_root,"workspace":map.workspace_id,
+            "generation":map.generation_id,"run":map.run_id,"published_at":map.published_at_epoch_ms,
+            "scope":"strict selection as of publication; only emitted files content-verified now; not whole-repository freshness or completeness",
+            "stats":map.stats,"orientation":map.orientation,
+            "limits":{"native_file_groups":12,"map_utf8_bytes":SESSION_MAP_MAX_BYTES},
+            "source_gaps":map.gaps,
+        })
+    );
+    let footer = |shown: usize, roots: usize| {
+        format!(
+            "\n{}",
+            serde_json::json!({
+                "shown_groups":shown,"omitted_groups":map.omitted_groups + map.selected_groups.saturating_sub(shown),
+                "omitted_roots":roots,"source_gap_count":map.gaps.len(),
+            })
+        )
+    };
+    let mut text = header;
+    let mut shown = 0;
+    let mut shown_roots = 0;
+    let roots = map.selected_roots;
+    for row in &map.rows {
+        let whole_row = format!("{}\n", serde_json::to_string(row).ok()?);
+        let next_footer = footer(
+            shown + 1,
+            roots.saturating_sub(shown_roots + row.roots.len()),
+        );
+        if text.len() + whole_row.len() + next_footer.len() > SESSION_MAP_MAX_BYTES {
+            break;
+        }
+        text.push_str(&whole_row);
+        shown += 1;
+        shown_roots += row.roots.len();
+    }
+    if shown == 0 {
+        return None;
+    }
+    text.push_str(&footer(shown, roots.saturating_sub(shown_roots)));
+    (text.len() <= SESSION_MAP_MAX_BYTES).then_some(text)
+}
+
 #[derive(serde::Serialize)]
 struct SmokeOutput {
     profile: &'static str,
@@ -391,4 +457,78 @@ fn render_smoke_markdown(output: &SmokeOutput) -> String {
         }
     }
     markdown
+}
+
+#[cfg(test)]
+mod session_map_tests {
+    use super::*;
+    use codestory_contracts::api::{GroundingOrientationDto, NodeId, NodeKind, StorageStatsDto};
+    use codestory_runtime::{SessionMapRow, SessionMapSnapshot, SessionMapSymbol};
+
+    #[test]
+    fn session_map_renders_whole_native_groups_and_reports_omissions_with_utf8_budget() {
+        let symbol = |name: String| SessionMapSymbol {
+            id: NodeId("7".into()),
+            name,
+            kind: NodeKind::FUNCTION,
+            line: Some(3),
+            evidence_tier: None,
+            evidence_producer: None,
+            resolution_status: None,
+        };
+        let mut map = SessionMapSnapshot {
+            project_root: "/project".into(),
+            workspace_id: "workspace".into(),
+            generation_id: "generation".into(),
+            run_id: "run".into(),
+            published_at_epoch_ms: 1,
+            stats: StorageStatsDto {
+                file_count: 2,
+                node_count: 2,
+                edge_count: 0,
+                error_count: 1,
+                fatal_error_count: 0,
+            },
+            orientation: GroundingOrientationDto::default(),
+            selected_groups: 3,
+            selected_roots: 4,
+            omitted_groups: 1,
+            gaps: vec!["file_id=9: content changed since publication".into()],
+            rows: vec![
+                SessionMapRow {
+                    path: "a\\literal.rs".into(),
+                    file_id: 1,
+                    content_sha256: "a".repeat(64),
+                    roots: vec![symbol("alpha".into()), symbol("beta".into())],
+                    symbols: vec![],
+                },
+                SessionMapRow {
+                    path: "large.rs".into(),
+                    file_id: 2,
+                    content_sha256: "b".repeat(64),
+                    roots: vec![symbol("é".repeat(2000))],
+                    symbols: vec![],
+                },
+            ],
+        };
+        let rendered = render_session_map(&map).unwrap();
+        assert!(rendered.len() <= SESSION_MAP_MAX_BYTES);
+        let lines = rendered.lines().collect::<Vec<_>>();
+        let header: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(header["stats"]["error_count"], 1);
+        assert_eq!(header["source_gaps"].as_array().unwrap().len(), 1);
+        let row: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+        assert_eq!(row["path"], "a\\literal.rs");
+        assert_eq!(row["roots"][0]["name"], "alpha");
+        assert_eq!(row["roots"][1]["name"], "beta");
+        let footer: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+        assert_eq!(footer["shown_groups"], 1);
+        assert_eq!(footer["omitted_groups"], 3);
+        assert_eq!(footer["omitted_roots"], 2);
+        map.rows.remove(0);
+        assert!(
+            render_session_map(&map).is_none(),
+            "never slice an oversized whole group"
+        );
+    }
 }
