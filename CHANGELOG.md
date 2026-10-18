@@ -8,6 +8,8 @@
 
 - Symbol search recognizes generic type definitions and keeps them ahead of incidental same-name matches.
 
+- Symbol search keeps qualified method definitions visible for unqualified names, ahead of incidental references and configuration labels.
+
 - Symbol search finds JavaScript and TypeScript classes and functions through verified named public exports, while keeping their original names and source locations. Export/import witness locations explain the match; unsupported or ambiguous bindings remain explicit.
 
 - TypeScript and TSX files parse type-only star exports, allowing independent named exports beside them to remain searchable. Type-only exports do not become value aliases.

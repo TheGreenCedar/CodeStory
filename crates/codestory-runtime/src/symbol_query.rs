@@ -526,6 +526,14 @@ fn search_match_rank(
 }
 
 fn full_definition_bucket(project_root: Option<&Path>, query: &str, hit: &SearchHit) -> u8 {
+    // A verified method definition need not repeat its owner in an unqualified query.
+    if hit.origin == SearchHitOrigin::IndexedSymbol
+        && is_callable_like_kind(hit.kind)
+        && symbol_name_match_rank_single(query, &hit.display_name).exact_terminal != 0
+        && callable_hit_line_quality(project_root, query, hit) == 2
+    {
+        return 2;
+    }
     if normalize_symbol_query(&hit.display_name) != normalize_symbol_query(query) {
         return 0;
     }
@@ -895,6 +903,170 @@ mod tests {
         let mut hit = hit_at_path(id, display_name, kind, score, path);
         hit.line = Some(line);
         hit
+    }
+
+    #[test]
+    fn terminal_callable_queries_require_implementation_source_and_keep_owner_specificity() {
+        let temp = tempdir().unwrap();
+        let incidental_path = temp.path().join("settings.py");
+        fs::write(&incidental_path, "pack = 1\n").unwrap();
+        let incidental = hit_at_path_line(
+            "incidental",
+            "pack",
+            NodeKind::VARIABLE,
+            1.0,
+            incidental_path.to_str().unwrap(),
+            1,
+        );
+        let mut failures = Vec::new();
+        for (label, source, kind, origin, should_precede) in [
+            (
+                "python",
+                Some("def pack(self):\n    return 1\n"),
+                NodeKind::METHOD,
+                SearchHitOrigin::IndexedSymbol,
+                true,
+            ),
+            (
+                "go",
+                Some("func (s *Store) pack() {}\n"),
+                NodeKind::METHOD,
+                SearchHitOrigin::IndexedSymbol,
+                true,
+            ),
+            (
+                "declaration",
+                Some("void pack();\n"),
+                NodeKind::METHOD,
+                SearchHitOrigin::IndexedSymbol,
+                false,
+            ),
+            (
+                "import",
+                Some("from elsewhere import pack\n"),
+                NodeKind::METHOD,
+                SearchHitOrigin::IndexedSymbol,
+                false,
+            ),
+            (
+                "wrong_name",
+                Some("def unpack(self):\n    return 1\n"),
+                NodeKind::METHOD,
+                SearchHitOrigin::IndexedSymbol,
+                false,
+            ),
+            (
+                "wrong_declaration",
+                Some("fn other() { pack(); }\n"),
+                NodeKind::UNKNOWN,
+                SearchHitOrigin::IndexedSymbol,
+                false,
+            ),
+            (
+                "callsite",
+                Some("return pack()\n"),
+                NodeKind::UNKNOWN,
+                SearchHitOrigin::IndexedSymbol,
+                false,
+            ),
+            (
+                "missing",
+                None,
+                NodeKind::METHOD,
+                SearchHitOrigin::IndexedSymbol,
+                false,
+            ),
+            (
+                "unknown",
+                Some("def pack(self):\n    return 1\n"),
+                NodeKind::UNKNOWN,
+                SearchHitOrigin::IndexedSymbol,
+                false,
+            ),
+            (
+                "text",
+                Some("def pack(self):\n    return 1\n"),
+                NodeKind::METHOD,
+                SearchHitOrigin::TextMatch,
+                false,
+            ),
+        ] {
+            let path = temp.path().join(format!("{label}.txt"));
+            if let Some(source) = source {
+                fs::write(&path, source).unwrap();
+            }
+            let mut candidate =
+                hit_at_path_line(label, "Store.pack", kind, 0.1, path.to_str().unwrap(), 1);
+            candidate.origin = origin;
+            let mut ranked = [candidate.clone(), incidental.clone()];
+            ranked.sort_by(|a, b| {
+                compare_search_hits_with_project_root(Some(temp.path()), "pack", a, b, None)
+            });
+            if (ranked[0].node_id == candidate.node_id) != should_precede {
+                failures.push(label);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "incorrect implementation eligibility: {failures:?}"
+        );
+
+        let definition_path = temp.path().join("implementation.py");
+        fs::write(&definition_path, "def pack(self):\n    return 1\n").unwrap();
+        for separator in [".", "::"] {
+            let owner = format!("Store{separator}pack");
+            let correct = hit_at_path_line(
+                "correct",
+                &owner,
+                NodeKind::METHOD,
+                0.1,
+                definition_path.to_str().unwrap(),
+                1,
+            );
+            let other = hit_at_path_line(
+                "other",
+                &format!("Other{separator}pack"),
+                NodeKind::METHOD,
+                1.0,
+                definition_path.to_str().unwrap(),
+                1,
+            );
+            let label_path = temp.path().join("settings.json");
+            fs::write(&label_path, format!("{{\"{owner}\": true}}\n")).unwrap();
+            let exact_label = hit_at_path_line(
+                "exact_label",
+                &owner,
+                NodeKind::ANNOTATION,
+                0.1,
+                label_path.to_str().unwrap(),
+                1,
+            );
+            let mut fallback = [other.clone(), exact_label.clone()];
+            fallback.sort_by(|a, b| {
+                compare_search_hits_with_project_root(Some(temp.path()), &owner, a, b, None)
+            });
+            assert_eq!(
+                fallback[0].node_id, exact_label.node_id,
+                "a wrong owner's terminal must not borrow an extracted query term"
+            );
+            for mut ranked in [
+                [other.clone(), correct.clone()],
+                [correct.clone(), other.clone()],
+            ] {
+                ranked.sort_by(|a, b| {
+                    compare_search_hits_with_project_root(Some(temp.path()), &owner, a, b, None)
+                });
+                assert_eq!(
+                    ranked[0].node_id, correct.node_id,
+                    "owner specificity for {owner}"
+                );
+                ranked.sort_by(|a, b| {
+                    compare_search_hits_with_project_root(Some(temp.path()), "pack", a, b, None)
+                });
+                assert_eq!(ranked[0].node_id, other.node_id);
+                assert_eq!(ranked[1].node_id, correct.node_id);
+            }
+        }
     }
 
     #[test]

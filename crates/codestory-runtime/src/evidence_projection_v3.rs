@@ -2540,6 +2540,119 @@ mod tests {
     }
 
     #[test]
+    fn core_search_keeps_qualified_callable_definitions_within_small_limits() {
+        let (project, _state, _process_cache, controller, service) = indexed_search_fixture();
+        fs::write(
+            project.path().join("src/storage.go"),
+            "package storage\ntype Warehouse struct{}\nfunc (w *Warehouse) pack() {}\nfunc pack() {}\nfunc relay() { external.pack() }\n",
+        )
+        .unwrap();
+        fs::write(
+            project.path().join("src/container.py"),
+            "class Bucket:\n    def pack(self):\n        return 1\n    def relay(self):\n        return external.pack()\n",
+        )
+        .unwrap();
+        for index in 0..12 {
+            fs::write(
+                project.path().join(format!("src/labels_{index}.json")),
+                "{\"pack\": \"parcel\"}\n",
+            )
+            .unwrap();
+        }
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("index methods and independent same-name structural keys");
+        service
+            .run_observational_with_cancel("exact_search", Arc::new(AtomicBool::new(false)), || {
+                let mut expected = Vec::new();
+                for name in ["Warehouse.pack", "Bucket.pack"] {
+                    let specific = controller.search_results(core_search_request(name))?;
+                    let definition = specific
+                        .hits
+                        .iter()
+                        .find(|hit| hit.display_name == name)
+                        .expect("qualified query finds the actual indexed method");
+                    assert_eq!(specific.hits[0].node_id, definition.node_id);
+                    expected.push(definition.clone());
+                }
+                let mut request = core_search_request("pack");
+                request.limit_per_source = 8;
+                let results = controller.search_results(request)?;
+                assert_eq!(results.hits.len(), 8, "public result cap is unchanged");
+                assert_eq!(results.hits[0].display_name, "pack");
+                assert_eq!(
+                    results.hits[0].kind,
+                    codestory_contracts::api::NodeKind::FUNCTION
+                );
+                let mut all_request = core_search_request("pack");
+                all_request.limit_per_source = 50;
+                let all = controller.search_results(all_request)?;
+                assert!(all.hits.len() > 8 && all.hits.len() <= 50);
+                assert_eq!(
+                    results
+                        .hits
+                        .iter()
+                        .map(|hit| &hit.node_id)
+                        .collect::<Vec<_>>(),
+                    all.hits
+                        .iter()
+                        .take(8)
+                        .map(|hit| &hit.node_id)
+                        .collect::<Vec<_>>()
+                );
+                let projected = project_search_v3(&service, "test", &results)?;
+                let json = serde_json::to_value(projected).unwrap();
+                let rows = json["evidence"].as_array().unwrap();
+                assert_eq!(rows.len(), 8);
+                for definition in &expected {
+                    let row = rows
+                        .iter()
+                        .find(|row| row["symbol_id"].as_str() == Some(&definition.node_id.0))
+                        .expect("qualified implementation survives incidental whole-name hits");
+                    assert_eq!(row["display_name"], definition.display_name);
+                    assert_eq!(row["path"].as_str(), definition.file_path.as_deref());
+                    assert_eq!(row["start_line"].as_u64(), definition.line.map(u64::from));
+                    assert!(row["excerpt"].as_str().unwrap().contains("pack("));
+                }
+                let nodes = controller
+                    .open_storage_read_only()
+                    .unwrap()
+                    .get_nodes()
+                    .unwrap();
+                let unknowns = nodes
+                    .iter()
+                    .filter(|node| {
+                        node.kind == codestory_contracts::graph::NodeKind::UNKNOWN
+                            && node.serialized_name.contains("pack")
+                    })
+                    .collect::<Vec<_>>();
+                assert!(
+                    !unknowns.is_empty(),
+                    "unresolved receiver control produces UNKNOWN nodes"
+                );
+                for unknown in unknowns {
+                    if let Some(position) = all
+                        .hits
+                        .iter()
+                        .position(|hit| hit.node_id.0 == unknown.id.0.to_string())
+                    {
+                        for definition in &expected {
+                            assert!(
+                                all.hits
+                                    .iter()
+                                    .position(|hit| hit.node_id == definition.node_id)
+                                    .unwrap()
+                                    < position
+                            );
+                        }
+                    }
+                }
+                Ok(())
+            })
+            .expect("core ranking and modern projection retain canonical definitions");
+    }
+
+    #[test]
     fn search_projection_retains_bounded_symbol_labels_without_fabricating_excerpts() {
         let (project, _state, _process_cache, controller, service) = indexed_search_fixture();
         fs::write(
