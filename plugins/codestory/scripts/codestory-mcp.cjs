@@ -20,6 +20,7 @@ const {
 
 const pluginRoot = path.dirname(__dirname);
 const launchCwd = workerData?.codestoryLaunchCwd || process.cwd();
+const mcpToolSurface = process.env.CODESTORY_MCP_TOOL_SURFACE || 'named';
 const binaryName = process.platform === 'win32' ? 'codestory-cli.exe' : 'codestory-cli';
 function positiveDurationEnv(name, fallback) {
   const raw = process.env[name];
@@ -3891,6 +3892,141 @@ function failOpenToolCatalog(catalog = canonicalMcpCatalog) {
   return JSON.parse(JSON.stringify(catalog.tools));
 }
 
+const canProjectDiscoveryLosslessly = (() => {
+  try {
+    if (typeof JSON.rawJSON !== 'function') return false;
+    let source;
+    JSON.parse('0', (_key, value, context) => {
+      source = context?.source;
+      return value;
+    });
+    return source === '0' && JSON.stringify(JSON.rawJSON('0')) === '0';
+  } catch {
+    return false;
+  }
+})();
+
+function losslessDiscoveryFrame(text) {
+  if (!canProjectDiscoveryLosslessly) return null;
+  try {
+    return JSON.parse(text, (_key, value, context) =>
+      typeof value === 'number' ? JSON.rawJSON(context.source) : value);
+  } catch {
+    return null;
+  }
+}
+
+function requireMcpToolSurface() {
+  if (!['named', 'family-v1'].includes(mcpToolSurface)) {
+    throw Object.assign(new Error('mcp_tool_surface_invalid:expected_named_or_family-v1'), {
+      code: 'mcp_tool_surface_invalid',
+    });
+  }
+  if (mcpToolSurface === 'family-v1' && !canProjectDiscoveryLosslessly) {
+    throw Object.assign(new Error('family_v1_lossless_json_unavailable'), {
+      code: 'family_v1_lossless_json_unavailable',
+    });
+  }
+  return mcpToolSurface;
+}
+
+// ID tokens already passed JSON parsing. Compare decimal value without rounding
+// or expanding exponent zeroes; serialization still keeps the original token.
+function familyJsonRpcIdKey(token) {
+  if (typeof token !== 'string') return null;
+  if (token === 'null' || token.startsWith('"')) return `literal:${token}`;
+  const match = /^(-?)(\d+)(?:\.(\d+))?(?:[eE]([+-]?\d+))?$/u.exec(token);
+  if (!match) return null;
+  const fraction = match[3] || '';
+  const coefficient = `${match[2]}${fraction}`.replace(/^0+/u, '');
+  if (!coefficient) return 'number:0';
+  const digits = coefficient.replace(/0+$/u, '');
+  const exponent = BigInt(match[4] || '0') - BigInt(fraction.length)
+    + BigInt(coefficient.length - digits.length);
+  return `number:${match[1]}${digits}e${exponent}`;
+}
+
+function familyToolCatalog(tools) {
+  const schemaValid = (schema) => {
+    if (!isPlainObject(schema) || Object.keys(schema).some((key) =>
+      !failOpenValidatedSchemaKeywords.includes(key))) return false;
+    if (Object.hasOwn(schema, 'properties') && !isPlainObject(schema.properties)) return false;
+    if (Object.hasOwn(schema, 'additionalProperties') && typeof schema.additionalProperties !== 'boolean') return false;
+    if (Object.hasOwn(schema, 'enum') && (!Array.isArray(schema.enum) || schema.enum.length === 0)) return false;
+    if (Object.hasOwn(schema, 'description') && typeof schema.description !== 'string') return false;
+    if (['minimum', 'maximum'].some((key) => Object.hasOwn(schema, key)
+      && (typeof schema[key] !== 'number' || !Number.isFinite(schema[key])))) return false;
+    if (['minLength', 'maxLength', 'minItems', 'maxItems'].some((key) => Object.hasOwn(schema, key)
+      && (!Number.isSafeInteger(schema[key]) || schema[key] < 0))) return false;
+    if (Object.hasOwn(schema, 'required') && (!Array.isArray(schema.required)
+      || schema.required.some((name) => typeof name !== 'string'))) return false;
+    if (Object.hasOwn(schema, 'type') && ([schema.type].flat().length === 0 || ![schema.type].flat().every((type) =>
+      ['object', 'array', 'string', 'boolean', 'integer', 'number', 'null'].includes(type)))) return false;
+    if (Object.values(schema.properties || {}).some((member) => !schemaValid(member))) return false;
+    if (Object.hasOwn(schema, 'items') && !schemaValid(schema.items)) return false;
+    if (Object.hasOwn(schema, 'not') && !schemaValid(schema.not)) return false;
+    return ['allOf', 'anyOf', 'oneOf'].every((key) => !Object.hasOwn(schema, key)
+      || (Array.isArray(schema[key]) && schema[key].length > 0 && schema[key].every(schemaValid)));
+  };
+  const generatedObjectContract = (schema) => (schema.type === 'object'
+    && schema.additionalProperties === false
+    && schema.properties?.project?.type === 'string'
+    && schema.properties.project.minLength >= 1
+    && schema.required?.includes('project'))
+    || schema.allOf?.some(generatedObjectContract);
+  if (!Array.isArray(tools) || tools.length === 0 || tools.some((tool) =>
+    !isPlainObject(tool) || typeof tool.name !== 'string' || !tool.name
+    || !schemaValid(tool.inputSchema) || !generatedObjectContract(tool.inputSchema)
+    || (Object.hasOwn(tool, 'outputSchema') && !isPlainObject(tool.outputSchema)))
+    || new Set(tools.map(({ name }) => name)).size !== tools.length) {
+    throw new Error('family_v1_catalog_invalid');
+  }
+  const operation = { type: 'string', enum: tools.map(({ name }) => name) };
+  return [{
+    name: 'call',
+    description: 'Call one canonical CodeStory operation. Its complete input contract is available through describe; arguments owns the required absolute project. This grant covers every operation.',
+    inputSchema: {
+      type: 'object', additionalProperties: false,
+      properties: { operation, arguments: { type: 'object' } },
+      required: ['operation', 'arguments'],
+    },
+    annotations: {
+      destructiveHint: tools.some(({ annotations }) => annotations?.destructiveHint !== false),
+      idempotentHint: tools.every(({ annotations }) => annotations?.idempotentHint === true),
+      openWorldHint: tools.some(({ annotations }) => annotations?.openWorldHint !== false),
+      readOnlyHint: tools.every(({ annotations }) => annotations?.readOnlyHint === true),
+    },
+  }, {
+    name: 'describe',
+    description: 'Read the complete canonical descriptor for one CodeStory operation without starting its runtime. Optional when the version-matched contract is already known.',
+    inputSchema: {
+      type: 'object', additionalProperties: false,
+      properties: { operation, project: { type: 'string', minLength: 1 } },
+      required: ['operation', 'project'],
+    },
+    annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: false, readOnlyHint: true },
+  }];
+}
+
+// Discovery is a view of the full canonical contract, which remains the
+// validation and runtime-handoff authority. Do not alter malformed listings.
+function projectDiscoveryTools(tools) {
+  if (!canProjectDiscoveryLosslessly || !Array.isArray(tools) || tools.some((tool) =>
+    !isPlainObject(tool) || typeof tool.name !== 'string' || !tool.name ||
+    !isPlainObject(tool.inputSchema) ||
+    (Object.hasOwn(tool, 'outputSchema') && !isPlainObject(tool.outputSchema)))) {
+    return tools;
+  }
+  let changed = false;
+  const projected = tools.map((tool) => {
+    if (!Object.hasOwn(tool, 'outputSchema')) return tool;
+    const { outputSchema, ...descriptor } = tool;
+    changed = true;
+    return descriptor;
+  });
+  return changed ? projected : tools;
+}
+
 function emergencyStatusToolCatalog() {
   return [{
     name: 'status',
@@ -4501,16 +4637,19 @@ function failOpenInvalidParamsError(id, tool, violations) {
 }
 
 function runFailOpenMcp(status, options = {}) {
+  const familySurface = requireMcpToolSurface() === 'family-v1';
   const baseCurrentStatus = () => (typeof status === 'function' ? status() : status);
   const catalog = Object.hasOwn(options, 'catalog') ? options.catalog : canonicalMcpCatalog;
   let catalogFailure = null;
   let tools;
+  let familyTools;
   let resources;
   let resourceTemplates;
   const catalogProfile = (revision) => catalog?.revisionProfiles?.[revision] ?? catalog;
   const selectCatalogProfile = (revision) => {
     const profile = catalogProfile(revision);
     tools = failOpenToolCatalog(profile);
+    if (familySurface) familyTools = familyToolCatalog(tools);
     if (!Array.isArray(profile?.resources) || !Array.isArray(profile?.resourceTemplates)) {
       throw new Error('generated_mcp_catalog_missing:run_generate_codestory_skill_syntax');
     }
@@ -4544,7 +4683,7 @@ function runFailOpenMcp(status, options = {}) {
   let runtimeReadyNotified = false;
   let stdinEnded = false;
   let handoffStderrObservation = null;
-  const delegatedRequestIds = new Set();
+  const delegatedRequests = new Map();
   let handoffFailureHandled = false;
   const notifyRuntimeReady = () => {
     if (!initializedNotification || runtimeReadyNotified) return;
@@ -4604,14 +4743,14 @@ function runFailOpenMcp(status, options = {}) {
         process.exit(failureDetails.code || 1);
         return;
       }
-      for (const id of delegatedRequestIds) {
+      for (const [id, pending] of delegatedRequests) {
         process.stdout.write(`${JSON.stringify(jsonrpcError(
-          JSON.parse(id),
+          familySurface ? losslessDiscoveryFrame(pending.exactId) : JSON.parse(id),
           -32000,
           detailedReason,
         ))}\n`);
       }
-      delegatedRequestIds.clear();
+      delegatedRequests.clear();
       options.onRuntimeFailure({
         reason: detailedReason,
         reasonCode: runtimeFailureCode(reasonCode),
@@ -4701,10 +4840,41 @@ function runFailOpenMcp(status, options = {}) {
             if (stdinEnded && ownsHandoff()) shutdownHandoffChild(activeHandoff, options);
             continue;
           }
+          let projected = parsed;
           for (const reply of Array.isArray(parsed) ? parsed : [parsed]) {
-            if (reply?.id !== undefined) delegatedRequestIds.delete(JSON.stringify(reply.id));
+            if (reply?.id === undefined) continue;
+            let key = JSON.stringify(reply.id);
+            if (familySurface) {
+              const preciseReply = losslessDiscoveryFrame(output);
+              key = preciseReply && familyJsonRpcIdKey(JSON.stringify(preciseReply.id));
+            }
+            const pending = delegatedRequests.get(key);
+            delegatedRequests.delete(key);
+            // Older profiles omit output schemas already. Keep their batch
+            // bytes intact, including unrelated precise numeric results.
+            if (
+              !Array.isArray(parsed) && pending?.method === 'tools/list' &&
+              ['2025-06-18', '2025-11-25'].includes(v3Session?.negotiated) &&
+              isPlainObject(reply) && reply.jsonrpc === '2.0' &&
+              !Object.hasOwn(reply, 'error') && isPlainObject(reply.result) &&
+              // Admit ordinary data before numeric serialization wrappers exist.
+              projectDiscoveryTools(reply.result.tools) !== reply.result.tools
+            ) {
+              // Parsed numeric IDs may collide. Only an exact lossless ID
+              // match authorizes projection; otherwise keep the raw reply.
+              const lossless = losslessDiscoveryFrame(output);
+              if (lossless && pending.exactId === JSON.stringify(lossless.id)) {
+                const tools = projectDiscoveryTools(lossless.result.tools);
+                if (tools !== lossless.result.tools) {
+                  projected = {
+                    ...lossless,
+                    result: { ...lossless.result, tools },
+                  };
+                }
+              }
+            }
           }
-          process.stdout.write(`${output}\n`);
+          process.stdout.write(`${projected === parsed ? output : JSON.stringify(projected)}\n`);
         }
       });
     }
@@ -4782,9 +4952,65 @@ function runFailOpenMcp(status, options = {}) {
     if (request.method === 'initialize' && request.id !== undefined) {
       initializeRequest = request;
     }
+    if (familySurface && (request.method === 'tools/list' || request.method === 'tools/call')) {
+      if (request.id === undefined) return null;
+      if (catalogFailure || !familyTools) {
+        return jsonrpcError(request.id, -32603, 'family_v1_catalog_invalid');
+      }
+      if (request.method === 'tools/list') {
+        return request.id === undefined ? null : jsonrpcResult(request.id, { tools: familyTools });
+      }
+      const familyTool = familyTools.find(({ name }) => name === request.params?.name);
+      if (!familyTool) return jsonrpcError(request.id, -32602, `unknown family tool: ${request.params?.name || '<missing>'}`);
+      const envelope = request.params?.arguments;
+      const violations = validatePublishedSchemaValue(familyTool.inputSchema, envelope);
+      for (const field of Object.keys(request.params || {})) {
+        if (!['name', 'arguments', '_meta'].includes(field)) {
+          violations.push(publishedSchemaViolation('unknown_property', `/params/${field}`, 'unknown family call field'));
+        }
+      }
+      if (violations.length) return failOpenInvalidParamsError(request.id, familyTool.name, violations);
+      const canonicalTool = tools.find(({ name }) => name === envelope.operation);
+      if (familyTool.name === 'call') {
+        violations.push(...validatePublishedSchemaValue(canonicalTool.inputSchema, envelope.arguments, '/arguments/arguments'));
+      }
+      const project = familyTool.name === 'call' ? envelope.arguments.project : envelope.project;
+      const selection = selectExplicitProject(project);
+      if (!selection.ok) violations.push(publishedSchemaViolation(selection.code,
+        familyTool.name === 'call' ? '/arguments/arguments/project' : '/arguments/project', selection.message));
+      if (violations.length) return failOpenInvalidParamsError(request.id, familyTool.name, violations);
+      if (familyTool.name === 'describe') {
+        const description = {
+          interface_version: 'family-v1',
+          protocol_version: v3Session?.negotiated ?? managedCliMcpProtocolVersion,
+          discovery_contract_sha256: v3Session?.discoveryContractSha256
+            ?? catalog.wireContract.discoveryContracts[v3Session?.negotiated ?? managedCliMcpProtocolVersion],
+          plugin_version: resolvedVersionForStatus(currentStatus()),
+          cli_version: pinnedCliVersion(),
+          tool: canonicalTool,
+        };
+        return jsonrpcResult(request.id, revisionNativeFailOpenToolResult(
+          v3Session?.negotiated ?? managedCliMcpProtocolVersion,
+          { structuredContent: description },
+        ));
+      }
+      const precise = losslessDiscoveryFrame(rawLine);
+      if (!precise) return jsonrpcError(request.id, -32603, 'family_v1_lossless_json_unavailable');
+      request = { ...request, params: { ...request.params, name: envelope.operation, arguments: envelope.arguments } };
+      rawLine = JSON.stringify({ ...precise, params: {
+        ...precise.params, name: envelope.operation, arguments: precise.params.arguments.arguments,
+      } });
+    }
     const delegated = allowHandoff && request.method !== 'initialize' ? maybeHandoff() : null;
     if (delegated) {
-      if (request.id !== undefined) delegatedRequestIds.add(JSON.stringify(request.id));
+      if (request.id !== undefined) {
+        const lossless = familySurface || request.method === 'tools/list' ? losslessDiscoveryFrame(rawLine) : null;
+        const exactId = lossless && !Array.isArray(lossless) ? JSON.stringify(lossless.id) : undefined;
+        delegatedRequests.set(familySurface ? familyJsonRpcIdKey(exactId) : JSON.stringify(request.id), {
+          method: request.method,
+          exactId,
+        });
+      }
       handoffDispatch(rawLine);
       return null;
     }
@@ -4817,7 +5043,7 @@ function runFailOpenMcp(status, options = {}) {
         },
       });
     } else if (request.method === 'tools/list') {
-      response = jsonrpcResult(request.id, { tools });
+      response = jsonrpcResult(request.id, { tools: projectDiscoveryTools(tools) });
     } else if (request.method === 'resources/list') {
       response = jsonrpcResult(request.id, { resources });
     } else if (request.method === 'resources/templates/list') {
@@ -4893,11 +5119,17 @@ function runFailOpenMcp(status, options = {}) {
     }
     if (!Array.isArray(frame)) {
       const response = handleRequest(frame, line);
-      if (response) process.stdout.write(`${JSON.stringify(response)}\n`);
+      if (response) {
+        if (familySurface && isPlainObject(frame) && validJsonRpcId(frame.id)) {
+          const precise = losslessDiscoveryFrame(line);
+          if (precise && Object.hasOwn(precise, 'id')) response.id = precise.id;
+        }
+        process.stdout.write(`${JSON.stringify(response)}\n`);
+      }
       return;
     }
     const revision = negotiatedProtocol?.negotiated ?? managedCliMcpProtocolVersion;
-    if (frame.length === 0 || revision === '2025-06-18' || revision === '2025-11-25') {
+    if (familySurface || frame.length === 0 || revision === '2025-06-18' || revision === '2025-11-25') {
       process.stdout.write(`${JSON.stringify(jsonrpcError(null, -32600, 'Invalid Request'))}\n`);
       return;
     }
@@ -4905,7 +5137,7 @@ function runFailOpenMcp(status, options = {}) {
     if (delegated) {
       for (const request of frame) {
         if (validateJsonRpcRequest(request) && request.id !== undefined) {
-          delegatedRequestIds.add(JSON.stringify(request.id));
+          delegatedRequests.set(JSON.stringify(request.id), { method: request.method });
         }
       }
       handoffDispatch(line);
@@ -5040,6 +5272,7 @@ function spawnStdioRuntime(resolved, runtimeCwd, stdio) {
 }
 
 async function main() {
+  requireMcpToolSurface();
   const runtimeCwd = releasePluginCacheCwd();
   const installed = await resolveCli({ provision: false });
   if (
@@ -5164,6 +5397,11 @@ async function main() {
 }
 
 function runLauncherError(error) {
+  if (['mcp_tool_surface_invalid', 'family_v1_lossless_json_unavailable'].includes(error.code)) {
+    process.stderr.write(`${error.message}\n`);
+    process.exitCode = 1;
+    return;
+  }
   releasePluginCacheCwd();
   const resolved = {
     source: 'launcher',

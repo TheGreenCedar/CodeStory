@@ -30,6 +30,9 @@ const generatedCatalog = JSON.parse(
 const preferredRevision = generatedCatalog.wireContract.preferredMcpProtocolVersion;
 const discoveryDigest = (revision = preferredRevision) =>
   generatedCatalog.wireContract.discoveryContracts[revision];
+let jsonSourceContext = false;
+JSON.parse("0", (_key, value, context) => { jsonSourceContext = context?.source === "0"; return value; });
+const losslessJsonAvailable = typeof JSON.rawJSON === "function" && jsonSourceContext;
 const toolTextJson = (response) => JSON.parse(response.result.content[0].text);
 const statusUri = launcherTest.projectBoundResourceUri("codestory://status", repoRoot);
 const {
@@ -184,6 +187,350 @@ test("fail-open tool schemas are the generated canonical MCP catalog", async () 
     Object.keys(snippet.inputSchema.allOf[0].properties).sort(),
     ["choose", "context", "end_line", "file_path", "function_body", "id", "line", "lines", "max_tool_result_bytes", "path", "paths", "project", "query", "resume_operation_attempt", "resume_operation_id", "scope", "start_line", "symbol_id"],
   );
+});
+
+function familyWireFixture(body, { revision = preferredRevision, surface = "family-v1", setup = "", catalog = "undefined" } = {}) {
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const fixture = `
+    ${setup}
+    const {EventEmitter}=require('node:events');const {PassThrough}=require('node:stream');
+    const run=require(${JSON.stringify(launcher)})._test.runFailOpenMcp;
+    let ready=false,starts=0;const seen=[],raw=[];
+    const child=new EventEmitter();child.stdin=new PassThrough();child.stdout=new PassThrough();child.stderr=new PassThrough();child.exitCode=null;child.signalCode=null;child.kill=()=>true;
+    let input='';child.stdin.setEncoding('utf8');child.stdin.on('data',chunk=>{input+=chunk;const lines=input.split(/\\r?\\n/u);input=lines.pop()||'';for(const line of lines)if(line){raw.push(line);seen.push(JSON.parse(line));}});
+    run({plugin_runtime:{plugin_version:'fixture',warnings:[]},runtime:{state:'preparing'},managed_retrieval:{state:'preparing'},warnings:[],readiness:[]},{shouldHandoff:()=>ready,startRuntime:()=>{starts++;return child},onRuntimeFailure:()=>{},${catalog === "undefined" ? "" : `catalog:${catalog},`}});
+    const sendRaw=line=>process.stdin.emit('data',line+'\\n');const send=frame=>sendRaw(JSON.stringify(frame));
+    const init=()=>send({jsonrpc:'2.0',id:'init',method:'initialize',params:{protocolVersion:${JSON.stringify(revision)}}});
+    const ack=()=>child.stdout.write(JSON.stringify({jsonrpc:'2.0',id:'init',result:{protocolVersion:${JSON.stringify(revision)},_meta:{codestory_protocol:{discovery_contract_sha256:${JSON.stringify(discoveryDigest(revision))}},codestory_publication:{schema_version:5,minimum_compatible_schema_version:5}}}})+'\\n');
+    ${body}
+    process.stderr.write('FAMILY_TRACE:'+JSON.stringify({starts,seen,raw})+'\\n');
+  `;
+  const result = spawnSync(process.execPath, ["-e", fixture], {
+    env: { ...process.env, CODESTORY_MCP_TOOL_SURFACE: surface }, encoding: "utf8", timeout: 5000,
+  });
+  const trace = result.stderr.split(/\r?\n/u).find((line) => line.startsWith("FAMILY_TRACE:"));
+  return { ...result, frames: result.stdout.trim() ? result.stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line)) : [], trace: trace ? JSON.parse(trace.slice(13)) : null };
+}
+
+test("family-v1 keeps listing and describe local and lowers only canonical calls", (t) => {
+  for (const [revision, profile] of Object.entries(generatedCatalog.revisionProfiles)) {
+    const call = { jsonrpc: "2.0", id: "work", method: "tools/call", params: { name: "call", arguments: { operation: "search", arguments: { project: repoRoot, query: "fixture", repo_text: "off", limit: 5 } }, _meta: { kept: true } } };
+    const result = familyWireFixture(`
+      init();send({jsonrpc:'2.0',method:'notifications/initialized'});
+      send({jsonrpc:'2.0',id:'before',method:'tools/list'});
+      send({...${JSON.stringify(call)},id:'preparing'});
+      for(const operation of ${JSON.stringify(profile.tools.map(({ name }) => name))})send({jsonrpc:'2.0',id:'describe-'+operation,method:'tools/call',params:{name:'describe',arguments:{operation,project:${JSON.stringify(repoRoot)}}}});
+      if(starts!==0)throw new Error('local discovery started runtime');
+      ready=true;send(${JSON.stringify(call)});ack();
+      child.stdout.write(${JSON.stringify('{"jsonrpc":"2.0","id":"work","result":{"content":[{"type":"text","text":"canonical"}],"structuredContent":{"kind":"complete","gaps":[],"count":9007199254740993},"_meta":{"kept":true,"n":0.1234567890123456789012345}}}')}+'\\n');
+      send({jsonrpc:'2.0',id:'after',method:'tools/list'});
+      send({jsonrpc:'2.0',id:'after-describe',method:'tools/call',params:{name:'describe',arguments:{operation:'search',project:${JSON.stringify(repoRoot)}}}});
+      process.env.CODESTORY_MCP_TOOL_SURFACE='named';send({jsonrpc:'2.0',id:'captured',method:'tools/list'});
+    `, { revision });
+    assert.equal(result.status, 0, result.stderr);
+    const named = familyWireFixture(`init();send({jsonrpc:'2.0',id:'named-list',method:'tools/list'});send(${JSON.stringify({ ...call, id: "preparing", params: { ...call.params, name: "search", arguments: call.params.arguments.arguments } })});`, { revision, surface: "named" });
+    assert.equal(named.status, 0, named.stderr);
+    assert.equal(named.trace.starts, 0);
+    assert.deepEqual(result.frames.find(({ id }) => id === "preparing").result, named.frames.find(({ id }) => id === "preparing").result);
+    for (const id of ["before", "after", "captured"]) {
+      const tools = result.frames.find((frame) => frame.id === id).result.tools;
+      assert.deepEqual(tools.map(({ name }) => name), ["call", "describe"]);
+      assert.deepEqual(tools[0].inputSchema.properties.operation.enum, profile.tools.map(({ name }) => name));
+      assert.deepEqual(tools[0].inputSchema.required, ["operation", "arguments"]);
+      assert.equal(tools[0].inputSchema.additionalProperties, false);
+    }
+    assert.equal(result.trace.starts, 1);
+    assert.deepEqual(result.trace.seen.map(({ method }) => method), ["initialize", "notifications/initialized", "tools/call"]);
+    assert.deepEqual(result.trace.seen[2], { ...call, params: { ...call.params, name: "search", arguments: call.params.arguments.arguments } });
+    for (const tool of profile.tools) {
+      const frame = result.frames.find(({ id }) => id === `describe-${tool.name}`);
+      const value = toolTextJson(frame);
+      assert.equal(value.interface_version, "family-v1");
+      assert.equal(value.discovery_contract_sha256, discoveryDigest(revision));
+      assert.deepEqual(value.tool, tool);
+    }
+    const rawResult = result.stdout.split(/\r?\n/u).find((line) => line.includes('"id":"work"'));
+    assert.ok(rawResult.includes('"count":9007199254740993'));
+    assert.ok(rawResult.includes('"n":0.1234567890123456789012345'));
+    const familyTools = result.frames.find(({ id }) => id === "before").result.tools;
+    const describe = result.frames.find(({ id }) => id === "describe-search");
+    t.diagnostic(JSON.stringify({ revision, named_descriptor_bytes: Buffer.byteLength(JSON.stringify(named.frames.find(({ id }) => id === "named-list").result.tools)), family_descriptor_bytes: Buffer.byteLength(JSON.stringify(familyTools)), search_describe_bytes: Buffer.byteLength(JSON.stringify(describe)) }));
+    if (revision === preferredRevision) t.diagnostic(`FAMILY_WIRE:${JSON.stringify({ listing: result.frames.find(({ id }) => id === "before"), search_describe: describe, lowered: result.trace.raw[2], canonical_result: rawResult })}`);
+  }
+});
+
+test("family-v1 rejects invalid envelopes and inner contracts before handoff", () => {
+  const invalid = [
+    { name: "search", arguments: { project: repoRoot, query: "fixture" } },
+    { name: "call", project: repoRoot, arguments: { operation: "search", arguments: { project: repoRoot, query: "fixture" } } },
+    { name: "call", arguments: { operation: "not-an-operation", arguments: { project: repoRoot } } },
+    { name: "call", arguments: { operation: "search", arguments: { project: repoRoot, query: "fixture" }, project: repoRoot } },
+    { name: "call", arguments: { operation: "search", arguments: [] } },
+    ...[{}, { project: ".", query: "fixture" }, { project: repoRoot }, { project: repoRoot, query: 17 }, { project: repoRoot, query: "fixture", limit: 0 }, { project: repoRoot, query: "fixture", unknown: true }, { project: repoRoot, query: "fixture", repo_text: "bad" }].map((argumentsValue) => ({ name: "call", arguments: { operation: "search", arguments: argumentsValue } })),
+    { name: "call", arguments: { operation: "snippet", arguments: { project: repoRoot, id: "1", path: "a.rs" } } },
+    { name: "describe", arguments: { operation: "search", project: "." } },
+    { name: "describe", arguments: { operation: "search", project: repoRoot, unknown: true } },
+  ];
+  for (const ready of [false, true]) {
+    const result = familyWireFixture(`init();ready=${ready};for(const [i,params]of ${JSON.stringify(invalid)}.entries())send({jsonrpc:'2.0',id:'bad-'+i,method:'tools/call',params});send({jsonrpc:'2.0',method:'tools/call',params:{name:'call',arguments:{operation:'status',arguments:{project:${JSON.stringify(repoRoot)}}}}});`);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.trace.starts, 0);
+    assert.equal(result.frames.length, invalid.length + 1, "family notification emitted a response");
+    for (let i = 0; i < invalid.length; i++) assert.equal(result.frames.find(({ id }) => id === `bad-${i}`).error?.code, -32602, `case ${i}`);
+  }
+  for (const inputSchema of [{}, { type: "object" }, { type: "object", properties: { project: { type: "string", minLength: 1 } }, required: ["project"] }]) {
+    const catalog = `(()=>{const c=require(${JSON.stringify(join(pluginRoot, "generated-mcp-catalog.json"))});for(const p of [c,...Object.values(c.revisionProfiles)])p.tools.find(t=>t.name==='search').inputSchema=${JSON.stringify(inputSchema)};return c})()`;
+    const result = familyWireFixture(`init();ready=true;send({jsonrpc:'2.0',id:'incomplete',method:'tools/call',params:{name:'call',arguments:{operation:'search',arguments:{project:${JSON.stringify(repoRoot)},unexpected:true}}}});`, { catalog });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.trace.starts, 0, "incomplete generated input contract started a runtime");
+    assert.equal(result.frames.find(({ id }) => id === "incomplete")?.error?.code, -32603);
+  }
+  for (const revision of Object.keys(generatedCatalog.revisionProfiles)) {
+    const result = familyWireFixture(`init();ready=true;send([{jsonrpc:'2.0',id:'A',method:'tools/list'},{jsonrpc:'2.0',id:'B',method:'tools/call',params:{name:'call',arguments:{operation:'status',arguments:{project:${JSON.stringify(repoRoot)}}}}}]);`, { revision });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.trace.starts, 0);
+    assert.deepEqual(result.frames.at(-1), { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid Request" } });
+  }
+});
+
+test("family-v1 preserves local IDs and numeric lowering with duplicate last-member semantics", () => {
+  const request = `{"jsonrpc":"2.0", "id":9007199254740993,"method":"tools/call","params":{"name":"call","arguments":{"operation":"status","operation":"search","arguments":{"project":${JSON.stringify(repoRoot)},"query":17,"query":"fixture spaced \\t text","repo_text":"off","limit":5e+0}},"_meta":{"number":0.1234567890123456789012345}}}`;
+  const describe = `{"jsonrpc":"2.0","id":9007199254740995,"method":"tools/call","params":{"name":"describe","arguments":{"operation":"search","project":${JSON.stringify(repoRoot)}}}}`;
+  const invalid = '{"jsonrpc":"2.0","id":9007199254740997,"method":"tools/call","params":{"name":"call","arguments":{"operation":"unknown","arguments":{}}}}';
+  const second = request.replace('"id":9007199254740993', '"id":9007199254740992');
+  const result = familyWireFixture(`init();sendRaw(${JSON.stringify(describe)});sendRaw(${JSON.stringify(invalid)});ready=true;sendRaw(${JSON.stringify(request)});sendRaw(${JSON.stringify(second)});ack();child.stdout.write('{"jsonrpc":"2.0","id":9007199254740992,"result":{"kept":true}}\\n');child.emit('close',17,null);`);
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(result.stdout.includes('"id":9007199254740995'));
+  assert.ok(result.stdout.includes('"id":9007199254740997'));
+  const forwarded = result.trace.raw.find((line) => line.includes('"name":"search"'));
+  assert.ok(forwarded.includes('"id":9007199254740993'));
+  assert.ok(forwarded.includes('"limit":5e+0'));
+  assert.ok(forwarded.includes('"number":0.1234567890123456789012345'));
+  assert.equal(JSON.parse(forwarded).params.arguments.query, "fixture spaced \t text");
+  assert.equal(result.trace.seen.filter(({ method }) => method === "tools/call").length, 2);
+  assert.ok(result.stdout.split(/\r?\n/u).some((line) => line.includes('"id":9007199254740993') && line.includes('"error"')), "failed pending call lost exact ID");
+  const identities = [
+    ["9007199254740993", "9007199254740992", false],
+    ["1e0", "1", true], ["1e0", "1.0", true], ["1.2300e+2", "123", true],
+    ["-0.00e8", "0", true], ["1e-400", "0", false], ["1e-400", "10e-401", true],
+    ["0.123456789012345678901", "0.123456789012345678902", false],
+    ['"1"', "1", false], ['"same"', '"same"', true], ["null", "null", true],
+  ];
+  for (const [requestId, replyId, completes] of identities) {
+    const pending = request.replace('"id":9007199254740993', `"id":${requestId}`);
+    const reply = `{"jsonrpc":"2.0","id":${replyId},"result":{"identity_fixture":true}}`;
+    const probe = familyWireFixture(`init();ready=true;sendRaw(${JSON.stringify(pending)});ack();child.stdout.write(${JSON.stringify(reply)}+'\\n');child.emit('close',17,null);`);
+    assert.equal(probe.status, 0, probe.stderr);
+    const failures = probe.stdout.split(/\r?\n/u).filter((line) => line.includes('"error":'));
+    assert.equal(failures.length, completes ? 0 : 1, `identity ${requestId} -> ${replyId}`);
+    if (!completes) assert.ok(failures[0].includes(`"id":${requestId}`), "failure ID changed");
+    assert.ok(probe.stdout.includes(reply), "canonical child reply changed");
+  }
+  for (const setup of ["JSON.rawJSON=undefined;", "const parse=JSON.parse;JSON.parse=(text,reviver)=>parse(text,typeof reviver==='function'?function(key,value){return reviver.call(this,key,value);}:reviver);"]) {
+    const unsupported = familyWireFixture("init();ready=true;sendRaw(" + JSON.stringify(request) + ");", { setup });
+    assert.notEqual(unsupported.status, 0);
+    assert.match(unsupported.stderr, /family_v1_lossless_json_unavailable/u);
+  }
+  for (const catalog of ["null", "{tools:[{name:'search',inputSchema:null}],resources:[],resourceTemplates:[]}", `(()=>{const c=require(${JSON.stringify(join(pluginRoot, "generated-mcp-catalog.json"))});for(const p of Object.values(c.revisionProfiles))p.tools[0].inputSchema={type:'object',additionalProperties:17};return c})()`]) {
+    const missing = familyWireFixture("init();ready=true;send({jsonrpc:'2.0',id:'list',method:'tools/list'});", { catalog });
+    assert.ok(missing.status !== 0 || missing.frames.find(({ id }) => id === "list")?.error, "missing catalog advertised a callable family");
+  }
+  const wrong = familyWireFixture("init();", { surface: "unknown" });
+  assert.notEqual(wrong.status, 0);
+  assert.match(wrong.stderr, /mcp_tool_surface_invalid/u);
+});
+
+test("plugin discovery projects only output schemas from the full local catalog", () => {
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  for (const [revision, profile] of Object.entries(generatedCatalog.revisionProfiles)) {
+    for (const state of ["preparing", "unavailable"]) {
+      const status = {
+        plugin_runtime: { plugin_version: "0.17.4", warnings: [] },
+        runtime: { state }, warnings: [], readiness: [],
+        managed_retrieval: { state },
+      };
+      const fixture = `const catalog=require(${JSON.stringify(join(pluginRoot, "generated-mcp-catalog.json"))});const before=JSON.stringify(catalog);require(${JSON.stringify(launcher)})._test.runFailOpenMcp(${JSON.stringify(status)},{catalog});process.on('exit',()=>{if(JSON.stringify(catalog)!==before)throw new Error('canonical catalog mutated')});`;
+      const requests = [
+        { jsonrpc: "2.0", id: "init", method: "initialize", params: { protocolVersion: revision } },
+        { jsonrpc: "2.0", id: null, method: "tools/list" },
+        { jsonrpc: "2.0", id: "invalid", method: "tools/call", params: {
+          name: "search", arguments: { project: repoRoot, query: 17, repo_text: "invalid" },
+        } },
+      ];
+      const result = spawnSync(process.execPath, ["-e", fixture], {
+        input: requests.map((request) => JSON.stringify(request)).join("\n") + "\n",
+        encoding: "utf8", timeout: 5000,
+      });
+      assert.equal(result.status, 0, result.stderr);
+      const frames = result.stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line));
+      assert.equal(frames[0].result._meta.codestory_protocol.discovery_contract_sha256, discoveryDigest(revision));
+      assert.deepEqual(frames[1], {
+        jsonrpc: "2.0", id: null, result: { tools: losslessJsonAvailable
+          ? profile.tools.map(({ outputSchema, ...tool }) => tool) : profile.tools },
+      }, `${revision} ${state}`);
+      assert.equal(frames[2].error.code, -32602);
+      assert.ok(frames[2].error.data.violations.some(({ pointer }) => pointer === "/arguments/query"));
+      assert.ok(frames[2].error.data.violations.some(({ pointer }) => pointer === "/arguments/repo_text"));
+    }
+  }
+});
+
+test("plugin discovery correlates ready replies without rewriting unrelated frames", () => {
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  for (const revision of Object.keys(generatedCatalog.revisionProfiles)) {
+    const modern = revision >= "2025-06-18";
+    const canonical = generatedCatalog.revisionProfiles[revision].tools.find(({ name }) => name === "search");
+    const rawNonList = ' {"jsonrpc":"2.0", "id":0, "result":{"tools":[{"outputSchema":{"type":"object"}}],"n":9007199254740993,"text":"\\u0061","structuredContent":{"kept":true},"_meta":{"limit":17}}}';
+    const rawResources = ' {"id":7,"jsonrpc":"2.0", "result":{"contents":[{"text":"unchanged"}]}}';
+    const fixture = `
+      const {EventEmitter}=require('node:events');const {PassThrough}=require('node:stream');
+      const run=require(${JSON.stringify(launcher)})._test.runFailOpenMcp;
+      const tool=require(${JSON.stringify(join(pluginRoot, "generated-mcp-catalog.json"))}).revisionProfiles[${JSON.stringify(revision)}].tools.find(t=>t.name==='search');
+      const child=new EventEmitter();child.stdin=new PassThrough();child.stdout=new PassThrough();child.stderr=new PassThrough();child.exitCode=null;child.signalCode=null;child.kill=()=>true;
+      const seen=[];let input='';child.stdin.setEncoding('utf8');child.stdin.on('data',chunk=>{input+=chunk;const lines=input.split(/\\r?\\n/u);input=lines.pop()||'';for(const line of lines)if(line)seen.push(JSON.parse(line));});
+      const status={plugin_runtime:{plugin_version:'0.17.4',warnings:[]},runtime:{state:'ready'},warnings:[],readiness:[],managed_retrieval:{state:'ready'}};
+      run(status,{shouldHandoff:()=>true,startRuntime:()=>child,onRuntimeFailure:()=>{}});
+      const send=frame=>process.stdin.emit('data',JSON.stringify(frame)+'\\n');
+      const reply=frame=>child.stdout.write(JSON.stringify(frame)+'\\n');
+      const list=id=>({jsonrpc:'2.0',id,method:'tools/list'});
+      const listing=id=>({jsonrpc:'2.0',id,result:{tools:[tool],nextCursor:'next',_meta:{kept:true}}});
+      send({jsonrpc:'2.0',id:'init',method:'initialize',params:{protocolVersion:${JSON.stringify(revision)}}});
+      send({jsonrpc:'2.0',method:'notifications/initialized'});
+      ${modern ? `send(list(null));send({jsonrpc:'2.0',id:0,method:'tools/call',params:{name:'status',arguments:{project:'/fixture'}}});send(list('0'));send(list('null'));send(list(''));send({jsonrpc:'2.0',id:7,method:'resources/read',params:{uri:'codestory://agent-guide'}});` : `send([list(null),{jsonrpc:'2.0',id:0,method:'tools/call',params:{name:'status',arguments:{project:'/fixture'}}},{jsonrpc:'2.0',method:'notifications/cancelled'},list('0')]);`}
+      process.stderr.write('BEFORE:'+JSON.stringify(seen.map(f=>f.method))+'\\n');
+      reply({jsonrpc:'2.0',id:'init',result:{protocolVersion:${JSON.stringify(revision)},_meta:{codestory_protocol:{discovery_contract_sha256:${JSON.stringify(discoveryDigest(revision))}},codestory_publication:{schema_version:5,minimum_compatible_schema_version:5}}}});
+      ${modern ? `child.stdout.write(${JSON.stringify(rawResources)}+'\\n');child.stdout.write(${JSON.stringify(rawNonList)}+'\\n');for(const id of ['','null','0',null])reply(listing(id));reply(listing(null));send({jsonrpc:'2.0',id:'0',method:'tools/call'});reply(listing('0'));send(list('already-ready'));reply(listing('already-ready'));` : `const batch='['+JSON.stringify(listing(null))+','+${JSON.stringify(rawNonList.trim())}+','+JSON.stringify(listing('0'))+']';process.stderr.write('BATCH:'+batch+'\\n');child.stdout.write(batch+'\\n');`}
+      send(list('error'));reply({jsonrpc:'2.0',id:'error',error:{code:-32000,message:'fixture',data:{tools:[tool]}}});
+      send({jsonrpc:'2.0',id:'error',method:'tools/call'});reply(listing('error'));
+      send(list('malformed'));reply({jsonrpc:'2.0',id:'malformed',result:{tools:[{name:'broken',outputSchema:{type:'object'}}]}});
+      send(list('missing-jsonrpc'));child.stdout.write(JSON.stringify({id:'missing-jsonrpc',result:{tools:[tool]}})+'\\n');
+      reply(listing(999));reply({jsonrpc:'2.0',method:'notifications/fixture',params:{tools:[tool]}});
+      child.stdout.write('native diagnostic sentinel\\n');
+      send(list('outstanding-list'));child.emit('close',17,null);reply(listing('outstanding-list'));
+    `;
+    const result = spawnSync(process.execPath, ["-e", fixture], { encoding: "utf8", timeout: 5000 });
+    assert.equal(result.status, 0, result.stderr);
+    assert.ok(result.stderr.includes('BEFORE:["initialize","notifications/initialized"]'), result.stderr);
+    const lines = result.stdout.trim().split(/\r?\n/u);
+    const frames = lines.filter((line) => line !== "native diagnostic sentinel").map((line) => JSON.parse(line));
+    assert.ok(lines.includes("native diagnostic sentinel"));
+    if (modern) {
+      assert.ok(lines.includes(rawNonList), "non-list bytes changed");
+      assert.ok(lines.includes(rawResources), "resource bytes changed");
+      for (const id of ["", "null", "0", null, "already-ready"]) {
+        const response = frames.find((frame) => frame.id === id && frame.result?.nextCursor === "next");
+        const { outputSchema, ...projected } = canonical;
+        assert.deepEqual(response.result, { tools: [losslessJsonAvailable ? projected : canonical], nextCursor: "next", _meta: { kept: true } });
+      }
+      assert.deepEqual(frames.filter((frame) => frame.id === null).at(-1).result.tools, [canonical], "answered list ID retained classification");
+      assert.deepEqual(frames.filter((frame) => frame.id === "0").at(-1).result.tools, [canonical], "reused ID kept list classification");
+    } else {
+      const batch = result.stderr.split(/\r?\n/u).find((line) => line.startsWith("BATCH:")).slice(6);
+      assert.ok(lines.includes(batch), "legacy batch bytes changed");
+    }
+    assert.deepEqual(frames.find((frame) => frame.id === "error" && frame.error).error.data.tools, [canonical]);
+    assert.deepEqual(frames.filter((frame) => frame.id === "error").at(-1).result.tools, [canonical]);
+    assert.deepEqual(frames.find((frame) => frame.id === "malformed").result.tools, [{ name: "broken", outputSchema: { type: "object" } }]);
+    assert.deepEqual(frames.find((frame) => frame.id === "missing-jsonrpc").result.tools, [canonical]);
+    assert.deepEqual(frames.find((frame) => frame.id === 999).result.tools, [canonical]);
+    assert.deepEqual(frames.find((frame) => frame.method === "notifications/fixture").params.tools, [canonical]);
+    assert.deepEqual(frames.filter((frame) => frame.id === "outstanding-list").map((frame) => frame.error?.code), [-32000]);
+  }
+});
+
+test("plugin discovery preserves numeric lexemes or relays the original listing", () => {
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const request = '{"jsonrpc":"2.0","id":9007199254740993,"method":"tools/list"}';
+  const reply = '{"jsonrpc":"2.0","id":9007199254740993,"result":{"tools":[{"name":"precision","inputSchema":{"type":"object","properties":{"value":{"type":"number","minimum":0.1234567890123456789012345,"maximum":9007199254740993}}},"outputSchema":{"type":"object"},"_meta":{"fraction":0.1234567890123456789012345,"integer":9007199254740993}}],"nextCursor":"next","_meta":{"integer":9007199254740993,"values":[0.1234567890123456789012345,1e+004,-0]}}}';
+  for (const revision of ["2025-06-18", "2025-11-25"]) {
+    for (const mode of ["native", "no-raw-json", "no-source-context"]) {
+      const fixture = `
+        ${mode === "no-raw-json" ? "JSON.rawJSON=undefined;" : ""}
+        ${mode === "no-source-context" ? "const parse=JSON.parse;JSON.parse=(text,reviver)=>parse(text,typeof reviver==='function'?function(key,value){return reviver.call(this,key,value);}:reviver);" : ""}
+        const {EventEmitter}=require('node:events');const {PassThrough}=require('node:stream');
+        const run=require(${JSON.stringify(launcher)})._test.runFailOpenMcp;
+        const child=new EventEmitter();child.stdin=new PassThrough();child.stdout=new PassThrough();child.stderr=new PassThrough();child.exitCode=null;child.signalCode=null;child.kill=()=>true;
+        let seen='';child.stdin.setEncoding('utf8');child.stdin.on('data',chunk=>{seen+=chunk;});
+        let ready=false;run({plugin_runtime:{plugin_version:'0.17.4',warnings:[]},runtime:{state:'ready'},warnings:[],readiness:[]},{shouldHandoff:()=>ready,startRuntime:()=>child,onRuntimeFailure:()=>{}});
+        const send=frame=>process.stdin.emit('data',JSON.stringify(frame)+'\\n');
+        send({jsonrpc:'2.0',id:'init',method:'initialize',params:{protocolVersion:${JSON.stringify(revision)}}});
+        send({jsonrpc:'2.0',id:'local',method:'tools/list'});ready=true;
+        send({jsonrpc:'2.0',method:'notifications/initialized'});
+        process.stdin.emit('data',${JSON.stringify(request)}+'\\n');
+        child.stdout.write(JSON.stringify({jsonrpc:'2.0',id:'init',result:{protocolVersion:${JSON.stringify(revision)},_meta:{codestory_protocol:{discovery_contract_sha256:${JSON.stringify(discoveryDigest(revision))}},codestory_publication:{schema_version:5,minimum_compatible_schema_version:5}}}})+'\\n');
+        child.stdout.write(${JSON.stringify(reply)}+'\\n');
+        process.stderr.write(seen);
+      `;
+      const result = spawnSync(process.execPath, ["-e", fixture], { encoding: "utf8", timeout: 5000 });
+      assert.equal(result.status, 0, result.stderr);
+      assert.ok(result.stderr.includes(request), "request bytes changed before dispatch");
+      const actual = result.stdout.trim().split(/\r?\n/u).at(-1);
+      const expected = mode === "native" && losslessJsonAvailable
+        ? reply.replace('"outputSchema":{"type":"object"},', "") : reply;
+      assert.equal(actual, expected, `${revision} ${mode}`);
+      const local = result.stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line))
+        .find((frame) => frame.id === "local");
+      assert.equal(local.result.tools.some((tool) => Object.hasOwn(tool, "outputSchema")),
+        !(mode === "native" && losslessJsonAvailable), `${revision} ${mode} local fallback`);
+    }
+  }
+});
+
+test("plugin discovery requires ordinary descriptors and exact lossless request identity", () => {
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const cases = [
+    { name: "non-list first", requests: [["9007199254740992", "tools/call"], ["9007199254740993", "tools/list"]],
+      replies: [["9007199254740992", false], ["9007199254740993", false]] },
+    { name: "list first", requests: [["9007199254740992", "tools/call"], ["9007199254740993", "tools/list"]],
+      replies: [["9007199254740993", true], ["9007199254740992", false]] },
+    { name: "non-list overwrites", requests: [["9007199254740992", "tools/list"], ["9007199254740993", "tools/call"]],
+      replies: [["9007199254740992", false], ["9007199254740993", false]] },
+    { name: "equivalent numeric spelling", requests: [["1e+0", "tools/list"]], replies: [["1.0", false]] },
+    ...["7", '"ordinary"', "null"].map((id) => ({
+      name: `exact ${id}`, requests: [[id, "tools/list"]], replies: [[id, true]],
+    })),
+  ];
+  const validTool = { name: "fixture", inputSchema: { type: "object" }, outputSchema: { type: "object" } };
+  const malformed = [
+    ...[17, [], null].map((tool) => ["entry", tool]),
+    ...["inputSchema", "outputSchema"].flatMap((field) =>
+      [17, [], null].map((value) => [field, { ...validTool, [field]: value }])),
+  ];
+  for (const [field, tool] of malformed) cases.push({
+    name: `malformed ${field} ${JSON.stringify(tool)}`, tool,
+    requests: [['"shape"', "tools/list"]], replies: [['"shape"', false]],
+  });
+  for (const revision of ["2025-06-18", "2025-11-25"]) {
+    for (const scenario of cases) {
+      const requests = scenario.requests.map(([id, method]) =>
+        `{"jsonrpc":"2.0","id":${id},"method":${JSON.stringify(method)}}`);
+      const tool = Object.hasOwn(scenario, "tool") ? scenario.tool : validTool;
+      const replies = scenario.replies.map(([id]) =>
+        `{"jsonrpc":"2.0","id":${id},"result":{"tools":[${JSON.stringify(tool)}],"_meta":{"integer":9007199254740993,"fraction":0.1234567890123456789012345}}}`);
+      const fixture = `
+        const {EventEmitter}=require('node:events');const {PassThrough}=require('node:stream');
+        const run=require(${JSON.stringify(launcher)})._test.runFailOpenMcp;
+        const child=new EventEmitter();child.stdin=new PassThrough();child.stdout=new PassThrough();child.stderr=new PassThrough();child.exitCode=null;child.signalCode=null;child.kill=()=>true;
+        let seen='';child.stdin.setEncoding('utf8');child.stdin.on('data',chunk=>{seen+=chunk;});
+        run({plugin_runtime:{plugin_version:'0.17.4',warnings:[]},runtime:{state:'ready'},warnings:[],readiness:[]},{shouldHandoff:()=>true,startRuntime:()=>child,onRuntimeFailure:()=>{}});
+        const send=frame=>process.stdin.emit('data',JSON.stringify(frame)+'\\n');
+        send({jsonrpc:'2.0',id:'init',method:'initialize',params:{protocolVersion:${JSON.stringify(revision)}}});
+        send({jsonrpc:'2.0',method:'notifications/initialized'});
+        for(const request of ${JSON.stringify(requests)})process.stdin.emit('data',request+'\\n');
+        child.stdout.write(JSON.stringify({jsonrpc:'2.0',id:'init',result:{protocolVersion:${JSON.stringify(revision)},_meta:{codestory_protocol:{discovery_contract_sha256:${JSON.stringify(discoveryDigest(revision))}},codestory_publication:{schema_version:5,minimum_compatible_schema_version:5}}}})+'\\n');
+        for(const response of ${JSON.stringify(replies)})child.stdout.write(response+'\\n');
+        process.stderr.write(seen);
+      `;
+      const result = spawnSync(process.execPath, ["-e", fixture], { encoding: "utf8", timeout: 5000 });
+      assert.equal(result.status, 0, result.stderr);
+      for (const request of requests) assert.ok(result.stderr.includes(request), "request bytes changed");
+      const actual = result.stdout.trim().split(/\r?\n/u).slice(-replies.length);
+      assert.deepEqual(actual, replies.map((reply, index) =>
+        scenario.replies[index][1] && losslessJsonAvailable
+          ? reply.replace(',"outputSchema":{"type":"object"}', "") : reply),
+      `${revision} ${scenario.name}`);
+    }
+  }
 });
 
 test("launcher wire contract matches the generated catalog read from the real CLI", async () => {
@@ -809,12 +1156,17 @@ test("managed provisioning replies satisfy every non-status tool output schema",
   const tools = generatedCatalog.tools.filter((tool) => tool.name !== "status");
   assert.equal(tools.length, 19);
   for (const tool of tools) {
+    assert.ok(tool.outputSchema && typeof tool.outputSchema === "object", `${tool.name} requires its full schema`);
     const result = launcherTest.failOpenToolResult(tool.name, status, { project: repoRoot });
     assert.deepEqual(
       launcherTest.validatePublishedSchemaValue(tool.outputSchema, result.structuredContent, "/result"),
       [],
       `${tool.name} provisioning response must satisfy its published output schema`,
     );
+    const invalid = structuredClone(result.structuredContent);
+    invalid.retry_after_ms = "invalid";
+    assert.ok(launcherTest.validatePublishedSchemaValue(tool.outputSchema, invalid, "/result").length > 0,
+      `${tool.name} full schema must reject malformed preparing results`);
     assert.deepEqual(result.structuredContent.minimum_next, {
       kind: "retry_same_request",
       after_ms: result.structuredContent.retry_after_ms,
@@ -847,6 +1199,9 @@ test("modern fail-open status matches its advertised output schema and text", ()
       assert.equal(toolResult.isError, false);
       assert.deepEqual(JSON.parse(toolResult.content[0].text), toolResult.structuredContent);
       assert.deepEqual(launcherTest.validatePublishedSchemaValue(outputSchema, toolResult.structuredContent, "/result"), []);
+      const invalid = structuredClone(toolResult.structuredContent);
+      invalid.project = 17;
+      assert.ok(launcherTest.validatePublishedSchemaValue(outputSchema, invalid, "/result").length > 0);
       assert.equal(toolResult.structuredContent.project, repoRoot);
       assert.equal(toolResult.structuredContent.state, state);
       assert.equal(toolResult.structuredContent.diagnostics_uri,
@@ -2014,6 +2369,7 @@ test("agent-facing guidance keeps embedding lifecycle internal", async () => {
   const guidanceFiles = [
     join(pluginRoot, "hooks", "codestory-activate.cjs"),
     join(pluginRoot, "skills", "codestory-grounding", "SKILL.md"),
+    join(pluginRoot, "skills", "codestory-grounding", "GUIDE.md"),
     join(pluginRoot, "skills", "codestory-grounding", "agents", "openai.yaml"),
     join(pluginRoot, "skills", "codestory-grounding", "references", "status-contract.md"),
     join(pluginRoot, "skills", "codestory-grounding", "references", "doctor.md"),
@@ -2041,8 +2397,8 @@ test("agent-facing guidance keeps embedding lifecycle internal", async () => {
 });
 
 test("grounding display helper preserves hostile JSON and removes safe spelling mirrors", async () => {
-  const skill = await readFile(join(pluginRoot, "skills", "codestory-grounding", "SKILL.md"), "utf8");
-  const example = [...skill.matchAll(/```javascript\n([\s\S]*?)```/gu)]
+  const guide = await readFile(join(pluginRoot, "skills", "codestory-grounding", "GUIDE.md"), "utf8");
+  const example = [...guide.matchAll(/```javascript\n([\s\S]*?)```/gu)]
     .find(([, code]) => code.includes("structuredContent"));
   assert.ok(example, "execute the shipped result-display example");
   const run = new Function("result", "text", example[1]);
