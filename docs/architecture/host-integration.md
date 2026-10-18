@@ -18,8 +18,10 @@ return a small repository map from the existing compatible complete core as
 data alone, without a skill-reading reminder or preloaded skill body. It
 passes only the absolute hook `cwd` to the verified existing CLI; active-state
 records never choose a project. The hidden command pins one immutable core,
-reuses strict grounding selection, groups selected roots by native file
-identity, and verifies only those selected files against indexed raw hashes
+reuses strict grounding selection. Within production tiers, entry/subsystem
+representatives stay first, then each indexed file gets a root before a file
+repeats. Selected roots are grouped by native file identity, and only those
+selected files are verified against indexed raw hashes
 under the captured source-index byte policy. Selection remains as of that
 publication, even when emitted files match current content. Error counts,
 orientation uncertainty, source gaps and omitted groups remain visible.

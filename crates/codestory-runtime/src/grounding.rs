@@ -544,12 +544,23 @@ fn diversify_grounding_root_records(
     }
     representatives.extend(leftovers);
 
-    let mut diversified = diversify_root_order_within(
+    let diversified = diversify_root_order_within(
         representatives,
         |record| representative_ids.contains(&record.node.id),
         surface_key,
         &mut state,
     );
+    // Keep the existing pins, then spend primary breadth on indexed files
+    // before repeating one. Native aliases remain a downstream source check.
+    let mut seen_files = HashSet::new();
+    let (mut diversified, repeated) = diversified.into_iter().partition::<Vec<_>, _>(|record| {
+        let first_in_file = record
+            .node
+            .file_node_id
+            .is_none_or(|file_id| seen_files.insert(file_id));
+        representative_ids.contains(&record.node.id) || first_in_file
+    });
+    diversified.extend(repeated);
     for tier in bands.into_iter().skip(3) {
         diversified.extend(diversify_root_order_within(
             tier,
@@ -2691,6 +2702,168 @@ mod tests {
                 "imports, tooling and secondary roles must stay deferred: {beta_path}"
             );
         }
+    }
+
+    #[test]
+    fn grounding_root_file_breadth_preserves_pins_repeats_and_secondary_tiers() {
+        let root = Path::new("/repo");
+        let record =
+            |id, file_id: Option<i64>, name: &str, path: &str, kind, line| GroundingNodeRecord {
+                node: Node {
+                    id: CoreNodeId(id),
+                    kind,
+                    serialized_name: name.to_string(),
+                    file_node_id: file_id.map(CoreNodeId),
+                    start_line: Some(line),
+                    ..Default::default()
+                },
+                display_name: name.to_string(),
+                file_path: Some(root.join(path)),
+            };
+        let mut records = (0..10)
+            .map(|index| {
+                record(
+                    100 + index,
+                    Some(10),
+                    &format!("Dispatch{index}"),
+                    "src/launch.ts",
+                    NodeKind::FUNCTION,
+                    index as u32 + 1,
+                )
+            })
+            .collect::<Vec<_>>();
+        records.extend([
+            record(
+                201,
+                Some(20),
+                "Shared",
+                "src/alpha.ts",
+                NodeKind::FUNCTION,
+                1,
+            ),
+            record(202, Some(20), "Tail", "src/alpha.ts", NodeKind::FUNCTION, 2),
+            record(
+                301,
+                Some(30),
+                "Shared",
+                "src/beta.ts",
+                NodeKind::FUNCTION,
+                1,
+            ),
+            record(
+                401,
+                Some(40),
+                "Boundary",
+                "crates/teal/src/lib.rs",
+                NodeKind::STRUCT,
+                1,
+            ),
+            record(
+                501,
+                Some(50),
+                "Tool",
+                "tools/helper.ts",
+                NodeKind::FUNCTION,
+                1,
+            ),
+            record(
+                601,
+                Some(60),
+                "Check",
+                "checks/unit.ts",
+                NodeKind::FUNCTION,
+                1,
+            ),
+            record(
+                701,
+                Some(70),
+                "\"./foreign.ts\"",
+                "src/imports.ts",
+                NodeKind::MODULE,
+                1,
+            ),
+            record(801, None, "UnboundA", "loose/a.ts", NodeKind::FUNCTION, 1),
+            record(802, None, "UnboundB", "loose/b.ts", NodeKind::FUNCTION, 1),
+        ]);
+        let roles = [
+            (10, FileRole::Entrypoint),
+            (20, FileRole::Source),
+            (30, FileRole::Source),
+            (40, FileRole::Source),
+            (50, FileRole::Source),
+            (60, FileRole::Test),
+            (70, FileRole::Source),
+        ]
+        .into_iter()
+        .collect();
+        let languages = (10..=70)
+            .step_by(10)
+            .map(|id| (id, if id == 40 { "rust" } else { "typescript" }.to_string()))
+            .collect();
+        let degrees = (100..110)
+            .map(|id| {
+                (
+                    CoreNodeId(id),
+                    CallDegrees {
+                        production_in_calls: 0,
+                        out_calls: 3,
+                    },
+                )
+            })
+            .collect();
+        let order = |input| {
+            diversify_grounding_root_records(
+                input,
+                root,
+                &roles,
+                &languages,
+                &degrees,
+                &HashMap::new(),
+            )
+        };
+        let ordered = order(records.clone());
+        let ids =
+            |rows: &[GroundingNodeRecord]| rows.iter().map(|r| r.node.id.0).collect::<Vec<_>>();
+        assert_eq!(
+            &ids(&ordered)[..4],
+            &[100, 401, 201, 301],
+            "entry/subsystem pins stay first; duplicate names in distinct files still gain breadth"
+        );
+        assert_eq!(
+            &ids(&ordered)[4..14],
+            &[101, 102, 103, 104, 105, 106, 107, 108, 109, 202],
+            "repeated-file roots retain their prior relative order"
+        );
+        assert_eq!(
+            &ids(&ordered)[14..],
+            &[501, 601, 801, 802, 701],
+            "tooling, secondary/unbound roots and imports remain in their existing tiers"
+        );
+        let facts = |rows: &[GroundingNodeRecord]| {
+            rows.iter()
+                .map(|r| {
+                    (
+                        r.node.id.0,
+                        (
+                            r.node.kind,
+                            r.node.file_node_id,
+                            r.node.start_line,
+                            r.display_name.clone(),
+                            r.file_path.clone(),
+                        ),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        assert_eq!(
+            facts(&ordered),
+            facts(&records),
+            "keep every record and source fact"
+        );
+        records.reverse();
+        assert_eq!(ids(&order(records.clone())), ids(&ordered));
+        records.rotate_left(3);
+        assert_eq!(ids(&order(records)), ids(&ordered));
     }
 
     #[test]
@@ -5610,6 +5783,16 @@ mod tests {
         let max = controller
             .grounding_snapshot(GroundingBudgetDto::Max)
             .expect("max snapshot");
+
+        let root_ids = |snapshot: &GroundingSnapshotDto| {
+            snapshot
+                .root_symbols
+                .iter()
+                .map(|root| root.id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(root_ids(&strict), root_ids(&max)[..8]);
+        assert_eq!(root_ids(&balanced), root_ids(&max)[..16]);
 
         // Fixture truth is independent of the returned shape: 24 files with 5
         // symbols each were seeded, and every file and symbol must be
