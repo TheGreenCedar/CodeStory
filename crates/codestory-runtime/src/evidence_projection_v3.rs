@@ -861,6 +861,14 @@ pub fn project_search_v3(
         was_bounded,
     } = search_evidence_selection(results);
     let mut gaps = Vec::new();
+    if results.public_exports.incomplete {
+        gaps.push(gap_row("search-public-export-incomplete", GapKindV3Dto::EvidenceMissing,
+            Some("Public export navigation is incomplete, unavailable or ambiguous; additional bindings may exist."))?);
+    }
+    if results.public_exports.bounded {
+        gaps.push(gap_row("search-public-export-bounded", GapKindV3Dto::OutputBudgetExceeded,
+            Some("Additional public export bindings or their complete provenance exceeded the navigation bound."))?);
+    }
     if symbolic
         && results.repo_text_mode == codestory_contracts::api::SearchRepoTextMode::Off
         && !results.repo_text_enabled
@@ -976,7 +984,16 @@ fn search_evidence_selection(results: &SearchResultsDto) -> SearchEvidenceSelect
             was_bounded = true;
             continue;
         }
-        rows.push(search_evidence_row(rows.len(), hit).expect("search hit has a path"));
+        let mut row = search_evidence_row(rows.len(), hit).expect("search hit has a path");
+        if let Some(binding) = results
+            .public_exports
+            .matches
+            .iter()
+            .find(|binding| binding.node_id == hit.node_id)
+        {
+            row.display_name = Some(symbol_id_text(&binding.presentation));
+        }
+        rows.push(row);
     }
     SearchEvidenceSelectionV3 {
         rows,

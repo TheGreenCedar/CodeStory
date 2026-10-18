@@ -4106,9 +4106,9 @@ fn projection_batch_reports_exact_shape_and_commits_once() -> Result<(), Storage
     assert_eq!(breakdown.persistence.component_access.row_attempts, 1);
     assert_eq!(breakdown.persistence.callable_projection.row_attempts, 1);
     assert_eq!(breakdown.persistence.file_errors.row_attempts, 2);
-    assert_eq!(breakdown.persistence.dirty_state.row_attempts, 4);
-    assert_eq!(breakdown.persistence.row_attempts(), 18);
-    assert_eq!(breakdown.persistence.statement_executions(), 19);
+    assert_eq!(breakdown.persistence.dirty_state.row_attempts, 6);
+    assert_eq!(breakdown.persistence.row_attempts(), 20);
+    assert_eq!(breakdown.persistence.statement_executions(), 21);
     assert_eq!(breakdown.persistence.files.bound_bytes, 130);
     assert_eq!(breakdown.persistence.file_errors.bound_bytes, 52);
     assert_eq!(breakdown.persistence.dirty_state.bound_bytes, 48);
@@ -15549,5 +15549,237 @@ fn test_trail_priority_refuses_conflicting_certainty_and_filters_before_cap()
         Some(ResolutionCertainty::Certain)
     );
     assert!(result.truncated);
+    Ok(())
+}
+
+#[test]
+fn public_export_projection_identity_and_transaction_faults() -> Result<(), StorageError> {
+    use codestory_contracts::graph::{PublicExportAlias, PublicExportAliasStatus};
+    let mut storage = Storage::new_in_memory()?;
+    flush_projection_persistence_fixture(&mut storage)?;
+    let publication = IndexPublicationRecord {
+        generation: 1,
+        generation_id: "exports".into(),
+        run_id: "run".into(),
+        mode: IndexPublicationMode::Full,
+        published_at_epoch_ms: 1,
+    };
+    storage.put_index_publication(&publication)?;
+    let hash = storage.get_file_content_hash(1)?.unwrap();
+    let alias = PublicExportAlias {
+        public_name: "PublicRun".into(),
+        local_name: "run".into(),
+        export_file_id: NodeId(1),
+        export_source_sha256: hash.clone(),
+        export_line: 1,
+        export_column: 1,
+        import_line: None,
+        module_specifier: None,
+        target_node_id: Some(NodeId(2)),
+        target_file_id: Some(NodeId(1)),
+        target_source_sha256: Some(hash),
+        status: PublicExportAliasStatus::Bound,
+    };
+    storage.replace_public_export_aliases(&publication, &[alias.clone()], true)?;
+    assert_eq!(
+        storage.public_export_aliases("PublicRun")?.rows,
+        vec![alias.clone()]
+    );
+    storage.conn.execute(
+        "UPDATE public_export_alias_publication SET producer_version=1 WHERE id=1",
+        [],
+    )?;
+    let previous_producer = storage.public_export_aliases("PublicRun")?;
+    assert!(!previous_producer.ready);
+    assert!(!previous_producer.complete);
+    assert!(previous_producer.rows.is_empty());
+    storage.replace_public_export_aliases(&publication, &[alias.clone()], true)?;
+    storage
+        .conn
+        .execute("DELETE FROM index_artifact_cache", [])?;
+    assert_eq!(
+        storage.public_export_aliases("PublicRun")?.rows,
+        vec![alias.clone()],
+        "query authority is durable, not the parser cache"
+    );
+    let cached_file = storage.get_file_by_id(1)?.unwrap();
+    storage
+        .conn
+        .authorizer(Some(|context: AuthContext<'_>| match context.action {
+            AuthAction::Update {
+                table_name: "file", ..
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
+        }))?;
+    assert!(
+        storage
+            .update_file_metadata(&cached_file, Some(&alias.export_source_sha256))
+            .is_err()
+    );
+    storage
+        .conn
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?;
+    storage
+        .conn
+        .authorizer(Some(|context: AuthContext<'_>| match context.action {
+            AuthAction::Delete {
+                table_name: "error",
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
+        }))?;
+    assert!(storage.replace_errors_for_files_batch(&[1], &[]).is_err());
+    storage
+        .conn
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?;
+    assert_eq!(
+        storage.public_export_aliases("PublicRun")?.rows,
+        vec![alias.clone()],
+        "cached metadata/error-clear failure preserves projection"
+    );
+    let prior_nodes = storage.get_nodes()?.len();
+    let prior_errors = storage.get_errors(None)?.len();
+    seed_ready_projection_snapshots(&storage)?;
+    storage
+        .conn
+        .authorizer(Some(|context: AuthContext<'_>| match context.action {
+            AuthAction::Delete {
+                table_name: "public_export_alias",
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
+        }))?;
+    assert!(flush_projection_persistence_fixture(&mut storage).is_err());
+    storage
+        .conn
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?;
+    assert_eq!(storage.get_nodes()?.len(), prior_nodes);
+    assert_eq!(storage.get_errors(None)?.len(), prior_errors);
+    assert!(storage.has_ready_grounding_snapshots()?);
+    assert!(storage.has_ready_resolution_support_snapshot(1)?);
+    assert_eq!(
+        storage.public_export_aliases("PublicRun")?.rows,
+        vec![alias.clone()]
+    );
+    storage.conn.commit_hook(Some(|| true))?;
+    assert!(
+        storage
+            .replace_public_export_aliases(&publication, &[], true)
+            .is_err()
+    );
+    assert!(flush_projection_persistence_fixture(&mut storage).is_err());
+    storage.conn.commit_hook(None::<fn() -> bool>)?;
+    assert_eq!(
+        storage.public_export_aliases("PublicRun")?.rows,
+        vec![alias]
+    );
+    assert!(storage.has_ready_grounding_snapshots()?);
+    // A publication-only identity transition retains authenticated rows.
+    let mut next = publication.clone();
+    next.generation = 2;
+    next.generation_id = "next".into();
+    storage.put_index_publication(&next)?;
+    assert_eq!(storage.public_export_aliases("PublicRun")?.rows.len(), 1);
+    storage
+        .conn
+        .execute("UPDATE file SET content_hash='different' WHERE id=1", [])?;
+    let stale = storage.public_export_aliases("PublicRun")?;
+    assert!(stale.rows.is_empty());
+    assert!(!stale.complete);
+    Ok(())
+}
+
+#[test]
+fn public_export_schema_migration_is_atomic_and_legacy_is_unavailable() -> Result<(), StorageError>
+{
+    let storage = Storage::new_in_memory()?;
+    storage.conn.execute_batch("DROP TABLE public_export_alias; DROP TABLE public_export_alias_publication; PRAGMA user_version=37;")?;
+    assert!(!storage.public_export_aliases("Public")?.ready);
+    storage
+        .conn
+        .authorizer(Some(|context: AuthContext<'_>| match context.action {
+            AuthAction::CreateTable {
+                table_name: "public_export_alias_publication",
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
+        }))?;
+    assert!(super::schema::apply_schema_migrations(&storage).is_err());
+    storage
+        .conn
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?;
+    assert_eq!(storage.schema_version()?, 37);
+    let count: i64 = storage.conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE name='public_export_alias'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(
+        count, 0,
+        "failed migration must roll back its first row family"
+    );
+    super::schema::apply_schema_migrations(&storage)?;
+    assert_eq!(storage.schema_version()?, CURRENT_SCHEMA_VERSION);
+    assert!(
+        !storage.public_export_aliases("Public")?.ready,
+        "migration is not extraction proof"
+    );
+    Ok(())
+}
+
+#[test]
+fn public_export_projection_caps_distinct_targets_not_witnesses() -> Result<(), StorageError> {
+    use codestory_contracts::graph::{PublicExportAlias, PublicExportAliasStatus};
+    let mut storage = Storage::new_in_memory()?;
+    flush_projection_persistence_fixture(&mut storage)?;
+    let publication = IndexPublicationRecord {
+        generation: 1,
+        generation_id: "cap".into(),
+        run_id: "cap".into(),
+        mode: IndexPublicationMode::Full,
+        published_at_epoch_ms: 1,
+    };
+    storage.put_index_publication(&publication)?;
+    let nodes = (100..301)
+        .map(|id| Node {
+            id: NodeId(id),
+            kind: NodeKind::CLASS,
+            serialized_name: format!("Owner{id}"),
+            file_node_id: Some(NodeId(1)),
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+    storage.insert_nodes_batch(&nodes)?;
+    let hash = storage.get_file_content_hash(1)?.unwrap();
+    let aliases = nodes
+        .iter()
+        .flat_map(|node| {
+            (0..3).map(|_| PublicExportAlias {
+                public_name: "Shared".into(),
+                local_name: node.serialized_name.clone(),
+                export_file_id: NodeId(1),
+                export_source_sha256: hash.clone(),
+                export_line: 1,
+                export_column: 1,
+                import_line: None,
+                module_specifier: None,
+                target_node_id: Some(node.id),
+                target_file_id: Some(NodeId(1)),
+                target_source_sha256: Some(hash.clone()),
+                status: PublicExportAliasStatus::Bound,
+            })
+        })
+        .collect::<Vec<_>>();
+    storage.replace_public_export_aliases(&publication, &aliases, true)?;
+    let found = storage.public_export_aliases("Shared")?;
+    assert_eq!(found.rows.len(), 200);
+    assert!(found.bounded);
+    assert!(!found.complete);
+    assert_eq!(
+        found
+            .rows
+            .iter()
+            .filter_map(|row| row.target_node_id)
+            .collect::<HashSet<_>>()
+            .len(),
+        200
+    );
     Ok(())
 }

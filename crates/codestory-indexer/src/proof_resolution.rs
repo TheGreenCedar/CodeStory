@@ -595,6 +595,8 @@ pub(crate) fn collect_call_resolution_inputs(
                 |index| index.cached_classes(),
             ),
             direct_exports,
+            public_exports: is_javascript_language(language)
+                .then(|| crate::public_exports::collect(tree, source, nodes)),
             export_poison_all,
             poisoned_export_names,
             rust_modules: rust_index
@@ -14703,6 +14705,17 @@ pub fn rematerialize_proof_resolution_projection_with_progress(
         }
         records.push(record);
     }
+    crate::public_exports::rematerialize(
+        store,
+        publication,
+        &records
+            .iter()
+            .map(|record| crate::public_exports::Source {
+                path: record.path.as_path(),
+                file: &record.file,
+            })
+            .collect::<Vec<_>>(),
+    )?;
     progress_observer(progress);
     let mut linear_records = Vec::new();
     let mut records = records
@@ -21167,6 +21180,7 @@ mod ruby_php_complexity_tests {
                 top_level_declarations: declarations,
                 inherent_methods: Vec::new(),
                 classes: Vec::new(),
+                public_exports: None,
                 direct_exports: Vec::new(),
                 export_poison_all: false,
                 poisoned_export_names: Vec::new(),
@@ -21463,6 +21477,7 @@ mod rust_complexity_tests {
                 top_level_declarations: declarations,
                 inherent_methods: methods,
                 classes: Vec::new(),
+                public_exports: None,
                 direct_exports: Vec::new(),
                 export_poison_all: false,
                 poisoned_export_names: Vec::new(),
@@ -22321,6 +22336,7 @@ mod go_complexity_tests {
                     }],
                     inherent_methods: Vec::new(),
                     classes: Vec::new(),
+                    public_exports: None,
                     direct_exports: Vec::new(),
                     export_poison_all: false,
                     poisoned_export_names: Vec::new(),
@@ -22472,6 +22488,7 @@ mod python_complexity_tests {
                     instance_method_names: Vec::new(),
                     java_scope: None,
                 }],
+                public_exports: None,
                 direct_exports: Vec::new(),
                 export_poison_all: false,
                 poisoned_export_names: Vec::new(),

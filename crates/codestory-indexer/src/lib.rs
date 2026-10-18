@@ -91,6 +91,7 @@ mod language_configs;
 mod languages;
 mod native_declarators;
 mod proof_resolution;
+mod public_exports;
 
 /// SRC-C2 fence classification: lives in its own file because
 /// `codestory-indexer`'s own source is indexed by
@@ -4383,6 +4384,8 @@ pub fn current_file_extraction_revision(language: &str) -> Option<&'static str> 
     match language {
         "python" => Some(languages::python::CALLABLE_DECLARATION_REVISION),
         "rust" => Some(languages::rust::CALLABLE_DECLARATION_REVISION),
+        "javascript" => Some("explicit-named-public-exports-v2"),
+        "typescript" | "tsx" => Some("explicit-named-public-exports-v3"),
         _ => None,
     }
 }
@@ -4953,6 +4956,13 @@ fn rebase_cached_index_artifact(
     }
     if let Some(resolution_file) = &mut artifact.resolution_file {
         resolution_file.file_id = new_file_id;
+        if let Some(exports) = &mut resolution_file.public_exports {
+            for binding in &mut exports.bindings {
+                if let crate::public_exports::ExportTarget::Local(id) = &mut binding.target {
+                    *id = id_remap.get(id).copied().unwrap_or(*id);
+                }
+            }
+        }
         for export in &mut resolution_file.direct_exports {
             export.declaration = id_remap
                 .get(&export.declaration)
@@ -17675,6 +17685,17 @@ mod proof_resolution_cache_tests {
                     instance_method_names: Vec::new(),
                     java_scope: None,
                 }],
+                public_exports: Some(crate::public_exports::ExportFileInput {
+                    complete: true,
+                    bindings: vec![crate::public_exports::ExportInput {
+                        name: "PublicC".into(),
+                        local_name: "C".into(),
+                        line: 1,
+                        column: 1,
+                        direct: false,
+                        target: crate::public_exports::ExportTarget::Local(old_owner),
+                    }],
+                }),
                 direct_exports: vec![CachedDirectExport {
                     exported_name: "C".to_owned(),
                     declaration: old_owner,
@@ -17755,6 +17776,10 @@ mod proof_resolution_cache_tests {
         assert_eq!(file.classes[0].declaration, new_owner);
         assert_eq!(file.classes[0].methods[0].declaration, new_method);
         assert_eq!(file.direct_exports[0].declaration, new_owner);
+        assert_eq!(
+            file.public_exports.unwrap().bindings[0].target,
+            crate::public_exports::ExportTarget::Local(new_owner)
+        );
         assert!(!file.export_poison_all);
         assert_eq!(file.poisoned_export_names, ["unrelated"]);
     }

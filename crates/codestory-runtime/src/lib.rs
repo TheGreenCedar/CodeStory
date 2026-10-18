@@ -177,6 +177,7 @@ mod indexed_source_call_path_v1;
 #[doc(hidden)]
 pub mod proof_qualification_support;
 pub mod public_call_path;
+mod public_exports;
 mod publication;
 mod repo_text;
 mod root_rank;

@@ -4956,8 +4956,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-typescript"
 version = "0.23.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c5f76ed8d947a75cc446d5fccd8b602ebf0cde64ccf2ffa434d873d7a575eff"
+source = "git+https://github.com/gthb/tree-sitter-typescript?rev=8a43a912d4a941767829a00ff0be80318762a4f1#8a43a912d4a941767829a00ff0be80318762a4f1"
 dependencies = [
  "cc",
  "tree-sitter-language",

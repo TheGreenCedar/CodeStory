@@ -41,6 +41,25 @@ inventory only and make no graph, semantic, typed-target, or sufficiency claim.
 Agent-facing packet/search quality is separate. Run-specific A/B artifacts are
 not blanket promotion proof for every parser-backed language.
 
+JavaScript and TypeScript additionally support source-verified navigation from
+explicit named public exports to a unique local class/function declaration,
+including one relative import/reexport hop. This is a search navigation
+projection, not a new typed call-resolution tier. Unsupported or ambiguous
+exports remain unresolved. See [indexing pipeline](indexing-pipeline.md#explicit-public-export-navigation)
+for the exact supported forms and publication boundary.
+
+TypeScript and TSX use the MIT-licensed `tree-sitter-typescript` grammar pinned to
+contributor commit `8a43a912d4a941767829a00ff0be80318762a4f1` from
+[`gthb/tree-sitter-typescript`](https://github.com/gthb/tree-sitter-typescript/tree/8a43a912d4a941767829a00ff0be80318762a4f1).
+This is the unmerged [upstream PR358](https://github.com/tree-sitter/tree-sitter-typescript/pull/358)
+type-star fix, not the published registry grammar. The existing Rust binding
+compiles its committed generated C parsers; no grammar generator or additional
+runtime is needed. Valid `export type *` and `export type * as Name` statements
+can coexist with supported named value exports. Type-only stars remain
+unsupported for value navigation, and malformed source still reports partial
+parser coverage. Existing TypeScript/TSX files are re-extracted on their next
+refresh through the durable extraction revision.
+
 ## Claim Ladder
 
 The source-derived ladder in `language_support.rs` maps current profiles only to

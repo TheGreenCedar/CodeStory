@@ -80,6 +80,7 @@ pub(crate) struct OrientationHitEvidence {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct OrientationEvidence {
     by_node: HashMap<NodeId, OrientationHitEvidence>,
+    pub(crate) public_exports: HashMap<NodeId, String>,
     graph_evaluated: usize,
 }
 
@@ -442,10 +443,28 @@ fn search_match_rank(
     hit: &SearchHit,
     evidence: Option<&OrientationEvidence>,
 ) -> SearchMatchRank {
-    let (rank, matched_symbol_query) = best_symbol_name_match(query, &hit.display_name);
+    let (canonical_rank, mut matched_symbol_query) =
+        best_symbol_name_match(query, &hit.display_name);
+    let alias = evidence.and_then(|value| value.public_exports.get(&hit.node_id));
+    let rank = alias
+        .map(|name| best_symbol_name_match(query, name).0)
+        .filter(|rank| *rank > canonical_rank)
+        .unwrap_or(canonical_rank);
+    let alias_exact = rank > canonical_rank;
+    if alias_exact {
+        matched_symbol_query = hit.display_name.clone();
+    }
     let is_exact_match =
         rank.exact_display != 0 || rank.exact_terminal != 0 || rank.exact_leading != 0;
-    let full_definition = full_definition_bucket(project_root, query, hit);
+    let full_definition = full_definition_bucket(
+        project_root,
+        if alias_exact {
+            &hit.display_name
+        } else {
+            query
+        },
+        hit,
+    );
     let definition_quality =
         exact_definition_quality_bucket(project_root, &matched_symbol_query, hit, is_exact_match);
     let qualified_prefix_path = qualified_prefix_path_bucket(query, hit);

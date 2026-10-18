@@ -36,6 +36,8 @@ mod bookmarks;
 mod core_retention;
 mod helpers;
 mod proof_resolution;
+mod public_exports;
+pub use public_exports::{PUBLIC_EXPORT_ALIAS_PRODUCER_VERSION, PublicExportAliasQuery};
 mod retrieval_manifest;
 mod row_mapping;
 mod schema;
@@ -88,10 +90,11 @@ const CANONICAL_SUFFIX_SCHEMA_VERSION: u32 = 34;
 const ATTACHED_COMMENT_SCHEMA_VERSION: u32 = 35;
 const PROOF_RESOLUTION_FK_INDEX_SCHEMA_VERSION: u32 = 36;
 const FILE_EXTRACTION_IDENTITY_SCHEMA_VERSION: u32 = 37;
-const SCHEMA_VERSION: u32 = FILE_EXTRACTION_IDENTITY_SCHEMA_VERSION;
+const PUBLIC_EXPORT_ALIAS_SCHEMA_VERSION: u32 = 38;
+const SCHEMA_VERSION: u32 = PUBLIC_EXPORT_ALIAS_SCHEMA_VERSION;
 // v37 only adds file extraction identity; retention's manifest/pointer
 // projection is unchanged. Keep this ceiling explicit across future bumps.
-const RETENTION_PUBLICATION_MAX_CORE_SCHEMA_VERSION: u32 = FILE_EXTRACTION_IDENTITY_SCHEMA_VERSION;
+const RETENTION_PUBLICATION_MAX_CORE_SCHEMA_VERSION: u32 = PUBLIC_EXPORT_ALIAS_SCHEMA_VERSION;
 // Reserved outside the sequential migration range so a future real schema version cannot
 // accidentally be treated as an interrupted run from this release.
 /// The `user_version` sentinel stamped while an incremental index run is
@@ -6513,7 +6516,8 @@ impl Storage {
                 "Index publication identity contains an invalid field".to_string(),
             ));
         }
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO index_publication (
                 id, generation, generation_id, run_id, mode, published_at_epoch_ms
              ) VALUES (1, ?1, ?2, ?3, ?4, ?5)
@@ -6531,6 +6535,12 @@ impl Storage {
                 publication.published_at_epoch_ms,
             ],
         )?;
+        tx.execute(
+            "UPDATE public_export_alias_publication SET publication=?1 WHERE id=1",
+            [serde_json::to_string(publication)
+                .map_err(|error| StorageError::Other(error.to_string()))?],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -9605,6 +9615,12 @@ impl Storage {
             projection_scalar_binds(3),
         );
         if !preserve_graph_derived_state {
+            // This family is rebuilt from authenticated source inputs before publication.
+            // Invalidation belongs to the graph/error/dirty transaction.
+            tx.execute("DELETE FROM public_export_alias", [])?;
+            tx.execute("DELETE FROM public_export_alias_publication", [])?;
+            record_projection_statement(&mut breakdown.persistence.dirty_state, 1, 0);
+            record_projection_statement(&mut breakdown.persistence.dirty_state, 1, 0);
             Self::invalidate_resolution_support_snapshot_on(&tx)?;
             record_projection_statement(
                 &mut breakdown.persistence.dirty_state,

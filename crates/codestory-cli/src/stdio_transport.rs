@@ -2795,19 +2795,7 @@ fn project_stdio_tool_execution_v3(
     let packet_diagnostics = None;
     let projection = match tool_name {
         "context" => project_stdio_context_result_v3(runtime, &response, result)?,
-        "search" => {
-            let results =
-                serde_json::from_value::<codestory_contracts::api::SearchResultsDto>(result)
-                    .map_err(|_| {
-                        ApiError::internal("Search execution returned an invalid internal DTO.")
-                    })?;
-            serde_json::to_value(codestory_runtime::project_search_v3(
-                &runtime.public_operation,
-                "codestory-stdio",
-                &results,
-            )?)
-            .map_err(|error| ApiError::internal(error.to_string()))?
-        }
+        "search" => result,
         _ => {
             return Ok(StdioToolExecutionV3 {
                 response,
@@ -3097,8 +3085,22 @@ fn handle_stdio_search_v3(
             hybrid_weights: None,
             hybrid_limits: None,
         })
+        .and_then(|result| project_typed_stdio_search_v3(runtime, &result))
         .map(|result| serde_json::json!({"result": result}))
         .unwrap_or_else(|error| serde_json::json!({"error": stdio_api_error_value(error)}))
+}
+
+// Keep the in-process match proof until the modern closed projection is built.
+fn project_typed_stdio_search_v3(
+    runtime: &RuntimeContext,
+    result: &codestory_contracts::api::SearchResultsDto,
+) -> Result<serde_json::Value, ApiError> {
+    serde_json::to_value(codestory_runtime::project_search_v3(
+        &runtime.public_operation,
+        "codestory-stdio",
+        result,
+    )?)
+    .map_err(|error| ApiError::internal(error.to_string()))
 }
 
 fn reserve_packet_diagnostics_capability_v3(
@@ -9005,6 +9007,167 @@ mod tests {
     }
 
     #[test]
+    fn native_public_export_core_search_preserves_typed_provenance_and_canonical_identity() {
+        let project = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let startup = crate::config::CliStartupConfig {
+            user_home: None,
+            allow_sensitive_project_root: false,
+            project_network_config_allowed: false,
+            stdio_cache_root: Some(cache.path().join("stdio")),
+            sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
+                cache.path().join("sidecar"),
+                codestory_retrieval::SidecarRuntimeDefaults::default(),
+            ),
+            source_index_policy: codestory_contracts::workspace::SourceIndexPolicy::default(),
+        };
+        let runtime = RuntimeContext::new_agent_sidecar_with_startup(
+            &args::ProjectArgs {
+                project: project.path().to_path_buf(),
+                cache_dir: Some(cache.path().to_path_buf()),
+            },
+            &startup,
+        )
+        .unwrap();
+        fs::write(
+            runtime.project_root.join("owner.ts"),
+            "export class _Painter { draw() {} }\n",
+        )
+        .unwrap();
+        fs::write(
+            runtime.project_root.join("entry.ts"),
+            "import { _Painter as Local } from './owner.js';\nexport { Local as Painter };\n",
+        )
+        .unwrap();
+        for n in 0..12 {
+            fs::write(
+                runtime.project_root.join(format!("callback{n}.ts")),
+                "export function painter() {}\n",
+            )
+            .unwrap();
+        }
+        runtime
+            .ensure_open(args::RefreshMode::Full)
+            .expect("publish actual source-built core");
+        codestory_retrieval::test_support::publish_deterministic_dense_pinned_query_fixture(
+            &runtime.project_root,
+            &runtime.storage_path,
+            runtime.sidecar.as_raw_config_for_test(),
+        )
+        .expect("publish full lexical retrieval fixture");
+        runtime
+            .activation
+            .use_published_retrieval_fixture_for_test();
+        let mut canonical_id = None;
+        for mode in ["off"] {
+            let request = json!({"params":{"name":"search","arguments":{"project":runtime.project_root,"query":"Painter","repo_text":mode,"limit":5}}});
+            let execution = runtime
+                .public_operation
+                .run_observational_with_cancel(
+                    stdio_public_operation_name("search", &request),
+                    Arc::new(AtomicBool::new(false)),
+                    || {
+                        project_stdio_tool_execution_v3(
+                            &runtime,
+                            &mut StdioServerState::default(),
+                            &request,
+                            &PreparedStdioToolCall::Raw,
+                            "search",
+                            crate::stdio_v3::McpRevisionV3::preferred(),
+                        )
+                    },
+                )
+                .expect("actual pinned modern execution route")
+                .value;
+            let root = execution
+                .response
+                .get("result")
+                .unwrap_or_else(|| panic!("{mode}: {}", execution.response));
+            let projection: codestory_contracts::packet_projection_v3::SearchProjectionV3Dto =
+                serde_json::from_value(root.clone()).expect("closed modern schema");
+            let rows = root["evidence"].as_array().expect("actual modern rows");
+            let owner = rows
+                .iter()
+                .find(|row| {
+                    row["display_name"]
+                        .as_str()
+                        .is_some_and(|label| label.contains("exported as Painter"))
+                })
+                .unwrap_or_else(|| panic!("{mode}: {root}"));
+            assert!(owner["path"].as_str().unwrap().ends_with("owner.ts"));
+            assert_eq!(owner["start_line"], json!(1));
+            assert!(
+                owner["excerpt"]
+                    .as_str()
+                    .unwrap()
+                    .contains("class _Painter")
+            );
+            assert!(
+                owner["display_name"]
+                    .as_str()
+                    .unwrap()
+                    .contains("entry.ts:2")
+            );
+            if let Some(id) = canonical_id.as_ref() {
+                assert_eq!(&owner["symbol_id"], id);
+            } else {
+                canonical_id = Some(owner["symbol_id"].clone());
+            }
+            assert!(!projection.evidence.as_slice().is_empty());
+            let served = build_served_tool_result_v3(
+                crate::stdio_v3::McpRevisionV3::preferred(),
+                "search",
+                root,
+                None,
+            )
+            .expect("actual schema-validated result builder");
+            assert_eq!(&served["structuredContent"], root);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(
+                    served["content"][0]["text"].as_str().unwrap()
+                )
+                .unwrap(),
+                *root
+            );
+            eprintln!(
+                "modern core alias wire bytes={} payload={}",
+                serde_json::to_vec(&served).unwrap().len(),
+                served
+            );
+        }
+        let result = runtime
+            .browser
+            .search_results(SearchRequest {
+                query: "Painter".into(),
+                repo_text: SearchRepoTextMode::Off,
+                limit_per_source: 5,
+                expand_search_plan: false,
+                hybrid_weights: None,
+                hybrid_limits: None,
+            })
+            .unwrap();
+        assert_eq!(result.hits[0].display_name, "_Painter");
+        assert!(
+            result.hits[0]
+                .verification_targets
+                .iter()
+                .any(|target| target.role == "public_export" && target.line == 2)
+        );
+        let wire = serde_json::to_value(&result).unwrap();
+        assert!(
+            wire.get("public_exports").is_none(),
+            "internal typed proof is not a legacy schema extension"
+        );
+        assert!(
+            wire["hits"][0]["verification_targets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|target| target["role"] == "public_export")
+        );
+    }
+
+    #[test]
     fn native_stable_tool_outputs_match_advertised_schemas() {
         let (_project, _cache, runtime) = stdio_inspect_only_runtime();
         fs::write(
@@ -9901,6 +10064,7 @@ mod tests {
         let context = stdio_tool_call_success("context", context_packet_json(&context_answer));
 
         let search_result = codestory_contracts::api::SearchResultsDto {
+            public_exports: Default::default(),
             query: "AppController".to_string(),
             retrieval_publication: None,
             retrieval: codestory_contracts::api::RetrievalStateDto {
@@ -12923,6 +13087,7 @@ version = "0.11.20"
             score_breakdown: None,
         };
         let result = codestory_contracts::api::SearchResultsDto {
+            public_exports: Default::default(),
             query: "test".to_string(),
             retrieval_publication: None,
             retrieval: codestory_contracts::api::RetrievalStateDto {
@@ -12973,6 +13138,7 @@ version = "0.11.20"
         // that, and retrieval_publication was reaching the wire while only `_meta` declared it.
         let declared = crate::stdio_catalog::SEARCH_RESULTS_SCHEMA.declared_property_names();
         let dto = codestory_contracts::api::SearchResultsDto {
+            public_exports: Default::default(),
             query: "scripted".into(),
             // Must be populated: serde skips a None, so a None fixture cannot observe the field
             // reaching the wire at all.
