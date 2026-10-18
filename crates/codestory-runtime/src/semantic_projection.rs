@@ -2,7 +2,7 @@ use super::{
     AccessKind, ApiError, BTreeMap, BTreeSet, BUILD_EDGE_SEED_BATCH_SIZE, BoundedTextRead,
     CancellationToken, DenseAnchorInput, DenseAnchorInputReuseMetadata,
     EmbeddingProfileContractDto, FileInfo, GraphEdge, GraphNode, GraphNodeId, HashMap, HashSet,
-    IndexPublicationRecord, IndexingPhaseTimings, Instant, LlmSymbolDoc, LlmSymbolDocStats, Path,
+    IndexPublicationRecord, IndexingPhaseTimings, Instant, LlmSymbolDocStats, Path,
     RetrievalFileRole, SEMANTIC_FILE_TEXT_CACHE_MAX_BYTES, SEMANTIC_FILE_TEXT_MAX_BYTES,
     SearchEngine, SourceIndexPolicy, SourcePolicyExclusionPolicyIdentity, Storage, StoreFileRole,
     SymbolSearchDoc, clamp_u128_to_u32, clamp_usize_to_u32, current_epoch_ms,

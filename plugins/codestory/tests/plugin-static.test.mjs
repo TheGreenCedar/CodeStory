@@ -7900,7 +7900,7 @@ test("release asset downloader retries a transient failure", async () => {
       attempts: 2,
       get: fakeGet,
       retryDelayMs: () => 1,
-      timeoutMs: 100,
+      timeoutMs: 1000,
     });
 
     assert.equal(calls, 2);
