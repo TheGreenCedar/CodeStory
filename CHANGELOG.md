@@ -4,7 +4,7 @@
 
 - Fresh sessions can receive a compact repository map from an existing index, with verified file locations and visible coverage limits. Warm startup maps arrive as navigation data; the full skill remains available by explicit invocation, with its exact path in fallback guidance.
 
-- Grounding maps keep entry points and subsystem representatives first, then show more production files before repeating roots from one file.
+- Grounding maps show production package layouts before repeating roots from the same subsystem.
 
 - Symbol search recognizes generic type definitions and keeps them ahead of incidental same-name matches.
 
