@@ -5115,7 +5115,7 @@ fn test_symbol_summary_uses_current_content_hash() -> Result<(), StorageError> {
         serialized_name: "do_work".to_string(),
         ..Default::default()
     }])?;
-    let doc = LlmSymbolDoc {
+    let doc = SymbolSearchDoc {
         node_id: NodeId(501),
         file_node_id: None,
         kind: NodeKind::FUNCTION,
@@ -5126,18 +5126,19 @@ fn test_symbol_summary_uses_current_content_hash() -> Result<(), StorageError> {
         doc_text: "function pkg::do_work in src/lib.rs line 12".to_string(),
         doc_version: 2,
         doc_hash: "semantic-hash-501".to_string(),
-        embedding_profile: None,
-        embedding_model: "local-hash-384".to_string(),
-        embedding_backend: None,
-        embedding_dim: 384,
-        doc_shape: None,
-        semantic_policy_version: Some("graph_first_v1".to_string()),
-        dense_reason: Some("public_api".to_string()),
-        embedding: vec![0.25_f32; 384],
+        attached_comment_text: Some(String::new()),
+        attached_comment_state: SymbolSearchDoc::ATTACHED_COMMENT_VERIFIED.into(),
+        attached_comment_policy: SymbolSearchDoc::ATTACHED_COMMENT_POLICY_VERSION.into(),
+        attached_comment_hash: SymbolSearchDoc::attached_comment_hash(
+            SymbolSearchDoc::ATTACHED_COMMENT_VERIFIED,
+            Some(""),
+        ),
+        policy_version: "graph_first_v3".into(),
+        source_provenance: "extracted".into(),
         updated_at_epoch_ms: 123,
     };
 
-    storage.upsert_llm_symbol_docs_batch(std::slice::from_ref(&doc))?;
+    storage.upsert_symbol_search_docs_batch(std::slice::from_ref(&doc))?;
     storage.upsert_symbol_summaries_batch(&[SymbolSummaryRecord {
         node_id: NodeId(501),
         content_hash: "semantic-hash-501".to_string(),
@@ -5153,18 +5154,33 @@ fn test_symbol_summary_uses_current_content_hash() -> Result<(), StorageError> {
             .map(|record| record.summary.as_str()),
         Some("do_work coordinates the package work.")
     );
+    assert_eq!(storage.get_all_current_symbol_summaries()?, summaries);
 
-    let changed_doc = LlmSymbolDoc {
+    let changed_doc = SymbolSearchDoc {
         doc_hash: "semantic-hash-501-changed".to_string(),
-        ..doc
+        ..doc.clone()
     };
-    storage.upsert_llm_symbol_docs_batch(&[changed_doc])?;
+    storage.upsert_symbol_search_docs_batch(&[changed_doc])?;
     assert!(
         storage
             .get_current_symbol_summaries_by_node_ids(&[NodeId(501)])?
             .is_empty(),
         "summary should not be returned once the symbol doc hash changes"
     );
+    assert!(storage.get_all_current_symbol_summaries()?.is_empty());
+
+    storage.upsert_symbol_search_docs_batch(&[doc])?;
+    assert_eq!(storage.get_all_current_symbol_summaries()?.len(), 1);
+    storage
+        .get_connection()
+        .execute("DELETE FROM symbol_search_doc WHERE node_id = 501", [])?;
+    assert!(
+        storage
+            .get_current_symbol_summaries_by_node_ids(&[NodeId(501)])?
+            .is_empty(),
+        "a retained summary without its modern source document is not current"
+    );
+    assert!(storage.get_all_current_symbol_summaries()?.is_empty());
     Ok(())
 }
 

@@ -12393,7 +12393,7 @@ impl Storage {
                     summary.model,
                     summary.updated_at_epoch_ms
              FROM symbol_summary summary
-             INNER JOIN llm_symbol_doc doc
+             INNER JOIN symbol_search_doc doc
                 ON doc.node_id = summary.node_id
                AND doc.doc_hash = summary.content_hash
              WHERE summary.node_id IN ({placeholders})
@@ -12425,7 +12425,7 @@ impl Storage {
                     summary.model,
                     summary.updated_at_epoch_ms
              FROM symbol_summary summary
-             INNER JOIN llm_symbol_doc doc
+             INNER JOIN symbol_search_doc doc
                 ON doc.node_id = summary.node_id
                AND doc.doc_hash = summary.content_hash
              ORDER BY summary.node_id ASC",

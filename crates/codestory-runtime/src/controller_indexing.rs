@@ -1595,13 +1595,16 @@ impl AppController {
             let storage = Store::open(&storage_path)
                 .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))?;
             let docs = storage
-                .get_all_llm_symbol_docs()
+                .get_symbol_search_docs_batch_after(None, usize::MAX)
                 .map_err(|e| ApiError::internal(format!("Failed to load symbol docs: {e}")))?;
             let current_summaries = storage
                 .get_all_current_symbol_summaries()
                 .map_err(|e| ApiError::internal(format!("Failed to load symbol summaries: {e}")))?;
             for doc in docs {
-                if current_summaries.contains_key(&doc.node_id) {
+                if current_summaries
+                    .get(&doc.node_id)
+                    .is_some_and(|summary| summary.model == model)
+                {
                     reused = reused.saturating_add(1);
                     continue;
                 }

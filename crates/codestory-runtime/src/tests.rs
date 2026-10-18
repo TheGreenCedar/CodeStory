@@ -6453,6 +6453,206 @@ fn semantic_projection_republish_runtime_cache_fault_completes_committed_generat
     }
 }
 
+#[test]
+fn symbol_summaries_follow_modern_documents_and_requested_model() {
+    let _env = hybrid_test_env();
+    let workspace = TempDir::new().expect("temporary project");
+    let source = workspace.path().join("workflow.py");
+    fs::write(
+        &source,
+        "def coordinate():\n    return 'initial'\n\ndef obsolete():\n    return 'old'\n",
+    )
+    .expect("write source");
+    fs::write(
+        workspace.path().join("neighbor.py"),
+        "def steady():\n    return 'fixed'\n",
+    )
+    .expect("write unchanged neighbor");
+    let storage_path = workspace.path().join(".cache/codestory.db");
+    let configured_controller = |model: &str| {
+        let mut runtime = test_sidecar_runtime_from_env();
+        runtime.summary.endpoint = Some("local".into());
+        runtime.summary.model = model.into();
+        let controller = AppController::new_with_config(runtime);
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+        controller
+    };
+    let controller = configured_controller("model-a");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("index fresh project");
+    let docs = Storage::open(&storage_path)
+        .expect("open current core")
+        .get_symbol_search_docs_batch_after(None, 100)
+        .expect("read modern documents");
+    assert!(!docs.is_empty());
+    assert!(
+        Storage::open(&storage_path)
+            .expect("open current core")
+            .get_all_llm_symbol_docs()
+            .expect("read legacy documents")
+            .is_empty(),
+        "the regression must not rely on seeded legacy documents"
+    );
+    let original = docs
+        .iter()
+        .find(|doc| doc.display_name == "coordinate")
+        .expect("coordinate document");
+    let stable = docs
+        .iter()
+        .find(|doc| doc.display_name == "steady")
+        .expect("unchanged neighbor");
+    let removed_id = docs
+        .iter()
+        .find(|doc| doc.display_name == "obsolete")
+        .expect("obsolete document")
+        .node_id;
+    let generated = controller.summarize_symbols_blocking().expect("summarize");
+    assert_eq!(generated.generated as usize, docs.len());
+    assert_eq!((generated.reused, generated.skipped), (0, 0));
+    let node_id = NodeId::from(original.node_id);
+    let summary = controller
+        .symbol_context(node_id.clone())
+        .expect("symbol context")
+        .summary
+        .expect("generated summary reaches context");
+    let ground = controller
+        .grounding_snapshot(GroundingBudgetDto::Strict)
+        .expect("ground current core");
+    assert_eq!(
+        ground
+            .root_symbols
+            .iter()
+            .find(|symbol| symbol.id == node_id)
+            .and_then(|symbol| symbol.summary.as_ref()),
+        Some(&summary),
+        "generated summary reaches grounding"
+    );
+    let unchanged = controller.summarize_symbols_blocking().expect("reuse");
+    assert_eq!(
+        (unchanged.generated, unchanged.reused as usize),
+        (0, docs.len())
+    );
+
+    let controller = configured_controller("model-b");
+    let changed_model = controller.summarize_symbols_blocking().expect("new model");
+    assert_eq!(
+        (changed_model.generated as usize, changed_model.reused),
+        (docs.len(), 0)
+    );
+    let current = Storage::open(&storage_path)
+        .expect("open summaries")
+        .get_all_current_symbol_summaries()
+        .expect("current summaries");
+    assert_eq!(current.len(), docs.len());
+    assert!(current.values().all(|record| record.model == "model-b"));
+    assert_eq!(
+        controller
+            .symbol_context(node_id.clone())
+            .expect("new model context")
+            .summary,
+        Some(summary)
+    );
+    let reused_model = controller
+        .summarize_symbols_blocking()
+        .expect("reuse model-b");
+    assert_eq!(
+        (reused_model.generated, reused_model.reused as usize),
+        (0, docs.len())
+    );
+
+    fs::write(&source, "def coordinate():\n    return 'changed'\n").expect("change source");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+        .expect("refresh changed and deleted definitions");
+    let storage = Storage::open(&storage_path).expect("open refreshed core");
+    let changed_docs = storage
+        .get_symbol_search_docs_batch_after(None, 100)
+        .expect("refreshed documents");
+    let changed = changed_docs
+        .iter()
+        .find(|doc| doc.display_name == "coordinate")
+        .expect("surviving definition");
+    assert_eq!(changed.node_id, original.node_id);
+    assert_ne!(changed.doc_hash, original.doc_hash);
+    let unchanged = changed_docs
+        .iter()
+        .find(|doc| doc.node_id == stable.node_id)
+        .expect("unchanged neighbor retained");
+    assert_eq!(unchanged.doc_hash, stable.doc_hash);
+    assert!(
+        storage
+            .get_node(removed_id)
+            .expect("deleted definition")
+            .is_none()
+    );
+    assert!(
+        storage
+            .get_current_symbol_summaries_by_node_ids(&[original.node_id, removed_id])
+            .expect("reject obsolete summaries")
+            .is_empty()
+    );
+    let current = storage
+        .get_all_current_symbol_summaries()
+        .expect("current summaries");
+    assert!(!current.contains_key(&original.node_id));
+    assert!(!current.contains_key(&removed_id));
+    assert_eq!(
+        current
+            .get(&stable.node_id)
+            .expect("unchanged summary")
+            .model,
+        "model-b"
+    );
+    assert!(
+        controller
+            .symbol_context(node_id.clone())
+            .expect("refreshed context")
+            .summary
+            .is_none()
+    );
+    drop(storage);
+    let ground = controller
+        .grounding_snapshot(GroundingBudgetDto::Strict)
+        .expect("refreshed grounding");
+    assert!(
+        ground
+            .root_symbols
+            .iter()
+            .find(|symbol| symbol.id == node_id)
+            .expect("surviving root")
+            .summary
+            .is_none()
+    );
+    assert!(
+        ground
+            .root_symbols
+            .iter()
+            .all(|symbol| symbol.id != NodeId::from(removed_id))
+    );
+    let refreshed = controller
+        .summarize_symbols_blocking()
+        .expect("summarize changed input");
+    assert!(refreshed.generated > 0);
+    assert!(
+        refreshed.reused > 0,
+        "unchanged neighboring input remains reusable"
+    );
+    assert!(
+        controller
+            .symbol_context(node_id)
+            .expect("new source context")
+            .summary
+            .is_some()
+    );
+    assert_no_staged_publication_artifacts(&storage_path);
+}
+
 /// `index --summarize` writes `symbol_summary`, which lives in the core
 /// database. Once a publication pointer exists the live handle is read-only, so
 /// the summaries have to reach disk through a staged republish instead.
@@ -6475,6 +6675,9 @@ fn symbol_summaries_persist_into_a_published_immutable_core() {
     let baseline = Storage::database_complete_index_publication(&storage_path)
         .expect("read baseline publication")
         .expect("baseline publication");
+    let frozen_database = codestory_store::resolve_core_database_path(&storage_path)
+        .expect("resolve baseline generation");
+    let frozen_bytes = fs::read(&frozen_database).expect("read baseline generation");
 
     let summarized_node = Storage::open(&storage_path)
         .expect("open published core")
@@ -6510,6 +6713,11 @@ fn symbol_summaries_persist_into_a_published_immutable_core() {
         .expect("read republished publication")
         .expect("republished publication");
     assert_eq!(republished.generation, baseline.generation + 1);
+    assert_eq!(
+        fs::read(&frozen_database).expect("read retained generation"),
+        frozen_bytes,
+        "summary publication must not mutate the previous generation"
+    );
     let stored: String = Storage::open(&storage_path)
         .expect("open republished core")
         .get_connection()

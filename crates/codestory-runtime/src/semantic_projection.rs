@@ -273,7 +273,7 @@ pub(super) fn build_search_state_for_nodes(
 pub(super) fn summarize_symbol_doc(
     endpoint: &str,
     model: &str,
-    doc: &LlmSymbolDoc,
+    doc: &SymbolSearchDoc,
     config: &codestory_retrieval::SummaryRuntimeConfig,
 ) -> Result<String, ApiError> {
     if endpoint.eq_ignore_ascii_case("local") || endpoint.eq_ignore_ascii_case("mock") {
@@ -345,7 +345,7 @@ pub(super) fn summary_endpoint_http_error(
     ApiError::internal(format!("Summary endpoint request failed: {error}"))
 }
 
-pub(super) fn local_symbol_summary(doc: &LlmSymbolDoc) -> String {
+pub(super) fn local_symbol_summary(doc: &SymbolSearchDoc) -> String {
     let kind = format!("{:?}", doc.kind).to_ascii_lowercase();
     let location = doc
         .file_path
