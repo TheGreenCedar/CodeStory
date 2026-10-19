@@ -657,6 +657,7 @@ impl SearchEngine {
 }
 
 impl SymbolIndexSession<'_> {
+    #[cfg(any(test, feature = "benchmark-support"))]
     pub fn add_nodes<I>(&mut self, nodes: I) -> Result<usize>
     where
         I: IntoIterator<Item = (NodeId, String)>,
