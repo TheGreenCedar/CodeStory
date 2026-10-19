@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- MCP affected results offer an optional lossless shared-field layout for impacted symbols; the default record array stays unchanged.
+
 - Grounding maps stop treating known decorator and inherited-type references as local declarations. Existing parser indexes rebuild once on their next refresh.
 
 - Explicit symbol-summary generation works on current indexes and refreshes summaries when the selected model changes.

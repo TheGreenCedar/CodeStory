@@ -259,6 +259,28 @@ test("family-v1 keeps listing and describe local and lowers only canonical calls
   }
 });
 
+test("family-v1 forwards affected layouts through the canonical contract", () => {
+  for (const revision of Object.keys(generatedCatalog.revisionProfiles)) {
+    const argumentsValue = { project: repoRoot, paths: ["src/owner.rs"], symbol_layout: "shared-fields-v1" };
+    const compact = { impacted_symbols: { shared_fields: { file_path: "src/owner.rs" }, rows: [{ node_id: "9007199254740993" }] } };
+    const result = familyWireFixture(`
+      init();ready=true;
+      send({jsonrpc:'2.0',id:'layout',method:'tools/call',params:{name:'call',arguments:{operation:'affected',arguments:${JSON.stringify(argumentsValue)}}}});ack();
+      child.stdout.write(${JSON.stringify(JSON.stringify({ jsonrpc: "2.0", id: "layout", result: { content: [{ type: "text", text: JSON.stringify(compact) }] } }))}+'\\n');
+    `, { revision });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.trace.starts, 1);
+    assert.deepEqual(result.trace.seen.at(-1).params, { name: "affected", arguments: argumentsValue });
+    assert.deepEqual(toolTextJson(result.frames.find(({ id }) => id === "layout")), compact);
+    for (const symbol_layout of [null, true, 1, "unknown"]) {
+      const rejected = familyWireFixture(`init();ready=true;send({jsonrpc:'2.0',id:'invalid-layout',method:'tools/call',params:{name:'call',arguments:{operation:'affected',arguments:${JSON.stringify({ ...argumentsValue, symbol_layout })}}}});`, { revision });
+      assert.equal(rejected.status, 0, rejected.stderr);
+      assert.equal(rejected.trace.starts, 0);
+      assert.equal(rejected.frames.find(({ id }) => id === "invalid-layout").error.code, -32602);
+    }
+  }
+});
+
 test("family-v1 rejects invalid envelopes and inner contracts before handoff", () => {
   const invalid = [
     { name: "search", arguments: { project: repoRoot, query: "fixture" } },

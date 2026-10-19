@@ -369,6 +369,7 @@ pub(crate) struct SchemaProperty {
     items: Option<SchemaItems>,
     object_schema: Option<&'static SchemaObject>,
     nullable: bool,
+    object_alternative: Option<&'static SchemaObject>,
 }
 
 impl SchemaProperty {
@@ -388,6 +389,7 @@ impl SchemaProperty {
             items: None,
             object_schema: None,
             nullable: false,
+            object_alternative: None,
         }
     }
 
@@ -411,6 +413,7 @@ impl SchemaProperty {
             items: None,
             object_schema: None,
             nullable: false,
+            object_alternative: None,
         }
     }
 
@@ -430,6 +433,7 @@ impl SchemaProperty {
             items: None,
             object_schema: None,
             nullable: false,
+            object_alternative: None,
         }
     }
 
@@ -449,6 +453,7 @@ impl SchemaProperty {
             items: None,
             object_schema: None,
             nullable: false,
+            object_alternative: None,
         }
     }
 
@@ -468,6 +473,7 @@ impl SchemaProperty {
             items: None,
             object_schema: None,
             nullable: false,
+            object_alternative: None,
         }
     }
 
@@ -491,6 +497,7 @@ impl SchemaProperty {
             items: Some(SchemaItems::Object(items)),
             object_schema: None,
             nullable: false,
+            object_alternative: None,
         }
     }
 
@@ -525,6 +532,7 @@ impl SchemaProperty {
             }),
             object_schema: None,
             nullable: false,
+            object_alternative: None,
         }
     }
 
@@ -601,6 +609,11 @@ impl SchemaProperty {
         self
     }
 
+    const fn with_object_alternative(mut self, alternative: &'static SchemaObject) -> Self {
+        self.object_alternative = Some(alternative);
+        self
+    }
+
     const fn nullable(mut self) -> Self {
         self.nullable = true;
         self
@@ -661,7 +674,11 @@ impl SchemaProperty {
                 }
             }
         }
-        Value::Object(schema)
+        let schema = Value::Object(schema);
+        match self.object_alternative {
+            Some(alternative) => json!({"anyOf": [schema, alternative.to_json()]}),
+            None => schema,
+        }
     }
 }
 
@@ -1430,6 +1447,37 @@ static AFFECTED_FOLLOW_UP_SCHEMA: SchemaObject = SchemaObject::object(
     &["action", "reason", "confidence"],
 );
 
+static AFFECTED_SYMBOL_RECORDS_SCHEMA: SchemaProperty = SchemaProperty::array(
+    "impacted_symbols",
+    "Impacted symbol DTOs in order (the default records layout).",
+    &GENERIC_OBJECT_SCHEMA,
+);
+
+static AFFECTED_SHARED_SYMBOLS_SCHEMA: SchemaObject = SchemaObject::object(
+    "Lossless shared-fields-v1 layout. Merge shared_fields into each ordered row to recover the symbol records; absent keys remain absent.",
+    &[
+        SchemaProperty::object(
+            "shared_fields",
+            "Fields present with identical JSON values in every symbol record.",
+        ),
+        SchemaProperty::array(
+            "rows",
+            "Ordered residual symbol records.",
+            &GENERIC_OBJECT_SCHEMA,
+        ),
+    ],
+    &["shared_fields", "rows"],
+);
+
+pub(crate) fn affected_records_output_schema() -> &'static Value {
+    static SCHEMA: OnceLock<Value> = OnceLock::new();
+    SCHEMA.get_or_init(|| {
+        let mut schema = AFFECTED_ANALYSIS_OUTPUT_SCHEMA.to_json();
+        schema["properties"]["impacted_symbols"] = AFFECTED_SYMBOL_RECORDS_SCHEMA.to_json();
+        schema
+    })
+}
+
 static AFFECTED_ANALYSIS_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
     "Changed-file impact analysis DTO from the last complete local index.",
     &[
@@ -1457,11 +1505,7 @@ static AFFECTED_ANALYSIS_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
         ),
         SchemaProperty::integer("matched_file_count", "Number of matched indexed files."),
         SchemaProperty::integer("depth", "Applied dependent graph walk depth."),
-        SchemaProperty::array(
-            "impacted_symbols",
-            "Impacted symbol DTOs.",
-            &GENERIC_OBJECT_SCHEMA,
-        ),
+        AFFECTED_SYMBOL_RECORDS_SCHEMA.with_object_alternative(&AFFECTED_SHARED_SYMBOLS_SCHEMA),
         SchemaProperty::array(
             "impacted_routes",
             "Impacted route or endpoint DTOs.",
@@ -2304,6 +2348,9 @@ static AFFECTED_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::integer("depth", "Dependent graph walk depth.")
             .with_default(ValueLiteral::Integer(2))
             .with_bounds(1, 8),
+        SchemaProperty::string("symbol_layout", "Symbol records by default; shared-fields-v1 losslessly factors common fields into shared_fields plus ordered residual rows.")
+            .with_enum(&["records", "shared-fields-v1"])
+            .with_default(ValueLiteral::String("records")),
         SchemaProperty::string(
             "filter",
             "Optional impacted-symbol filter by path or display-name substring.",

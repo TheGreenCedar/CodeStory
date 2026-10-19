@@ -4475,9 +4475,36 @@ fn stdio_initialize_result_json(request: &serde_json::Value) -> serde_json::Valu
 #[derive(Debug)]
 enum PreparedStdioToolCall {
     Raw,
-    Affected(AffectedAnalysisRequest),
+    Affected(StdioAffectedRequest),
     Snippet(StdioSnippetRequest),
     ProveCallPath(codestory_runtime::public_call_path::UnvalidatedCallPathContract),
+}
+
+#[derive(Debug)]
+struct StdioAffectedRequest {
+    analysis: AffectedAnalysisRequest,
+    symbol_layout: AffectedSymbolLayout,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AffectedSymbolLayout {
+    Records,
+    SharedFieldsV1,
+}
+
+impl AffectedSymbolLayout {
+    fn parse(request: &serde_json::Value) -> Result<Self, ApiError> {
+        match request.pointer("/params/arguments/symbol_layout") {
+            None => Ok(Self::Records),
+            Some(serde_json::Value::String(value)) if value == "records" => Ok(Self::Records),
+            Some(serde_json::Value::String(value)) if value == "shared-fields-v1" => {
+                Ok(Self::SharedFieldsV1)
+            }
+            _ => Err(ApiError::invalid_argument(
+                "affected.symbol_layout must be records or shared-fields-v1",
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -4496,9 +4523,13 @@ fn prepare_stdio_tool_call(
 ) -> std::result::Result<PreparedStdioToolCall, ApiError> {
     match name {
         "affected" => {
-            let affected = stdio_affected_request(request)?;
-            stdio_preflight_affected_paths(session, request, &affected)?;
-            Ok(PreparedStdioToolCall::Affected(affected))
+            let symbol_layout = AffectedSymbolLayout::parse(request)?;
+            let analysis = stdio_affected_request(request)?;
+            stdio_preflight_affected_paths(session, request, &analysis)?;
+            Ok(PreparedStdioToolCall::Affected(StdioAffectedRequest {
+                analysis,
+                symbol_layout,
+            }))
         }
         "snippet" => stdio_snippet_request(request).map(PreparedStdioToolCall::Snippet),
         name if crate::prove_call_path::is_proof_tool_name(name) => {
@@ -4941,15 +4972,16 @@ fn handle_stdio_files(runtime: &RuntimeContext, request: &serde_json::Value) -> 
 
 fn handle_stdio_affected(
     runtime: &RuntimeContext,
-    request: &AffectedAnalysisRequest,
+    request: &StdioAffectedRequest,
 ) -> serde_json::Value {
     runtime
         .browser
-        .affected_analysis(request.clone())
-        .map(|result| {
+        .affected_analysis(request.analysis.clone())
+        .and_then(|result| {
             let value = serde_json::to_value(result)
-                .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}));
-            serde_json::json!({"result": compact_stdio_affected_result(value)})
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+            render_stdio_affected_result(value, request.symbol_layout)
+                .map(|value| serde_json::json!({"result": value}))
         })
         .unwrap_or_else(|error| serde_json::json!({"error": stdio_api_error_value(error)}))
 }
@@ -5087,6 +5119,51 @@ fn stdio_preflight_affected_paths(
         }
     }
     Ok(())
+}
+
+fn render_stdio_affected_result(
+    value: serde_json::Value,
+    layout: AffectedSymbolLayout,
+) -> Result<serde_json::Value, ApiError> {
+    let mut value = compact_stdio_affected_result(value);
+    crate::stdio_arguments::validate_structured_content(
+        crate::stdio_catalog::affected_records_output_schema(),
+        &value,
+    )
+    .map_err(|_| ApiError::internal("affected canonical output schema violation"))?;
+    if layout == AffectedSymbolLayout::SharedFieldsV1
+        && let Some(symbols) = value.get_mut("impacted_symbols")
+        && let Some(rows) = symbols.as_array_mut()
+    {
+        let mut shared = rows
+            .first()
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        // Numeric equality alone would merge distinct JSON such as 0.0 and -0.0.
+        shared.retain(|key, common| {
+            let common_json = serde_json::to_vec(common).expect("JSON value is serializable");
+            rows.iter().all(|row| {
+                row.get(key).is_some_and(|item| {
+                    serde_json::to_vec(item).is_ok_and(|json| json == common_json)
+                })
+            })
+        });
+        for row in rows.iter_mut() {
+            if let Some(row) = row.as_object_mut() {
+                row.retain(|key, _| !shared.contains_key(key));
+            }
+        }
+        *symbols = serde_json::json!({"shared_fields": shared, "rows": rows});
+        let schema = crate::stdio_v3::catalog::modern_output_schema_v3(
+            "affected",
+            crate::stdio_v3::V3SurfaceSet::EvidenceOnly,
+        )
+        .ok_or_else(|| ApiError::internal("affected output schema missing"))?;
+        crate::stdio_arguments::validate_structured_content(schema, &value)
+            .map_err(|_| ApiError::internal("affected layout output schema violation"))?;
+    }
+    Ok(value)
 }
 
 fn compact_stdio_affected_result(mut value: serde_json::Value) -> serde_json::Value {
@@ -9203,9 +9280,10 @@ mod tests {
         ] {
             let request = json!({"params":{"name":tool,"arguments":arguments}});
             let prepared = match tool {
-                "affected" => {
-                    PreparedStdioToolCall::Affected(stdio_affected_request(&request).unwrap())
-                }
+                "affected" => PreparedStdioToolCall::Affected(StdioAffectedRequest {
+                    analysis: stdio_affected_request(&request).unwrap(),
+                    symbol_layout: AffectedSymbolLayout::parse(&request).unwrap(),
+                }),
                 "snippet" => {
                     PreparedStdioToolCall::Snippet(stdio_snippet_request(&request).unwrap())
                 }
@@ -10181,6 +10259,182 @@ mod tests {
                 .is_none(),
             "client process identity leaked a filesystem path"
         );
+    }
+
+    fn expand_affected_symbols(value: &mut serde_json::Value) {
+        let symbols = &mut value["impacted_symbols"];
+        let shared = symbols["shared_fields"].as_object().unwrap();
+        *symbols = serde_json::Value::Array(
+            symbols["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| {
+                    let mut record = shared.clone();
+                    for (key, value) in row.as_object().unwrap() {
+                        assert!(
+                            !record.contains_key(key),
+                            "shared and residual fields overlap"
+                        );
+                        record.insert(key.clone(), value.clone());
+                    }
+                    serde_json::Value::Object(record)
+                })
+                .collect(),
+        );
+    }
+
+    #[test]
+    fn affected_symbol_layout_is_lossless_after_caps_and_checked_for_every_revision() {
+        let base = json!({
+            "project_root":"/project", "changed_paths":["owner.rs"], "change_records":[],
+            "matched_files":[], "uncovered_inputs":[], "matched_file_count":0, "depth":2,
+            "impacted_symbols":[], "impacted_tests":[],
+            "bounds":{"requested_depth":2,"maximum_depth":8,"visited_node_count":90,
+                "visited_edge_count":100,"impacted_symbol_limit":200,"impacted_route_limit":50},
+            "completeness":{"complete":true,"confidence":"complete","direct_impact_count":60,
+                "propagated_impact_count":0,"candidate_test_count":0,"uncovered_input_count":0,
+                "unavailable_evidence_count":0,"truncated":false,"truncation_reasons":[]}
+        });
+        let repeated = (0..=STDIO_AFFECTED_SYMBOL_OUTPUT_LIMIT).map(|index| json!({
+            "node_id": format!("{}", 9007199254740993_u64 + index as u64),
+            "file_path":"src/Unicode 🦀/owner.rs", "reason":"dependent via CALL", "distance":1,
+            "unknown":{"nested":[null,true,1,1.0,"escaped \" \n"]},"line":index+1
+        })).collect::<Vec<_>>();
+        let heterogeneous = vec![
+            json!({"same":null,"different":null,"number":1,"zero":0.0,"nested":{"n":0.0}}),
+            json!({"same":null,"different":false,"number":1.0,"zero":-0.0,"nested":{"n":-0.0}}),
+            json!({"same":null,"number":true,"zero":0,"nested":{"n":0}}),
+        ];
+        for rows in [
+            vec![],
+            vec![json!({"unknown":null})],
+            heterogeneous,
+            repeated,
+        ] {
+            let mut input = base.clone();
+            input["impacted_symbols"] = json!(rows);
+            let expected = compact_stdio_affected_result(input.clone());
+            let records =
+                render_stdio_affected_result(input.clone(), AffectedSymbolLayout::Records).unwrap();
+            assert_eq!(
+                serde_json::to_vec(&records).unwrap(),
+                serde_json::to_vec(&expected).unwrap()
+            );
+            let compact =
+                render_stdio_affected_result(input, AffectedSymbolLayout::SharedFieldsV1).unwrap();
+            let mut expanded = compact.clone();
+            expand_affected_symbols(&mut expanded);
+            assert_eq!(
+                serde_json::to_vec(&expanded).unwrap(),
+                serde_json::to_vec(&records).unwrap()
+            );
+            if rows.len() > STDIO_AFFECTED_SYMBOL_OUTPUT_LIMIT {
+                assert!(
+                    serde_json::to_vec(&compact).unwrap().len()
+                        < serde_json::to_vec(&records).unwrap().len()
+                );
+                assert_eq!(
+                    compact["impacted_symbols"]["rows"]
+                        .as_array()
+                        .unwrap()
+                        .len(),
+                    50
+                );
+                assert_eq!(compact["counts"]["impacted_symbols"], 51);
+                assert_eq!(compact["completeness"]["complete"], false);
+                eprintln!(
+                    "affected layout bytes records={} compact={}",
+                    serde_json::to_vec(&records).unwrap().len(),
+                    serde_json::to_vec(&compact).unwrap().len()
+                );
+            }
+            for &revision in crate::stdio_v3::McpRevisionV3::all() {
+                for value in [&records, &compact] {
+                    let served =
+                        build_served_tool_result_v3(revision, "affected", value, None).unwrap();
+                    let text: serde_json::Value =
+                        serde_json::from_str(served["content"][0]["text"].as_str().unwrap())
+                            .unwrap();
+                    assert_eq!(text, *value);
+                    if revision.profile().structured_content {
+                        assert_eq!(served["structuredContent"], *value);
+                    } else {
+                        assert!(served.get("structuredContent").is_none());
+                    }
+                }
+            }
+        }
+        for symbols in [json!([null]), json!({"shared_fields":{},"rows":[]})] {
+            let mut invalid = base.clone();
+            invalid["impacted_symbols"] = symbols;
+            assert!(
+                render_stdio_affected_result(invalid, AffectedSymbolLayout::SharedFieldsV1)
+                    .is_err()
+            );
+        }
+        for symbols in [
+            json!({"shared_fields":[],"rows":[]}),
+            json!({"shared_fields":{},"rows":[null]}),
+            json!({"shared_fields":{},"rows":[],"hidden":[]}),
+        ] {
+            let mut invalid = base.clone();
+            invalid["impacted_symbols"] = symbols;
+            assert!(
+                build_served_tool_result_v3(
+                    crate::stdio_v3::McpRevisionV3::preferred(),
+                    "affected",
+                    &invalid,
+                    None
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn native_affected_layouts_serve_the_same_indexed_facts() {
+        let (_project, _cache, runtime) = stdio_inspect_only_runtime();
+        fs::write(
+            runtime.project_root.join("owner.rs"),
+            "pub fn entry() -> usize { helper() }\nfn helper() -> usize { 7 }\n",
+        )
+        .unwrap();
+        runtime.ensure_open(args::RefreshMode::Full).unwrap();
+        let session = StdioServerSession::new(None);
+        for &revision in crate::stdio_v3::McpRevisionV3::all() {
+            let mut original = None;
+            for layout in [None, Some("records"), Some("shared-fields-v1")] {
+                let mut request =
+                    json!({"params":{"name":"affected","arguments":{"paths":["owner.rs"]}}});
+                if let Some(layout) = layout {
+                    request["params"]["arguments"]["symbol_layout"] = json!(layout);
+                }
+                let prepared = prepare_stdio_tool_call(&session, "affected", &request).unwrap();
+                let execution = project_stdio_tool_execution_v3(
+                    &runtime,
+                    &mut StdioServerState::default(),
+                    &request,
+                    &prepared,
+                    "affected",
+                    revision,
+                )
+                .unwrap();
+                let root = &execution.response["result"];
+                let served = build_served_tool_result_v3(revision, "affected", root, None).unwrap();
+                let mut body: serde_json::Value =
+                    serde_json::from_str(served["content"][0]["text"].as_str().unwrap()).unwrap();
+                if layout == Some("shared-fields-v1") {
+                    expand_affected_symbols(&mut body);
+                }
+                assert!(!body["impacted_symbols"].as_array().unwrap().is_empty());
+                if let Some(original) = &original {
+                    assert_eq!(&body, original);
+                } else {
+                    original = Some(body);
+                }
+            }
+        }
     }
 
     #[test]
@@ -15062,6 +15316,33 @@ version = "0.11.20"
                 Some(codestory_runtime::ActivationCapabilityState::Ready)
             );
         }
+    }
+
+    #[test]
+    fn affected_invalid_symbol_layout_refuses_before_activation() {
+        let cache = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut session = StdioServerSession::new(None);
+        session.startup.stdio_cache_root = Some(cache.path().to_path_buf());
+        for layout in [
+            json!(null),
+            json!(true),
+            json!(1),
+            json!({}),
+            json!("shared-fields-v2"),
+        ] {
+            let request = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"affected","arguments":{"project":project.path(),"paths":["owner.rs"],"symbol_layout":layout}}});
+            let response = handle_stdio_message(
+                &mut session,
+                &request.to_string(),
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap();
+            assert_eq!(response["error"]["code"], -32602, "{response}");
+            assert!(session.active_project.is_none());
+            assert!(session.retained_projects.is_empty());
+        }
+        assert_eq!(fs::read_dir(cache.path()).unwrap().count(), 0);
     }
 
     #[test]

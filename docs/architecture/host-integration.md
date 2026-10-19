@@ -127,6 +127,20 @@ Relayed projection also requires the lossless reply ID to match its pending
 listing request exactly. A reply matching only after numeric rounding, or
 using a different numeric spelling, retains the original full reply.
 
+### Affected symbol layouts
+
+MCP `affected` keeps its `impacted_symbols` record array by default. The optional
+`symbol_layout: "shared-fields-v1"` replaces only that array with an object containing
+`shared_fields` and ordered `rows`. Merge the shared object into each residual row
+to recover the original records, including unknown fields and null values. Only
+fields present with identical JSON values in every selected row are shared;
+missing fields stay missing. No second expanded representation is returned.
+
+Layout is a stdio rendering choice after the normal response caps and canonical
+output validation. Counts, limits, completeness, errors and preparation behavior
+remain the same. Named calls and family calls use the same declared argument;
+ordinary CLI and HTTP affected responses keep their existing shape.
+
 ### Explicit family-v1 surface
 
 The launcher captures `CODESTORY_MCP_TOOL_SURFACE` once at startup. Absent, empty,

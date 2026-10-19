@@ -25,7 +25,7 @@ There is no MCP `index`, `doctor`, `ready`, `explore`, `drill`, `query`,
 | `search` | `query` | `limit`, `repo_text` (`auto`/`on`/`off`) | Discovery for adaptive source and relationship inspection. |
 | `ground` | | `budget` (`strict`/`balanced`/`max`) | First call may refresh the local map. |
 | `files` | | `language`, `path`, `role`, `limit`, `include_framework_coverage` | Refreshes the local map before dispatch. No `refresh` field. |
-| `affected` | exactly one of `paths`, `changed_paths`, `change_records` | `depth`, `filter` | Never discovers git changes. |
+| `affected` | exactly one of `paths`, `changed_paths`, `change_records` | `depth`, `filter`, `symbol_layout` | Never discovers git changes. |
 | `symbol` | `query` or `id` | `choose` | |
 | `trail` | `query` or `id` | `direction` (`incoming`/`outgoing`/`both`), `depth`, `max_nodes`, `story`, `choose`, `caller_scope` (`production_only`/`include_tests_and_benches`) | There is no `mode` field. Default caller scope hides test/bench callers. |
 | `callers` | `query` or `id` | `depth`, `max_nodes`, `choose`, `caller_scope` | |
