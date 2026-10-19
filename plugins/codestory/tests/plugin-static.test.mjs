@@ -2385,7 +2385,7 @@ test("plugin metadata maps skill and direct stdio server", async () => {
   assert.match(agentMetadata, /dependencies:\s*\r?\n\s+tools:/u);
   assert.match(agentMetadata, /type: "mcp"/u);
   assert.match(agentMetadata, /value: "codestory"/u);
-  assert.match(agentMetadata, /allow_implicit_invocation: false/u);
+  assert.match(agentMetadata, /allow_implicit_invocation: true/u);
   assert.match(agentMetadata, /read and follow the loaded codestory-grounding skill/isu);
   assert.match(agentMetadata, /sole source of truth/isu);
   assert.match(agentMetadata, /adds no parallel instructions/isu);

@@ -5,7 +5,8 @@ pieces: a small Node launcher packaged with the plugin and the matching native
 CodeStory executable. The launcher owns installation compatibility. The native
 process owns every product operation.
 
-The canonical grounding skill is available through explicit invocation. Its `SKILL.md`
+The canonical grounding skill permits implicit invocation and can also be invoked
+explicitly. Its `SKILL.md`
 keeps common request and evidence limits; the complete manual lives beside it
 in `GUIDE.md`, preserving its relative reference links. Consult that guide for
 needed unfamiliar or complex detail, not as a prerequisite for known operations.

@@ -9,4 +9,4 @@ dependencies:
       description: "CodeStory plugin MCP server for local repository grounding, status, graph navigation, packets, and search."
       transport: "stdio"
 policy:
-  allow_implicit_invocation: false
+  allow_implicit_invocation: true

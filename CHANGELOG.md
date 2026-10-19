@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Codex can discover the grounding skill automatically again. Shared Claude Code/Codex startup hooks remain disabled.
+
 - MCP affected results offer an optional lossless shared-field layout for impacted symbols; the default record array stays unchanged.
 
 - Grounding maps stop treating known decorator and inherited-type references as local declarations. Existing parser indexes rebuild once on their next refresh.
