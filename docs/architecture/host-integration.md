@@ -13,7 +13,13 @@ Tool requests, runtime behavior and validation are unchanged.
 
 ## Startup navigation
 
-On an explicit fresh `SessionStart` (`source: startup`), the activation hook may
+The shared Claude Code/Codex hook manifest has no automatic registrations. It
+emits no startup map, skill reminder or session diagnostic state. MCP tools and
+the canonical skill remain available independently. Cursor and Copilot retain
+their separate registrations; the shared activation helper and hidden map
+command remain available, without a claim of map delivery on those hosts.
+
+When invoked with an explicit fresh `SessionStart` (`source: startup`), the activation hook may
 return a small repository map from the existing compatible complete core as
 data alone, without a skill-reading reminder or preloaded skill body. It
 passes only the absolute hook `cwd` to the verified existing CLI; active-state

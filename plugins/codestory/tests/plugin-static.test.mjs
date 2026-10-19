@@ -9074,7 +9074,7 @@ test("mcp launcher keeps managed provision failures primary", async () => {
   }
 });
 
-test("session-start hooks are thin and host manifests point at them", async () => {
+test("host manifests limit automatic startup hooks to Cursor and Copilot", async () => {
   const hookConfig = JSON.parse(
     await readFile(join(pluginRoot, "hooks", "claude-codex-hooks.json"), "utf8"),
   );
@@ -9085,10 +9085,7 @@ test("session-start hooks are thin and host manifests point at them", async () =
     await readFile(join(pluginRoot, "hooks", "cursor-hooks.json"), "utf8"),
   );
   const hostManifest = join(pluginRoot, ".claude-plugin", "plugin.json");
-  const hookCommands = Object.values(hookConfig.hooks)
-    .flat()
-    .flatMap((entry) => entry.hooks);
-  const hookScript = /hooks[\\/]([\w.-]+\.(?:js|mjs|cjs|ps1|sh))/u;
+  assert.deepEqual(hookConfig.hooks, {});
 
   assert.equal(copilotHookConfig.hooks.sessionStart.length, 1);
   assert.equal(cursorHookConfig.version, 1);
@@ -9096,21 +9093,6 @@ test("session-start hooks are thin and host manifests point at them", async () =
   assert.match(cursorHookConfig.hooks.sessionStart[0].command, /codestory-activate\.cjs/u);
   assert.match(cursorHookConfig.hooks.sessionStart[0].command, /\$\{CURSOR_PLUGIN_ROOT\}/u);
   assert.doesNotMatch(cursorHookConfig.hooks.sessionStart[0].command, /\$\{PLUGIN_ROOT\}/u);
-  assert.equal(Object.hasOwn(hookConfig.hooks, "UserPromptSubmit"), false);
-
-  for (const hook of hookCommands) {
-    assert.match(hook.command, /codestory-activate\.cjs/u);
-    assert.match(hook.commandWindows, /codestory-activate\.cjs/u);
-    assert.equal(
-      Object.hasOwn(hook, "args"),
-      false,
-      "shell-guarded hooks should not rely on args-only launch",
-    );
-    const match = `${hook.command}\n${hook.commandWindows}`.match(hookScript);
-    assert.ok(match, `cannot find hook script in command: ${hook.command}`);
-    await access(join(pluginRoot, "hooks", match[1]));
-  }
-
   const manifest = JSON.parse(await readFile(hostManifest, "utf8"));
   assert.equal(manifest.hooks, "./hooks/claude-codex-hooks.json");
   const cursorManifest = JSON.parse(
