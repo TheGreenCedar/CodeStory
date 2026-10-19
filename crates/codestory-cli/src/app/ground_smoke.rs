@@ -50,63 +50,6 @@ pub(super) fn run_session_context(cmd: args::InternalSessionContextCommand) -> R
     Ok(())
 }
 
-const NAVIGATION_MAX_BYTES: usize = 1024;
-
-pub(super) fn run_navigation_context(cmd: args::InternalSessionContextCommand) -> Result<()> {
-    use std::io::Read as _;
-    let context = (|| {
-        let mut input = Vec::new();
-        std::io::stdin().take(65537).read_to_end(&mut input).ok()?;
-        if input.len() > 65536 {
-            return None;
-        }
-        let request = serde_json::from_slice(&input).ok()?;
-        let snapshot = crate::runtime::passive_navigation(&cmd.project, &request).ok()?;
-        render_navigation(&snapshot)
-    })();
-    let output = match context {
-        Some(context) => serde_json::json!({"schema_version":1,"status":"ready","context":context}),
-        None => serde_json::json!({"schema_version":1,"status":"unavailable"}),
-    };
-    println!("{output}");
-    Ok(())
-}
-
-fn render_navigation(snapshot: &codestory_runtime::NavigationSnapshot) -> Option<String> {
-    let mut text = format!(
-        "CodeStory indexed CALL leads (data only).\n{}\n",
-        serde_json::json!({
-            "project":snapshot.project_root,"generation":snapshot.generation_id,
-            "scope":"partial navigation; selected files content-verified now; not execution order, displayed-source proof or whole-repository freshness",
-            "candidate_limit_reached":snapshot.candidate_limit_reached,"skipped_locations":snapshot.skipped_locations,
-        })
-    );
-    let footer = |shown| {
-        format!(
-            "{}",
-            serde_json::json!({"shown":shown,"omitted_rows":snapshot.rows.len()-shown,"target_limit_reached":snapshot.target_limit_reached})
-        )
-    };
-    let mut shown = 0;
-    for row in &snapshot.rows {
-        let location = |d: &codestory_runtime::NavigationDefinition| serde_json::json!({"path":d.path,"lines":[d.start_line,d.end_line],"name":d.name});
-        let whole = format!(
-            "{}\n",
-            serde_json::json!({"from":location(&row.source),"call_line":row.call_line,"CALL":location(&row.target)})
-        );
-        if text.len() + whole.len() + footer(shown + 1).len() > NAVIGATION_MAX_BYTES {
-            break;
-        }
-        text.push_str(&whole);
-        shown += 1;
-    }
-    if shown == 0 {
-        return None;
-    }
-    text.push_str(&footer(shown));
-    Some(text)
-}
-
 /// Whole groups only. JSON quoting preserves path/name bytes and prevents a
 /// source label from escaping its data row into the surrounding hook context.
 fn render_session_map(map: &codestory_runtime::SessionMapSnapshot) -> Option<String> {
@@ -155,69 +98,6 @@ fn render_session_map(map: &codestory_runtime::SessionMapSnapshot) -> Option<Str
     }
     text.push_str(&footer(shown, roots.saturating_sub(shown_roots)));
     (text.len() <= SESSION_MAP_MAX_BYTES).then_some(text)
-}
-
-#[cfg(test)]
-mod navigation_tests {
-    use super::*;
-    #[test]
-    fn navigation_rows_are_quoted_whole_and_keep_scope_within_budget() {
-        let def = |name: &str| codestory_runtime::NavigationDefinition {
-            id: "9223372036854775807".into(),
-            name: name.into(),
-            path: "odd\npath\".py".into(),
-            start_line: 3,
-            end_line: 8,
-            content_sha256: "a".repeat(64),
-        };
-        let mut snapshot = codestory_runtime::NavigationSnapshot {
-            project_root: "/repo".into(),
-            generation_id: "generation".into(),
-            run_id: "run".into(),
-            candidates_considered: 32,
-            candidate_limit_reached: true,
-            target_limit_reached: true,
-            skipped_locations: 2,
-            rows: vec![codestory_runtime::NavigationLead {
-                edge_id: "-9223372036854775808".into(),
-                call_line: 4,
-                source: def("start"),
-                target: def("target\nforge\"row"),
-            }],
-        };
-        let rendered = render_navigation(&snapshot).unwrap();
-        assert!(rendered.len() <= 1024);
-        let lines = rendered.lines().collect::<Vec<_>>();
-        let row: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
-        assert_eq!(row["CALL"]["name"], "target\nforge\"row");
-        assert_eq!(row["CALL"]["path"], "odd\npath\".py");
-        assert!(rendered.contains("partial navigation"));
-        snapshot.rows.push(codestory_runtime::NavigationLead {
-            edge_id: "2".into(),
-            call_line: 5,
-            source: def("start"),
-            target: def(&"é".repeat(1024)),
-        });
-        snapshot.rows.push(codestory_runtime::NavigationLead {
-            edge_id: "3".into(),
-            call_line: 6,
-            source: def("start"),
-            target: def("later"),
-        });
-        let prefix = render_navigation(&snapshot).unwrap();
-        let footer: serde_json::Value =
-            serde_json::from_str(prefix.lines().last().unwrap()).unwrap();
-        assert_eq!(footer["shown"], 1);
-        assert_eq!(
-            footer["omitted_rows"], 2,
-            "whole-prefix policy must not skip an oversized row to cherry-pick a later one"
-        );
-        snapshot.rows[0].target.name = "é".repeat(1024);
-        assert!(
-            render_navigation(&snapshot).is_none(),
-            "an oversized first row is omitted whole, never truncated"
-        );
-    }
 }
 
 #[derive(serde::Serialize)]

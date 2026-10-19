@@ -835,25 +835,6 @@ fn resolve_target_with(
 /// Existing-core hook observation: capture ordinary config without repository
 /// inspection, readiness, or any retrieval transport attachment.
 pub(crate) fn passive_session_map(project: &Path) -> Result<codestory_runtime::SessionMapSnapshot> {
-    let (runtime, root, storage) = passive_core_context(project)?;
-    runtime
-        .grounding_service()
-        .passive_session_map_at(root, storage)
-        .map_err(map_api_error)
-}
-
-pub(crate) fn passive_navigation(
-    project: &Path,
-    request: &codestory_runtime::NavigationRequest,
-) -> Result<codestory_runtime::NavigationSnapshot> {
-    let (runtime, root, storage) = passive_core_context(project)?;
-    runtime
-        .grounding_service()
-        .passive_navigation_at(root, storage, request)
-        .map_err(map_api_error)
-}
-
-fn passive_core_context(project: &Path) -> Result<(Runtime, PathBuf, PathBuf)> {
     if !project.is_absolute() {
         bail!("Session context requires an absolute project path");
     }
@@ -879,10 +860,13 @@ fn passive_core_context(project: &Path) -> Result<(Runtime, PathBuf, PathBuf)> {
         &startup.sidecar_defaults.with_cache_root(process_cache),
         &config.runtime_overrides(),
     );
-    let runtime = Runtime::new_with_process_config(
-        RuntimeProcessConfig::new_with_retrieval_config(sidecar, startup.source_index_policy),
-    );
-    Ok((runtime, root, storage))
+    Runtime::new_with_process_config(RuntimeProcessConfig::new_with_retrieval_config(
+        sidecar,
+        startup.source_index_policy,
+    ))
+    .grounding_service()
+    .passive_session_map_at(root, storage)
+    .map_err(map_api_error)
 }
 
 /// Canonicalize a project argument before deriving cache identity.
