@@ -4445,6 +4445,17 @@ impl GroundingService {
         self.controller.passive_session_map_at(root, storage_path)
     }
 
+    /// Existing complete-core observation; never prepares missing infrastructure.
+    pub fn passive_navigation_at(
+        &self,
+        root: PathBuf,
+        storage_path: PathBuf,
+        request: &crate::NavigationRequest,
+    ) -> Result<crate::NavigationSnapshot, ApiError> {
+        self.controller
+            .passive_navigation_at(root, storage_path, request)
+    }
+
     pub fn grounding_snapshot(
         &self,
         budget: GroundingBudgetDto,
@@ -5107,6 +5118,340 @@ pub(crate) mod activation_tests {
         );
 
         (project, cache, storage_path, retrieval_pointer)
+    }
+
+    #[test]
+    fn passive_navigation_verifies_declarations_novel_calls_and_selected_source() {
+        let project = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let process = tempfile::tempdir().unwrap();
+        let path = project.path().join("owner.py");
+        let text = "class Engine:\n    @staticmethod\n    def start(self):\n        self.known()\n        self.beta()\n        self.beta()\n        self.gamma()\n        self.delta()\n        self.extra()\n    def known(self):\n        pass\n    def beta(self):\n        pass\n    def gamma(self):\n        pass\n    def delta(self):\n        pass\n    def extra(self):\n        pass\n";
+        fs::write(&path, text).unwrap();
+        let runtime = crate::test_runtime_with_owned_cache_root(process.path());
+        let storage_path = cache.path().join("codestory.db");
+        runtime
+            .project_service()
+            .open_project_summary_with_storage_path(
+                project.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .unwrap();
+        runtime
+            .index_service()
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .unwrap();
+        let request = |paths: Vec<String>, explicit: bool, source: &str| crate::NavigationRequest {
+            input_paths: paths,
+            candidate_limit_reached: false,
+            locations: vec![
+                crate::NavigationLocation {
+                    path: explicit.then(|| "owner.py".into()),
+                    line: 3,
+                    text: source.into(),
+                },
+                crate::NavigationLocation {
+                    path: explicit.then(|| "owner.py".into()),
+                    line: 10,
+                    text: "    def known(self):".into(),
+                },
+            ],
+        };
+        let observe = |r: &crate::NavigationRequest| {
+            runtime
+                .grounding_service()
+                .passive_navigation_at(project.path().to_path_buf(), storage_path.clone(), r)
+                .unwrap()
+        };
+        let req = request(vec!["owner.py".into()], false, "    def start(self):");
+        let publication = fs::read(
+            codestory_store::CorePublicationLayout::from_storage_path(&storage_path)
+                .unwrap()
+                .publication_path(),
+        )
+        .unwrap();
+        let baseline = observe(&req);
+        assert_eq!(
+            baseline
+                .rows
+                .iter()
+                .map(|r| r.target.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Engine.beta", "Engine.gamma", "Engine.delta"]
+        );
+        assert!(baseline.target_limit_reached);
+        assert_eq!(baseline.rows[0].call_line, 5);
+        let store = Store::open_read_only(&storage_path).unwrap();
+        let seed_node = store
+            .get_node(codestory_contracts::graph::NodeId(
+                baseline.rows[0].source.id.parse().unwrap(),
+            ))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            seed_node.start_line,
+            Some(2),
+            "decorated canonical extent starts before its declaration"
+        );
+        assert_eq!(
+            baseline.rows[0].source.start_line, 3,
+            "navigation uses the explicit declaration occurrence"
+        );
+        drop(store);
+        assert!(
+            baseline
+                .rows
+                .iter()
+                .all(|r| r.source.content_sha256.len() == 64
+                    && r.source.content_sha256 == r.target.content_sha256
+                    && r.edge_id.parse::<i64>().is_ok())
+        );
+        assert!(
+            observe(&request(vec![], true, "    def start(self):"))
+                .rows
+                .len()
+                == 3
+        );
+        assert!(
+            observe(&request(vec!["owner.py".into()], false, "wrong source"))
+                .rows
+                .is_empty()
+        );
+        fs::write(project.path().join("equal.py"), text).unwrap();
+        assert!(
+            observe(&request(
+                vec!["owner.py".into(), "equal.py".into()],
+                false,
+                "    def start(self):"
+            ))
+            .rows
+            .is_empty(),
+            "equal bytes are not one native file"
+        );
+        let mut bounded = request(vec!["owner.py".into()], false, "    def start(self):");
+        bounded.locations = (0..33)
+            .map(|_| crate::NavigationLocation {
+                path: Some("owner.py".into()),
+                line: 3,
+                text: "    def start(self):".into(),
+            })
+            .collect();
+        let limited = observe(&bounded);
+        assert_eq!(limited.candidates_considered, 32);
+        assert!(limited.candidate_limit_reached);
+        let beta = &baseline.rows[0].target.id;
+        let gamma = &baseline.rows[1].target.id;
+        mutate_active_generation_sql(
+            &storage_path,
+            &format!(
+                "UPDATE occurrence SET kind=1 WHERE element_id={beta}; UPDATE edge SET certainty='probable',confidence=0.62 WHERE resolved_target_node_id={gamma};"
+            ),
+        );
+        let filtered = observe(&req);
+        assert_eq!(
+            filtered
+                .rows
+                .iter()
+                .map(|r| r.target.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Engine.delta", "Engine.extra"]
+        );
+        // A real definition remains eligible when its ID also has references.
+        mutate_active_generation_sql(
+            &storage_path,
+            &format!(
+                "UPDATE occurrence SET kind=0 WHERE element_id={beta}; INSERT INTO occurrence SELECT element_id,1,file_node_id,5,14,5,17 FROM occurrence WHERE element_id={beta};"
+            ),
+        );
+        assert_eq!(observe(&req).rows[0].target.name, "Engine.beta");
+        // Two equally specific declaration owners are not resolved by ID order.
+        let seed = &baseline.rows[0].source.id;
+        mutate_active_generation_sql(
+            &storage_path,
+            &format!(
+                "INSERT INTO node SELECT 900000000000000001,kind,serialized_name,qualified_name,canonical_id,file_node_id,start_line,start_col,end_line,end_col FROM node WHERE id={seed}; INSERT INTO occurrence SELECT 900000000000000001,kind,file_node_id,start_line,start_col,end_line,end_col FROM occurrence WHERE element_id={seed};"
+            ),
+        );
+        assert!(observe(&req).rows.is_empty());
+        mutate_active_generation_sql(
+            &storage_path,
+            "DELETE FROM occurrence WHERE element_id=900000000000000001; DELETE FROM node WHERE id=900000000000000001;",
+        );
+        fs::write(&path, text.replace("self.beta()", "self.zeta()")).unwrap();
+        assert!(
+            observe(&req).rows.is_empty(),
+            "known changed selected source refuses old CALL facts"
+        );
+        fs::write(&path, vec![b'x'; 2_000_001]).unwrap();
+        assert!(
+            observe(&req).rows.is_empty(),
+            "source cap is checked before allocation"
+        );
+        fs::remove_file(&path).unwrap();
+        assert!(observe(&req).rows.is_empty());
+        assert_eq!(
+            publication,
+            fs::read(
+                codestory_store::CorePublicationLayout::from_storage_path(&storage_path)
+                    .unwrap()
+                    .publication_path()
+            )
+            .unwrap()
+        );
+        let absent = cache.path().join("absent/codestory.db");
+        assert!(
+            runtime
+                .grounding_service()
+                .passive_navigation_at(project.path().to_path_buf(), absent.clone(), &req)
+                .is_err()
+        );
+        assert!(!absent.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn passive_navigation_verifies_a_separate_target_file() {
+        let project = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let process = tempfile::tempdir().unwrap();
+        fs::write(
+            project.path().join("entry.py"),
+            "from dependency import helper\ndef entry():\n    helper()\n",
+        )
+        .unwrap();
+        let target = project.path().join("dependency.py");
+        fs::write(&target, "def helper():\n    pass\n").unwrap();
+        let runtime = crate::test_runtime_with_owned_cache_root(process.path());
+        let storage_path = cache.path().join("codestory.db");
+        runtime
+            .project_service()
+            .open_project_summary_with_storage_path(
+                project.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .unwrap();
+        runtime
+            .index_service()
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .unwrap();
+        let req = crate::NavigationRequest {
+            input_paths: vec![],
+            candidate_limit_reached: false,
+            locations: vec![crate::NavigationLocation {
+                path: Some("entry.py".into()),
+                line: 2,
+                text: "def entry():".into(),
+            }],
+        };
+        let observe = || {
+            runtime
+                .grounding_service()
+                .passive_navigation_at(project.path().to_path_buf(), storage_path.clone(), &req)
+                .unwrap()
+        };
+        assert!(
+            observe().rows.is_empty(),
+            "ordinary Python import resolution is not Certain in this fixture"
+        );
+        // Isolate per-target source authority with a typed Certain CALL input;
+        // this does not assert Python import-resolution fidelity.
+        let store = Store::open_read_only(&storage_path).unwrap();
+        let entry = store
+            .get_nodes_for_file_line(project.path().join("entry.py").to_str().unwrap(), 2)
+            .unwrap()
+            .into_iter()
+            .find(|n| n.kind == codestory_contracts::graph::NodeKind::FUNCTION)
+            .unwrap();
+        let helper = store
+            .get_nodes_for_file_line(target.to_str().unwrap(), 1)
+            .unwrap()
+            .into_iter()
+            .find(|n| n.kind == codestory_contracts::graph::NodeKind::FUNCTION)
+            .unwrap();
+        let calls = store.get_edges_for_node_id(entry.id).unwrap();
+        let edge = calls
+            .iter()
+            .find(|e| {
+                e.kind == codestory_contracts::graph::EdgeKind::CALL
+                    && e.effective_source() == entry.id
+                    && e.line == Some(3)
+            })
+            .unwrap();
+        let edge_id = edge.id.0;
+        let target_id = helper.id.0;
+        drop(store);
+        mutate_active_generation_sql(
+            &storage_path,
+            &format!(
+                "UPDATE edge SET resolved_target_node_id={target_id},certainty='certain',confidence=1.0 WHERE id={edge_id};"
+            ),
+        );
+        let before = observe();
+        assert_eq!(
+            before.rows.len(),
+            1,
+            "typed cross-file CALL control must reach target verification: {before:?}"
+        );
+        assert_eq!(before.rows[0].target.path, "dependency.py");
+        fs::write(&target, "def helper():\n    stop\n").unwrap();
+        assert!(
+            observe().rows.is_empty(),
+            "an unchanged caller cannot certify a changed target"
+        );
+        fs::remove_file(&target).unwrap();
+        assert!(observe().rows.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn passive_navigation_accepts_contained_native_alias_and_refuses_escape() {
+        let project = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let process = tempfile::tempdir().unwrap();
+        let source = "def entry():\n    helper()\ndef helper():\n    pass\n";
+        fs::write(project.path().join("owner.py"), source).unwrap();
+        let runtime = crate::test_runtime_with_owned_cache_root(process.path());
+        let storage_path = cache.path().join("codestory.db");
+        runtime
+            .project_service()
+            .open_project_summary_with_storage_path(
+                project.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .unwrap();
+        runtime
+            .index_service()
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .unwrap();
+        std::os::unix::fs::symlink(
+            project.path().join("owner.py"),
+            project.path().join("alias.py"),
+        )
+        .unwrap();
+        let req = |path: &str| crate::NavigationRequest {
+            input_paths: vec![],
+            candidate_limit_reached: false,
+            locations: vec![crate::NavigationLocation {
+                path: Some(path.into()),
+                line: 1,
+                text: "def entry():".into(),
+            }],
+        };
+        let observe = |r: &crate::NavigationRequest| {
+            runtime
+                .grounding_service()
+                .passive_navigation_at(project.path().to_path_buf(), storage_path.clone(), r)
+                .unwrap()
+        };
+        assert_eq!(observe(&req("alias.py")).rows.len(), 1);
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("owner.py"), source).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("owner.py"),
+            project.path().join("escape.py"),
+        )
+        .unwrap();
+        assert!(observe(&req("escape.py")).rows.is_empty());
+        assert!(observe(&req("../owner.py")).rows.is_empty());
     }
 
     #[test]

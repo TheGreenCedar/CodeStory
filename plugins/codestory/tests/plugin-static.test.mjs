@@ -9799,3 +9799,88 @@ test("markdown link checker passes for shipped doc surfaces", () => {
   });
   assert.equal(result.status, 0, result.stderr || result.stdout);
 });
+
+
+test("reactive navigation passes bounded locator data additively and fails open", async () => {
+  const root = await mkdtemp(join(tmpdir(), "codestory-navigation-"));
+  try {
+    const marker = join(root, "request.json");
+    const cli = await writeNodeCli(root, `let input="";process.stdin.on("data",chunk=>input+=chunk);process.stdin.on("end",()=>{require("fs").writeFileSync(process.env.TEST_MARKER,JSON.stringify({args:process.argv.slice(2),request:JSON.parse(input)}));console.log(JSON.stringify({schema_version:1,status:"ready",context:"Indexed CALL navigation data"}));});`);
+    const env = { CODEX_THREAD_ID:"navigation-test", PLUGIN_DATA:root, CODESTORY_CLI:cli, TEST_MARKER:marker };
+    const script = join(pluginRoot,"hooks","codestory-navigation.cjs");
+    const event = {hook_event_name:"PostToolUse",cwd:root,tool_name:"Bash",tool_input:{command:"rtk proxy rg -n 'def start' 'source file.py'"},tool_response:"8:    def start(self):\n"};
+    const original = JSON.stringify(event);
+    const output = runHookProcess(script,event,env);
+    assert.equal(output.hookSpecificOutput.additionalContext,"Indexed CALL navigation data");
+    assert.equal(JSON.stringify(event),original);
+    assert.equal(output.hookSpecificOutput.hookEventName,"PostToolUse");
+    assert.ok(!("decision" in output) && !("updatedMCPToolOutput" in output) && !("updatedToolInput" in output));
+    const called = JSON.parse(await readFile(marker,"utf8"));
+    assert.deepEqual(called.args,["internal-navigation-context","--project",root]);
+    assert.ok(called.request.input_paths.includes("source file.py"));
+    assert.deepEqual(called.request.locations,[{path:null,line:8,text:"    def start(self):"}]);
+    // Both files are real locator candidates; unsupported spelling must not
+    // silently disappear and turn two pathless owners into one.
+    await writeFile(join(root,"owner.py"),"def entry():\n    alpha()\n");
+    await writeFile(join(root,'other"file.py'),"def entry():\n    beta()\n");
+    const unsupported = [
+      String.raw`rg --no-filename -n '^def entry' owner.py "other\"file.py"`,
+      `rg -n '^def entry' owner.py 'other'file.py`,
+      `rg -n '^def entry' owner.py other"file.py"`,
+      String.raw`rg -n '^def entry' owner.py other\ file.py`,
+      `rg -n '^def entry' owner.py; cat other.py`,
+      `rg -n '^def entry' owner.py && cat other.py`,
+      `rg -n '^def entry' owner.py | cat other.py`,
+      `rg -n '^def entry' owner.py\ncat other.py`,
+      'rg -n pattern owner.py "$OTHER"',
+      'rg -n pattern owner.py $(printf other.py)',
+      'rg -n pattern owner.py `printf other.py`',
+      'rg -n pattern owner.py other*.py',
+      'rg -n pattern owner.py "unterminated',
+    ];
+    await rm(marker);
+    for (const command of unsupported) {
+      assert.deepEqual(runHookProcess(script,{...event,tool_input:{command},tool_response:"1:def entry():\n1:def entry():\n"},env),{},command);
+      await assert.rejects(readFile(marker),/ENOENT/u);
+    }
+    for (const command of [
+      "rtk proxy rg -n 'def (__init_processing|_get_child_validator|validate|normalized|__normalize|_normalize|_validate_schema|_validate_items|_validate_type|_error|_resolve_rules_set|_resolve_schema)' cerberus/validator.py",
+      "rg -n '^def entry' 'données 世界.py'",
+    ]) {
+      runHookProcess(script,{...event,tool_input:{command}},env);
+      const request=JSON.parse(await readFile(marker,"utf8")).request;
+      assert.ok(request.input_paths.includes(command.endsWith("cerberus/validator.py")?"cerberus/validator.py":"données 世界.py"));
+    }
+    runHookProcess(script,{...event,tool_input:{command:"rg -n -- owner.py '-other.py'"}},env);
+    assert.ok(JSON.parse(await readFile(marker,"utf8")).request.input_paths.includes("-other.py"),"option-looking literals cannot silently disappear from file ambiguity checks");
+    // Explicit output locations do not need command-path inference.
+    runHookProcess(script,{...event,tool_input:{command:unsupported[0]},tool_response:"owner.py:1:def entry():\n"},env);
+    const explicitUnsupported=JSON.parse(await readFile(marker,"utf8")).request;
+    assert.deepEqual(explicitUnsupported.input_paths,[]);
+    assert.deepEqual(explicitUnsupported.locations,[{path:"owner.py",line:1,text:"def entry():"}]);
+
+    const explicit={...event,tool_response:'odd path.py:3:    def target():\n'};
+    runHookProcess(script,explicit,env);
+    assert.deepEqual(JSON.parse(await readFile(marker,"utf8")).request.locations,[{path:"odd path.py",line:3,text:"    def target():"}]);
+    runHookProcess(script,{...event,tool_response:Array.from({length:33},(_,i)=>`${i+1}:x`).join("\n")},env);
+    const bounded=JSON.parse(await readFile(marker,"utf8")).request;
+    assert.equal(bounded.locations.length,32);
+    assert.equal(bounded.candidate_limit_reached,true);
+    await rm(marker);
+    for (const bad of [{...event,hook_event_name:"SessionStart"},{...event,cwd:"relative"},{...event,tool_response:{}},{...event,tool_response:"not a locator"}]) {
+      assert.deepEqual(runHookProcess(script,bad,env),{});
+      await assert.rejects(readFile(marker),/ENOENT/u);
+    }
+    for (const raw of ['{invalid',JSON.stringify({...event,tool_response:"x".repeat(65536)})]) {
+      const result=spawnSync(process.execPath,[script],{input:raw,encoding:"utf8",env:{...process.env,...env}});
+      assert.equal(result.status,0,result.stderr);
+      assert.deepEqual(JSON.parse(result.stdout),{});
+      await assert.rejects(readFile(marker),/ENOENT/u);
+    }
+    for (const program of ['process.exit(2)','console.log("bad json")','console.log(JSON.stringify({schema_version:1,status:"unavailable"}))','console.log(JSON.stringify({schema_version:1,status:"ready",context:"é".repeat(513)}))','setTimeout(()=>{},10000)']) {
+      const failing=await writeNodeCli(root,program);
+      assert.deepEqual(runHookProcess(script,event,{...env,CODESTORY_CLI:failing}),{});
+    }
+    assert.deepEqual(runHookProcess(script,event,{...env,CODESTORY_CLI:join(root,"absent")}),{});
+  } finally { await rm(root,{recursive:true,force:true}); }
+});

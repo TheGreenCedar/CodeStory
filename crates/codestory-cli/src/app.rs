@@ -245,6 +245,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
         Command::Retrieval(cmd) => retrieval::run_retrieval(cmd),
         Command::InternalOwnedDelete(cmd) => lifecycle::run_internal_owned_delete(cmd),
         Command::InternalSessionContext(cmd) => ground_smoke::run_session_context(cmd),
+        Command::InternalNavigationContext(cmd) => ground_smoke::run_navigation_context(cmd),
         Command::InternalDirtyHook(cmd) => dirty_hooks::run_internal_dirty_hook(cmd),
         Command::InternalEmbeddingServer => {
             embedding_server_transport::run_internal_embedding_server()

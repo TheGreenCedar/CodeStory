@@ -131,6 +131,8 @@ pub(crate) enum Command {
     InternalOwnedDelete(InternalOwnedDeleteCommand),
     #[command(name = "internal-session-context", hide = true)]
     InternalSessionContext(InternalSessionContextCommand),
+    #[command(name = "internal-navigation-context", hide = true)]
+    InternalNavigationContext(InternalSessionContextCommand),
     #[command(name = "internal-dirty-hook", hide = true)]
     InternalDirtyHook(InternalDirtyHookCommand),
     #[command(name = "internal-embedding-server", hide = true)]
