@@ -165,13 +165,12 @@ impl AppController {
             let mut literals = Vec::new();
             let mut identities = Vec::new();
             for token in &request.input_paths {
-                if let Some((raw, canonical)) = literal_path(&root, token) {
-                    if let Ok(identity) = codestory_workspace::workspace_path_identity(&canonical) {
-                        if !identities.contains(&identity) {
-                            identities.push(identity);
-                            literals.push((raw, canonical));
-                        }
-                    }
+                if let Some((raw, canonical)) = literal_path(&root, token)
+                    && let Ok(identity) = codestory_workspace::workspace_path_identity(&canonical)
+                    && !identities.contains(&identity)
+                {
+                    identities.push(identity);
+                    literals.push((raw, canonical));
                 }
             }
             let mut seeds = Vec::new();
