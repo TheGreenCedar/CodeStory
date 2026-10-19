@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Symbol search finds declarations even when frequent call sites share the same name.
+
 - Codex can discover the grounding skill automatically again. Shared Claude Code/Codex startup hooks remain disabled.
 
 - MCP affected results offer an optional lossless shared-field layout for impacted symbols; the default record array stays unchanged.

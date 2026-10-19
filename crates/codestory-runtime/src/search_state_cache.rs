@@ -133,11 +133,13 @@ fn reuse_completed_search_state(
         SEARCH_SYMBOL_STREAM_BATCH_SIZE,
         cancel_token,
         |batch| {
-            engine.extend_symbol_projection(
-                batch
-                    .into_iter()
-                    .map(|entry| (entry.node_id, entry.display_name)),
-            );
+            engine.extend_symbol_projection_with_eligibility(batch.into_iter().map(|entry| {
+                (
+                    entry.node_id,
+                    entry.display_name,
+                    search::engine::symbol_kind_is_searchable(entry.node_kind),
+                )
+            }));
             Ok(())
         },
     )?;
@@ -207,7 +209,10 @@ pub(super) fn build_persisted_search_state_from_canonical_symbols(
     loop {
         let batch_started = Instant::now();
         let batch = storage
-            .get_canonical_search_symbol_batch_after(after_node_id, SEARCH_SYMBOL_STREAM_BATCH_SIZE)
+            .get_canonical_search_symbol_detail_batch_after(
+                after_node_id,
+                SEARCH_SYMBOL_STREAM_BATCH_SIZE,
+            )
             .map_err(|error| {
                 ApiError::internal(format!(
                     "Failed to stream canonical search symbols: {error}"
@@ -224,12 +229,18 @@ pub(super) fn build_persisted_search_state_from_canonical_symbols(
             .into_iter()
             .map(|entry| {
                 node_names.insert(entry.node_id, entry.display_name.clone());
-                (entry.node_id, entry.display_name)
+                (
+                    entry.node_id,
+                    entry.display_name,
+                    search::engine::symbol_kind_is_searchable(entry.node_kind),
+                )
             })
             .collect::<Vec<_>>();
-        symbol_session.add_nodes(symbols).map_err(|error| {
-            ApiError::internal(format!("Failed to index search nodes: {error}"))
-        })?;
+        symbol_session
+            .add_nodes_with_eligibility(symbols)
+            .map_err(|error| {
+                ApiError::internal(format!("Failed to index search nodes: {error}"))
+            })?;
         #[cfg(test)]
         publication_test_checkpoint(PublicationTestBoundary::SearchSymbolPage, cancel_token)?;
         if is_indexing_cancelled(cancel_token) {

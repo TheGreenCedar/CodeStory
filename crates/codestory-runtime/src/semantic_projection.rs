@@ -210,10 +210,14 @@ pub(super) fn build_search_state_for_nodes(
     for node in &nodes {
         let display_name = node_display_name(node);
         node_names.insert(node.id, display_name.clone());
-        search_nodes.push((node.id, display_name));
+        search_nodes.push((
+            node.id,
+            display_name,
+            search::engine::symbol_kind_is_searchable(Some(node.kind as i64)),
+        ));
         if search_nodes.len() >= SEARCH_NODE_BATCH_SIZE {
             symbol_session
-                .add_nodes(std::mem::take(&mut search_nodes))
+                .add_nodes_with_eligibility(std::mem::take(&mut search_nodes))
                 .map_err(|e| ApiError::internal(format!("Failed to index search nodes: {e}")))?;
             if is_indexing_cancelled(cancel_token) {
                 return Err(indexing_cancelled_error());
@@ -222,7 +226,7 @@ pub(super) fn build_search_state_for_nodes(
     }
     if !search_nodes.is_empty() {
         symbol_session
-            .add_nodes(search_nodes)
+            .add_nodes_with_eligibility(search_nodes)
             .map_err(|e| ApiError::internal(format!("Failed to index search nodes: {e}")))?;
     }
     #[cfg(test)]

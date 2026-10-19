@@ -37,12 +37,13 @@ use codestory_contracts::language_support::{
     language_support_profile_for_language_name,
 };
 use codestory_indexer::CancellationToken;
+#[cfg(test)]
+use codestory_store::SearchSymbolProjection;
 use codestory_store::{
     BUILD_EDGE_SEED_BATCH_SIZE, CURRENT_SCHEMA_VERSION, DenseAnchorInput,
     DenseAnchorInputReuseMetadata, FileInfo, FileRole as StoreFileRole, GroundingEdgeKindCount,
     GroundingNodeRecord, IndexPublicationRecord, LlmSymbolDoc, LlmSymbolDocStats,
-    SearchSymbolProjection, SourcePolicyExclusionPolicyIdentity, Store, SymbolSearchDoc,
-    SymbolSummaryRecord,
+    SourcePolicyExclusionPolicyIdentity, Store, SymbolSearchDoc, SymbolSummaryRecord,
 };
 use codestory_workspace::owned_deletion::OwnedDeletionRoot;
 #[cfg(test)]

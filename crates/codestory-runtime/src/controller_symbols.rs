@@ -363,6 +363,9 @@ impl AppController {
             after_node_id = batch.last().map(|entry| entry.node_id);
             stream_rows = stream_rows.saturating_add(batch.len());
             for entry in batch {
+                if !crate::search::engine::symbol_kind_is_searchable(entry.node_kind) {
+                    continue;
+                }
                 let display_name =
                     if entry.node_kind == Some(codestory_contracts::graph::NodeKind::FILE as i64) {
                         let path = Path::new(&entry.display_name);

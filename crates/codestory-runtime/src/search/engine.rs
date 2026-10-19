@@ -3,7 +3,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use codestory_contracts::bounded_locks::{
     self, FileLockKind, LockDeadline, PUBLICATION_LOCK_WAIT, acquire_with_deadline,
 };
-use codestory_contracts::graph::NodeId;
+use codestory_contracts::graph::{NodeId, NodeKind};
 use codestory_workspace::owned_deletion::OwnedDeletionRoot;
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as NucleoConfig, Matcher, Utf32String};
@@ -170,7 +170,7 @@ impl EmbeddingRuntime {
 }
 
 pub struct SearchEngine {
-    symbols: Vec<(Utf32String, NodeId)>,
+    symbols: Vec<(Utf32String, NodeId, bool)>,
     index: Index,
     reader: IndexReader,
     llm_docs: HashMap<NodeId, LlmSearchDoc>,
@@ -445,7 +445,7 @@ impl SearchEngine {
     }
 
     #[cfg(test)]
-    pub(crate) fn symbols(&self) -> &[(Utf32String, NodeId)] {
+    pub(crate) fn symbols(&self) -> &[(Utf32String, NodeId, bool)] {
         &self.symbols
     }
 
@@ -589,10 +589,19 @@ impl SearchEngine {
     where
         I: IntoIterator<Item = (NodeId, String)>,
     {
+        self.extend_symbol_projection_with_eligibility(
+            symbols.into_iter().map(|(id, name)| (id, name, true)),
+        );
+    }
+
+    pub(crate) fn extend_symbol_projection_with_eligibility<I>(&mut self, symbols: I)
+    where
+        I: IntoIterator<Item = (NodeId, String, bool)>,
+    {
         self.symbols.extend(
             symbols
                 .into_iter()
-                .map(|(id, name)| (Utf32String::from(name.as_str()), id)),
+                .map(|(id, name, eligible)| (Utf32String::from(name.as_str()), id, eligible)),
         );
     }
 
@@ -652,11 +661,18 @@ impl SymbolIndexSession<'_> {
     where
         I: IntoIterator<Item = (NodeId, String)>,
     {
+        self.add_nodes_with_eligibility(nodes.into_iter().map(|(id, name)| (id, name, true)))
+    }
+
+    pub(crate) fn add_nodes_with_eligibility<I>(&mut self, nodes: I) -> Result<usize>
+    where
+        I: IntoIterator<Item = (NodeId, String, bool)>,
+    {
         if self.failed {
             bail!("symbol index session has failed");
         }
         let start_count = self.docs_written;
-        for (id, name) in nodes {
+        for (id, name, eligible) in nodes {
             #[cfg(test)]
             if take_symbol_index_test_fault(SymbolIndexTestFault::AddDocument) {
                 self.failed = true;
@@ -685,7 +701,7 @@ impl SymbolIndexSession<'_> {
                 })?;
                 return Err(add_error.into());
             }
-            self.engine.symbols.push((fuzzy_name, id));
+            self.engine.symbols.push((fuzzy_name, id, eligible));
             self.docs_written = self.docs_written.saturating_add(1);
         }
         Ok(self.docs_written.saturating_sub(start_count))
@@ -734,8 +750,13 @@ impl Drop for SymbolIndexSession<'_> {
     }
 }
 
+// Match the existing hydration boundary without removing raw graph/index rows.
+pub(crate) fn symbol_kind_is_searchable(kind: Option<i64>) -> bool {
+    kind != Some(NodeKind::UNKNOWN as i64)
+}
+
 pub(crate) fn search_symbols_with_scores(
-    symbols: &[(Utf32String, NodeId)],
+    symbols: &[(Utf32String, NodeId, bool)],
     query: &str,
 ) -> Vec<(NodeId, f32)> {
     if query.is_empty() {
@@ -760,7 +781,8 @@ pub(crate) fn search_symbols_with_scores(
                 let mut matcher = Matcher::new(NucleoConfig::DEFAULT);
                 chunk
                     .iter()
-                    .filter_map(|(name, id)| {
+                    .filter(|(_, _, eligible)| *eligible)
+                    .filter_map(|(name, id, _)| {
                         pattern
                             .score(name.slice(..), &mut matcher)
                             .map(|score| (*id, score, symbol_candidate_rank(query, name, score)))
@@ -772,7 +794,8 @@ pub(crate) fn search_symbols_with_scores(
         let mut matcher = Matcher::new(NucleoConfig::DEFAULT);
         symbols
             .iter()
-            .filter_map(|(name, id)| {
+            .filter(|(_, _, eligible)| *eligible)
+            .filter_map(|(name, id, _)| {
                 pattern
                     .score(name.slice(..), &mut matcher)
                     .map(|score| (*id, score, symbol_candidate_rank(query, name, score)))
@@ -803,7 +826,7 @@ pub(crate) fn search_core_symbol_names_with_scores(
 ) -> Vec<(NodeId, f32)> {
     let symbols = symbols
         .iter()
-        .map(|(id, name)| (Utf32String::from(name.as_str()), *id))
+        .map(|(id, name)| (Utf32String::from(name.as_str()), *id, true))
         .collect::<Vec<_>>();
     search_symbols_with_scores(&symbols, query)
 }
@@ -1071,11 +1094,18 @@ mod tests {
         let mut engine = SearchEngine::new(Some(directory.path()))?;
         {
             let mut session = engine.begin_symbol_index()?;
-            session.add_nodes(vec![(NodeId(1), "Partial".to_string())])?;
+            session.add_nodes_with_eligibility(vec![
+                (NodeId(1), "Partial".to_string(), false),
+                (NodeId(2), "Partial".to_string(), true),
+            ])?;
         }
 
         assert!(engine.symbols().is_empty());
         assert_eq!(engine.tantivy_doc_count(), 0);
+        // The public pair API still admits its entries, including an ID from
+        // the aborted typed batch; eligibility must roll back with the names.
+        engine.index_nodes(vec![(NodeId(1), "Partial".to_string())])?;
+        assert_eq!(engine.search_symbol("Partial"), vec![NodeId(1)]);
         Ok(())
     }
 
