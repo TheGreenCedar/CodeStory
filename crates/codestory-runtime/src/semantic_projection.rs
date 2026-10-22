@@ -3163,10 +3163,87 @@ pub(super) fn flush_pending_dense_anchor_inputs(
     Ok(())
 }
 
+// Display envelopes must not silently repartition a type's compact search
+// document. Only the private text input uses these precise declaration spans.
+fn rust_type_compact_input_views(
+    storage: &Storage,
+    nodes: &[&GraphNode],
+    graph: &SemanticDocGraphContext,
+) -> Result<HashMap<GraphNodeId, GraphNode>, ApiError> {
+    use codestory_contracts::graph::{NodeKind, OccurrenceKind};
+
+    let candidates = nodes
+        .iter()
+        .copied()
+        .filter(|node| {
+            matches!(node.kind, NodeKind::STRUCT | NodeKind::ENUM)
+                && semantic_doc_language_from_path(graph.file_path_for_node(node)) == Some("rust")
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let ids = candidates.iter().map(|node| node.id).collect::<Vec<_>>();
+    let occurrences = storage
+        .get_occurrences_for_node_ids(&ids)
+        .map_err(|error| {
+            ApiError::internal(format!("Failed to load type declarations: {error}"))
+        })?;
+    let mut views = HashMap::new();
+    for node in candidates {
+        let (Some(file), Some(sl), Some(sc), Some(el), Some(ec)) = (
+            node.file_node_id,
+            node.start_line,
+            node.start_col,
+            node.end_line,
+            node.end_col,
+        ) else {
+            continue;
+        };
+        let mut declarations = occurrences
+            .get(&node.id)
+            .into_iter()
+            .flatten()
+            .filter(|row| row.element_id == node.id.0 && row.kind == OccurrenceKind::DECLARATION);
+        let Some(row) = declarations.next() else {
+            continue;
+        };
+        let span = &row.location;
+        if declarations.next().is_some()
+            || span.file_node_id != file
+            || [
+                sl,
+                sc,
+                el,
+                ec,
+                span.start_line,
+                span.start_col,
+                span.end_line,
+                span.end_col,
+            ]
+            .contains(&0)
+            || (sl, sc) >= (el, ec)
+            || (span.start_line, span.start_col) >= (span.end_line, span.end_col)
+            || (span.start_line, span.start_col) < (sl, sc)
+            || (span.end_line, span.end_col) > (el, ec)
+        {
+            continue;
+        }
+        let mut view = node.clone();
+        view.start_line = Some(span.start_line);
+        view.start_col = Some(span.start_col);
+        view.end_line = Some(span.end_line);
+        view.end_col = Some(span.end_col);
+        views.insert(node.id, view);
+    }
+    Ok(views)
+}
+
 struct SemanticNodeBuildContext<'a> {
     graph_context: &'a SemanticDocGraphContext,
     file_text_cache: &'a HashMap<String, Option<String>>,
     stored_docs: Option<&'a HashMap<GraphNodeId, SymbolSearchDoc>>,
+    compact_input_views: &'a HashMap<GraphNodeId, GraphNode>,
     component_access: &'a HashMap<GraphNodeId, AccessKind>,
     existing_docs: &'a HashMap<GraphNodeId, DenseAnchorInputReuseMetadata>,
     updated_at_epoch_ms: i64,
@@ -3233,7 +3310,7 @@ fn build_semantic_symbol_docs(
             } else {
                 let doc_text = build_llm_symbol_doc_text_with_policy(
                     context.graph_context,
-                    node,
+                    context.compact_input_views.get(&node.id).unwrap_or(node),
                     &display_name,
                     file_path.as_deref(),
                     context.file_text_cache,
@@ -3405,17 +3482,6 @@ pub(super) fn process_semantic_symbol_nodes(
     seen_symbol_node_ids: &mut Vec<GraphNodeId>,
     seen_dense_node_ids: &mut Vec<GraphNodeId>,
 ) -> Result<(), ApiError> {
-    let context = SemanticNodeBuildContext {
-        graph_context,
-        file_text_cache,
-        stored_docs,
-        component_access,
-        existing_docs,
-        updated_at_epoch_ms,
-        semantic_alias_mode,
-        semantic_max_tokens,
-        flow_neighbor_ids,
-    };
     let mut progress = SemanticProjectionProgress {
         stats,
         doc_build_ns,
@@ -3428,6 +3494,23 @@ pub(super) fn process_semantic_symbol_nodes(
             return Err(indexing_cancelled_error());
         }
         let doc_build_started = Instant::now();
+        let compact_input_views = if stored_docs.is_none() {
+            rust_type_compact_input_views(storage, semantic_window, graph_context)?
+        } else {
+            HashMap::new()
+        };
+        let context = SemanticNodeBuildContext {
+            graph_context,
+            file_text_cache,
+            stored_docs,
+            compact_input_views: &compact_input_views,
+            component_access,
+            existing_docs,
+            updated_at_epoch_ms,
+            semantic_alias_mode,
+            semantic_max_tokens,
+            flow_neighbor_ids,
+        };
         let built_docs = build_semantic_symbol_docs(semantic_window, &context)?;
         *progress.doc_build_ns = progress
             .doc_build_ns
@@ -4200,6 +4283,11 @@ fn build_full_dense_selection_plan(
             &prepared.file_read_paths,
             cancel_token,
         )?;
+        let compact_input_views = if stored_docs.is_none() {
+            rust_type_compact_input_views(storage, &nodes.iter().collect::<Vec<_>>(), &graph)?
+        } else {
+            HashMap::new()
+        };
         for node in &nodes {
             let display_name = node_display_name(node);
             let file_path = graph.file_path_for_node(node);
@@ -4209,7 +4297,7 @@ fn build_full_dense_selection_plan(
                 .unwrap_or_else(|| {
                     build_llm_symbol_doc_text_with_policy(
                         &graph,
-                        node,
+                        compact_input_views.get(&node.id).unwrap_or(node),
                         &display_name,
                         file_path,
                         &prepared.file_text_cache,
@@ -4283,34 +4371,40 @@ fn build_loaded_dense_selection_plan(
         build_semantic_file_text_cache(&graph, &semantic_nodes, policy.max_file_bytes);
     let mut seeds = HashMap::new();
     let mut base_reasons = HashMap::new();
-    for node in semantic_nodes {
+    for window in semantic_nodes.chunks(policy.stream_sort_window_size.max(1)) {
         if is_indexing_cancelled(cancel_token) {
             return Err(indexing_cancelled_error());
         }
-        let display_name = node_display_name(node);
-        let file_path = graph.file_path_for_node(node);
-        let doc_text = build_llm_symbol_doc_text_with_policy(
-            &graph,
-            node,
-            &display_name,
-            file_path,
-            &file_text_cache,
-            policy.alias_mode,
-            policy.max_tokens,
-        );
-        let reason = base_dense_anchor_reason_for_node(
-            &graph,
-            node,
-            &display_name,
-            file_path,
-            &doc_text,
-            access.get(&node.id).copied(),
-        );
-        base_reasons.insert(node.id, reason);
-        if dense_anchor_reason_is_flow_seed(reason)
-            && flow_neighbor_node_is_primary_source(node, file_paths)
-        {
-            seeds.insert(node.id, node.clone());
+        let compact_input_views = rust_type_compact_input_views(storage, window, &graph)?;
+        for &node in window {
+            if is_indexing_cancelled(cancel_token) {
+                return Err(indexing_cancelled_error());
+            }
+            let display_name = node_display_name(node);
+            let file_path = graph.file_path_for_node(node);
+            let doc_text = build_llm_symbol_doc_text_with_policy(
+                &graph,
+                compact_input_views.get(&node.id).unwrap_or(node),
+                &display_name,
+                file_path,
+                &file_text_cache,
+                policy.alias_mode,
+                policy.max_tokens,
+            );
+            let reason = base_dense_anchor_reason_for_node(
+                &graph,
+                node,
+                &display_name,
+                file_path,
+                &doc_text,
+                access.get(&node.id).copied(),
+            );
+            base_reasons.insert(node.id, reason);
+            if dense_anchor_reason_is_flow_seed(reason)
+                && flow_neighbor_node_is_primary_source(node, file_paths)
+            {
+                seeds.insert(node.id, node.clone());
+            }
         }
     }
     Ok((

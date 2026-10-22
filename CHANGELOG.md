@@ -4,6 +4,8 @@
 
 - Rust struct and enum source excerpts include their fields, variants and outer attributes. Navigation keeps precise name locations, and existing Rust indexes rebuild on their next refresh.
 
+- Rust struct and enum search documents retain their declaration and comment text when source excerpts expand to include attributes and fields.
+
 - Symbol search finds declarations even when frequent call sites share the same name.
 
 - Codex can discover the grounding skill automatically again. Shared Claude Code/Codex startup hooks remain disabled.

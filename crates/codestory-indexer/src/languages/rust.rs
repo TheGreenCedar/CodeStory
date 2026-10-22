@@ -88,7 +88,7 @@ fn rust_language() -> tree_sitter::Language {
     tree_sitter_rust::LANGUAGE.into()
 }
 
-pub(crate) const DECLARATION_REVISION: &str = extraction_revision!("rust-declaration-source-v5");
+pub(crate) const DECLARATION_REVISION: &str = extraction_revision!("rust-declaration-source-v6");
 
 pub(crate) fn callable_declaration_span(node: TsNode<'_>) -> GraphNodeSpan {
     if !matches!(node.kind(), "function_item" | "function_signature_item") {

@@ -108,6 +108,16 @@ lookup remain a separate bounded-streaming concern. Index telemetry exposes
 selected symbols, retained context files and path bytes, and lookup entries so
 that boundary stays visible.
 
+Fresh Rust struct and enum compact documents use a private input view from one
+precise, same-file declaration occurrence contained in the displayed extent.
+Occurrence reads are batched within the existing semantic window or flow-seed
+page; stored-document republish does not perform this lookup. Missing, ambiguous
+or invalid anchors retain the displayed input. Public and dense locations and
+attached comments keep the full declaration envelope. Callables, enum variants
+and other languages keep their existing document inputs. The Rust extraction
+revision invalidates affected file documents before fresh materialization;
+the global document and embedding versions remain unchanged.
+
 Projection-only republish is a writer, never an activation or observational
 repair path. Runtime accepts only current stored document contracts, rebuilds
 graph-derived context and dense selection, and delegates atomic old-or-new core

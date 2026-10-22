@@ -1155,9 +1155,13 @@ mod tests {
             mix_str(&mut previous, config.language_name);
             mix_str(&mut previous, config.graph_query);
             mix_optional_str(&mut previous, config.tags_query);
-            // Hold the shared occurrence revision fixed when testing the older
-            // language-local callable-envelope change.
-            if !matches!(config.language_name, "python" | "rust")
+            // Rust's v5 display envelopes must not reuse v6 compact inputs.
+            if config.language_name == "rust" {
+                mix_str(
+                    &mut previous,
+                    "canonical-reference-occurrences-v1;rust-declaration-source-v5",
+                );
+            } else if config.language_name != "python"
                 && let Some(revision) =
                     crate::current_file_extraction_revision(config.language_name)
             {

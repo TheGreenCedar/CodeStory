@@ -127,6 +127,8 @@ mod search_plan_tests;
 mod search_scoring_tests;
 #[path = "tests/snippets.rs"]
 mod snippet_tests;
+#[path = "tests/rust_type_semantic_inputs.rs"]
+mod rust_type_semantic_inputs;
 
 #[test]
 fn runtime_facade_remains_inside_the_default_source_index_cap() {
