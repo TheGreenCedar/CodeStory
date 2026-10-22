@@ -4390,7 +4390,7 @@ fn source_content_hash(bytes: &[u8]) -> String {
 pub fn current_file_extraction_revision(language: &str) -> Option<&'static str> {
     match language {
         "python" => Some(languages::python::CALLABLE_DECLARATION_REVISION),
-        "rust" => Some(languages::rust::CALLABLE_DECLARATION_REVISION),
+        "rust" => Some(languages::rust::DECLARATION_REVISION),
         "javascript" => Some(extraction_revision!("explicit-named-public-exports-v2")),
         "typescript" | "tsx" => Some(extraction_revision!("explicit-named-public-exports-v3")),
         _ if languages::extraction_for_language(language).is_some() => {
@@ -17204,7 +17204,7 @@ fn index_file_with_resolution_inputs(
     if language_config.language_name == "python" {
         languages::python::apply_callable_declaration_envelopes(&tree, &mut final_nodes);
     } else if language_config.language_name == "rust" {
-        languages::rust::apply_callable_declaration_envelopes(&tree, &mut final_nodes);
+        languages::rust::apply_declaration_envelopes(&tree, &mut final_nodes);
     }
     let callable_projection_states =
         build_callable_projection_states(&final_nodes, &result_edges, &result_occurrences);

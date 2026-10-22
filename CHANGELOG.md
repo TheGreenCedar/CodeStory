@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Rust struct and enum source excerpts include their fields, variants and outer attributes. Navigation keeps precise name locations, and existing Rust indexes rebuild on their next refresh.
+
 - Symbol search finds declarations even when frequent call sites share the same name.
 
 - Codex can discover the grounding skill automatically again. Shared Claude Code/Codex startup hooks remain disabled.

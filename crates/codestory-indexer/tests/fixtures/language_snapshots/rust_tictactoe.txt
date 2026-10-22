@@ -1,4 +1,4 @@
-node ENUM name=Token qn=Token canonical=game.rs:Token line=7 col=6 end=7:11 file=FILE:game.rs@1
+node ENUM name=Token qn=Token canonical=game.rs:Token line=6 col=1 end=11:2 file=FILE:game.rs@1
 node ENUM_CONSTANT name=Token::TOKEN_NONE qn=Token::TOKEN_NONE canonical=rust-ordinal-v2:game.rs:Token::TOKEN_NONE#0 line=8 col=5 end=8:15 file=FILE:game.rs@1
 node ENUM_CONSTANT name=Token::TOKEN_PLAYER_A qn=Token::TOKEN_PLAYER_A canonical=rust-ordinal-v2:game.rs:Token::TOKEN_PLAYER_A#0 line=9 col=5 end=9:19 file=FILE:game.rs@1
 node ENUM_CONSTANT name=Token::TOKEN_PLAYER_B qn=Token::TOKEN_PLAYER_B canonical=rust-ordinal-v2:game.rs:Token::TOKEN_PLAYER_B#0 line=10 col=5 end=10:19 file=FILE:game.rs@1
@@ -58,13 +58,13 @@ node METHOD name=TicTacToe::run qn=TicTacToe::run canonical=rust-ordinal-v2:game
 node METHOD name=TicTacToe::start qn=TicTacToe::start canonical=rust-ordinal-v2:game.rs:TicTacToe::start#0 line=348 col=5 end=355:6 file=FILE:game.rs@1
 node MODULE name=Write qn=Write canonical=rust-ordinal-v2:game.rs:Write#0 line=1 col=21 end=1:26 file=FILE:game.rs@1
 node MODULE name=std::fmt qn=std::fmt canonical=rust-ordinal-v2:game.rs:std::fmt#0 line=2 col=5 end=2:13 file=FILE:game.rs@1
-node STRUCT name=ArtificialPlayer qn=ArtificialPlayer canonical=game.rs:ArtificialPlayer line=262 col=8 end=262:24 file=FILE:game.rs@1
-node STRUCT name=Field qn=Field canonical=game.rs:Field line=38 col=8 end=38:13 file=FILE:game.rs@1
-node STRUCT name=GameObject qn=GameObject canonical=game.rs:GameObject line=4 col=8 end=4:18 file=FILE:game.rs@1
-node STRUCT name=HumanPlayer qn=HumanPlayer canonical=game.rs:HumanPlayer line=203 col=8 end=203:19 file=FILE:game.rs@1
-node STRUCT name=Move qn=Move canonical=game.rs:Move line=14 col=8 end=14:12 file=FILE:game.rs@1
-node STRUCT name=Node qn=Node canonical=game.rs:Node line=256 col=8 end=256:12 file=FILE:game.rs@1
-node STRUCT name=TicTacToe qn=TicTacToe canonical=game.rs:TicTacToe line=335 col=8 end=335:17 file=FILE:game.rs@1
+node STRUCT name=ArtificialPlayer qn=ArtificialPlayer canonical=game.rs:ArtificialPlayer line=261 col=1 end=265:2 file=FILE:game.rs@1
+node STRUCT name=Field qn=Field canonical=game.rs:Field line=37 col=1 end=41:2 file=FILE:game.rs@1
+node STRUCT name=GameObject qn=GameObject canonical=game.rs:GameObject line=4 col=1 end=4:19 file=FILE:game.rs@1
+node STRUCT name=HumanPlayer qn=HumanPlayer canonical=game.rs:HumanPlayer line=202 col=1 end=206:2 file=FILE:game.rs@1
+node STRUCT name=Move qn=Move canonical=game.rs:Move line=13 col=1 end=17:2 file=FILE:game.rs@1
+node STRUCT name=Node qn=Node canonical=game.rs:Node line=255 col=1 end=259:2 file=FILE:game.rs@1
+node STRUCT name=TicTacToe qn=TicTacToe canonical=game.rs:TicTacToe line=335 col=1 end=338:2 file=FILE:game.rs@1
 node UNKNOWN name=ArtificialPlayer::evaluate qn=ArtificialPlayer::evaluate canonical=rust-ordinal-v2:game.rs:ArtificialPlayer::evaluate#1 line=301 col=43 end=301:51 file=FILE:game.rs@1
 node UNKNOWN name=ArtificialPlayer::min_max qn=ArtificialPlayer::min_max canonical=rust-ordinal-v2:game.rs:ArtificialPlayer::min_max#1 line=303 col=38 end=303:45 file=FILE:game.rs@1
 node UNKNOWN name=ArtificialPlayer::min_max qn=ArtificialPlayer::min_max canonical=rust-ordinal-v2:game.rs:ArtificialPlayer::min_max#2 line=330 col=25 end=330:32 file=FILE:game.rs@1
@@ -257,48 +257,48 @@ edge CALL src=METHOD:TicTacToe::start@348 dst=UNKNOWN:new@353 resolved_src=- res
 edge CALL src=METHOD:TicTacToe::start@348 dst=UNKNOWN:string_out@350 resolved_src=- resolved_dst=- line=350 confidence=- certainty=- callsite=h0:350:1:h85 candidates=[]
 edge IMPORT src=MODULE:Write@1 dst=MODULE:Write@1 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 edge IMPORT src=MODULE:std::fmt@2 dst=MODULE:std::fmt@2 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge INHERITANCE src=STRUCT:ArtificialPlayer@262 dst=INTERFACE:Player@196 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge INHERITANCE src=STRUCT:HumanPlayer@203 dst=INTERFACE:Player@196 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=ENUM:Token@7 dst=ENUM_CONSTANT:Token::TOKEN_NONE@8 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=ENUM:Token@7 dst=ENUM_CONSTANT:Token::TOKEN_PLAYER_A@9 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=ENUM:Token@7 dst=ENUM_CONSTANT:Token::TOKEN_PLAYER_B@10 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge INHERITANCE src=STRUCT:ArtificialPlayer@261 dst=INTERFACE:Player@196 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge INHERITANCE src=STRUCT:HumanPlayer@202 dst=INTERFACE:Player@196 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=ENUM:Token@6 dst=ENUM_CONSTANT:Token::TOKEN_NONE@8 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=ENUM:Token@6 dst=ENUM_CONSTANT:Token::TOKEN_PLAYER_A@9 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=ENUM:Token@6 dst=ENUM_CONSTANT:Token::TOKEN_PLAYER_B@10 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 edge MEMBER src=INTERFACE:Player@196 dst=FUNCTION:Player::name@199 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 edge MEMBER src=INTERFACE:Player@196 dst=FUNCTION:Player::token@198 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 edge MEMBER src=INTERFACE:Player@196 dst=FUNCTION:Player::turn@197 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:ArtificialPlayer@262 dst=FIELD:ArtificialPlayer::name@264 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:ArtificialPlayer@262 dst=FIELD:ArtificialPlayer::token@263 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:ArtificialPlayer@262 dst=METHOD:ArtificialPlayer::evaluate@275 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:ArtificialPlayer@262 dst=METHOD:ArtificialPlayer::min_max@287 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:ArtificialPlayer@262 dst=METHOD:ArtificialPlayer::name@324 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:ArtificialPlayer@262 dst=METHOD:ArtificialPlayer::new@268 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:ArtificialPlayer@262 dst=METHOD:ArtificialPlayer::token@320 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:ArtificialPlayer@262 dst=METHOD:ArtificialPlayer::turn@328 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:Field@38 dst=FIELD:Field::grid@39 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:Field@38 dst=FIELD:Field::left@40 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:Field@38 dst=METHOD:Field::clear@78 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:Field@38 dst=METHOD:Field::clear_move@165 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:Field@38 dst=METHOD:Field::clone_field@67 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:Field@38 dst=METHOD:Field::in_range@135 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:Field@38 dst=METHOD:Field::is_empty@139 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:Field@38 dst=METHOD:Field::is_full@143 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:Field@38 dst=METHOD:Field::make_move@147 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:Field@38 dst=METHOD:Field::new@44 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:Field@38 dst=METHOD:Field::opponent@57 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:Field@38 dst=METHOD:Field::same_in_row@111 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:Field@38 dst=METHOD:Field::show@87 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:HumanPlayer@203 dst=FIELD:HumanPlayer::name@205 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:HumanPlayer@203 dst=FIELD:HumanPlayer::token@204 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:HumanPlayer@203 dst=METHOD:HumanPlayer::check@220 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:HumanPlayer@203 dst=METHOD:HumanPlayer::input@216 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:HumanPlayer@203 dst=METHOD:HumanPlayer::name@238 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:HumanPlayer@203 dst=METHOD:HumanPlayer::new@209 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:HumanPlayer@203 dst=METHOD:HumanPlayer::token@234 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:HumanPlayer@203 dst=METHOD:HumanPlayer::turn@242 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:Move@14 dst=FIELD:Move::col@16 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:Move@14 dst=FIELD:Move::row@15 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:Move@14 dst=METHOD:Move::new@20 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:Node@256 dst=FIELD:Node::mv@257 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:Node@256 dst=FIELD:Node::value@258 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:ArtificialPlayer@261 dst=FIELD:ArtificialPlayer::name@264 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:ArtificialPlayer@261 dst=FIELD:ArtificialPlayer::token@263 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:ArtificialPlayer@261 dst=METHOD:ArtificialPlayer::evaluate@275 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:ArtificialPlayer@261 dst=METHOD:ArtificialPlayer::min_max@287 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:ArtificialPlayer@261 dst=METHOD:ArtificialPlayer::name@324 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:ArtificialPlayer@261 dst=METHOD:ArtificialPlayer::new@268 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:ArtificialPlayer@261 dst=METHOD:ArtificialPlayer::token@320 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:ArtificialPlayer@261 dst=METHOD:ArtificialPlayer::turn@328 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Field@37 dst=FIELD:Field::grid@39 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Field@37 dst=FIELD:Field::left@40 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Field@37 dst=METHOD:Field::clear@78 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Field@37 dst=METHOD:Field::clear_move@165 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Field@37 dst=METHOD:Field::clone_field@67 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Field@37 dst=METHOD:Field::in_range@135 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Field@37 dst=METHOD:Field::is_empty@139 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Field@37 dst=METHOD:Field::is_full@143 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Field@37 dst=METHOD:Field::make_move@147 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Field@37 dst=METHOD:Field::new@44 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Field@37 dst=METHOD:Field::opponent@57 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Field@37 dst=METHOD:Field::same_in_row@111 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Field@37 dst=METHOD:Field::show@87 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:HumanPlayer@202 dst=FIELD:HumanPlayer::name@205 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:HumanPlayer@202 dst=FIELD:HumanPlayer::token@204 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:HumanPlayer@202 dst=METHOD:HumanPlayer::check@220 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:HumanPlayer@202 dst=METHOD:HumanPlayer::input@216 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:HumanPlayer@202 dst=METHOD:HumanPlayer::name@238 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:HumanPlayer@202 dst=METHOD:HumanPlayer::new@209 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:HumanPlayer@202 dst=METHOD:HumanPlayer::token@234 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:HumanPlayer@202 dst=METHOD:HumanPlayer::turn@242 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Move@13 dst=FIELD:Move::col@16 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Move@13 dst=FIELD:Move::row@15 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Move@13 dst=METHOD:Move::new@20 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Node@255 dst=FIELD:Node::mv@257 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Node@255 dst=FIELD:Node::value@258 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 edge MEMBER src=STRUCT:TicTacToe@335 dst=FIELD:TicTacToe::field@336 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 edge MEMBER src=STRUCT:TicTacToe@335 dst=FIELD:TicTacToe::players@337 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 edge MEMBER src=STRUCT:TicTacToe@335 dst=METHOD:TicTacToe::_reset@381 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
@@ -307,7 +307,7 @@ edge MEMBER src=STRUCT:TicTacToe@335 dst=METHOD:TicTacToe::new@341 resolved_src=
 edge MEMBER src=STRUCT:TicTacToe@335 dst=METHOD:TicTacToe::run@357 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 edge MEMBER src=STRUCT:TicTacToe@335 dst=METHOD:TicTacToe::start@348 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 file path=game.rs language=rust lines=404 complete=true role=Source
-occurrence element=ENUM:Token@7 kind=DECLARATION span=7:6-7:11
+occurrence element=ENUM:Token@6 kind=DECLARATION span=7:6-7:11
 occurrence element=ENUM_CONSTANT:Token::TOKEN_NONE@8 kind=DECLARATION span=8:5-8:15
 occurrence element=ENUM_CONSTANT:Token::TOKEN_PLAYER_A@9 kind=DECLARATION span=9:5-9:19
 occurrence element=ENUM_CONSTANT:Token::TOKEN_PLAYER_B@10 kind=DECLARATION span=10:5-10:19
@@ -368,18 +368,18 @@ occurrence element=METHOD:TicTacToe::run@357 kind=DEFINITION span=357:5-379:6
 occurrence element=METHOD:TicTacToe::start@348 kind=DEFINITION span=348:5-355:6
 occurrence element=MODULE:Write@1 kind=DEFINITION span=1:21-1:26
 occurrence element=MODULE:std::fmt@2 kind=DEFINITION span=2:5-2:13
-occurrence element=STRUCT:ArtificialPlayer@262 kind=DECLARATION span=262:8-262:24
-occurrence element=STRUCT:ArtificialPlayer@262 kind=DEFINITION span=267:6-267:22
-occurrence element=STRUCT:ArtificialPlayer@262 kind=DEFINITION span=319:17-319:33
-occurrence element=STRUCT:Field@38 kind=DECLARATION span=38:8-38:13
-occurrence element=STRUCT:Field@38 kind=DEFINITION span=43:6-43:11
+occurrence element=STRUCT:ArtificialPlayer@261 kind=DECLARATION span=262:8-262:24
+occurrence element=STRUCT:ArtificialPlayer@261 kind=DEFINITION span=267:6-267:22
+occurrence element=STRUCT:ArtificialPlayer@261 kind=DEFINITION span=319:17-319:33
+occurrence element=STRUCT:Field@37 kind=DECLARATION span=38:8-38:13
+occurrence element=STRUCT:Field@37 kind=DEFINITION span=43:6-43:11
 occurrence element=STRUCT:GameObject@4 kind=DECLARATION span=4:8-4:18
-occurrence element=STRUCT:HumanPlayer@203 kind=DECLARATION span=203:8-203:19
-occurrence element=STRUCT:HumanPlayer@203 kind=DEFINITION span=208:6-208:17
-occurrence element=STRUCT:HumanPlayer@203 kind=DEFINITION span=233:17-233:28
-occurrence element=STRUCT:Move@14 kind=DECLARATION span=14:8-14:12
-occurrence element=STRUCT:Move@14 kind=DEFINITION span=19:6-19:10
-occurrence element=STRUCT:Node@256 kind=DECLARATION span=256:8-256:12
+occurrence element=STRUCT:HumanPlayer@202 kind=DECLARATION span=203:8-203:19
+occurrence element=STRUCT:HumanPlayer@202 kind=DEFINITION span=208:6-208:17
+occurrence element=STRUCT:HumanPlayer@202 kind=DEFINITION span=233:17-233:28
+occurrence element=STRUCT:Move@13 kind=DECLARATION span=14:8-14:12
+occurrence element=STRUCT:Move@13 kind=DEFINITION span=19:6-19:10
+occurrence element=STRUCT:Node@255 kind=DECLARATION span=256:8-256:12
 occurrence element=STRUCT:TicTacToe@335 kind=DECLARATION span=335:8-335:17
 occurrence element=STRUCT:TicTacToe@335 kind=DEFINITION span=340:6-340:15
 occurrence element=UNKNOWN:ArtificialPlayer::evaluate@301 kind=DEFINITION span=301:43-301:51

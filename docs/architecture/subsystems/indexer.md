@@ -64,6 +64,11 @@ collected against the inner function before that displayed range is expanded.
 Decorator callee references remain graph nodes but cannot act as lexical
 callers for argument expressions; canonical declarations, including one-line
 functions, remain eligible owners.
+Rust struct and enum display ranges include their fields, variants and attached
+outer attributes. These ranges expand after precise name occurrences, stable
+type identities and call ownership have been collected; enum variants keep
+their own name anchors. The same late stage retains Rust callable attributes,
+while malformed syntax leaves the original anchors unchanged.
 Parser body metadata joins the outer declaration coordinates to the proper
 execution-body range. Successful verified extraction and current cache replay
 record the Python or Rust extraction revision with the file's source hash.
