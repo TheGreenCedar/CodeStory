@@ -4406,6 +4406,7 @@ pub fn current_file_extraction_revision(language: &str) -> Option<&'static str> 
     match language {
         "python" => Some(languages::python::CALLABLE_DECLARATION_REVISION),
         "rust" => Some(languages::rust::DECLARATION_REVISION),
+        "bash" => Some(extraction_revision!("bash-callsite-source-order-v1")),
         "javascript" => Some(extraction_revision!("explicit-named-public-exports-v2")),
         "typescript" | "tsx" => Some(extraction_revision!("explicit-named-public-exports-v3")),
         _ if languages::extraction_for_language(language).is_some() => {

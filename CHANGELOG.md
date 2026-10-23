@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Bash call navigation handles commands inside prefix assignments without interrupting indexing or losing links between repeated calls on the same line. Existing Bash indexes rebuild on their next refresh.
+
 - Repository navigation stays available when a structural file has unsupported text bytes, while that file keeps explicit incomplete coverage and no source projection.
 
 - Rust struct and enum source excerpts include their fields, variants and outer attributes. Navigation keeps precise name locations, and existing Rust indexes rebuild on their next refresh.

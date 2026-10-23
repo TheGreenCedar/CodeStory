@@ -259,7 +259,7 @@ const PHP_ADAPTER_VERSION: &str = "reference-v4";
 const CSHARP_ADAPTER_VERSION: &str = "reference-v2";
 const SWIFT_ADAPTER_VERSION: &str = "reference-v3";
 const DART_ADAPTER_VERSION: &str = "reference-v2";
-const BASH_ADAPTER_VERSION: &str = "reference-v2";
+const BASH_ADAPTER_VERSION: &str = "reference-v3";
 const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 28;
 const INSTALLED_ADAPTERS: &[(&str, &str)] = &[
     ("bash", BASH_ADAPTER_VERSION),
@@ -1054,12 +1054,13 @@ impl<'a, 'tree> BashResolutionProducer<'a, 'tree> {
                 }
             }
         }
+        let mut pending_call = None;
         if node.kind() == "command"
             && let Some(callee) = bash_command_callee(node)
             && let Some(raw_target) = node_text(callee, self.source).map(str::to_string)
         {
             let literal = bash_literal_command_name(callee, &raw_target);
-            self.calls.push(IndexedBashCall {
+            pending_call = Some(IndexedBashCall {
                 callee,
                 form: if literal.is_some() {
                     CalleeForm::Identifier
@@ -1076,7 +1077,20 @@ impl<'a, 'tree> BashResolutionProducer<'a, 'tree> {
         let direct_program_child = node.kind() == "program";
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
+            // Prefix assignments can contain commands before this command's
+            // callee. Emit at its source position, not at the parent's entry;
+            // a dynamic callee still precedes commands nested within its span.
+            if pending_call
+                .as_ref()
+                .is_some_and(|call| call.callee.start_byte() <= child.start_byte())
+            {
+                self.calls
+                    .push(pending_call.take().expect("pending Bash call"));
+            }
             self.visit(child, child_caller, direct_program_child);
+        }
+        if let Some(call) = pending_call {
+            self.calls.push(call);
         }
     }
 
