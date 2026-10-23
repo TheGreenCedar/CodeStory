@@ -2377,6 +2377,140 @@ fn test_full_refresh_resolves_flushed_calls_in_serial_pipeline_and_cache_replay(
 }
 
 #[test]
+fn full_refresh_skips_unused_predecessor_reads_but_incremental_retains_them() -> Result<()> {
+    use codestory_workspace::BuildMode;
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+
+    let dir = tempdir()?;
+    let caller = dir.path().join("caller.go");
+    let target = dir.path().join("target.go");
+    let manifest = dir.path().join("package.json");
+    let oversized = dir.path().join("oversized.rs");
+    std::fs::write(&caller, "package sample\nfunc begin() { finish() }\n")?;
+    std::fs::write(&target, "package sample\nfunc finish() {}\n")?;
+    std::fs::write(&manifest, "{\"scripts\":{\"build\":\"vite build\"}}\n")?;
+    std::fs::write(&oversized, "// oversized source\n".repeat(32))?;
+    let files = vec![caller, target, manifest, oversized];
+    let baseline_plan = codestory_workspace::RefreshExecutionPlan {
+        mode: BuildMode::FullRefresh,
+        files_to_index: files,
+        files_to_remove: Vec::new(),
+        existing_file_ids: HashMap::new(),
+    };
+    let mut unexpected_full_failures = Vec::new();
+    for (label, mode, file_backed) in [
+        ("full-serial", BuildMode::FullRefresh, false),
+        ("full-pipeline", BuildMode::FullRefresh, true),
+        ("incremental-serial", BuildMode::Incremental, false),
+        ("incremental-file-backed", BuildMode::Incremental, true),
+    ] {
+        let mut storage = if file_backed {
+            Storage::open_build(dir.path().join(format!("{label}.sqlite")))?
+        } else {
+            Storage::new_in_memory()?
+        };
+        let indexer = WorkspaceIndexer::new(dir.path().to_path_buf())
+            .with_source_file_byte_cap(256)
+            .with_artifact_cache_policies(ArtifactCachePolicies {
+                parser: ArtifactCachePolicy::KnownEmpty,
+                structural: ArtifactCachePolicy::ReadThrough,
+            })
+            .with_batch_config(IncrementalIndexingConfig {
+                file_batch_size: 1,
+                ..IncrementalIndexingConfig::default()
+            });
+        indexer.run(&mut storage, &baseline_plan, &EventBus::new(), None)?;
+        assert!(
+            storage
+                .get_edges()?
+                .iter()
+                .any(|edge| { edge.kind == EdgeKind::CALL && edge.resolved_target.is_some() })
+        );
+        assert!(!storage.get_errors(None)?.is_empty());
+        assert!(!storage.get_index_artifact_cache_entries()?.is_empty());
+        let before = projection_snapshot(&storage)?;
+        let plan = codestory_workspace::RefreshExecutionPlan {
+            mode,
+            existing_file_ids: storage
+                .get_files()?
+                .into_iter()
+                .map(|file| (file.path, file.id))
+                .collect(),
+            ..baseline_plan.clone()
+        };
+        assert!(
+            !plan.existing_file_ids.is_empty(),
+            "{label}: populated store"
+        );
+        let preparing = Arc::new(AtomicBool::new(false));
+        let setup_reads = Arc::new(AtomicUsize::new(0));
+        let authorizer_preparing = preparing.clone();
+        let authorizer_reads = setup_reads.clone();
+        storage
+            .get_connection()
+            .authorizer(Some(move |context: AuthContext<'_>| {
+                if matches!(
+                    context.action,
+                    AuthAction::Read {
+                        table_name: "node",
+                        ..
+                    }
+                ) && !authorizer_preparing.load(Ordering::SeqCst)
+                {
+                    authorizer_reads.fetch_add(1, Ordering::SeqCst);
+                    Authorization::Deny
+                } else {
+                    Authorization::Allow
+                }
+            }))?;
+        let prepare_boundary = preparing.clone();
+        let indexer = indexer.with_pipeline_test_hooks(FullRefreshPipelineTestHooks {
+            before_prepare_chunk: Some(Arc::new(move |_| {
+                prepare_boundary.store(true, Ordering::SeqCst);
+            })),
+            ..FullRefreshPipelineTestHooks::default()
+        });
+        let result = indexer.run(&mut storage, &plan, &EventBus::new(), None);
+        storage
+            .get_connection()
+            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)?;
+        if mode == BuildMode::Incremental {
+            let error = result.expect_err("incremental must discover prior projections");
+            assert!(
+                error
+                    .to_string()
+                    .contains("Storage file identity lookup error"),
+                "{label}: unexpected failure: {error:#}"
+            );
+            assert!(setup_reads.load(Ordering::SeqCst) > 0, "{label}");
+            assert!(!preparing.load(Ordering::SeqCst), "{label}");
+        } else {
+            match result {
+                Ok(stats) => {
+                    assert_eq!(setup_reads.load(Ordering::SeqCst), 0, "{label}");
+                    assert!(preparing.load(Ordering::SeqCst), "{label}");
+                    assert_eq!(stats.full_refresh_queue_capacity, usize::from(file_backed));
+                    assert!(stats.graph_projection_changed, "{label}");
+                    assert!(stats.resolution_ran, "{label}");
+                }
+                Err(error) => unexpected_full_failures.push(format!("{label}: {error:#}")),
+            }
+        }
+        assert_eq!(
+            projection_snapshot(&storage)?,
+            before,
+            "{label}: projections changed"
+        );
+    }
+    assert!(
+        unexpected_full_failures.is_empty(),
+        "full refresh must not read unused predecessor identities before preparation: {}",
+        unexpected_full_failures.join("; ")
+    );
+    Ok(())
+}
+
+#[test]
 fn test_file_backed_full_refresh_uses_bounded_projection_pipeline() -> Result<()> {
     use codestory_store::Store as Storage;
     use std::fs;

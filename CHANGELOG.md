@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Full repository reindexing avoids redundant file lookups before rebuilding the index.
+
 - Bash call navigation handles commands inside prefix assignments without interrupting indexing or losing links between repeated calls on the same line. Existing Bash indexes rebuild on their next refresh.
 
 - Repository navigation stays available when a structural file has unsupported text bytes, while that file keeps explicit incomplete coverage and no source projection.

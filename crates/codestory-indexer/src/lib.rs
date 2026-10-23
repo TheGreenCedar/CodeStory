@@ -1971,13 +1971,16 @@ impl WorkspaceIndexer {
         let cancelled = Arc::new(AtomicBool::new(false));
         let root = self.root.clone();
         let existing_projection_setup_started = Instant::now();
-        let existing_projection_ids = plan.existing_file_ids.clone();
-        let existing_projection_file_ids = Self::existing_projection_file_ids(
-            storage,
-            &root,
-            &plan.files_to_index,
-            &existing_projection_ids,
-        )?;
+        let existing_projection_file_ids = match plan.mode {
+            // Full-refresh preparation and persistence do not consult predecessor IDs.
+            codestory_workspace::BuildMode::FullRefresh => HashSet::new(),
+            codestory_workspace::BuildMode::Incremental => Self::existing_projection_file_ids(
+                storage,
+                &root,
+                &plan.files_to_index,
+                &plan.existing_file_ids,
+            )?,
+        };
         stats.setup_existing_projection_ids_ms =
             duration_ms_u64(existing_projection_setup_started.elapsed());
         if Self::is_cancelled(cancel_token) {
