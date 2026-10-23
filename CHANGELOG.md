@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Failed indexing reports repeat less run metadata while retaining every progress and cancellation detail.
+
 - Full repository reindexing avoids redundant file lookups before rebuilding the index.
 
 - Bash call navigation handles commands inside prefix assignments without interrupting indexing or losing links between repeated calls on the same line. Existing Bash indexes rebuild on their next refresh.
