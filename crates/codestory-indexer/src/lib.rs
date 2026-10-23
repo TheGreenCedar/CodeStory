@@ -1435,14 +1435,22 @@ impl<'a> ProjectionWriter<'a> {
     }
 
     fn accept_storage(&mut self, mut local_storage: IntermediateStorage) -> Result<()> {
-        // A verified malformed snapshot replaces the old projection with source
-        // identity only. An operational failure cannot authorize that removal.
-        let verified_malformed = !local_storage.file_content_hashes.is_empty()
-            && !local_storage.errors.is_empty()
-            && local_storage
-                .errors
-                .iter()
-                .all(|error| error.coverage_reason == Some(FileCoverageReason::Malformed));
+        // Verified format/encoding rejection replaces the old projection with
+        // source identity only. Operational failures cannot authorize removal.
+        let verified_rejected_source = !local_storage.errors.is_empty()
+            && local_storage.files.first().is_some_and(|file| {
+                local_storage
+                    .file_content_hashes
+                    .iter()
+                    .any(|hash| hash.file_id == file.id)
+                    && local_storage.errors.iter().all(|error| {
+                        error.file_id == Some(NodeId(file.id))
+                            && matches!(
+                                error.coverage_reason,
+                                Some(FileCoverageReason::Malformed | FileCoverageReason::Binary)
+                            )
+                    })
+            });
         let mut source_identity_only = false;
         if let Some((file_id, file_complete, file_path)) = local_storage
             .files
@@ -1461,7 +1469,7 @@ impl<'a> ProjectionWriter<'a> {
                 .storage
                 .get_callable_projection_states_for_file(file_id)
                 .map_err(|e| anyhow!("Storage state lookup error: {:?}", e))?;
-            let replace_file_owned_projection = verified_malformed
+            let replace_file_owned_projection = verified_rejected_source
                 || !local_storage.structural_text_projections.is_empty()
                 || local_storage
                     .files
@@ -1561,7 +1569,7 @@ impl<'a> ProjectionWriter<'a> {
                 retain_file_identity_rows(&mut local_storage, file_id, false);
                 self.stats.source_identity_only_files =
                     self.stats.source_identity_only_files.saturating_add(1);
-            } else if !file_complete && !verified_malformed {
+            } else if !file_complete && !verified_rejected_source {
                 // An unreadable, drifting, oversized, or parser-partial source is retry
                 // evidence, not proof that its previous symbols disappeared. Preserve the
                 // last verified projection and update only the file/error rows below.
@@ -3692,9 +3700,30 @@ impl WorkspaceIndexer {
                 },
             )
         })?;
+        // Metadata can become stale during the read. A decoder rejection must
+        // not bypass the actual raw-byte policy bound.
+        if bytes.len() as u64 > self.structural_source_byte_cap {
+            return Err(incomplete_file_storage(
+                &full_path,
+                None,
+                language,
+                codestory_contracts::graph::ErrorInfo {
+                    message: format!(
+                        "Structural source {:?} exceeds the {} byte raw source limit",
+                        path, self.structural_source_byte_cap
+                    ),
+                    file_id: None,
+                    line: None,
+                    column: None,
+                    is_fatal: false,
+                    index_step: codestory_contracts::graph::IndexStep::Indexing,
+                    coverage_reason: Some(FileCoverageReason::Oversized),
+                },
+            ));
+        }
         let content_hash = source_content_hash(&bytes);
         let source = structural::decode_structural_source(&bytes).map_err(|error| {
-            incomplete_file_storage(
+            let rejected = incomplete_file_storage(
                 &full_path,
                 None,
                 language,
@@ -3707,11 +3736,10 @@ impl WorkspaceIndexer {
                     index_step: codestory_contracts::graph::IndexStep::Indexing,
                     coverage_reason: Some(FileCoverageReason::Binary),
                 },
-            )
+            );
+            verify_rejected_source_snapshot(rejected, &full_path, language, &content_hash)
         })?;
-        if bytes.len() as u64 > self.structural_source_byte_cap
-            || source.len() as u64 > self.structural_source_byte_cap
-        {
+        if source.len() as u64 > self.structural_source_byte_cap {
             return Err(incomplete_file_storage(
                 &full_path,
                 None,
@@ -4269,25 +4297,12 @@ impl WorkspaceIndexer {
                     },
                 );
                 if reason == FileCoverageReason::Malformed {
-                    match verify_source_snapshot(
+                    local_storage = verify_rejected_source_snapshot(
+                        local_storage,
                         &prepared_input.full_path,
+                        language,
                         &prepared_input.content_hash,
-                    ) {
-                        Ok(modification_time) => {
-                            let file = &mut local_storage.files[0];
-                            file.modification_time = modification_time;
-                            local_storage.file_content_hashes.push(
-                                codestory_store::FileContentHash {
-                                    file_id: file.id,
-                                    content_hash: prepared_input.content_hash.clone(),
-                                },
-                            );
-                        }
-                        Err(error) => {
-                            local_storage =
-                                changed_source_storage(&prepared_input.full_path, language, error);
-                        }
-                    }
+                    );
                 }
                 return PreparedIndexJobResult {
                     local_storage,
@@ -4492,6 +4507,30 @@ fn verify_source_snapshot(path: &Path, expected_hash: &str) -> Result<i64> {
     Ok(codestory_workspace::clamp_system_time_to_epoch_millis(
         after.modified()?,
     ))
+}
+
+// A stable rejection has no projection, but its raw source identity must meet
+// the same preparation and publication fences as decoded structural input.
+fn verify_rejected_source_snapshot(
+    mut storage: IntermediateStorage,
+    path: &Path,
+    language: &str,
+    content_hash: &str,
+) -> IntermediateStorage {
+    match verify_source_snapshot(path, content_hash) {
+        Ok(modification_time) => {
+            let file = &mut storage.files[0];
+            file.modification_time = modification_time;
+            storage
+                .file_content_hashes
+                .push(codestory_store::FileContentHash {
+                    file_id: file.id,
+                    content_hash: content_hash.to_owned(),
+                });
+            storage
+        }
+        Err(error) => changed_source_storage(path, language, error),
+    }
 }
 
 fn workspace_structural_source_exclusion(

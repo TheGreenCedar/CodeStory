@@ -9142,7 +9142,7 @@ fn full_and_incremental_publications_advance_one_durable_generation() {
 }
 
 #[test]
-fn encoded_structural_generations_bind_raw_bytes_reuse_cache_and_preserve_publication() {
+fn encoded_structural_generations_bind_raw_bytes_reuse_cache_and_keep_rejections_explicit() {
     use sha2::{Digest, Sha256};
     let process_cache = tempfile::tempdir().unwrap();
     let workspace = tempdir().unwrap();
@@ -9214,24 +9214,48 @@ fn encoded_structural_generations_bind_raw_bytes_reuse_cache_and_preserve_public
         structural_live_identity(&storage_path).cache_rows,
         previous.cache_rows
     );
-    let retained = structural_live_identity(&storage_path);
+    // Strict decoder rejection remains a Binary gap, not exact source; the
+    // authenticated opaque identity no longer blocks unrelated publication.
     for invalid in [
         vec![0xff, 0xfe, 0x41],
         vec![0xfe, 0xff, 0xd8, 0x00],
         vec![0xff, 0xfe, 0, 0],
     ] {
-        fs::write(&path, invalid).unwrap();
-        let error = controller
+        fs::write(&path, &invalid).unwrap();
+        controller
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
-            .unwrap_err();
-        assert_eq!(error.code, "source_binary");
-        assert_eq!(structural_live_identity(&storage_path), retained);
+            .expect("verified opaque input remains explicitly incomplete");
+        let storage = Store::open_read_only(&storage_path).unwrap();
+        let file = storage.get_file_by_path(&path).unwrap().unwrap();
+        assert!(!file.complete);
+        assert_eq!(
+            storage.get_file_content_hash(file.id).unwrap(),
+            Some(format!("{:x}", Sha256::digest(&invalid)))
+        );
+        assert!(
+            crate::stored_file_coverage_diagnostics(workspace.path(), &storage)
+                .unwrap()
+                .iter()
+                .any(|gap| gap.reason == FileCoverageReason::Binary
+                    && gap.verified_source
+                    && !gap.projection_available)
+        );
+        assert!(
+            !storage
+                .get_structural_text_projection_file_ids()
+                .unwrap()
+                .contains(&file.id)
+        );
+        assert!(matches!(
+            crate::search_evidence::verified_file_checked(&storage, Some(workspace.path()), &file),
+            Err(crate::search_evidence::VerifiedFileError::Unavailable)
+        ));
         assert_no_staged_publication_artifacts(&storage_path);
     }
 }
 
 #[test]
-fn structural_full_generations_reuse_unchanged_cache_and_preserve_previous_on_invalid_input() {
+fn structural_full_generations_reuse_cache_and_keep_explicit_rejected_source_gaps() {
     let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = tempdir().expect("workspace dir");
     let markdown_path = workspace.path().join("guide.md");
@@ -9393,29 +9417,28 @@ fn structural_full_generations_reuse_unchanged_cache_and_preserve_previous_on_in
     assert_eq!(structural_before_failure.cache_rows.len(), 2);
 
     fs::write(&markdown_path, [0xff, 0xfe, 0xfd]).expect("write invalid utf8");
-    let error = controller
+    controller
         .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
-        .expect_err("invalid structural input must fail closed");
-    assert_eq!(error.code, "source_binary");
-    assert!(error.details.as_ref().is_some_and(|details| {
-        details
-            .coverage_gaps
+        .expect("verified opaque structural input retains an identity-only gap");
+    let rejected_publication = Store::database_index_publication(&storage_path)
+        .expect("read rejected-source publication")
+        .expect("unrelated source remains published");
+    assert_eq!(rejected_publication.generation, third.generation + 1);
+    let storage = Store::open_read_only(&storage_path).unwrap();
+    let manifest = storage
+        .validate_structural_text_unit_publication(&rejected_publication)
+        .unwrap();
+    assert_eq!(manifest.projection_count, 1, "only valid JSON is projected");
+    assert!(
+        crate::stored_file_coverage_diagnostics(workspace.path(), &storage)
+            .unwrap()
             .iter()
-            .any(|gap| gap.reason == FileCoverageReason::Binary)
-    }));
-    let preserved = Store::database_index_publication(&storage_path)
-        .expect("read preserved publication")
-        .expect("preserved publication");
-    assert_eq!(preserved, third);
-    Store::open_read_only(&storage_path)
-        .expect("open preserved publication")
-        .validate_structural_text_unit_publication(&preserved)
-        .expect("previous structural manifest remains valid");
-    assert_eq!(
-        structural_live_identity(&storage_path),
-        structural_before_failure,
-        "collector failure changed the prior structural manifest or cache identity"
+            .any(|gap| gap.path == "guide.md"
+                && gap.reason == FileCoverageReason::Binary
+                && gap.verified_source
+                && !gap.projection_available)
     );
+    drop(storage);
     assert_no_staged_publication_artifacts(&storage_path);
 
     fs::write(&markdown_path, "# Replacement\n").expect("restore markdown");

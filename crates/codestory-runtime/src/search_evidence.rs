@@ -242,9 +242,17 @@ fn verified_file_read(
     if format!("{:x}", Sha256::digest(&bytes)) != expected_hash {
         return Err(VerifiedFileError::Stale);
     }
+    // A verified raw hash does not qualify opaque structural bytes as exact
+    // indexed text. Use the same strict decoding contract as their collector.
+    // Ordinary current-path readers have a separate, unindexed contract.
+    let content = if codestory_indexer::structural::is_structural_candidate_path(&path) {
+        codestory_contracts::source_text::decode_structural_text(&bytes)
+    } else {
+        codestory_contracts::source_text::decode_source_text(&path, &bytes)
+    }
+    .map_err(|_| VerifiedFileError::Unavailable)?;
     Ok(VerifiedSourceFile {
-        content: codestory_contracts::source_text::decode_source_text(&path, &bytes)
-            .map_err(|_| VerifiedFileError::Unavailable)?,
+        content,
         content_sha256: expected_hash,
         path,
     })

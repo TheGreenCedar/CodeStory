@@ -151,7 +151,11 @@ in different encodings is different source. Both raw and decoded bytes obey the
 source cap. Unpaired surrogates, odd payloads, bare UTF-16 BOMs, decoded binary
 controls, unknown encodings, malformed format syntax, and unreadable sources
 retain distinct coverage reasons and do not create reusable structural cache
-entries.
+entries. A fully read, within-cap decoding rejection can retain a reverified raw
+identity with an incomplete `binary` gap and no projection. It may coexist with
+unrelated published source; it is never decoded by guessing or replacement.
+Both the preparation and publication fences verify the original bytes, and
+indexed text readers preserve the strict structural decoding contract.
 
 ## Resolution and Semantic Fallback
 
