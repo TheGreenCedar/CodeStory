@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Indexing avoids repeated proof-publication sorting while preserving published records and digests.
+
 - Indexing avoids duplicate proof seal checks while retaining source and graph verification.
 
 - Repository indexing avoids repeated import lookups while preserving per-file resolution.
