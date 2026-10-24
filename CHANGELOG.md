@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Repository indexing avoids repeated import lookups while preserving per-file resolution.
+
 - Go indexing avoids redundant scope lookups while preserving variable shadowing and call resolution.
 
 - Failed indexing reports repeat less run metadata while retaining every progress and cancellation detail.
