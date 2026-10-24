@@ -628,13 +628,18 @@ fn collect_go_local_composite_receiver_call_specs(
                 method_name,
             });
         }
-        #[cfg(test)]
-        GO_LOCAL_SCOPE_LOOKUPS.with(|work| work.set(work.get().saturating_add(1)));
-        let Some(scope_end) = go_navigation_binding_scope(node, callable) else {
-            return;
-        };
         match node.kind() {
             "short_var_declaration" | "assignment_statement" => {
+                let scope_end = if node.kind() == "assignment_statement" {
+                    callable.end_byte()
+                } else {
+                    #[cfg(test)]
+                    GO_LOCAL_SCOPE_LOOKUPS.with(|work| work.set(work.get().saturating_add(1)));
+                    let Some(scope_end) = go_navigation_binding_scope(node, callable) else {
+                        return;
+                    };
+                    scope_end
+                };
                 let left = node
                     .child_by_field_name("left")
                     .map(go_expression_list_items)
@@ -709,11 +714,7 @@ fn collect_go_local_composite_receiver_call_specs(
                     intervals.push(GoNavigationBindingInterval {
                         name,
                         start_byte: node.end_byte(),
-                        end_byte: if node.kind() == "assignment_statement" {
-                            callable.end_byte()
-                        } else {
-                            scope_end
-                        },
+                        end_byte: scope_end,
                         binding_priority: if node.kind() == "assignment_statement"
                             && owner.is_none()
                         {
@@ -727,6 +728,11 @@ fn collect_go_local_composite_receiver_call_specs(
             }
             "var_spec" => {
                 let Some(type_node) = node.child_by_field_name("type") else {
+                    return;
+                };
+                #[cfg(test)]
+                GO_LOCAL_SCOPE_LOOKUPS.with(|work| work.set(work.get().saturating_add(1)));
+                let Some(scope_end) = go_navigation_binding_scope(node, callable) else {
                     return;
                 };
                 let owner = trimmed_node_text(type_node, source)
@@ -752,6 +758,11 @@ fn collect_go_local_composite_receiver_call_specs(
                 }
             }
             "const_spec" | "type_spec" => {
+                #[cfg(test)]
+                GO_LOCAL_SCOPE_LOOKUPS.with(|work| work.set(work.get().saturating_add(1)));
+                let Some(scope_end) = go_navigation_binding_scope(node, callable) else {
+                    return;
+                };
                 for name in go_navigation_declared_names(node, source) {
                     intervals.push(GoNavigationBindingInterval {
                         name,
@@ -2067,6 +2078,101 @@ mod complexity_tests {
         assert_eq!(
             shallow.0, nested.0,
             "irrelevant parentheses added navigation ancestry"
+        );
+    }
+
+    #[test]
+    fn go_local_scope_lookups_ignore_nonbinding_identifier_uses() {
+        let measure = |identifier_uses: bool| {
+            let mut source = String::from(
+                r#"package proof
+import pkg "example.com/worker"
+type Worker struct{}
+func (w *Worker) Run() {}
+func (w *Worker) WithCapture() {
+    func() { w.Run() }()
+    w.Run()
+}
+func caller(v int) {
+    fresh := &Worker{}
+    fresh.Run()
+    pkg.New()
+    shadow := &Worker{}
+    { shadow := 1; _ = shadow }
+    shadow.Run()
+    escaped := &Worker{}
+    _ = &escaped
+    escaped.Run()
+    captured := &Worker{}
+    func() { captured.Run() }()
+"#,
+            );
+            // Same byte widths and line counts keep every output span stable.
+            // Identifier reads still require the existing capture analysis,
+            // but their scope_end value is not consumed by any binding branch.
+            for _ in 0..64 {
+                source.push_str(if identifier_uses {
+                    "    _ = v\n"
+                } else {
+                    "    _ = 0\n"
+                });
+            }
+            source.push_str("}\n");
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_go::LANGUAGE.into())
+                .expect("Go grammar");
+            let tree = parser.parse(&source, None).expect("Go source");
+            assert!(!tree.root_node().has_error(), "valid Go fixture");
+            GO_LOCAL_SCOPE_LOOKUPS.with(|work| work.set(0));
+            let specs = receiver_call_specs(&tree, &source);
+            let scope_lookups = GO_LOCAL_SCOPE_LOOKUPS.with(std::cell::Cell::get);
+            for receiver in ["fresh", "shadow", "w"] {
+                assert!(
+                    specs.iter().any(|spec| spec.receiver_name == receiver
+                        && spec.owner_name == "Worker"
+                        && spec.method_name == "Run"
+                        && spec.owner_module.is_none()),
+                    "concrete receiver {receiver} must survive capture and scope restoration"
+                );
+            }
+            assert!(specs.iter().any(|spec| spec.receiver_name == "pkg"
+                && spec.method_name == "New"
+                && spec.owner_module.as_deref() == Some("example.com/worker")
+                && spec.binding_marker.as_deref() == Some(PACKAGE_FUNCTION_CALLSITE_MARKER)));
+            assert!(
+                !specs
+                    .iter()
+                    .any(|spec| { matches!(spec.receiver_name.as_str(), "escaped" | "captured") }),
+                "address escape and local capture must remain blocked"
+            );
+            // Preserve every field and its order, including coordinates and
+            // receiver/certainty flags, for the same-fixture RED/GREEN audit.
+            let complete_specs = format!("{specs:#?}");
+            eprintln!("GO_LOCAL_SCOPE_DEMAND_LOOKUPS {identifier_uses} {scope_lookups}");
+            eprintln!(
+                "GO_LOCAL_SCOPE_DEMAND_SOURCE {identifier_uses} {}",
+                serde_json::to_string(&source).expect("complete source")
+            );
+            eprintln!(
+                "GO_LOCAL_SCOPE_DEMAND_OUTPUT {identifier_uses} {}",
+                serde_json::to_string(&complete_specs).expect("complete specs")
+            );
+            (scope_lookups, complete_specs)
+        };
+        let literals = measure(false);
+        let identifiers = measure(true);
+        assert_eq!(
+            literals.1, identifiers.1,
+            "complete navigation specs changed"
+        );
+        assert!(
+            literals.0 > 0,
+            "real scope-bearing bindings must contribute"
+        );
+        assert_eq!(
+            literals.0, identifiers.0,
+            "nonbinding identifier reads added unused scope-end lookups"
         );
     }
 
