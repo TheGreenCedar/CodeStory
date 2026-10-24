@@ -4,16 +4,16 @@ use super::{
     ApiError, CancellationToken, EmbeddingProfileContractDto, FileLockKind,
     HYBRID_RETRIEVAL_ENABLED_ENV, HashMap, IndexPublicationRecord, Instant, LockDeadline,
     OwnedDeletionRoot, PUBLICATION_LOCK_WAIT, Path, PathBuf, RetrievalFallbackReasonDto,
-    RetrievalModeDto, RetrievalStateDto, SearchEngine, SearchSymbolProjection, SemanticModeDto,
-    Storage, Store, StoredSemanticDocsContractDto, UNIX_EPOCH, Uuid, acquire_with_deadline,
-    bounded_locks, clamp_u128_to_u32, clamp_usize_to_u32,
-    embedding_runtime_availability_from_config, indexing_cancelled_error, is_indexing_cancelled,
-    open_storage_for_read,
+    RetrievalModeDto, RetrievalStateDto, SearchEngine, SemanticModeDto, Storage, Store,
+    StoredSemanticDocsContractDto, UNIX_EPOCH, Uuid, acquire_with_deadline, bounded_locks,
+    clamp_u128_to_u32, clamp_usize_to_u32, embedding_runtime_availability_from_config,
+    indexing_cancelled_error, is_indexing_cancelled, open_storage_for_read,
 };
 use crate::semantic_projection::{
     SEARCH_SYMBOL_STREAM_BATCH_SIZE, SearchStateBuildStats, current_embedding_contract_for_runtime,
     load_persisted_semantic_docs_for_runtime,
 };
+use codestory_store::SearchSymbolProjectionDetail;
 use serde::{Deserialize, Serialize};
 
 pub(super) fn search_index_storage_path(storage_path: &Path) -> PathBuf {
@@ -473,7 +473,7 @@ pub(super) fn load_canonical_search_symbols(
     storage: &Storage,
     batch_size: usize,
     cancel_token: Option<&CancellationToken>,
-    mut consume_batch: impl FnMut(Vec<SearchSymbolProjection>) -> Result<(), ApiError>,
+    mut consume_batch: impl FnMut(Vec<SearchSymbolProjectionDetail>) -> Result<(), ApiError>,
 ) -> Result<
     (
         HashMap<codestory_contracts::graph::NodeId, String>,
@@ -496,7 +496,7 @@ pub(super) fn load_canonical_search_symbols(
     loop {
         let batch_started = Instant::now();
         let batch = storage
-            .get_canonical_search_symbol_batch_after(after_node_id, batch_size)
+            .get_canonical_search_symbol_detail_batch_after(after_node_id, batch_size)
             .map_err(|e| {
                 ApiError::internal(format!("Failed to stream canonical search symbols: {e}"))
             })?;
@@ -576,11 +576,13 @@ pub(super) fn load_persisted_search_state_for_runtime(
         })?;
         let (node_names, _) = load_canonical_search_symbols(storage, 10_000, None, |batch| {
             symbol_session
-                .add_nodes(
-                    batch
-                        .into_iter()
-                        .map(|entry| (entry.node_id, entry.display_name)),
-                )
+                .add_nodes_with_eligibility(batch.into_iter().map(|entry| {
+                    (
+                        entry.node_id,
+                        entry.display_name,
+                        crate::search::engine::symbol_kind_is_searchable(entry.node_kind),
+                    )
+                }))
                 .map(|_| ())
                 .map_err(|error| {
                     ApiError::internal(format!("Failed to index legacy search nodes: {error}"))
@@ -623,11 +625,13 @@ pub(super) fn load_persisted_search_state_for_runtime(
     engine.load_symbol_projection(std::iter::empty());
     let (node_names, stream_stats) =
         load_canonical_search_symbols(storage, SEARCH_SYMBOL_STREAM_BATCH_SIZE, None, |batch| {
-            engine.extend_symbol_projection(
-                batch
-                    .into_iter()
-                    .map(|entry| (entry.node_id, entry.display_name)),
-            );
+            engine.extend_symbol_projection_with_eligibility(batch.into_iter().map(|entry| {
+                (
+                    entry.node_id,
+                    entry.display_name,
+                    crate::search::engine::symbol_kind_is_searchable(entry.node_kind),
+                )
+            }));
             Ok(())
         })?;
     let completion_count_mismatch = completion.as_ref().is_some_and(|marker| {

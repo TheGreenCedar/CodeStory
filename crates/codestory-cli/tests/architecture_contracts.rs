@@ -2633,7 +2633,7 @@ fn product_search_builds_stream_canonical_nodes_without_legacy_projection_rebuil
 
     assert!(
         persisted_builder.contains("get_canonical_search_symbol_count()")
-            && persisted_builder.contains("get_canonical_search_symbol_batch_after(")
+            && persisted_builder.contains("get_canonical_search_symbol_detail_batch_after(")
             && persisted_builder.contains("engine.begin_symbol_index()")
             && runtime_rebuild.contains("build_persisted_search_state_from_canonical_symbols("),
         "persisted product search should stream canonical node pages through one symbol writer"

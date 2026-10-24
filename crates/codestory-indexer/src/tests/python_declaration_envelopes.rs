@@ -1,6 +1,163 @@
 use super::*;
 
 #[test]
+fn python_reference_occurrences_preserve_declarations_and_grounding_owners() -> Result<()> {
+    let sources = [
+        (
+            "owners.py",
+            "class Base:\n    pass\n\nclass Box(Base):\n    @property\n    def value(self):\n        return self._value\n\n    @classmethod\n    def create(cls, value):\n        result = cls()\n        result._value = value\n        return result\n\n    @staticmethod\n    def normalize(value):\n        return str(value).strip()\n\nclass Failure(Exception):\n    pass\n\ndef plain(value):\n    return Box.normalize(value)\n",
+        ),
+        (
+            "mixed.py",
+            "import plugins\n\ndef property(fn):\n    return fn\n\nclass LocalBase:\n    pass\n\nclass Child(LocalBase, plugins.Base):\n    @property\n    @plugins.trace('label')\n    def run(self):\n        return 1\n",
+        ),
+    ];
+    let dir = tempdir()?;
+    let paths = sources
+        .iter()
+        .map(|(name, source)| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, source)?;
+            Ok(path)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut store = Storage::new_in_memory()?;
+    WorkspaceIndexer::new(dir.path().to_path_buf()).run_incremental(
+        &mut store,
+        &codestory_workspace::RefreshInfo {
+            mode: codestory_workspace::BuildMode::Incremental,
+            files_to_index: paths.clone(),
+            files_to_remove: vec![],
+            existing_file_ids: HashMap::new(),
+        },
+        &EventBus::new(),
+        None,
+    )?;
+    let nodes = store.get_nodes()?;
+    let edges = store.get_edges()?;
+    let file_ids = paths
+        .iter()
+        .map(|path| store.get_file_by_path(path).map(|file| file.unwrap().id))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let all_occurrences = store.get_occurrences()?;
+    let node = |file: usize, name: &str, line: u32| {
+        let file_id = file_ids[file];
+        nodes
+            .iter()
+            .find(|node| {
+                node.file_node_id == Some(NodeId(file_id))
+                    && node_matches_name(node, name)
+                    && all_occurrences
+                        .iter()
+                        .any(|occ| occ.element_id == node.id.0 && occ.location.start_line == line)
+            })
+            .unwrap_or_else(|| panic!("missing {name}:{line} in {:?}", paths[file]))
+    };
+    for (file, name, line) in [
+        (0, "property", 5),
+        (0, "classmethod", 9),
+        (0, "staticmethod", 15),
+        (0, "Exception", 19),
+        (0, "Base", 4),
+        (1, "property", 10),
+        (1, "LocalBase", 9),
+        (1, "plugins.Base", 9),
+    ] {
+        let target = node(file, name, line);
+        let occurrences = store.get_occurrences_for_node(target.id)?;
+        assert!(occurrences.iter().any(|occ| occ.location.start_line == line && occ.kind == OccurrenceKind::REFERENCE),
+            "{name}:{line} must remain reference evidence: {occurrences:?}");
+        assert!(
+            !occurrences.iter().any(
+                |occ| occ.location.start_line == line && occ.kind == OccurrenceKind::DEFINITION
+            ),
+            "{name}:{line} is not a local definition"
+        );
+    }
+    for (file, name, line) in [
+        (0, "Base", 1),
+        (0, "Box", 4),
+        (0, "value", 6),
+        (0, "create", 10),
+        (0, "normalize", 16),
+        (0, "Failure", 19),
+        (0, "plain", 22),
+        (1, "property", 3),
+        (1, "LocalBase", 6),
+        (1, "Child", 9),
+        (1, "run", 12),
+    ] {
+        let owner = node(file, name, line);
+        assert!(
+            store
+                .get_occurrences_for_node(owner.id)?
+                .iter()
+                .any(
+                    |occ| occ.kind == OccurrenceKind::DEFINITION && occ.location.start_line == line
+                ),
+            "{name}:{line} retains its real declaration; selected={owner:?}, occurrences={:?}, matching={:?}",
+            store.get_occurrences_for_node(owner.id)?,
+            nodes
+                .iter()
+                .filter(|n| n.file_node_id == owner.file_node_id && node_matches_name(n, name))
+                .collect::<Vec<_>>()
+        );
+    }
+    for (file, owner, owner_line, target, target_line, kind) in [
+        (0, "Box", 4, "Base", 4, EdgeKind::INHERITANCE),
+        (0, "Failure", 19, "Exception", 19, EdgeKind::INHERITANCE),
+        (0, "value", 6, "property", 5, EdgeKind::CALL),
+        (0, "create", 10, "classmethod", 9, EdgeKind::CALL),
+        (0, "normalize", 16, "staticmethod", 15, EdgeKind::CALL),
+        (1, "Child", 9, "plugins.Base", 9, EdgeKind::INHERITANCE),
+        (1, "run", 12, "property", 10, EdgeKind::CALL),
+    ] {
+        assert!(
+            edges.iter().any(|edge| edge.kind == kind
+                && edge.source == node(file, owner, owner_line).id
+                && edge.target == node(file, target, target_line).id),
+            "{owner} -> {target} retains {kind:?}"
+        );
+    }
+    for snapshot in [false, true] {
+        if snapshot {
+            store.refresh_grounding_snapshots()?;
+        }
+        let roots = store.get_grounding_root_symbol_candidates(100, 0)?;
+        for (name, line) in [
+            ("property", 5),
+            ("classmethod", 9),
+            ("staticmethod", 15),
+            ("Exception", 19),
+        ] {
+            assert!(
+                !roots
+                    .iter()
+                    .any(|root| root.node.id == node(0, name, line).id),
+                "reference-only {name} is not an owner ({snapshot})"
+            );
+        }
+        for (file, name, line) in [
+            (0, "Base", 1),
+            (0, "Box", 4),
+            (0, "Failure", 19),
+            (0, "plain", 22),
+            (1, "property", 3),
+            (1, "LocalBase", 6),
+            (1, "Child", 9),
+        ] {
+            assert!(
+                roots
+                    .iter()
+                    .any(|root| root.node.id == node(file, name, line).id),
+                "real {name} remains an owner ({snapshot})"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn python_callable_declarations_join_exact_core_and_execution_body_spans() -> Result<()> {
     let cases = [
         ("plain", "def worker():\n    pass\n", 1, 2, 2, 1),

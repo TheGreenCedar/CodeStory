@@ -36,6 +36,8 @@ mod bookmarks;
 mod core_retention;
 mod helpers;
 mod proof_resolution;
+mod public_exports;
+pub use public_exports::{PUBLIC_EXPORT_ALIAS_PRODUCER_VERSION, PublicExportAliasQuery};
 mod retrieval_manifest;
 mod row_mapping;
 mod schema;
@@ -88,10 +90,11 @@ const CANONICAL_SUFFIX_SCHEMA_VERSION: u32 = 34;
 const ATTACHED_COMMENT_SCHEMA_VERSION: u32 = 35;
 const PROOF_RESOLUTION_FK_INDEX_SCHEMA_VERSION: u32 = 36;
 const FILE_EXTRACTION_IDENTITY_SCHEMA_VERSION: u32 = 37;
-const SCHEMA_VERSION: u32 = FILE_EXTRACTION_IDENTITY_SCHEMA_VERSION;
+const PUBLIC_EXPORT_ALIAS_SCHEMA_VERSION: u32 = 38;
+const SCHEMA_VERSION: u32 = PUBLIC_EXPORT_ALIAS_SCHEMA_VERSION;
 // v37 only adds file extraction identity; retention's manifest/pointer
 // projection is unchanged. Keep this ceiling explicit across future bumps.
-const RETENTION_PUBLICATION_MAX_CORE_SCHEMA_VERSION: u32 = FILE_EXTRACTION_IDENTITY_SCHEMA_VERSION;
+const RETENTION_PUBLICATION_MAX_CORE_SCHEMA_VERSION: u32 = PUBLIC_EXPORT_ALIAS_SCHEMA_VERSION;
 // Reserved outside the sequential migration range so a future real schema version cannot
 // accidentally be treated as an interrupted run from this release.
 /// The `user_version` sentinel stamped while an incremental index run is
@@ -2155,11 +2158,21 @@ fn grounding_trimmed_name_expr(alias: &str) -> String {
 }
 
 fn grounding_indexable_predicate(alias: &str) -> String {
+    // Missing occurrences remain unknown; exclude only explicit reference-only IDs.
     format!(
-        "{alias}.kind NOT IN ({}, {}, {})",
+        "{alias}.kind NOT IN ({}, {}, {})
+         AND {alias}.id NOT IN (
+             SELECT element_id FROM occurrence WHERE kind = {reference_kind}
+             EXCEPT
+             SELECT element_id FROM occurrence
+             WHERE kind IN ({definition_kind}, {declaration_kind})
+         )",
         NodeKind::FILE as i32,
         NodeKind::UNKNOWN as i32,
-        NodeKind::BUILTIN_TYPE as i32
+        NodeKind::BUILTIN_TYPE as i32,
+        reference_kind = OccurrenceKind::REFERENCE as i32,
+        definition_kind = OccurrenceKind::DEFINITION as i32,
+        declaration_kind = OccurrenceKind::DECLARATION as i32,
     )
 }
 
@@ -3124,7 +3137,8 @@ pub struct FileContentHash {
     pub content_hash: String,
 }
 
-/// Successful extraction identity, committed with the exact file projection.
+/// Verified source and extraction producer, committed with the file projection.
+/// Parser-partial identity does not certify complete coverage or cache reuse.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileExtractionIdentity {
     pub file_id: i64,
@@ -6512,7 +6526,8 @@ impl Storage {
                 "Index publication identity contains an invalid field".to_string(),
             ));
         }
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO index_publication (
                 id, generation, generation_id, run_id, mode, published_at_epoch_ms
              ) VALUES (1, ?1, ?2, ?3, ?4, ?5)
@@ -6530,6 +6545,12 @@ impl Storage {
                 publication.published_at_epoch_ms,
             ],
         )?;
+        tx.execute(
+            "UPDATE public_export_alias_publication SET publication=?1 WHERE id=1",
+            [serde_json::to_string(publication)
+                .map_err(|error| StorageError::Other(error.to_string()))?],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -9028,7 +9049,13 @@ impl Storage {
             let file = batch.files.iter().find(|file| file.id == identity.file_id);
             if !extraction_file_ids.insert(identity.file_id)
                 || !file.is_some_and(|file| {
-                    file.indexed && file.complete && file.language == identity.language
+                    file.indexed
+                        && file.language == identity.language
+                        && (file.complete
+                            || !batch
+                                .file_errors
+                                .iter()
+                                .any(|error| error.file_id == Some(NodeId(identity.file_id))))
                 })
                 || file_content_hashes.get(&identity.file_id).copied()
                     != Some(identity.source_content_hash.as_str())
@@ -9040,7 +9067,7 @@ impl Storage {
                 || identity.extraction_revision.trim().is_empty()
             {
                 return Err(StorageError::Other(format!(
-                    "extraction identity {} does not describe a complete verified file projection",
+                    "extraction identity {} does not describe a verified error-free file extraction",
                     identity.file_id
                 )));
             }
@@ -9598,6 +9625,12 @@ impl Storage {
             projection_scalar_binds(3),
         );
         if !preserve_graph_derived_state {
+            // This family is rebuilt from authenticated source inputs before publication.
+            // Invalidation belongs to the graph/error/dirty transaction.
+            tx.execute("DELETE FROM public_export_alias", [])?;
+            tx.execute("DELETE FROM public_export_alias_publication", [])?;
+            record_projection_statement(&mut breakdown.persistence.dirty_state, 1, 0);
+            record_projection_statement(&mut breakdown.persistence.dirty_state, 1, 0);
             Self::invalidate_resolution_support_snapshot_on(&tx)?;
             record_projection_statement(
                 &mut breakdown.persistence.dirty_state,
@@ -12370,7 +12403,7 @@ impl Storage {
                     summary.model,
                     summary.updated_at_epoch_ms
              FROM symbol_summary summary
-             INNER JOIN llm_symbol_doc doc
+             INNER JOIN symbol_search_doc doc
                 ON doc.node_id = summary.node_id
                AND doc.doc_hash = summary.content_hash
              WHERE summary.node_id IN ({placeholders})
@@ -12402,7 +12435,7 @@ impl Storage {
                     summary.model,
                     summary.updated_at_epoch_ms
              FROM symbol_summary summary
-             INNER JOIN llm_symbol_doc doc
+             INNER JOIN symbol_search_doc doc
                 ON doc.node_id = summary.node_id
                AND doc.doc_hash = summary.content_hash
              ORDER BY summary.node_id ASC",
@@ -15121,6 +15154,73 @@ fn is_common_unqualified_call_name(name: &str) -> bool {
 #[cfg(test)]
 mod grounding_snapshot_fast_path_tests {
     use super::*;
+
+    #[test]
+    fn grounding_excludes_explicit_reference_only_nodes_and_keeps_unknown_or_mixed_authority()
+    -> Result<(), StorageError> {
+        let mut storage = Storage::new_in_memory()?;
+        insert_grounding_test_file(
+            &mut storage,
+            10,
+            "source.rs",
+            &[
+                (101, NodeKind::FUNCTION, "external_callable", 1),
+                (102, NodeKind::CLASS, "ExternalType", 2),
+                (103, NodeKind::FUNCTION, "local_callable", 3),
+                (104, NodeKind::CLASS, "DeclaredType", 4),
+                (105, NodeKind::MODULE, "synthetic_navigation", 5),
+            ],
+        )?;
+        let occurrences = [
+            (101, OccurrenceKind::REFERENCE),
+            (102, OccurrenceKind::REFERENCE),
+            (103, OccurrenceKind::DEFINITION),
+            (103, OccurrenceKind::REFERENCE),
+            (104, OccurrenceKind::DECLARATION),
+            (104, OccurrenceKind::REFERENCE),
+        ]
+        .into_iter()
+        .map(|(id, kind)| Occurrence {
+            element_id: id,
+            kind,
+            location: codestory_contracts::graph::SourceLocation {
+                file_node_id: NodeId(10),
+                start_line: 1,
+                start_col: 1,
+                end_line: 1,
+                end_col: 2,
+            },
+        })
+        .collect::<Vec<_>>();
+        storage.insert_occurrences_batch(&occurrences)?;
+        for snapshot in [false, true] {
+            if snapshot {
+                storage.refresh_grounding_snapshots()?;
+            }
+            let expected = HashSet::from([NodeId(103), NodeId(104), NodeId(105)]);
+            for records in [
+                storage.get_grounding_root_symbol_candidates(20, 0)?,
+                storage.get_grounding_root_symbols_for_files(&[10], 20)?,
+                storage.get_grounding_top_symbols_for_files(&[10], 20)?,
+            ] {
+                assert_eq!(
+                    records
+                        .into_iter()
+                        .map(|r| r.node.id)
+                        .collect::<HashSet<_>>(),
+                    expected,
+                    "reference-only exclusion must agree for roots and file rows ({snapshot})"
+                );
+            }
+            assert_eq!(storage.get_grounding_file_summaries()?[0].symbol_count, 3);
+            assert_eq!(
+                storage.get_occurrences_for_node(NodeId(101))?.len(),
+                1,
+                "reference graph evidence is retained"
+            );
+        }
+        Ok(())
+    }
 
     fn insert_grounding_test_file(
         storage: &mut Storage,

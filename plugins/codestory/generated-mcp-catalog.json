@@ -10,15 +10,15 @@
     ],
     "preferredMcpProtocolVersion": "2025-11-25",
     "discoveryContracts": {
-      "2024-11-05": "f66f5345582da21a98b297b98d9f2e2dab054899746c1aa47a72c786bf1f9e69",
-      "2025-03-26": "dc0d3ed5d1ac887cb36dd65a2fbb5b4e9ae5eb32664522bed42b02830f375299",
-      "2025-06-18": "584297572e40cfb7f98c6e2446b15c2e7af4f01bbcf3a27456ec7e384fa554b8",
-      "2025-11-25": "18ce81099cb0cd0f03dd4050af9a45bbc195fdc4fd7002d7b8721cddb9582cbd"
+      "2024-11-05": "87c0b532e836efc089162255250cffbecb0931cf70b09b605980e4e7da9e88f4",
+      "2025-03-26": "0e2cc4a76c54659819abe07352e55a55f00de37bd2b9593374cff47b208f58aa",
+      "2025-06-18": "235fc9265e8ac4ee1b7dcd53e6070dcdb03b811c952a4e2e41c453a0f420ba26",
+      "2025-11-25": "b26d40ff3d3e177c86b56010d37fb2237d9f24de7eb44c494d4ff530d601a21a"
     }
   },
   "revisionProfiles": {
     "2024-11-05": {
-      "discoveryContractSha256": "f66f5345582da21a98b297b98d9f2e2dab054899746c1aa47a72c786bf1f9e69",
+      "discoveryContractSha256": "87c0b532e836efc089162255250cffbecb0931cf70b09b605980e4e7da9e88f4",
       "tools": [
         {
           "description": "Inspect CodeStory readiness for the requested repository when diagnostics are needed. CodeStory effect: observational and does not activate managed state.",
@@ -614,6 +614,15 @@
                   "resume_operation_id": {
                     "description": "Optional exact preparation operation from a deadline result; pass with resume_operation_attempt.",
                     "maxLength": 128,
+                    "type": "string"
+                  },
+                  "symbol_layout": {
+                    "default": "records",
+                    "description": "Symbol records by default; shared-fields-v1 losslessly factors common fields into shared_fields plus ordered residual rows.",
+                    "enum": [
+                      "records",
+                      "shared-fields-v1"
+                    ],
                     "type": "string"
                   }
                 },
@@ -1919,7 +1928,7 @@
       ]
     },
     "2025-03-26": {
-      "discoveryContractSha256": "dc0d3ed5d1ac887cb36dd65a2fbb5b4e9ae5eb32664522bed42b02830f375299",
+      "discoveryContractSha256": "0e2cc4a76c54659819abe07352e55a55f00de37bd2b9593374cff47b208f58aa",
       "tools": [
         {
           "annotations": {
@@ -2551,6 +2560,15 @@
                   "resume_operation_id": {
                     "description": "Optional exact preparation operation from a deadline result; pass with resume_operation_attempt.",
                     "maxLength": 128,
+                    "type": "string"
+                  },
+                  "symbol_layout": {
+                    "default": "records",
+                    "description": "Symbol records by default; shared-fields-v1 losslessly factors common fields into shared_fields plus ordered residual rows.",
+                    "enum": [
+                      "records",
+                      "shared-fields-v1"
+                    ],
                     "type": "string"
                   }
                 },
@@ -3940,7 +3958,7 @@
       ]
     },
     "2025-06-18": {
-      "discoveryContractSha256": "584297572e40cfb7f98c6e2446b15c2e7af4f01bbcf3a27456ec7e384fa554b8",
+      "discoveryContractSha256": "235fc9265e8ac4ee1b7dcd53e6070dcdb03b811c952a4e2e41c453a0f420ba26",
       "tools": [
         {
           "_meta": {
@@ -7567,6 +7585,15 @@
                     "description": "Optional exact preparation operation from a deadline result; pass with resume_operation_attempt.",
                     "maxLength": 128,
                     "type": "string"
+                  },
+                  "symbol_layout": {
+                    "default": "records",
+                    "description": "Symbol records by default; shared-fields-v1 losslessly factors common fields into shared_fields plus ordered residual rows.",
+                    "enum": [
+                      "records",
+                      "shared-fields-v1"
+                    ],
+                    "type": "string"
                   }
                 },
                 "required": [
@@ -7875,15 +7902,45 @@
                         "type": "array"
                       },
                       "impacted_symbols": {
-                        "description": "Impacted symbol DTOs.",
-                        "items": {
-                          "additionalProperties": true,
-                          "description": "Generic JSON object.",
-                          "properties": {},
-                          "required": [],
-                          "type": "object"
-                        },
-                        "type": "array"
+                        "anyOf": [
+                          {
+                            "description": "Impacted symbol DTOs in order (the default records layout).",
+                            "items": {
+                              "additionalProperties": true,
+                              "description": "Generic JSON object.",
+                              "properties": {},
+                              "required": [],
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          {
+                            "additionalProperties": false,
+                            "description": "Lossless shared-fields-v1 layout. Merge shared_fields into each ordered row to recover the symbol records; absent keys remain absent.",
+                            "properties": {
+                              "rows": {
+                                "description": "Ordered residual symbol records.",
+                                "items": {
+                                  "additionalProperties": true,
+                                  "description": "Generic JSON object.",
+                                  "properties": {},
+                                  "required": [],
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              },
+                              "shared_fields": {
+                                "description": "Fields present with identical JSON values in every symbol record.",
+                                "type": "object"
+                              }
+                            },
+                            "required": [
+                              "shared_fields",
+                              "rows"
+                            ],
+                            "type": "object"
+                          }
+                        ]
                       },
                       "impacted_tests": {
                         "description": "Likely impacted test file DTOs.",
@@ -14750,7 +14807,7 @@
       ]
     },
     "2025-11-25": {
-      "discoveryContractSha256": "18ce81099cb0cd0f03dd4050af9a45bbc195fdc4fd7002d7b8721cddb9582cbd",
+      "discoveryContractSha256": "b26d40ff3d3e177c86b56010d37fb2237d9f24de7eb44c494d4ff530d601a21a",
       "tools": [
         {
           "_meta": {
@@ -18377,6 +18434,15 @@
                     "description": "Optional exact preparation operation from a deadline result; pass with resume_operation_attempt.",
                     "maxLength": 128,
                     "type": "string"
+                  },
+                  "symbol_layout": {
+                    "default": "records",
+                    "description": "Symbol records by default; shared-fields-v1 losslessly factors common fields into shared_fields plus ordered residual rows.",
+                    "enum": [
+                      "records",
+                      "shared-fields-v1"
+                    ],
+                    "type": "string"
                   }
                 },
                 "required": [
@@ -18685,15 +18751,45 @@
                         "type": "array"
                       },
                       "impacted_symbols": {
-                        "description": "Impacted symbol DTOs.",
-                        "items": {
-                          "additionalProperties": true,
-                          "description": "Generic JSON object.",
-                          "properties": {},
-                          "required": [],
-                          "type": "object"
-                        },
-                        "type": "array"
+                        "anyOf": [
+                          {
+                            "description": "Impacted symbol DTOs in order (the default records layout).",
+                            "items": {
+                              "additionalProperties": true,
+                              "description": "Generic JSON object.",
+                              "properties": {},
+                              "required": [],
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          {
+                            "additionalProperties": false,
+                            "description": "Lossless shared-fields-v1 layout. Merge shared_fields into each ordered row to recover the symbol records; absent keys remain absent.",
+                            "properties": {
+                              "rows": {
+                                "description": "Ordered residual symbol records.",
+                                "items": {
+                                  "additionalProperties": true,
+                                  "description": "Generic JSON object.",
+                                  "properties": {},
+                                  "required": [],
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              },
+                              "shared_fields": {
+                                "description": "Fields present with identical JSON values in every symbol record.",
+                                "type": "object"
+                              }
+                            },
+                            "required": [
+                              "shared_fields",
+                              "rows"
+                            ],
+                            "type": "object"
+                          }
+                        ]
                       },
                       "impacted_tests": {
                         "description": "Likely impacted test file DTOs.",
@@ -29186,6 +29282,15 @@
                 "description": "Optional exact preparation operation from a deadline result; pass with resume_operation_attempt.",
                 "maxLength": 128,
                 "type": "string"
+              },
+              "symbol_layout": {
+                "default": "records",
+                "description": "Symbol records by default; shared-fields-v1 losslessly factors common fields into shared_fields plus ordered residual rows.",
+                "enum": [
+                  "records",
+                  "shared-fields-v1"
+                ],
+                "type": "string"
               }
             },
             "required": [
@@ -29494,15 +29599,45 @@
                     "type": "array"
                   },
                   "impacted_symbols": {
-                    "description": "Impacted symbol DTOs.",
-                    "items": {
-                      "additionalProperties": true,
-                      "description": "Generic JSON object.",
-                      "properties": {},
-                      "required": [],
-                      "type": "object"
-                    },
-                    "type": "array"
+                    "anyOf": [
+                      {
+                        "description": "Impacted symbol DTOs in order (the default records layout).",
+                        "items": {
+                          "additionalProperties": true,
+                          "description": "Generic JSON object.",
+                          "properties": {},
+                          "required": [],
+                          "type": "object"
+                        },
+                        "type": "array"
+                      },
+                      {
+                        "additionalProperties": false,
+                        "description": "Lossless shared-fields-v1 layout. Merge shared_fields into each ordered row to recover the symbol records; absent keys remain absent.",
+                        "properties": {
+                          "rows": {
+                            "description": "Ordered residual symbol records.",
+                            "items": {
+                              "additionalProperties": true,
+                              "description": "Generic JSON object.",
+                              "properties": {},
+                              "required": [],
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          "shared_fields": {
+                            "description": "Fields present with identical JSON values in every symbol record.",
+                            "type": "object"
+                          }
+                        },
+                        "required": [
+                          "shared_fields",
+                          "rows"
+                        ],
+                        "type": "object"
+                      }
+                    ]
                   },
                   "impacted_tests": {
                     "description": "Likely impacted test file DTOs.",

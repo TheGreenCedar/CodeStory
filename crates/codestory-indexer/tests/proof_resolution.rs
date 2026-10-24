@@ -8288,6 +8288,16 @@ fn go_unsupported_shadowed_and_open_domains_never_authorize_exact_receipts() -> 
             "Run",
         ),
         (
+            "address_escape.go",
+            concat!(
+                "package proof\n",
+                "type Worker struct{}\n",
+                "func (*Worker) Run() {}\n",
+                "func caller(w *Worker) { _ = &w; w.Run() }\n",
+            ),
+            "Run",
+        ),
+        (
             "pointer_promotion.go",
             concat!(
                 "package proof\n",

@@ -107,7 +107,8 @@ fn python_language() -> tree_sitter::Language {
     tree_sitter_python::LANGUAGE.into()
 }
 
-pub(crate) const CALLABLE_DECLARATION_REVISION: &str = "python-callable-declaration-v1";
+pub(crate) const CALLABLE_DECLARATION_REVISION: &str =
+    extraction_revision!("python-callable-declaration-v1");
 
 pub(crate) fn callable_declaration_node(node: TsNode<'_>) -> TsNode<'_> {
     node.parent()

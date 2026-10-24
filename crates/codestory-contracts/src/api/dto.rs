@@ -1165,13 +1165,29 @@ pub struct SearchPlanDto {
     pub source_truth_checks: Vec<String>,
 }
 
+/// In-process match proof. Never part of the public serialized search contract.
+#[derive(Debug, Clone)]
+pub struct SearchPublicExportMatch {
+    pub node_id: NodeId,
+    pub public_name: String,
+    pub presentation: String,
+    pub verification_target: SearchVerificationTargetDto,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SearchPublicExportEvidence {
+    pub matches: Vec<SearchPublicExportMatch>,
+    pub incomplete: bool,
+    pub bounded: bool,
+}
+
 /// Search response with product hits and optional diagnostics.
-///
-/// `hits` is the merged presentation list. Source-specific lists and shadow
-/// fields are compatibility/diagnostic surfaces for callers that need to audit
-/// provenance, fallback, or sidecar behavior.
+/// `hits` is the merged list; source-specific lists retain provenance diagnostics.
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct SearchResultsDto {
+    #[serde(skip)]
+    #[specta(skip)]
+    pub public_exports: SearchPublicExportEvidence,
     pub query: String,
     /// Exact complete retrieval publication used to build this response.
     #[serde(default, skip_serializing_if = "Option::is_none")]

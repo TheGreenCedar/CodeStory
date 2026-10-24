@@ -1089,7 +1089,7 @@ impl WorkspaceDiscovery {
         let (repository_tracked_paths, repository_metadata_issues, repository_tracking_digest) =
             repository_tracked_paths(&manifest.root_dir());
         let mut all_files = Vec::new();
-        let mut seen = HashSet::new();
+        let mut seen = HashMap::<String, usize>::new();
         let mut issues = repository_metadata_issues;
         let mut warnings: Vec<WorkspaceInventoryIssue> = Vec::new();
         let mut warned_non_source_symlinks = HashSet::new();
@@ -1295,7 +1295,13 @@ impl WorkspaceDiscovery {
             }
             let walk_had_errors = issues.len() != issue_count_before_walk;
             for tracked_path in &repository_tracked_paths {
-                if seen.contains(&normalized_compare_key(&workspace_root, tracked_path)) {
+                if seen
+                    .get(&normalized_compare_key(&workspace_root, tracked_path))
+                    .is_some_and(|&index| {
+                        !has_supported_source_route(tracked_path)
+                            || has_supported_source_route(&all_files[index])
+                    })
+                {
                     continue;
                 }
                 let metadata = fs::metadata(tracked_path);
@@ -2102,7 +2108,7 @@ fn source_file_limit_exceeded(files: &[PathBuf], max_files: Option<usize>) -> bo
 
 fn push_discovered_file_within_limit(
     files: &mut Vec<PathBuf>,
-    seen: &mut HashSet<String>,
+    seen: &mut HashMap<String, usize>,
     path: PathBuf,
     workspace_root: &Path,
     max_files: Option<usize>,
@@ -2984,13 +2990,19 @@ fn registry_language_for_path(path: &Path) -> Option<&'static str> {
 
 fn push_discovered_file(
     files: &mut Vec<PathBuf>,
-    seen: &mut HashSet<String>,
+    seen: &mut HashMap<String, usize>,
     path: PathBuf,
     workspace_root: &Path,
 ) {
     let normalized = normalize_lexical_path(&path);
     let key = normalized_compare_key(workspace_root, &normalized);
-    if seen.insert(key) {
+    if let Some(&index) = seen.get(&key) {
+        // The admitted source spelling selects its decoder; an unsupported alias cannot hide it.
+        if !has_supported_source_route(&files[index]) && has_supported_source_route(&normalized) {
+            files[index] = normalized;
+        }
+    } else {
+        seen.insert(key, files.len());
         files.push(normalized);
     }
 }
@@ -4096,6 +4108,146 @@ mod tests {
                 && entry.observed_size > entry.byte_cap
                 && entry.policy_version == "test-policy-v1"
         }));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovered_supported_alias_replaces_only_unsupported_representative() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let mut failures = Vec::new();
+        for (logical_name, target_name) in [
+            ("commands.ps1", "data.bin"),
+            ("zcommands.ps1", "aaa-data.bin"),
+            ("styles.scss", "artifact.bin"),
+        ] {
+            let root = tempdir()?;
+            let target = root.path().join(target_name);
+            let logical = root.path().join(logical_name);
+            fs::write(&target, "source bytes")?;
+            symlink(target_name, &logical)?;
+            let another_supported = root.path().join("alternate.ps1");
+            symlink(target_name, &another_supported)?;
+            for first in [&target, &logical] {
+                let second = if first == &target { &logical } else { &target };
+                let mut files = Vec::new();
+                let mut seen = Default::default();
+                for path in [first, second] {
+                    assert!(push_discovered_file_within_limit(
+                        &mut files,
+                        &mut seen,
+                        path.clone(),
+                        root.path(),
+                        Some(1),
+                    ));
+                }
+                assert_eq!(files.len(), 1);
+                assert_eq!(seen.len(), 1);
+                if files != [logical.clone()] {
+                    failures.push((logical_name, first.file_name().unwrap().to_owned()));
+                }
+                let retained = files.clone();
+                assert!(push_discovered_file_within_limit(
+                    &mut files,
+                    &mut seen,
+                    another_supported.clone(),
+                    root.path(),
+                    Some(1),
+                ));
+                assert_eq!(
+                    files, retained,
+                    "later supported aliases preserve the selected route"
+                );
+
+                let unknown = root.path().join("unrelated.unknown");
+                fs::write(&unknown, "ordinary artifact")?;
+                assert!(!push_discovered_file_within_limit(
+                    &mut files,
+                    &mut seen,
+                    unknown.clone(),
+                    root.path(),
+                    Some(1),
+                ));
+                assert!(
+                    files.contains(&unknown),
+                    "unknown input remains in raw inventory"
+                );
+            }
+
+            for (first, second) in [
+                (&logical, root.path().join("other.ps1")),
+                (&target, root.path().join("other.bin")),
+            ] {
+                symlink(target_name, &second)?;
+                let mut files = Vec::new();
+                let mut seen = Default::default();
+                for path in [first, &second] {
+                    push_discovered_file(&mut files, &mut seen, path.clone(), root.path());
+                }
+                assert_eq!(
+                    files,
+                    [first.clone()],
+                    "equal route support keeps first spelling"
+                );
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "unsupported spellings hid supported routes: {failures:?}"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tracked_supported_alias_replaces_unsupported_walk_representative() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        for excluded in [false, true] {
+            let temp = tempdir()?;
+            let root = temp.path().canonicalize()?;
+            let target = root.join("data.bin");
+            let logical = root.join("build/commands.rs");
+            fs::create_dir(root.join("build"))?;
+            fs::write(&target, "pub fn tracked_source() {}\n")?;
+            symlink("../data.bin", &logical)?;
+            let unknown = root.join("opaque.unknown");
+            fs::write(&unknown, "ordinary artifact")?;
+            run_git(&root, &["init", "--quiet"])?;
+            run_git(&root, &["add", "-f", "build/commands.rs"])?;
+            let mut manifest = WorkspaceManifest::open(root.clone())?;
+            if excluded {
+                manifest.settings.source_groups[0]
+                    .exclude_patterns
+                    .push("**/build/commands.rs".into());
+            }
+            let inventory = WorkspaceDiscovery.source_inventory_with_policy(
+                &manifest,
+                1024,
+                "test-policy-v1",
+            )?;
+            assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Complete);
+            assert!(inventory.discovered_files.contains(&unknown));
+            if excluded {
+                assert!(
+                    inventory.files.is_empty(),
+                    "excluded alias was admitted: {inventory:?}"
+                );
+                assert!(!inventory.discovered_files.contains(&logical));
+                assert!(inventory.discovered_files.contains(&target));
+            } else {
+                assert_eq!(inventory.files, [logical.clone()]);
+                assert!(inventory.discovered_files.contains(&logical));
+                assert!(!inventory.discovered_files.contains(&target));
+                assert!(
+                    inventory
+                        .warnings
+                        .iter()
+                        .any(|warning| warning.path == logical)
+                );
+            }
+        }
         Ok(())
     }
 

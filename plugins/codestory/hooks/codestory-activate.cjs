@@ -3,12 +3,17 @@
 const {
   rememberActiveState,
   writeHookOutput,
+  resolveCli,
+  pluginDataDir,
 } = require('./codestory-runtime.cjs');
+
+const path = require('path');
+const { spawnSync } = require('child_process');
 
 const SESSION_CONTEXT = [
   'CODESTORY GROUNDING AVAILABLE',
   '',
-  'For repository work, read and follow the loaded codestory-grounding skill. It is the sole source of truth for CodeStory tool routing and evidence boundaries; this hook adds no parallel instructions.',
+  `For repository work, read and follow the canonical CodeStory skill at ${JSON.stringify(path.join(__dirname, '..', 'skills', 'codestory-grounding', 'SKILL.md'))}. It is the sole source of truth for CodeStory tool routing and evidence boundaries; this hook adds no parallel instructions.`,
 ].join('\n');
 
 function readHookInput() {
@@ -26,7 +31,27 @@ function readHookInput() {
 }
 
 function contextFor(event) {
-  return event === 'SessionStart' || event === 'sessionStart' ? SESSION_CONTEXT : null;
+  if (event !== 'SessionStart' && event !== 'sessionStart') return null;
+  return Buffer.byteLength(SESSION_CONTEXT, 'utf8') <= 4096 ? SESSION_CONTEXT
+    : 'CODESTORY GROUNDING AVAILABLE\n\nThe canonical skill path exceeds the hook context limit; no path was emitted. Locate the installed codestory-grounding skill before using CodeStory.';
+}
+
+function startupContext(input, context) {
+  if (input.hook_event_name !== 'SessionStart' || input.source !== 'startup'
+      || typeof input.cwd !== 'string' || !path.isAbsolute(input.cwd)) return context;
+  try {
+    const cli = resolveCli([], pluginDataDir());
+    if (!cli) return context;
+    const result = spawnSync(cli, ['internal-session-context', '--project', input.cwd], {
+      encoding: 'utf8', shell: false, windowsHide: true, timeout: 2000, maxBuffer: 16 * 1024,
+    });
+    if (result.error || result.status !== 0) return context;
+    const output = JSON.parse(result.stdout);
+    if (output?.schema_version !== 1 || output?.status !== 'ready'
+        || typeof output.context !== 'string' || !output.context.trim()
+        || Buffer.byteLength(output.context, 'utf8') > 3584) return context;
+    return output.context;
+  } catch { return context; }
 }
 
 async function main() {
@@ -48,7 +73,7 @@ async function main() {
         bridge_removed: true,
       },
     });
-    writeHookOutput(event, context);
+    writeHookOutput(event, startupContext(input, context));
   } catch {
     // Best effort only. A hook failure must not block the agent session.
   }

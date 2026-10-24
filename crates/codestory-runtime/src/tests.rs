@@ -119,6 +119,8 @@ mod activation_coverage_tests;
 pub(crate) mod freshness_observer_tests;
 #[path = "tests/repo_text.rs"]
 mod repo_text_tests;
+#[path = "tests/rust_type_semantic_inputs.rs"]
+mod rust_type_semantic_inputs;
 #[path = "tests/search_intent.rs"]
 mod search_intent_tests;
 #[path = "tests/search_plan.rs"]
@@ -4852,6 +4854,204 @@ fn a_partially_parsed_file_is_reported_incomplete_not_indexed() {
     );
 }
 
+#[test]
+fn stable_parser_partial_extraction_is_fresh_without_claiming_complete_coverage() {
+    let _env = hybrid_test_env();
+    let workspace = tempdir().expect("workspace");
+    for (name, source) in [
+        (
+            "partial.rs",
+            "pub fn retained_partial_anchor() -> i32 { 1 }\npub fn broken( {\n",
+        ),
+        (
+            "partial.py",
+            "def retained_python_anchor():\n    return 1\n\ndef broken(\n",
+        ),
+    ] {
+        fs::write(workspace.path().join(name), source).expect("partial source");
+    }
+    let storage_path = workspace.path().join(".cache/codestory.db");
+    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open project");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("publish verified partial source");
+    let storage = Storage::open(&storage_path).expect("storage");
+    for name in ["partial.rs", "partial.py"] {
+        let file = storage
+            .get_file_by_path(&workspace.path().join(name))
+            .expect("file")
+            .expect("indexed partial file");
+        assert!(
+            file.indexed && !file.complete,
+            "fixture must remain parser-partial: {file:?}"
+        );
+    }
+    assert!(storage.get_errors(None).expect("errors").is_empty());
+    let manifest = WorkspaceManifest::open_with_storage_owned_exclusions(
+        workspace.path().to_path_buf(),
+        &storage_path,
+    )
+    .expect("workspace manifest");
+    let freshness = index_freshness_from_storage(workspace.path(), &manifest, &storage);
+    assert_eq!(
+        freshness.status,
+        IndexFreshnessStatusDto::Fresh,
+        "byte-identical published parser-partial source must converge: {freshness:?}"
+    );
+    assert_eq!(freshness.changed_file_count, 0);
+    let observations = crate::agent::packet_compiler::observe_admitted_source_coverage(
+        &controller,
+        &storage,
+        &["partial.rs".into(), "partial.py".into()],
+    );
+    assert_eq!(observations.len(), 2);
+    assert!(observations.iter().all(|row| row.status
+        == codestory_contracts::api::SourceCoverageStatusDto::Incomplete
+        && row.reason == Some(codestory_contracts::graph::FileCoverageReason::ParserPartial)));
+    assert!(
+        crate::agent::packet_coverage::PacketCoverageInput::from_observations(&observations)
+            .blocks_packet_availability()
+    );
+    for query in ["retained_partial_anchor", "retained_python_anchor"] {
+        let results = controller
+            .search_results(SearchRequest {
+                query: query.into(),
+                repo_text: SearchRepoTextMode::Off,
+                limit_per_source: 3,
+                expand_search_plan: false,
+                hybrid_weights: None,
+                hybrid_limits: None,
+            })
+            .expect("fresh partial source admits core-only search");
+        assert!(
+            results.hits.iter().any(|hit| hit.display_name == query),
+            "{query}: {:?}",
+            results.hits
+        );
+    }
+}
+
+#[test]
+fn invalid_utf8_parser_extraction_is_fresh_without_exact_source_hydration() {
+    let _env = hybrid_test_env();
+    let workspace = tempdir().expect("workspace");
+    let inputs: [(&str, &[u8]); 4] = [
+        (
+            "comment.rs",
+            b"// invalid: \x80\npub fn lossy_anchor() -> i32 { 1 }\n",
+        ),
+        ("broken.rs", b"// invalid: \x80\npub fn broken( {\n"),
+        (
+            "comment.py",
+            b"# invalid: \x80\ndef lossy_anchor():\n    return 1\n",
+        ),
+        ("broken.py", b"# invalid: \x80\ndef broken(\n"),
+    ];
+    for (name, source) in inputs {
+        fs::write(workspace.path().join(name), source).expect("source");
+    }
+    fs::write(
+        workspace.path().join("healthy.rs"),
+        "pub fn healthy_utf8_anchor() {}\n",
+    )
+    .expect("healthy source");
+    let storage_path = workspace.path().join(".cache/codestory.db");
+    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open project");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("publish verified partial sources");
+    for iteration in 0..2 {
+        let storage = Storage::open(&storage_path).expect("storage");
+        let manifest = WorkspaceManifest::open_with_storage_owned_exclusions(
+            workspace.path().to_path_buf(),
+            &storage_path,
+        )
+        .expect("manifest");
+        let freshness = index_freshness_from_storage(workspace.path(), &manifest, &storage);
+        assert_eq!(
+            freshness.status,
+            IndexFreshnessStatusDto::Fresh,
+            "{iteration}: {freshness:?}"
+        );
+        for (name, _) in inputs {
+            let file = storage
+                .get_file_by_path(&workspace.path().join(name))
+                .expect("file")
+                .expect("partial");
+            assert!(file.indexed && !file.complete, "{name}: {file:?}");
+            let revision =
+                codestory_indexer::current_file_extraction_revision(&file.language).unwrap();
+            assert!(
+                storage
+                    .files_with_extraction_revision_mismatch(&file.language, revision)
+                    .expect("revision")
+                    .is_empty()
+            );
+            assert!(
+                !storage
+                    .file_extraction_identity_matches(file.id, &file.language, revision)
+                    .expect("complete reuse")
+            );
+            assert!(
+                crate::search_evidence::verified_file_checked(
+                    &storage,
+                    Some(workspace.path()),
+                    &file
+                )
+                .is_err(),
+                "{name}: lossy graph is not exact hydrated source"
+            );
+        }
+        let result = controller
+            .search_results(SearchRequest {
+                query: "healthy_utf8_anchor".into(),
+                repo_text: SearchRepoTextMode::Off,
+                limit_per_source: 3,
+                expand_search_plan: false,
+                hybrid_weights: None,
+                hybrid_limits: None,
+            })
+            .expect("unrelated healthy search must not loop refreshing lossy source");
+        assert!(
+            result.hits.iter().any(
+                |hit| hit.display_name == "healthy_utf8_anchor" && hit.source_excerpt.is_some()
+            )
+        );
+        if iteration == 0 {
+            let (name, source) = inputs[0];
+            let replacement = source
+                .iter()
+                .map(|byte| if *byte == 0x80 { 0x81 } else { *byte })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                String::from_utf8_lossy(source),
+                String::from_utf8_lossy(&replacement)
+            );
+            fs::write(workspace.path().join(name), replacement).expect("raw source drift");
+            assert_eq!(
+                index_freshness_from_storage(workspace.path(), &manifest, &storage).status,
+                IndexFreshnessStatusDto::Stale
+            );
+            drop(storage);
+            controller
+                .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+                .expect("refresh different raw identity");
+        }
+    }
+}
+
 /// CAP-1b: the production path from a citation's path to an exclusion row.
 ///
 /// The unit tests for the cap set `source_coverage` directly, so they never
@@ -6255,6 +6455,206 @@ fn semantic_projection_republish_runtime_cache_fault_completes_committed_generat
     }
 }
 
+#[test]
+fn symbol_summaries_follow_modern_documents_and_requested_model() {
+    let _env = hybrid_test_env();
+    let workspace = TempDir::new().expect("temporary project");
+    let source = workspace.path().join("workflow.py");
+    fs::write(
+        &source,
+        "def coordinate():\n    return 'initial'\n\ndef obsolete():\n    return 'old'\n",
+    )
+    .expect("write source");
+    fs::write(
+        workspace.path().join("neighbor.py"),
+        "def steady():\n    return 'fixed'\n",
+    )
+    .expect("write unchanged neighbor");
+    let storage_path = workspace.path().join(".cache/codestory.db");
+    let configured_controller = |model: &str| {
+        let mut runtime = test_sidecar_runtime_from_env();
+        runtime.summary.endpoint = Some("local".into());
+        runtime.summary.model = model.into();
+        let controller = AppController::new_with_config(runtime);
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+        controller
+    };
+    let controller = configured_controller("model-a");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("index fresh project");
+    let docs = Storage::open(&storage_path)
+        .expect("open current core")
+        .get_symbol_search_docs_batch_after(None, 100)
+        .expect("read modern documents");
+    assert!(!docs.is_empty());
+    assert!(
+        Storage::open(&storage_path)
+            .expect("open current core")
+            .get_all_llm_symbol_docs()
+            .expect("read legacy documents")
+            .is_empty(),
+        "the regression must not rely on seeded legacy documents"
+    );
+    let original = docs
+        .iter()
+        .find(|doc| doc.display_name == "coordinate")
+        .expect("coordinate document");
+    let stable = docs
+        .iter()
+        .find(|doc| doc.display_name == "steady")
+        .expect("unchanged neighbor");
+    let removed_id = docs
+        .iter()
+        .find(|doc| doc.display_name == "obsolete")
+        .expect("obsolete document")
+        .node_id;
+    let generated = controller.summarize_symbols_blocking().expect("summarize");
+    assert_eq!(generated.generated as usize, docs.len());
+    assert_eq!((generated.reused, generated.skipped), (0, 0));
+    let node_id = NodeId::from(original.node_id);
+    let summary = controller
+        .symbol_context(node_id.clone())
+        .expect("symbol context")
+        .summary
+        .expect("generated summary reaches context");
+    let ground = controller
+        .grounding_snapshot(GroundingBudgetDto::Strict)
+        .expect("ground current core");
+    assert_eq!(
+        ground
+            .root_symbols
+            .iter()
+            .find(|symbol| symbol.id == node_id)
+            .and_then(|symbol| symbol.summary.as_ref()),
+        Some(&summary),
+        "generated summary reaches grounding"
+    );
+    let unchanged = controller.summarize_symbols_blocking().expect("reuse");
+    assert_eq!(
+        (unchanged.generated, unchanged.reused as usize),
+        (0, docs.len())
+    );
+
+    let controller = configured_controller("model-b");
+    let changed_model = controller.summarize_symbols_blocking().expect("new model");
+    assert_eq!(
+        (changed_model.generated as usize, changed_model.reused),
+        (docs.len(), 0)
+    );
+    let current = Storage::open(&storage_path)
+        .expect("open summaries")
+        .get_all_current_symbol_summaries()
+        .expect("current summaries");
+    assert_eq!(current.len(), docs.len());
+    assert!(current.values().all(|record| record.model == "model-b"));
+    assert_eq!(
+        controller
+            .symbol_context(node_id.clone())
+            .expect("new model context")
+            .summary,
+        Some(summary)
+    );
+    let reused_model = controller
+        .summarize_symbols_blocking()
+        .expect("reuse model-b");
+    assert_eq!(
+        (reused_model.generated, reused_model.reused as usize),
+        (0, docs.len())
+    );
+
+    fs::write(&source, "def coordinate():\n    return 'changed'\n").expect("change source");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+        .expect("refresh changed and deleted definitions");
+    let storage = Storage::open(&storage_path).expect("open refreshed core");
+    let changed_docs = storage
+        .get_symbol_search_docs_batch_after(None, 100)
+        .expect("refreshed documents");
+    let changed = changed_docs
+        .iter()
+        .find(|doc| doc.display_name == "coordinate")
+        .expect("surviving definition");
+    assert_eq!(changed.node_id, original.node_id);
+    assert_ne!(changed.doc_hash, original.doc_hash);
+    let unchanged = changed_docs
+        .iter()
+        .find(|doc| doc.node_id == stable.node_id)
+        .expect("unchanged neighbor retained");
+    assert_eq!(unchanged.doc_hash, stable.doc_hash);
+    assert!(
+        storage
+            .get_node(removed_id)
+            .expect("deleted definition")
+            .is_none()
+    );
+    assert!(
+        storage
+            .get_current_symbol_summaries_by_node_ids(&[original.node_id, removed_id])
+            .expect("reject obsolete summaries")
+            .is_empty()
+    );
+    let current = storage
+        .get_all_current_symbol_summaries()
+        .expect("current summaries");
+    assert!(!current.contains_key(&original.node_id));
+    assert!(!current.contains_key(&removed_id));
+    assert_eq!(
+        current
+            .get(&stable.node_id)
+            .expect("unchanged summary")
+            .model,
+        "model-b"
+    );
+    assert!(
+        controller
+            .symbol_context(node_id.clone())
+            .expect("refreshed context")
+            .summary
+            .is_none()
+    );
+    drop(storage);
+    let ground = controller
+        .grounding_snapshot(GroundingBudgetDto::Strict)
+        .expect("refreshed grounding");
+    assert!(
+        ground
+            .root_symbols
+            .iter()
+            .find(|symbol| symbol.id == node_id)
+            .expect("surviving root")
+            .summary
+            .is_none()
+    );
+    assert!(
+        ground
+            .root_symbols
+            .iter()
+            .all(|symbol| symbol.id != NodeId::from(removed_id))
+    );
+    let refreshed = controller
+        .summarize_symbols_blocking()
+        .expect("summarize changed input");
+    assert!(refreshed.generated > 0);
+    assert!(
+        refreshed.reused > 0,
+        "unchanged neighboring input remains reusable"
+    );
+    assert!(
+        controller
+            .symbol_context(node_id)
+            .expect("new source context")
+            .summary
+            .is_some()
+    );
+    assert_no_staged_publication_artifacts(&storage_path);
+}
+
 /// `index --summarize` writes `symbol_summary`, which lives in the core
 /// database. Once a publication pointer exists the live handle is read-only, so
 /// the summaries have to reach disk through a staged republish instead.
@@ -6277,6 +6677,9 @@ fn symbol_summaries_persist_into_a_published_immutable_core() {
     let baseline = Storage::database_complete_index_publication(&storage_path)
         .expect("read baseline publication")
         .expect("baseline publication");
+    let frozen_database = codestory_store::resolve_core_database_path(&storage_path)
+        .expect("resolve baseline generation");
+    let frozen_bytes = fs::read(&frozen_database).expect("read baseline generation");
 
     let summarized_node = Storage::open(&storage_path)
         .expect("open published core")
@@ -6312,6 +6715,11 @@ fn symbol_summaries_persist_into_a_published_immutable_core() {
         .expect("read republished publication")
         .expect("republished publication");
     assert_eq!(republished.generation, baseline.generation + 1);
+    assert_eq!(
+        fs::read(&frozen_database).expect("read retained generation"),
+        frozen_bytes,
+        "summary publication must not mutate the previous generation"
+    );
     let stored: String = Storage::open(&storage_path)
         .expect("open republished core")
         .get_connection()
@@ -8734,7 +9142,120 @@ fn full_and_incremental_publications_advance_one_durable_generation() {
 }
 
 #[test]
-fn structural_full_generations_reuse_unchanged_cache_and_preserve_previous_on_invalid_input() {
+fn encoded_structural_generations_bind_raw_bytes_reuse_cache_and_keep_rejections_explicit() {
+    use sha2::{Digest, Sha256};
+    let process_cache = tempfile::tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let path = workspace.path().join("commands.ps1");
+    let text = "# café 🦀\r\nfunction Invoke-Thing {\r\n  Write-Output 'é🦀'\r\n}\r\n";
+    let encode = |little: bool| {
+        let mut bytes = if little {
+            vec![0xff, 0xfe]
+        } else {
+            vec![0xfe, 0xff]
+        };
+        for unit in text.encode_utf16() {
+            bytes.extend(if little {
+                unit.to_le_bytes()
+            } else {
+                unit.to_be_bytes()
+            });
+        }
+        bytes
+    };
+    let storage_path = workspace.path().join(".cache/codestory.db");
+    fs::write(&path, encode(true)).unwrap();
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .unwrap();
+    let first = controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .unwrap();
+    assert_eq!(first.structural_artifact_cache.unwrap().misses, 1);
+    let stable = controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .unwrap();
+    assert_eq!(stable.structural_artifact_cache.unwrap().hits, 1);
+    let previous = structural_live_identity(&storage_path);
+    let store = Store::open_read_only(&storage_path).unwrap();
+    let mut files = store.get_files().unwrap();
+    assert_eq!(files.len(), 1);
+    let file = files.pop().unwrap();
+    assert_eq!(file.path.file_name().unwrap(), "commands.ps1");
+    let source =
+        crate::search_evidence::verified_file_checked(&store, Some(workspace.path()), &file)
+            .unwrap();
+    assert_eq!(source.content, text);
+    assert_eq!(
+        source.content_sha256,
+        format!("{:x}", Sha256::digest(encode(true)))
+    );
+    let (_, windows) = controller
+        .path_source_windows("commands.ps1", &[(2, 3)], 1024)
+        .unwrap();
+    let window = windows[0].render("commands.ps1".into(), 2, 3, 1024);
+    assert!(window.snippet.contains("Invoke-Thing"));
+    assert!(window.snippet.contains("é🦀"));
+    fs::write(&path, encode(false)).unwrap();
+    assert!(matches!(
+        crate::search_evidence::verified_file_checked(&store, Some(workspace.path()), &file),
+        Err(crate::search_evidence::VerifiedFileError::Stale)
+    ));
+    drop(store);
+    let changed = controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .unwrap();
+    assert_eq!(changed.structural_artifact_cache.unwrap().misses, 1);
+    assert_ne!(
+        structural_live_identity(&storage_path).cache_rows,
+        previous.cache_rows
+    );
+    // Strict decoder rejection remains a Binary gap, not exact source; the
+    // authenticated opaque identity no longer blocks unrelated publication.
+    for invalid in [
+        vec![0xff, 0xfe, 0x41],
+        vec![0xfe, 0xff, 0xd8, 0x00],
+        vec![0xff, 0xfe, 0, 0],
+    ] {
+        fs::write(&path, &invalid).unwrap();
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("verified opaque input remains explicitly incomplete");
+        let storage = Store::open_read_only(&storage_path).unwrap();
+        let file = storage.get_file_by_path(&path).unwrap().unwrap();
+        assert!(!file.complete);
+        assert_eq!(
+            storage.get_file_content_hash(file.id).unwrap(),
+            Some(format!("{:x}", Sha256::digest(&invalid)))
+        );
+        assert!(
+            crate::stored_file_coverage_diagnostics(workspace.path(), &storage)
+                .unwrap()
+                .iter()
+                .any(|gap| gap.reason == FileCoverageReason::Binary
+                    && gap.verified_source
+                    && !gap.projection_available)
+        );
+        assert!(
+            !storage
+                .get_structural_text_projection_file_ids()
+                .unwrap()
+                .contains(&file.id)
+        );
+        assert!(matches!(
+            crate::search_evidence::verified_file_checked(&storage, Some(workspace.path()), &file),
+            Err(crate::search_evidence::VerifiedFileError::Unavailable)
+        ));
+        assert_no_staged_publication_artifacts(&storage_path);
+    }
+}
+
+#[test]
+fn structural_full_generations_reuse_cache_and_keep_explicit_rejected_source_gaps() {
     let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = tempdir().expect("workspace dir");
     let markdown_path = workspace.path().join("guide.md");
@@ -8896,29 +9417,28 @@ fn structural_full_generations_reuse_unchanged_cache_and_preserve_previous_on_in
     assert_eq!(structural_before_failure.cache_rows.len(), 2);
 
     fs::write(&markdown_path, [0xff, 0xfe, 0xfd]).expect("write invalid utf8");
-    let error = controller
+    controller
         .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
-        .expect_err("invalid structural input must fail closed");
-    assert_eq!(error.code, "source_binary");
-    assert!(error.details.as_ref().is_some_and(|details| {
-        details
-            .coverage_gaps
+        .expect("verified opaque structural input retains an identity-only gap");
+    let rejected_publication = Store::database_index_publication(&storage_path)
+        .expect("read rejected-source publication")
+        .expect("unrelated source remains published");
+    assert_eq!(rejected_publication.generation, third.generation + 1);
+    let storage = Store::open_read_only(&storage_path).unwrap();
+    let manifest = storage
+        .validate_structural_text_unit_publication(&rejected_publication)
+        .unwrap();
+    assert_eq!(manifest.projection_count, 1, "only valid JSON is projected");
+    assert!(
+        crate::stored_file_coverage_diagnostics(workspace.path(), &storage)
+            .unwrap()
             .iter()
-            .any(|gap| gap.reason == FileCoverageReason::Binary)
-    }));
-    let preserved = Store::database_index_publication(&storage_path)
-        .expect("read preserved publication")
-        .expect("preserved publication");
-    assert_eq!(preserved, third);
-    Store::open_read_only(&storage_path)
-        .expect("open preserved publication")
-        .validate_structural_text_unit_publication(&preserved)
-        .expect("previous structural manifest remains valid");
-    assert_eq!(
-        structural_live_identity(&storage_path),
-        structural_before_failure,
-        "collector failure changed the prior structural manifest or cache identity"
+            .any(|gap| gap.path == "guide.md"
+                && gap.reason == FileCoverageReason::Binary
+                && gap.verified_source
+                && !gap.projection_available)
     );
+    drop(storage);
     assert_no_staged_publication_artifacts(&storage_path);
 
     fs::write(&markdown_path, "# Replacement\n").expect("restore markdown");

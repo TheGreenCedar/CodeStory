@@ -1884,7 +1884,7 @@ fn hydrate_admitted_file_source(
     if format!("{:x}", Sha256::digest(&bytes)) != expected_hash {
         return Err(PacketAdmissionGapKindV1::SourceUnavailable);
     }
-    let Ok(text) = String::from_utf8(bytes) else {
+    let Ok(text) = codestory_contracts::source_text::decode_source_text(&file.path, &bytes) else {
         return Err(PacketAdmissionGapKindV1::SourceUnavailable);
     };
     if text.lines().count() != file.line_count as usize {
@@ -8162,6 +8162,131 @@ mod tests {
             complete_file_markdown("x\n", 1, 8),
             Err(PacketAdmissionGapKindV1::SourceBudgetExceeded)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn encoded_contained_source_alias_uses_admitted_logical_route() {
+        use std::os::unix::fs::symlink;
+        for (logical_name, target_name) in [
+            ("commands.ps1", "data.bin"),
+            ("zcommands.ps1", "aaa-data.bin"),
+        ] {
+            let cache = tempfile::tempdir().unwrap();
+            let project = tempfile::tempdir().unwrap();
+            let logical = project.path().join(logical_name);
+            let target = project.path().join(target_name);
+            let text = "function Invoke-Thing {\r\n  Write-Output 'é🦀'\r\n}\r\n";
+            let mut bytes = vec![0xff, 0xfe];
+            for unit in text.encode_utf16() {
+                bytes.extend(unit.to_le_bytes());
+            }
+            std::fs::write(&target, &bytes).unwrap();
+            symlink(target_name, &logical).unwrap();
+            let storage_path = project.path().join(".cache/codestory.db");
+            let controller = AppController::new_with_owned_cache_root(cache.path());
+            controller
+                .open_project_summary_with_storage_path(
+                    project.path().to_path_buf(),
+                    storage_path.clone(),
+                )
+                .unwrap();
+            controller
+                .run_indexing_blocking_without_runtime_refresh(
+                    codestory_contracts::api::IndexMode::Full,
+                )
+                .unwrap();
+            let storage = Store::open_read_only(&storage_path).unwrap();
+            let file = storage
+                .get_file_by_path(&logical)
+                .unwrap()
+                .expect("full indexing admits the selected contained structural alias");
+            assert!(file.indexed && file.complete);
+            let verified = crate::search_evidence::verified_file_checked(
+                &storage,
+                Some(project.path()),
+                &file,
+            )
+            .expect("logical source route has complete pinned decoded text");
+            assert_eq!(verified.content, text);
+            let admission = PacketAdmissionReceiptV1 {
+                packet_ordinal: 0,
+                stable_identity: format!("path:{logical_name}"),
+                score_version: "test".into(),
+                reserved_source_bytes: INTERIM_SOURCE_ROW_UPPER_BOUND as u32,
+                origin: PacketAdmissionOriginV1::Retrieval,
+            };
+            let packet = hydrate_admitted_file_source(&controller, &storage, &admission, &file);
+            let windows = controller.path_source_windows(logical_name, &[(2, 2)], 1024);
+            assert!(
+                packet.is_ok() && windows.is_ok(),
+                "admitted alias must retain decoder route; packet={packet:?}; windows_error={:?}",
+                windows.as_ref().err()
+            );
+            assert!(packet.unwrap().source.contains("é🦀"));
+            assert!(
+                windows.unwrap().1[0]
+                    .render(logical_name.into(), 2, 2, 1024)
+                    .snippet
+                    .contains("é🦀")
+            );
+        }
+    }
+
+    #[test]
+    fn encoded_file_admission_hydrates_decoded_text_only_for_pinned_raw_bytes() {
+        let cache = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let controller = AppController::new_with_owned_cache_root(cache.path());
+        controller.state.lock().project_root = Some(project.path().to_path_buf());
+        let storage = Store::new_in_memory().unwrap();
+        let path = project.path().join("commands.ps1");
+        let text = "function Invoke-Thing {\r\n  Write-Output 'é🦀'\r\n}\r\n";
+        let file = FileInfo {
+            id: 1,
+            path: path.clone(),
+            language: "powershell".into(),
+            modification_time: 0,
+            indexed: true,
+            complete: true,
+            line_count: 3,
+            file_role: FileRole::Source,
+        };
+        storage.insert_file(&file).unwrap();
+        let admission = PacketAdmissionReceiptV1 {
+            packet_ordinal: 0,
+            stable_identity: "path:commands.ps1".into(),
+            score_version: "test".into(),
+            reserved_source_bytes: INTERIM_SOURCE_ROW_UPPER_BOUND as u32,
+            origin: PacketAdmissionOriginV1::Retrieval,
+        };
+        for little in [true, false] {
+            let mut bytes = if little {
+                vec![0xff, 0xfe]
+            } else {
+                vec![0xfe, 0xff]
+            };
+            for unit in text.encode_utf16() {
+                bytes.extend(if little {
+                    unit.to_le_bytes()
+                } else {
+                    unit.to_be_bytes()
+                });
+            }
+            std::fs::write(&path, &bytes).unwrap();
+            storage
+                .update_file_metadata(&file, Some(&format!("{:x}", Sha256::digest(&bytes))))
+                .unwrap();
+            let hydrated =
+                hydrate_admitted_file_source(&controller, &storage, &admission, &file).unwrap();
+            assert_eq!((hydrated.start_line, hydrated.end_line), (1, 3));
+            assert!(hydrated.source.contains("é🦀"));
+            std::fs::write(&path, text).unwrap();
+            assert!(matches!(
+                hydrate_admitted_file_source(&controller, &storage, &admission, &file),
+                Err(PacketAdmissionGapKindV1::SourceUnavailable)
+            ));
+        }
     }
 
     #[test]

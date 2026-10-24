@@ -14,6 +14,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::{Arc, RwLock};
 
 mod c;
 mod cpp;
@@ -80,9 +81,23 @@ pub(crate) struct SemanticCandidateNodeSnapshot {
     pub language_family: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ImportLookupKey {
+    kinds: Vec<i32>,
+    symbol: String,
+    language: Option<&'static str>,
+}
+
+type ImportLookupMatches = Vec<(i64, Option<i64>)>;
+
 /// In-memory candidate index loaded from stored graph nodes.
 #[derive(Debug, Clone, Default)]
 pub struct SemanticCandidateIndex {
+    // Clones have identical immutable records, so their memoized IDs remain valid.
+    // Every load/rebuild/snapshot restoration starts with a fresh empty cache.
+    import_name_cache: Arc<RwLock<HashMap<ImportLookupKey, ImportLookupMatches>>>,
+    #[cfg(test)]
+    import_lookup_computations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     nodes: Vec<SemanticCandidateNode>,
     nodes_by_kind: HashMap<i32, Vec<usize>>,
     serialized_exact: HashMap<String, Vec<usize>>,
@@ -211,6 +226,50 @@ impl SemanticCandidateIndex {
             }
         }
         index
+    }
+
+    fn import_nodes_for_name(
+        &self,
+        kinds: &[i32],
+        symbol: &str,
+        language: Option<&'static str>,
+    ) -> ImportLookupMatches {
+        let key = ImportLookupKey {
+            kinds: kinds.to_vec(),
+            symbol: symbol.to_string(),
+            language,
+        };
+        if let Some(cached) = self
+            .import_name_cache
+            .read()
+            .expect("import cache lock")
+            .get(&key)
+        {
+            return cached.clone();
+        }
+
+        // Compute outside the write lock so unrelated lookups remain parallel.
+        #[cfg(test)]
+        self.import_lookup_computations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let matches = self
+            .nodes_for_name(
+                kinds,
+                symbol,
+                &symbol.to_ascii_lowercase(),
+                language,
+                true,
+                4,
+            )
+            .into_iter()
+            .map(|node| (node.id, node.file_node_id))
+            .collect();
+        self.import_name_cache
+            .write()
+            .expect("import cache lock")
+            .entry(key)
+            .or_insert(matches)
+            .clone()
     }
 
     fn nodes_for_name<'a>(
@@ -482,19 +541,12 @@ pub(super) fn resolve_import_candidates(
     confidence: f32,
 ) -> Result<Vec<SemanticResolutionCandidate>> {
     let ids = index
-        .nodes_for_name(
-            kinds,
-            symbol,
-            &symbol.to_ascii_lowercase(),
-            caller_language,
-            true,
-            4,
-        )
+        .import_nodes_for_name(kinds, symbol, caller_language)
         .into_iter()
-        .filter(|node| {
-            file_id.is_none() || node.file_node_id.is_none() || node.file_node_id != file_id
+        .filter(|&(_, node_file_id)| {
+            file_id.is_none() || node_file_id.is_none() || node_file_id != file_id
         })
-        .map(|node| node.id)
+        .map(|(node_id, _)| node_id)
         .collect::<Vec<_>>();
     Ok(to_candidates(ids, confidence))
 }
@@ -645,6 +697,123 @@ mod tests {
             params![id, NodeKind::FILE as i32, path],
         )?;
         Ok(())
+    }
+
+    fn import_fixture(rows: &[(i64, NodeKind, &str, i64, &str)]) -> SemanticCandidateIndex {
+        SemanticCandidateIndex::from_snapshot_nodes(
+            rows.iter()
+                .map(
+                    |&(id, kind, name, file, language)| super::SemanticCandidateNodeSnapshot {
+                        id,
+                        kind: kind as i32,
+                        serialized_name: name.into(),
+                        qualified_name: None,
+                        file_node_id: Some(file),
+                        language_family: Some(language.into()),
+                    },
+                )
+                .collect(),
+        )
+    }
+
+    fn import_result(
+        index: &SemanticCandidateIndex,
+        kinds: &[i32],
+        symbol: &str,
+        file: Option<i64>,
+        language: Option<&'static str>,
+        confidence: f32,
+    ) -> Vec<(i64, u32)> {
+        resolve_import_candidates(index, kinds, symbol, file, language, confidence)
+            .unwrap()
+            .into_iter()
+            .map(|candidate| (candidate.target_node_id, candidate.confidence.to_bits()))
+            .collect()
+    }
+
+    #[test]
+    fn repeated_import_lookup_reuses_work_before_caller_file_filter() {
+        let index = import_fixture(&[
+            (10, NodeKind::MODULE, "shared", 1, "go"),
+            (11, NodeKind::MODULE, "shared", 1, "go"),
+            (12, NodeKind::MODULE, "shared", 1, "go"),
+            (13, NodeKind::MODULE, "shared", 1, "go"),
+            (14, NodeKind::MODULE, "shared", 2, "go"),
+        ]);
+        let kinds = [NodeKind::MODULE as i32];
+        // Select four before exclusion: caller1 must not refill from node14.
+        assert!(import_result(&index, &kinds, "shared", Some(1), Some("go"), 0.58).is_empty());
+        for file in [Some(2), Some(3), None] {
+            assert_eq!(
+                import_result(&index, &kinds, "shared", file, Some("go"), 0.58),
+                (10..14)
+                    .map(|id| (id, 0.58f32.to_bits()))
+                    .collect::<Vec<_>>()
+            );
+        }
+        // Confidence is request-specific even when the base candidates are shared.
+        assert_eq!(
+            import_result(&index, &kinds, "shared", Some(2), Some("go"), 0.75),
+            (10..14)
+                .map(|id| (id, 0.75f32.to_bits()))
+                .collect::<Vec<_>>()
+        );
+        for file in [Some(1), Some(2)] {
+            assert!(import_result(&index, &kinds, "absent", file, Some("go"), 0.58).is_empty());
+        }
+        let actual = index
+            .import_lookup_computations
+            .load(std::sync::atomic::Ordering::Relaxed);
+        eprintln!("IMPORT_BASE_LOOKUP_COMPUTATIONS {actual}");
+        assert_eq!(
+            actual, 2,
+            "one shared lookup and one cached negative; caller identity must not repeat base work"
+        );
+    }
+
+    #[test]
+    fn import_lookup_partitions_and_index_lifetimes_preserve_order() {
+        let index = import_fixture(&[
+            (10, NodeKind::MODULE, "alpha", 1, "go"),
+            (11, NodeKind::PACKAGE, "betaalpha", 2, "go"),
+            (12, NodeKind::MODULE, "ALPHA", 2, "go"),
+            (13, NodeKind::MODULE, "alpha", 2, "rust"),
+        ]);
+        let modules = [NodeKind::MODULE as i32];
+        let check = |index: &SemanticCandidateIndex, kinds: &[i32], name, language, ids: &[i64]| {
+            assert_eq!(
+                import_result(index, kinds, name, None, language, 0.58),
+                ids.iter()
+                    .map(|&id| (id, 0.58f32.to_bits()))
+                    .collect::<Vec<_>>()
+            );
+        };
+        check(&index, &modules, "alpha", Some("go"), &[10]);
+        check(&index, &modules, "ALPHA", Some("go"), &[12]);
+        check(&index, &modules, "alpha", Some("rust"), &[13]);
+        check(&index, &modules, "alpha", None, &[10, 13]);
+        check(
+            &index,
+            &[NodeKind::MODULE as i32, NodeKind::PACKAGE as i32],
+            "pha",
+            Some("go"),
+            &[10, 12, 11],
+        );
+        check(
+            &index,
+            &[NodeKind::PACKAGE as i32, NodeKind::MODULE as i32],
+            "pha",
+            Some("go"),
+            &[11, 10, 12],
+        );
+        check(&index.clone(), &modules, "alpha", Some("go"), &[10]);
+        let snapshot = index.snapshot_nodes();
+        let restored = SemanticCandidateIndex::from_snapshot_nodes(snapshot.clone());
+        check(&restored, &modules, "alpha", Some("go"), &[10]);
+        let mut changed = snapshot;
+        changed[0].id = 110;
+        let rebuilt = SemanticCandidateIndex::from_snapshot_nodes(changed);
+        check(&rebuilt, &modules, "alpha", Some("go"), &[110]);
     }
 
     #[test]

@@ -64,11 +64,23 @@ collected against the inner function before that displayed range is expanded.
 Decorator callee references remain graph nodes but cannot act as lexical
 callers for argument expressions; canonical declarations, including one-line
 functions, remain eligible owners.
+Rust struct and enum display ranges include their fields, variants and attached
+outer attributes. These ranges expand after precise name occurrences, stable
+type identities and call ownership have been collected; enum variants keep
+their own name anchors. The same late stage retains Rust callable attributes,
+while malformed syntax leaves the original anchors unchanged.
 Parser body metadata joins the outer declaration coordinates to the proper
 execution-body range. Successful verified extraction and current cache replay
-record the Python extraction revision with the file's source hash; incomplete
-extraction cannot certify an inherited projection. A revision mismatch forces
-file projection replacement before equality-based reuse.
+record the Python or Rust extraction revision with the file's source hash.
+Indexed, hash-verified parser-partial files with no file-level error retain this
+producer identity while remaining incomplete; the identity certifies neither
+complete coverage nor inherited-graph cache reuse. Missing or outdated producer
+identity still selects the file for refresh. For complete projections, a revision
+mismatch forces replacement before equality-based reuse.
+Parser-backed invalid UTF-8 retains the existing lossy graph view only as
+incomplete navigation. Raw-source/producer identity can remain current, but
+complete cache reuse, Exact lookup inputs and exact source hydration stay
+unavailable, including when cached replacement text parses without errors.
 
 ## What Gets Flushed
 
@@ -104,7 +116,7 @@ setup, and commit time without treating them as additive phases.
 
 The twelve structural unit collector families emit source-range-only evidence
 without claiming parser-backed graph resolution. Finalization slices the exact
-UTF-8 source span and records the collector producer, evidence tier, resolution
+decoded UTF-8 source span and records the collector producer, evidence tier, resolution
 status, language, kind, file role, descriptor version, source hash, and span.
 The content identity is stable for an equivalent descriptor and exact source
 slice; placement identity additionally includes file and node identity.
@@ -130,10 +142,20 @@ files are capped at 1 MiB and 2,048 units, both carried on `SourceIndexPolicy`
 rather than compiled into the collector, so an operator override reaches them and
 an exclusion names the bound that refused it. A bound failure rejects the whole
 file instead of publishing a truncated projection. Structural cache identity
-v2 invalidates pre-limit artifacts, and cache hits enforce the same unit cap.
-Invalid UTF-8/binary bytes, malformed format syntax, and unreadable sources
+remains v4: unchanged admitted UTF-8 artifacts remain reusable, and cache hits
+enforce the same unit cap.
+Structural text accepts UTF-8 and strict BOM-marked UTF-16LE/BE. UTF-16 BOMs
+select byte order and are omitted from decoded coordinates; UTF-8 BOM handling
+is unchanged. Native hashes and cache keys cover original bytes, so equal text
+in different encodings is different source. Both raw and decoded bytes obey the
+source cap. Unpaired surrogates, odd payloads, bare UTF-16 BOMs, decoded binary
+controls, unknown encodings, malformed format syntax, and unreadable sources
 retain distinct coverage reasons and do not create reusable structural cache
-entries.
+entries. A fully read, within-cap decoding rejection can retain a reverified raw
+identity with an incomplete `binary` gap and no projection. It may coexist with
+unrelated published source; it is never decoded by guessing or replacement.
+Both the preparation and publication fences verify the original bytes, and
+indexed text readers preserve the strict structural decoding contract.
 
 ## Resolution and Semantic Fallback
 

@@ -31,6 +31,8 @@ use tree_sitter::{Node as TsNode, Parser, Tree};
 thread_local! {
     static RUST_RESOLUTION_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static GO_RESOLUTION_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GO_BINDING_ANCESTRY_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GO_DECLARED_NAME_ANCESTRY_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PYTHON_RESOLUTION_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static C_CPP_RESOLUTION_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static RUBY_PHP_RESOLUTION_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -259,7 +261,7 @@ const PHP_ADAPTER_VERSION: &str = "reference-v4";
 const CSHARP_ADAPTER_VERSION: &str = "reference-v2";
 const SWIFT_ADAPTER_VERSION: &str = "reference-v3";
 const DART_ADAPTER_VERSION: &str = "reference-v2";
-const BASH_ADAPTER_VERSION: &str = "reference-v2";
+const BASH_ADAPTER_VERSION: &str = "reference-v3";
 const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 28;
 const INSTALLED_ADAPTERS: &[(&str, &str)] = &[
     ("bash", BASH_ADAPTER_VERSION),
@@ -595,6 +597,8 @@ pub(crate) fn collect_call_resolution_inputs(
                 |index| index.cached_classes(),
             ),
             direct_exports,
+            public_exports: is_javascript_language(language)
+                .then(|| crate::public_exports::collect(tree, source, nodes)),
             export_poison_all,
             poisoned_export_names,
             rust_modules: rust_index
@@ -1052,12 +1056,13 @@ impl<'a, 'tree> BashResolutionProducer<'a, 'tree> {
                 }
             }
         }
+        let mut pending_call = None;
         if node.kind() == "command"
             && let Some(callee) = bash_command_callee(node)
             && let Some(raw_target) = node_text(callee, self.source).map(str::to_string)
         {
             let literal = bash_literal_command_name(callee, &raw_target);
-            self.calls.push(IndexedBashCall {
+            pending_call = Some(IndexedBashCall {
                 callee,
                 form: if literal.is_some() {
                     CalleeForm::Identifier
@@ -1074,7 +1079,20 @@ impl<'a, 'tree> BashResolutionProducer<'a, 'tree> {
         let direct_program_child = node.kind() == "program";
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
+            // Prefix assignments can contain commands before this command's
+            // callee. Emit at its source position, not at the parent's entry;
+            // a dynamic callee still precedes commands nested within its span.
+            if pending_call
+                .as_ref()
+                .is_some_and(|call| call.callee.start_byte() <= child.start_byte())
+            {
+                self.calls
+                    .push(pending_call.take().expect("pending Bash call"));
+            }
             self.visit(child, child_caller, direct_program_child);
+        }
+        if let Some(call) = pending_call {
+            self.calls.push(call);
         }
     }
 
@@ -7596,6 +7614,29 @@ fn go_prepare_binding_decisions(
     let mut intervals = Vec::<GoBindingInterval>::new();
     walk_nodes(root, &mut |node| {
         count_go_resolution_work(1);
+        // Other kinds cannot add bindings. Returning from this callback still
+        // lets walk_nodes visit their descendants, including nested declarations.
+        if !matches!(
+            node.kind(),
+            "function_declaration"
+                | "method_declaration"
+                | "parameter_declaration"
+                | "variadic_parameter_declaration"
+                | "short_var_declaration"
+                | "assignment_statement"
+                | "var_spec"
+                | "const_spec"
+                | "type_spec"
+                | "range_clause"
+                | "receive_statement"
+                | "type_switch_guard"
+                | "type_switch_statement"
+                | "unary_expression"
+        ) {
+            return;
+        }
+        #[cfg(test)]
+        GO_BINDING_ANCESTRY_LOOKUPS.with(|work| work.set(work.get().saturating_add(1)));
         let Some(callable) = go_enclosing_callable(node, returned_closures) else {
             return;
         };
@@ -7624,6 +7665,8 @@ fn go_prepare_binding_decisions(
             }
             return;
         }
+        #[cfg(test)]
+        GO_BINDING_ANCESTRY_LOOKUPS.with(|work| work.set(work.get().saturating_add(1)));
         let Some((scope_id, scope_start, scope_end, depth)) = go_binding_scope(node, callable)
         else {
             return;
@@ -7941,9 +7984,6 @@ fn go_callables_declaring_name(
 ) -> HashSet<usize> {
     let mut result = HashSet::new();
     walk_nodes(root, &mut |node| {
-        let Some(callable) = go_enclosing_callable(node, returned_closures) else {
-            return;
-        };
         let declared = match node.kind() {
             "parameter_declaration" | "variadic_parameter_declaration" => {
                 let boundary = node
@@ -7987,7 +8027,12 @@ fn go_callables_declaring_name(
                 .any(|name| name == wanted),
             _ => false,
         };
-        if declared {
+        if !declared {
+            return;
+        }
+        #[cfg(test)]
+        GO_DECLARED_NAME_ANCESTRY_LOOKUPS.with(|work| work.set(work.get().saturating_add(1)));
+        if let Some(callable) = go_enclosing_callable(node, returned_closures) {
             result.insert(callable.id());
         }
     });
@@ -14703,6 +14748,17 @@ pub fn rematerialize_proof_resolution_projection_with_progress(
         }
         records.push(record);
     }
+    crate::public_exports::rematerialize(
+        store,
+        publication,
+        &records
+            .iter()
+            .map(|record| crate::public_exports::Source {
+                path: record.path.as_path(),
+                file: &record.file,
+            })
+            .collect::<Vec<_>>(),
+    )?;
     progress_observer(progress);
     let mut linear_records = Vec::new();
     let mut records = records
@@ -21167,6 +21223,7 @@ mod ruby_php_complexity_tests {
                 top_level_declarations: declarations,
                 inherent_methods: Vec::new(),
                 classes: Vec::new(),
+                public_exports: None,
                 direct_exports: Vec::new(),
                 export_poison_all: false,
                 poisoned_export_names: Vec::new(),
@@ -21463,6 +21520,7 @@ mod rust_complexity_tests {
                 top_level_declarations: declarations,
                 inherent_methods: methods,
                 classes: Vec::new(),
+                public_exports: None,
                 direct_exports: Vec::new(),
                 export_poison_all: false,
                 poisoned_export_names: Vec::new(),
@@ -22214,6 +22272,164 @@ mod go_complexity_tests {
     use super::*;
     use tree_sitter::Parser;
 
+    #[test]
+    fn go_binding_ancestry_ignores_noncontributing_expression_nodes() {
+        let measure = |depth: usize| {
+            // Calls precede the changing expression. Fixed-width padding also
+            // keeps declaration spans stable; only the real source hash differs.
+            let source = format!(
+                concat!(
+                    "package proof\n",
+                    "type Worker struct{{}}\n",
+                    "func (w *Worker) Run() {{}}\n",
+                    "func shadow() {{ var new int; _ = new }}\n",
+                    "func caller() {{\n",
+                    "  worker := &Worker{{}}\n",
+                    "  worker.Run()\n",
+                    "  {{ worker := 0; worker.Run() }}\n",
+                    "  worker.Run()\n",
+                    "  _ = {}{}0{}{}\n",
+                    "}}\n",
+                ),
+                " ".repeat(64 - depth),
+                "(".repeat(depth),
+                ")".repeat(depth),
+                " ".repeat(64 - depth),
+            );
+            let config = crate::get_language_for_ext("go").expect("Go config");
+            let mut parser = Parser::new();
+            parser.set_language(&config.language).expect("Go grammar");
+            let tree = parser.parse(&source, None).expect("Go syntax tree");
+            assert!(!tree.root_node().has_error());
+            GO_BINDING_ANCESTRY_LOOKUPS.with(|work| work.set(0));
+            GO_DECLARED_NAME_ANCESTRY_LOOKUPS.with(|work| work.set(0));
+            let index = GoResolutionIndex::build(&tree, &source, NodeId(1), &[]);
+            let lookups = GO_BINDING_ANCESTRY_LOOKUPS.with(std::cell::Cell::get);
+            let declared_lookups = GO_DECLARED_NAME_ANCESTRY_LOOKUPS.with(std::cell::Cell::get);
+            eprintln!("GO_BINDING_ANCESTRY_LOOKUPS {depth} {lookups}");
+            eprintln!("GO_DECLARED_NAME_ANCESTRY_LOOKUPS {depth} {declared_lookups}");
+            assert_eq!(index.calls.len(), 3, "fixture must retain three calls");
+            let mut callable_spans = HashMap::new();
+            walk_nodes(tree.root_node(), &mut |node| {
+                if matches!(node.kind(), "function_declaration" | "method_declaration") {
+                    callable_spans.insert(node.id(), (node.start_byte(), node.end_byte()));
+                }
+            });
+            let closures = GoReturnedClosureIndex::prepare(tree.root_node());
+            let owners = go_callables_declaring_name(tree.root_node(), &source, "new", &closures);
+            let mut cursor = tree.root_node().walk();
+            let shadow = tree
+                .root_node()
+                .named_children(&mut cursor)
+                .find(|node| {
+                    node.child_by_field_name("name")
+                        .and_then(|name| node_text(name, &source))
+                        == Some("shadow")
+                })
+                .expect("named shadow owner");
+            assert_eq!(owners, HashSet::from([shadow.id()]));
+            let absent =
+                go_callables_declaring_name(tree.root_node(), &source, "never_declared", &closures);
+            assert!(absent.is_empty());
+            let owner_spans = owners
+                .iter()
+                .map(|id| callable_spans[id])
+                .collect::<Vec<_>>();
+            let mut bindings = index
+                .binding_decisions
+                .iter()
+                .map(|((callable, byte, name), decision)| {
+                    let receiver = match decision {
+                        GoBindingDecision::Blocked => None,
+                        GoBindingDecision::Receiver(binding) => Some((
+                            binding.owner_name.clone(),
+                            binding.pointer,
+                            binding.constructor,
+                            binding.constructor_uses_builtin_new,
+                            binding.imported,
+                            binding.implicit,
+                        )),
+                    };
+                    (callable_spans[callable], *byte, name.clone(), receiver)
+                })
+                .collect::<Vec<_>>();
+            bindings.sort();
+            assert_eq!(bindings.len(), 3);
+            assert_eq!(
+                bindings
+                    .iter()
+                    .map(|binding| binding.3.is_some())
+                    .collect::<Vec<_>>(),
+                vec![true, false, true],
+                "local shadow must block only the middle receiver call"
+            );
+            for receiver in bindings.iter().filter_map(|binding| binding.3.as_ref()) {
+                assert_eq!(
+                    receiver,
+                    &("Worker".to_string(), true, true, false, false, false)
+                );
+            }
+            let source_hash = source_content_hash(source.as_bytes());
+            let (_, mut calls, file) = crate::index_file_with_resolution_inputs(
+                Path::new("binding_ancestry.go"),
+                &source,
+                &source_hash,
+                &config,
+                None,
+                None,
+            )
+            .expect("complete fixture extraction");
+            let mut file = file.expect("cached Go file inputs");
+            assert!(file.complete && file.lookup_input_complete);
+            assert_eq!(calls.len(), 3);
+            // Retain each fixture's actual records for exact RED/GREEN review.
+            eprintln!(
+                "GO_BINDING_ANCESTRY_FIXTURE {depth} {}",
+                serde_json::to_string(&(&bindings, &calls, &file, &owner_spans, &absent))
+                    .expect("fixture records")
+            );
+            assert_eq!(file.source_sha256, source_hash);
+            file.source_sha256.clear();
+            for call in &mut calls {
+                assert_eq!(call.callsite.source_sha256, source_hash);
+                call.callsite.source_sha256.clear();
+            }
+            (
+                lookups,
+                bindings,
+                calls,
+                file,
+                source_hash,
+                declared_lookups,
+            )
+        };
+        let shallow = measure(0);
+        let nested = measure(64);
+        assert_ne!(
+            shallow.4, nested.4,
+            "source identities must remain distinct"
+        );
+        assert_eq!(shallow.1, nested.1, "complete binding decisions changed");
+        assert_eq!(
+            shallow.2, nested.2,
+            "cached calls changed beyond source hash"
+        );
+        assert_eq!(
+            shallow.3, nested.3,
+            "cached file changed beyond source hash"
+        );
+        assert!(shallow.0 > 0, "first-pass ancestry work must be measured");
+        assert_eq!(
+            shallow.0, nested.0,
+            "irrelevant parentheses added first-pass ancestry lookups"
+        );
+        assert!(shallow.5 > 0, "declaring-name ancestry must be measured");
+        assert_eq!(
+            shallow.5, nested.5,
+            "irrelevant parentheses added declaring-name ancestry"
+        );
+    }
+
     fn go_source(count: usize) -> String {
         let mut source = String::from(
             "package proof\ntype Worker struct{}\nfunc (w *Worker) Run() {}\nfunc caller() {\n",
@@ -22321,6 +22537,7 @@ mod go_complexity_tests {
                     }],
                     inherent_methods: Vec::new(),
                     classes: Vec::new(),
+                    public_exports: None,
                     direct_exports: Vec::new(),
                     export_poison_all: false,
                     poisoned_export_names: Vec::new(),
@@ -22472,6 +22689,7 @@ mod python_complexity_tests {
                     instance_method_names: Vec::new(),
                     java_scope: None,
                 }],
+                public_exports: None,
                 direct_exports: Vec::new(),
                 export_poison_all: false,
                 poisoned_export_names: Vec::new(),

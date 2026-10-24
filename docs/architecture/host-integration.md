@@ -5,6 +5,42 @@ pieces: a small Node launcher packaged with the plugin and the matching native
 CodeStory executable. The launcher owns installation compatibility. The native
 process owns every product operation.
 
+The canonical grounding skill permits implicit invocation and can also be invoked
+explicitly. Its `SKILL.md`
+keeps common request and evidence limits; the complete manual lives beside it
+in `GUIDE.md`, preserving its relative reference links. Consult that guide for
+needed unfamiliar or complex detail, not as a prerequisite for known operations.
+Tool requests, runtime behavior and validation are unchanged.
+
+## Startup navigation
+
+The shared Claude Code/Codex hook manifest has no automatic registrations. It
+emits no startup map, skill reminder or session diagnostic state. MCP tools and
+the canonical skill remain available independently. Cursor and Copilot retain
+their separate registrations; the shared activation helper and hidden map
+command remain available, without a claim of map delivery on those hosts.
+
+When invoked with an explicit fresh `SessionStart` (`source: startup`), the activation hook may
+return a small repository map from the existing compatible complete core as
+data alone, without a skill-reading reminder or preloaded skill body. It
+passes only the absolute hook `cwd` to the verified existing CLI; active-state
+records never choose a project. The hidden command pins one immutable core,
+reuses strict grounding selection, groups selected roots by native file
+identity, and verifies only those selected files against indexed raw hashes
+under the captured source-index byte policy. Selection remains as of that
+publication, even when emitted files match current content. Error counts,
+orientation uncertainty, source gaps and omitted groups remain visible.
+
+The map contains at most 12 whole file groups within 3584 UTF-8 bytes. Hook
+context remains bounded to 4096 UTF-8 bytes. The child has a two-second deadline and
+never indexes, repairs, provisions or attaches retrieval. A missing or unusable
+core, invalid child result or timeout returns guidance with the canonical
+packaged skill's absolute path; resume, clear and compact events use that same
+fallback. Paths are JSON-quoted and never truncated; a path that cannot fit is
+reported unavailable rather than clipped. Runtime
+receipts verify the CLI hash; explicit executable overrides retain their
+existing operator-controlled contract.
+
 ## Installed lifecycle
 
 ```mermaid
@@ -55,7 +91,7 @@ repository commit pinned in the marketplace catalog over TLS, plus
 and nothing in this repository claims it is.
 
 The fail-open catalog prevents installation work from looking like a missing
-plugin. It keeps diagnostics and the complete tool schema visible while the
+plugin. It keeps diagnostics and complete tool input schemas visible while the
 native executable is prepared, then forwards requests to that executable.
 
 The local `CodeStoryDev` marketplace uses a separate, explicit trust contract.
@@ -75,6 +111,67 @@ process must agree on: the `_meta.codestory_publication` schema version and the
 MCP protocol revisions the executable implements. The generated MCP catalog
 records both, read back out of the real binary, so the launcher's mirrored
 constants are pinned to the CLI it ships with.
+
+The plugin's modern `tools/list` responses omit the optional `outputSchema`
+member. The generated canonical catalog and direct CLI discovery retain full
+schemas; native output validation, launcher input validation and result
+payloads are unchanged. The discovery digest continues to identify that full
+underlying runtime contract, rather than the plugin's projected listing.
+Plugin clients consequently lose advertised static return types and standard
+client-side output-schema validation through discovery. This is an interface
+tradeoff, not universal compatibility preservation. Older profile listings
+already omit output schemas and remain unchanged.
+Projection requires standard JSON source-context and raw-JSON support. Hosts
+without those primitives retain the full original listing; relayed numeric
+identities, schema bounds and metadata are never rounded for compaction.
+Relayed projection also requires the lossless reply ID to match its pending
+listing request exactly. A reply matching only after numeric rounding, or
+using a different numeric spelling, retains the original full reply.
+
+### Affected symbol layouts
+
+MCP `affected` keeps its `impacted_symbols` record array by default. The optional
+`symbol_layout: "shared-fields-v1"` replaces only that array with an object containing
+`shared_fields` and ordered `rows`. Merge the shared object into each residual row
+to recover the original records, including unknown fields and null values. Only
+fields present with identical JSON values in every selected row are shared;
+missing fields stay missing. No second expanded representation is returned.
+
+Layout is a stdio rendering choice after the normal response caps and canonical
+output validation. Counts, limits, completeness, errors and preparation behavior
+remain the same. Named calls and family calls use the same declared argument;
+ordinary CLI and HTTP affected responses keep their existing shape.
+
+### Explicit family-v1 surface
+
+The launcher captures `CODESTORY_MCP_TOOL_SURFACE` once at startup. Absent, empty,
+or `named` preserves the existing named tools; `family-v1` explicitly advertises
+only `call` and `describe`. Other values fail before runtime startup. This is an
+opt-in adapter interface, not an automatic migration of installed grants.
+
+`call` accepts a closed `{operation, arguments}` envelope. The canonical inner
+arguments own the sole required absolute `project`. The selected full generated
+catalog validates the envelope and every inner argument before the launcher
+lowers it to the existing named `tools/call`. It adds no product orchestration.
+`describe({operation,project})` returns the complete selected canonical descriptor
+and catalog/runtime version identity locally. Listings and describe remain local
+before and after runtime readiness; a missing or malformed full catalog cannot
+make arbitrary inner arguments callable. Describe reads no index or publication.
+
+A family `call` grant covers all canonical operations. Individual operation grants,
+per-operation client input typing and advertised return types are unavailable through this surface;
+clients must deliberately accept that difference. Canonical input/output
+validation and complete results remain unchanged. Named calls are rejected on
+the family interface, and every batch is rejected atomically. The default named
+surface retains its aliases, revision profiles and legacy batch behavior.
+
+Family translation requires standard JSON source-context/raw-JSON support and
+fails honestly if it is unavailable. Ordinary parsed values own validation;
+lossless values own serialization, including local response IDs, precise inner
+numbers and metadata. Duplicate object keys use JSON's last-member semantics
+consistently. Canonical results, failures, preparing/retry hints, paging, gaps and
+publication identity pass through unchanged; retries wrap their canonical
+operation in the same family envelope. Direct CLI discovery is unchanged.
 
 `initialize` negotiates. The server answers with a revision it implements and
 reports the requested revision, the negotiated revision, the supported set, and

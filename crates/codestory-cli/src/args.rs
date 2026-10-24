@@ -129,6 +129,8 @@ pub(crate) enum Command {
     Retrieval(RetrievalCommand),
     #[command(name = "internal-owned-delete", hide = true)]
     InternalOwnedDelete(InternalOwnedDeleteCommand),
+    #[command(name = "internal-session-context", hide = true)]
+    InternalSessionContext(InternalSessionContextCommand),
     #[command(name = "internal-dirty-hook", hide = true)]
     InternalDirtyHook(InternalDirtyHookCommand),
     #[command(name = "internal-embedding-server", hide = true)]
@@ -173,6 +175,12 @@ pub(crate) enum InternalDirtyHookAction {
     Install,
     Uninstall,
     Status,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct InternalSessionContextCommand {
+    #[arg(long, value_name = "REPOSITORY")]
+    pub(crate) project: PathBuf,
 }
 
 #[derive(Args, Debug)]

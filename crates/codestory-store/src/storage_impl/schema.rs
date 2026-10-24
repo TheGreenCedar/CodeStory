@@ -603,6 +603,9 @@ const GROUNDING_SUMMARY_DESTINATION_INDEX_NAMES: &[&str] = &[
 ];
 
 pub(super) fn create_tables(conn: &Connection) -> Result<(), StorageError> {
+    for statement in super::public_exports::TABLES {
+        conn.execute(statement, [])?;
+    }
     for statement in TABLE_STATEMENTS {
         conn.execute(statement, [])?;
     }
@@ -895,6 +898,18 @@ pub(super) fn apply_schema_migrations(storage: &Storage) -> Result<(), StorageEr
         tx.commit()?;
     }
 
+    if stored_version < PUBLIC_EXPORT_ALIAS_SCHEMA_VERSION
+        || stored_version == INCOMPLETE_INCREMENTAL_SCHEMA_VERSION
+    {
+        let tx = storage.conn.unchecked_transaction()?;
+        for statement in super::public_exports::TABLES {
+            tx.execute(statement, [])?;
+        }
+        if stored_version != INCOMPLETE_INCREMENTAL_SCHEMA_VERSION {
+            tx.pragma_update(None, "user_version", PUBLIC_EXPORT_ALIAS_SCHEMA_VERSION)?;
+        }
+        tx.commit()?;
+    }
     if stored_version < SCHEMA_VERSION {
         storage.set_schema_version(SCHEMA_VERSION)?;
     }

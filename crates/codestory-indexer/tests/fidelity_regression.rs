@@ -1320,3 +1320,592 @@ fn test_trailing_space_extension_indexes_without_abort() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn public_export_navigation_is_bound_and_refreshes_target_only_edits() -> anyhow::Result<()> {
+    use codestory_store::{IndexPublicationMode, IndexPublicationRecord};
+    let dir = tempdir()?;
+    let root = dir.path();
+    let inputs = [
+        (
+            "owner.ts",
+            "export class _Painter { draw() {} }\nexport function _paint() {}\n",
+        ),
+        (
+            "entry.ts",
+            "import { _Painter as Local } from './owner.js';\nexport { Local as Painter };\nexport { _paint as paint } from './owner.js';\nexport function run() { new Local().draw(); }\n",
+        ),
+        ("local.js", "class _Local {}\nexport { _Local as Local };\n"),
+        ("a.ts", "export { _Painter as Shared } from './owner.js';\n"),
+        ("b.ts", "export { _paint as Shared } from './owner.js';\n"),
+        (
+            "barrel.ts",
+            "export { Painter as Chained } from './entry.js';\nexport * from './owner.js';\n",
+        ),
+        (
+            "unsupported.ts",
+            "import Default from './owner.js';\nexport { Default as NotProven };\nexport type { _Painter as TypeOnly } from './owner.js';\n",
+        ),
+    ];
+    for (path, source) in inputs {
+        fs::write(root.join(path), source)?;
+    }
+    let mut store = Storage::new_in_memory()?;
+    let indexer = WorkspaceIndexer::new(root.to_path_buf());
+    let refresh =
+        |paths: Vec<std::path::PathBuf>, existing_file_ids| codestory_workspace::RefreshInfo {
+            mode: codestory_workspace::BuildMode::Incremental,
+            files_to_index: paths,
+            files_to_remove: vec![],
+            existing_file_ids,
+        };
+    indexer.run_incremental(
+        &mut store,
+        &refresh(
+            inputs.iter().map(|(path, _)| root.join(path)).collect(),
+            HashMap::new(),
+        ),
+        &EventBus::new(),
+        None,
+    )?;
+    let publication = IndexPublicationRecord {
+        generation: 1,
+        generation_id: "exports".into(),
+        run_id: "run".into(),
+        mode: IndexPublicationMode::Full,
+        published_at_epoch_ms: 1,
+    };
+    codestory_indexer::rematerialize_proof_resolution_projection(&mut store, &publication)?;
+    store.put_index_publication(&publication)?;
+    for (name, canonical) in [
+        ("Painter", "_Painter"),
+        ("paint", "_paint"),
+        ("Local", "_Local"),
+    ] {
+        let found = store.public_export_aliases(name)?;
+        assert!(found.ready, "{name}");
+        assert_eq!(
+            found.rows.len(),
+            1,
+            "{name}: {found:?}; nodes: {:?}",
+            store.get_nodes()?
+        );
+        assert!(
+            store
+                .get_node(found.rows[0].target_node_id.unwrap())?
+                .unwrap()
+                .serialized_name
+                .ends_with(canonical)
+        );
+    }
+    let painter = store.public_export_aliases("Painter")?.rows[0]
+        .target_node_id
+        .unwrap();
+    let draw = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .filter(|fact| fact.callsite.raw_target == "draw")
+        .collect::<Vec<_>>();
+    assert!(
+        !draw.is_empty(),
+        "negative control must contain a real callsite"
+    );
+    assert!(
+        draw.iter().all(|fact| fact.status
+            != codestory_contracts::proof_resolution::ProofResolutionStatus::Exact),
+        "navigation aliases cannot broaden exact-call admission"
+    );
+    assert_eq!(store.public_export_aliases("Shared")?.rows.len(), 2);
+    store
+        .get_connection()
+        .execute_batch("SAVEPOINT cache_eviction; DELETE FROM index_artifact_cache;")?;
+    assert_eq!(
+        store.public_export_aliases("Painter")?.rows[0].target_node_id,
+        Some(painter),
+        "parser eviction cannot erase durable query authority"
+    );
+    let missing =
+        codestory_indexer::rematerialize_proof_resolution_projection(&mut store, &publication)
+            .expect_err("missing parser inputs cannot certify an empty replacement");
+    assert!(missing.to_string().contains("coverage is missing"));
+    assert_eq!(
+        store.public_export_aliases("Painter")?.rows.len(),
+        1,
+        "failed staged reconstruction preserves prior rows"
+    );
+    store
+        .get_connection()
+        .execute_batch("ROLLBACK TO cache_eviction; RELEASE cache_eviction;")?;
+    for name in ["Chained", "NotProven", "TypeOnly", "Invented"] {
+        assert!(store.public_export_aliases(name)?.rows.is_empty(), "{name}");
+    }
+    // Only the target is indexed. An unchanged exporter must not retain its old binding.
+    fs::write(
+        root.join("owner.ts"),
+        "export class Other {}\nexport function _paint() {}\n",
+    )?;
+    let existing = store
+        .get_files()?
+        .into_iter()
+        .map(|file| (file.path, file.id))
+        .collect();
+    indexer.run_incremental(
+        &mut store,
+        &refresh(vec![root.join("owner.ts")], existing),
+        &EventBus::new(),
+        None,
+    )?;
+    let mut next = publication.clone();
+    next.generation = 2;
+    next.generation_id = "next".into();
+    codestory_indexer::rematerialize_proof_resolution_projection(&mut store, &next)?;
+    store.put_index_publication(&next)?;
+    assert!(store.public_export_aliases("Painter")?.rows.is_empty());
+    assert!(
+        store.get_node(painter)?.is_none()
+            || store.get_node(painter)?.unwrap().serialized_name != "_Painter"
+    );
+    // A competing concrete .js source makes .js -> .ts navigation ambiguous.
+    fs::write(
+        root.join("owner.js"),
+        "export class _Painter {}\nexport function _paint() {}\n",
+    )?;
+    let existing = store
+        .get_files()?
+        .into_iter()
+        .map(|file| (file.path, file.id))
+        .collect();
+    indexer.run_incremental(
+        &mut store,
+        &refresh(vec![root.join("owner.js")], existing),
+        &EventBus::new(),
+        None,
+    )?;
+    next.generation = 3;
+    next.generation_id = "third".into();
+    codestory_indexer::rematerialize_proof_resolution_projection(&mut store, &next)?;
+    store.put_index_publication(&next)?;
+    let ambiguous = store.public_export_aliases("paint")?;
+    assert!(ambiguous.ready);
+    assert!(!ambiguous.complete);
+    assert!(ambiguous.rows.is_empty());
+    // Drift after extraction must reject the staged rebuild, not invent an empty binding.
+    fs::write(root.join("owner.js"), "export function changed() {}\n")?;
+    assert!(
+        codestory_indexer::rematerialize_proof_resolution_projection(&mut store, &next).is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn public_export_supported_bindings_coexist_with_unsupported_coverage() -> anyhow::Result<()> {
+    use codestory_store::{IndexPublicationMode, IndexPublicationRecord};
+    let cases = [
+        (
+            "supported",
+            "export class _Owner {}\n",
+            "export { _Owner as Public } from './owner.js';\n",
+            1,
+            false,
+        ),
+        (
+            "exporter_const",
+            "export class _Owner {}\n",
+            "export { _Owner as Public } from './owner.js';\nexport const version = 1;\n",
+            1,
+            true,
+        ),
+        (
+            "target_const",
+            "export class _Owner {}\nexport const version = 1;\n",
+            "export { _Owner as Public } from './owner.js';\n",
+            1,
+            true,
+        ),
+        (
+            "mixed_named_import",
+            "export class _Owner {}\nexport const version = 1;\nexport interface Other { size: number }\nexport default function unrelated() {}\n",
+            "import { _Owner as Local } from './owner.js';\nexport { Local as Public };\nexport const version = 2;\nexport declare namespace Other { const size: number; }\nexport type { Other } from './types';\nexport * from './unavailable';\n",
+            1,
+            true,
+        ),
+        (
+            "same_file",
+            "class _Owner {}\nexport { _Owner as Public };\nexport const version = 1;\n",
+            "export const other = 2;\n",
+            1,
+            true,
+        ),
+        (
+            "namespace_reexport_has_no_local_binding",
+            "class _Owner {}\nexport { _Owner as Public };\nexport * as _Owner from './unavailable';\n",
+            "export const version = 1;\n",
+            1,
+            true,
+        ),
+        (
+            "public_name_conflict",
+            "export class _Owner {}\n",
+            "export { _Owner as Public } from './owner.js';\nexport const Public = 1;\n",
+            0,
+            true,
+        ),
+        (
+            "target_name_conflict",
+            "export class _Owner {}\nexport const _Owner = 1;\n",
+            "export { _Owner as Public } from './owner.js';\n",
+            0,
+            true,
+        ),
+        (
+            "public_namespace_conflict",
+            "export class _Owner {}\n",
+            "export { _Owner as Public } from './owner.js';\nexport declare namespace Public { const size: number; }\n",
+            0,
+            true,
+        ),
+        (
+            "target_namespace_conflict",
+            "export class _Owner {}\nexport declare namespace _Owner { const size: number; }\n",
+            "export { _Owner as Public } from './owner.js';\n",
+            0,
+            true,
+        ),
+        (
+            "public_namespace_export_conflict",
+            "export class _Owner {}\n",
+            "export { _Owner as Public } from './owner.js';\nexport * as Public from './unavailable';\n",
+            0,
+            true,
+        ),
+        (
+            "local_namespace_conflict",
+            "class _Owner {}\ndeclare namespace _Owner { const size: number; }\nexport { _Owner as Public };\n",
+            "export const version = 1;\n",
+            0,
+            true,
+        ),
+        (
+            "function_with_unsupported_exports",
+            "export function _Owner() {}\nexport const version = 1;\nexport default class Other {}\n",
+            "export { _Owner as Public } from './owner.js';\nexport * from './unavailable';\nexport type { Other } from './types';\n",
+            1,
+            true,
+        ),
+        (
+            "duplicate_alias",
+            "export class _Owner {}\n",
+            "export { _Owner as Public } from './owner.js';\nexport { _Owner as Public } from './owner.js';\n",
+            0,
+            true,
+        ),
+        (
+            "missing_target",
+            "export class Other {}\n",
+            "export { _Owner as Public } from './owner.js';\n",
+            0,
+            true,
+        ),
+        (
+            "partial_exporter",
+            "export class _Owner {}\n",
+            "export { _Owner as Public } from './owner.js';\nfunction broken( {\n",
+            0,
+            true,
+        ),
+        (
+            "type_star_coexistence",
+            "export class _Owner {}\n",
+            "export { _Owner as Public } from './owner.js';\nexport type * from './types';\n",
+            1,
+            true,
+        ),
+        (
+            "partial_target",
+            "export class _Owner {}\nfunction broken( {\n",
+            "export { _Owner as Public } from './owner.js';\n",
+            0,
+            true,
+        ),
+        (
+            "unsupported_target",
+            "export const _Owner = 1;\n",
+            "export { _Owner as Public } from './owner.js';\n",
+            0,
+            true,
+        ),
+        (
+            "quoted_public_conflict",
+            "class _Owner {}\nclass Other {}\nexport { _Owner as Public };\nexport { Other as \"Public\" };\n",
+            "export const version = 1;\n",
+            0,
+            true,
+        ),
+        (
+            "quoted_public_unrelated",
+            "class _Owner {}\nclass Other {}\nexport { _Owner as Public };\nexport { Other as \"Different\" };\n",
+            "export const version = 1;\n",
+            1,
+            true,
+        ),
+        (
+            "quoted_empty_public_unrelated",
+            "class _Owner {}\nclass Other {}\nexport { _Owner as Public };\nexport { Other as \"\" };\n",
+            "export const version = 1;\n",
+            1,
+            true,
+        ),
+        (
+            "single_quoted_public_conflict",
+            "class _Owner {}\nclass Other {}\nexport { _Owner as Public };\nexport { Other as 'Public' };\n",
+            "export const version = 1;\n",
+            0,
+            true,
+        ),
+        (
+            "quoted_local_conflict",
+            "export class _Owner {}\nexport class Other {}\n",
+            "export { _Owner as Public } from './owner.js';\nexport { \"Other\" as Public } from './owner.js';\n",
+            0,
+            true,
+        ),
+        (
+            "quoted_local_unrelated",
+            "export class _Owner {}\nexport class Other {}\n",
+            "export { _Owner as Public } from './owner.js';\nexport { \"Other\" as Different } from './owner.js';\n",
+            1,
+            true,
+        ),
+        (
+            "quoted_alias_never_resolves",
+            "export class _Owner {}\n",
+            "export { _Owner as \"Public\" } from './owner.js';\n",
+            0,
+            true,
+        ),
+        (
+            "quoted_namespace_conflict",
+            "export class _Owner {}\n",
+            "export { _Owner as Public } from './owner.js';\nexport * as \"Public\" from './other.js';\n",
+            0,
+            true,
+        ),
+        (
+            "quoted_namespace_unrelated",
+            "export class _Owner {}\n",
+            "export { _Owner as Public } from './owner.js';\nexport * as \"Different\" from './other.js';\n",
+            1,
+            true,
+        ),
+        (
+            "escaped_json_public_conflict",
+            "class _Owner {}\nclass Other {}\nexport { _Owner as Public };\nexport { Other as \"Pub\\u006cic\" };\n",
+            "export const version = 1;\n",
+            0,
+            true,
+        ),
+        (
+            "escaped_json_public_unrelated",
+            "class _Owner {}\nclass Other {}\nexport { _Owner as Public };\nexport { Other as \"Diffe\\u0072ent\" };\n",
+            "export const version = 1;\n",
+            1,
+            true,
+        ),
+        (
+            "unknown_single_quoted_public",
+            "class _Owner {}\nclass Other {}\nexport { _Owner as Public };\nexport { Other as 'Pub\\u006cic' };\n",
+            "export const version = 1;\n",
+            0,
+            true,
+        ),
+        (
+            "unknown_identifier_public",
+            "class _Owner {}\nclass Other {}\nexport { _Owner as Public };\nexport { Other as Pub\\u006cic };\n",
+            "export const version = 1;\n",
+            0,
+            true,
+        ),
+        (
+            "unknown_local_declaration",
+            "class _Owner {}\nconst _Ow\\u006eer = 1;\nexport { _Owner as Public };\n",
+            "export const version = 1;\n",
+            0,
+            true,
+        ),
+        (
+            "unknown_local_does_not_poison_direct_reexport",
+            "export class _Owner {}\n",
+            "const Diffe\\u0072ent = 1;\nexport { _Owner as Public } from './owner.js';\nexport const version = 1;\n",
+            1,
+            true,
+        ),
+        (
+            "quoted_target_export_conflict",
+            "export class _Owner {}\nclass Other {}\nexport { Other as \"_Owner\" };\n",
+            "export { _Owner as Public } from './owner.js';\n",
+            0,
+            true,
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (name, target, exporter, expected, partial_coverage) in cases {
+        let dir = tempdir()?;
+        let root = dir.path();
+        fs::write(root.join("owner.ts"), target)?;
+        fs::write(root.join("entry.ts"), exporter)?;
+        let mut store = Storage::new_in_memory()?;
+        WorkspaceIndexer::new(root.to_path_buf()).run_incremental(
+            &mut store,
+            &codestory_workspace::RefreshInfo {
+                mode: codestory_workspace::BuildMode::Incremental,
+                files_to_index: vec![root.join("owner.ts"), root.join("entry.ts")],
+                files_to_remove: vec![],
+                existing_file_ids: HashMap::new(),
+            },
+            &EventBus::new(),
+            None,
+        )?;
+        let publication = IndexPublicationRecord {
+            generation: 1,
+            generation_id: name.into(),
+            run_id: name.into(),
+            mode: IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        codestory_indexer::rematerialize_proof_resolution_projection(&mut store, &publication)?;
+        store.put_index_publication(&publication)?;
+        let found = store.public_export_aliases("Public")?;
+        if !matches!(name, "partial_exporter" | "partial_target") {
+            assert!(
+                store.get_files()?.iter().all(|file| file.complete),
+                "valid fixture must have complete parser coverage: {name}"
+            );
+        }
+        eprintln!(
+            "mixed export matrix {name}: expected={expected} actual={} ready={} complete={}",
+            found.rows.len(),
+            found.ready,
+            found.complete
+        );
+        if !found.ready || found.rows.len() != expected || partial_coverage && found.complete {
+            failures.push(name);
+        }
+        for row in found.rows {
+            assert_eq!(
+                store
+                    .get_node(row.target_node_id.unwrap())?
+                    .unwrap()
+                    .serialized_name,
+                "_Owner"
+            );
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "mixed-export matrix failures: {failures:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn public_export_type_star_grammar_preserves_value_authority() -> anyhow::Result<()> {
+    use codestory_store::{IndexPublicationMode, IndexPublicationRecord};
+    let cases = [
+        ("plain", "export type * from './owner.js';\n", true, true),
+        (
+            "namespace",
+            "export type * as Types from './owner.js';\n",
+            true,
+            true,
+        ),
+        (
+            "type_only",
+            "export type * as Public from './owner.js';\n",
+            true,
+            false,
+        ),
+        ("missing_from", "export type * './owner.js';\n", false, true),
+        (
+            "missing_namespace_name",
+            "export type * as from './owner.js';\n",
+            false,
+            true,
+        ),
+        (
+            "unclosed_string",
+            "export type * from './owner.js\n",
+            false,
+            true,
+        ),
+        (
+            "unrelated_error",
+            "export type * from './owner.js';\nfunction broken( {\n",
+            false,
+            true,
+        ),
+    ];
+    let mut failures = Vec::new();
+    for extension in ["ts", "tsx"] {
+        for (name, type_export, parsed, named_exports) in cases {
+            let dir = tempdir()?;
+            let root = dir.path();
+            let owner = root.join(format!("owner.{extension}"));
+            let entry = root.join(format!("entry.{extension}"));
+            fs::write(
+                &owner,
+                "export class _Owner {}\nexport function _run() {}\n",
+            )?;
+            let mut source = String::new();
+            if named_exports {
+                source.push_str("export { _Owner as Public, _run as Run } from './owner.js';\n");
+            }
+            source.push_str(type_export);
+            fs::write(&entry, source)?;
+            let mut store = Storage::new_in_memory()?;
+            WorkspaceIndexer::new(root.to_path_buf()).run_incremental(
+                &mut store,
+                &codestory_workspace::RefreshInfo {
+                    mode: codestory_workspace::BuildMode::Incremental,
+                    files_to_index: vec![owner, entry.clone()],
+                    files_to_remove: vec![],
+                    existing_file_ids: HashMap::new(),
+                },
+                &EventBus::new(),
+                None,
+            )?;
+            let publication = IndexPublicationRecord {
+                generation: 1,
+                generation_id: format!("{extension}-{name}"),
+                run_id: name.into(),
+                mode: IndexPublicationMode::Full,
+                published_at_epoch_ms: 1,
+            };
+            codestory_indexer::rematerialize_proof_resolution_projection(&mut store, &publication)?;
+            store.put_index_publication(&publication)?;
+            let actual_parsed = store.get_file_by_path(&entry)?.unwrap().complete;
+            let class = store.public_export_aliases("Public")?;
+            let function = store.public_export_aliases("Run")?;
+            let namespace = store.public_export_aliases("Types")?;
+            let expected = usize::from(parsed && named_exports);
+            eprintln!(
+                "type-star matrix {extension}/{name}: parsed={actual_parsed} expected={parsed} class={} function={} expected={expected}",
+                class.rows.len(),
+                function.rows.len()
+            );
+            if actual_parsed != parsed
+                || !class.ready
+                || class.complete
+                || class.rows.len() != expected
+                || function.rows.len() != expected
+                || !namespace.rows.is_empty()
+            {
+                failures.push(format!("{extension}/{name}"));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "type-star matrix failures: {failures:?}"
+    );
+    Ok(())
+}

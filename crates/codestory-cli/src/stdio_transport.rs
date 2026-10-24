@@ -2795,19 +2795,7 @@ fn project_stdio_tool_execution_v3(
     let packet_diagnostics = None;
     let projection = match tool_name {
         "context" => project_stdio_context_result_v3(runtime, &response, result)?,
-        "search" => {
-            let results =
-                serde_json::from_value::<codestory_contracts::api::SearchResultsDto>(result)
-                    .map_err(|_| {
-                        ApiError::internal("Search execution returned an invalid internal DTO.")
-                    })?;
-            serde_json::to_value(codestory_runtime::project_search_v3(
-                &runtime.public_operation,
-                "codestory-stdio",
-                &results,
-            )?)
-            .map_err(|error| ApiError::internal(error.to_string()))?
-        }
+        "search" => result,
         _ => {
             return Ok(StdioToolExecutionV3 {
                 response,
@@ -3097,8 +3085,22 @@ fn handle_stdio_search_v3(
             hybrid_weights: None,
             hybrid_limits: None,
         })
+        .and_then(|result| project_typed_stdio_search_v3(runtime, &result))
         .map(|result| serde_json::json!({"result": result}))
         .unwrap_or_else(|error| serde_json::json!({"error": stdio_api_error_value(error)}))
+}
+
+// Keep the in-process match proof until the modern closed projection is built.
+fn project_typed_stdio_search_v3(
+    runtime: &RuntimeContext,
+    result: &codestory_contracts::api::SearchResultsDto,
+) -> Result<serde_json::Value, ApiError> {
+    serde_json::to_value(codestory_runtime::project_search_v3(
+        &runtime.public_operation,
+        "codestory-stdio",
+        result,
+    )?)
+    .map_err(|error| ApiError::internal(error.to_string()))
 }
 
 fn reserve_packet_diagnostics_capability_v3(
@@ -3646,7 +3648,7 @@ fn stdio_public_operation_name<'a>(name: &'a str, request: &serde_json::Value) -
             .and_then(serde_json::Value::as_str)
             .is_some_and(|query| !query.trim().is_empty())
         {
-            "graph_assisted"
+            "resolution"
         } else {
             "graph"
         }
@@ -4473,9 +4475,36 @@ fn stdio_initialize_result_json(request: &serde_json::Value) -> serde_json::Valu
 #[derive(Debug)]
 enum PreparedStdioToolCall {
     Raw,
-    Affected(AffectedAnalysisRequest),
+    Affected(StdioAffectedRequest),
     Snippet(StdioSnippetRequest),
     ProveCallPath(codestory_runtime::public_call_path::UnvalidatedCallPathContract),
+}
+
+#[derive(Debug)]
+struct StdioAffectedRequest {
+    analysis: AffectedAnalysisRequest,
+    symbol_layout: AffectedSymbolLayout,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AffectedSymbolLayout {
+    Records,
+    SharedFieldsV1,
+}
+
+impl AffectedSymbolLayout {
+    fn parse(request: &serde_json::Value) -> Result<Self, ApiError> {
+        match request.pointer("/params/arguments/symbol_layout") {
+            None => Ok(Self::Records),
+            Some(serde_json::Value::String(value)) if value == "records" => Ok(Self::Records),
+            Some(serde_json::Value::String(value)) if value == "shared-fields-v1" => {
+                Ok(Self::SharedFieldsV1)
+            }
+            _ => Err(ApiError::invalid_argument(
+                "affected.symbol_layout must be records or shared-fields-v1",
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -4494,9 +4523,13 @@ fn prepare_stdio_tool_call(
 ) -> std::result::Result<PreparedStdioToolCall, ApiError> {
     match name {
         "affected" => {
-            let affected = stdio_affected_request(request)?;
-            stdio_preflight_affected_paths(session, request, &affected)?;
-            Ok(PreparedStdioToolCall::Affected(affected))
+            let symbol_layout = AffectedSymbolLayout::parse(request)?;
+            let analysis = stdio_affected_request(request)?;
+            stdio_preflight_affected_paths(session, request, &analysis)?;
+            Ok(PreparedStdioToolCall::Affected(StdioAffectedRequest {
+                analysis,
+                symbol_layout,
+            }))
         }
         "snippet" => stdio_snippet_request(request).map(PreparedStdioToolCall::Snippet),
         name if crate::prove_call_path::is_proof_tool_name(name) => {
@@ -4939,15 +4972,16 @@ fn handle_stdio_files(runtime: &RuntimeContext, request: &serde_json::Value) -> 
 
 fn handle_stdio_affected(
     runtime: &RuntimeContext,
-    request: &AffectedAnalysisRequest,
+    request: &StdioAffectedRequest,
 ) -> serde_json::Value {
     runtime
         .browser
-        .affected_analysis(request.clone())
-        .map(|result| {
+        .affected_analysis(request.analysis.clone())
+        .and_then(|result| {
             let value = serde_json::to_value(result)
-                .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}));
-            serde_json::json!({"result": compact_stdio_affected_result(value)})
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+            render_stdio_affected_result(value, request.symbol_layout)
+                .map(|value| serde_json::json!({"result": value}))
         })
         .unwrap_or_else(|error| serde_json::json!({"error": stdio_api_error_value(error)}))
 }
@@ -5085,6 +5119,51 @@ fn stdio_preflight_affected_paths(
         }
     }
     Ok(())
+}
+
+fn render_stdio_affected_result(
+    value: serde_json::Value,
+    layout: AffectedSymbolLayout,
+) -> Result<serde_json::Value, ApiError> {
+    let mut value = compact_stdio_affected_result(value);
+    crate::stdio_arguments::validate_structured_content(
+        crate::stdio_catalog::affected_records_output_schema(),
+        &value,
+    )
+    .map_err(|_| ApiError::internal("affected canonical output schema violation"))?;
+    if layout == AffectedSymbolLayout::SharedFieldsV1
+        && let Some(symbols) = value.get_mut("impacted_symbols")
+        && let Some(rows) = symbols.as_array_mut()
+    {
+        let mut shared = rows
+            .first()
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        // Numeric equality alone would merge distinct JSON such as 0.0 and -0.0.
+        shared.retain(|key, common| {
+            let common_json = serde_json::to_vec(common).expect("JSON value is serializable");
+            rows.iter().all(|row| {
+                row.get(key).is_some_and(|item| {
+                    serde_json::to_vec(item).is_ok_and(|json| json == common_json)
+                })
+            })
+        });
+        for row in rows.iter_mut() {
+            if let Some(row) = row.as_object_mut() {
+                row.retain(|key, _| !shared.contains_key(key));
+            }
+        }
+        *symbols = serde_json::json!({"shared_fields": shared, "rows": rows});
+        let schema = crate::stdio_v3::catalog::modern_output_schema_v3(
+            "affected",
+            crate::stdio_v3::V3SurfaceSet::EvidenceOnly,
+        )
+        .ok_or_else(|| ApiError::internal("affected output schema missing"))?;
+        crate::stdio_arguments::validate_structured_content(schema, &value)
+            .map_err(|_| ApiError::internal("affected layout output schema violation"))?;
+    }
+    Ok(value)
 }
 
 fn compact_stdio_affected_result(mut value: serde_json::Value) -> serde_json::Value {
@@ -9005,6 +9084,167 @@ mod tests {
     }
 
     #[test]
+    fn native_public_export_core_search_preserves_typed_provenance_and_canonical_identity() {
+        let project = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let startup = crate::config::CliStartupConfig {
+            user_home: None,
+            allow_sensitive_project_root: false,
+            project_network_config_allowed: false,
+            stdio_cache_root: Some(cache.path().join("stdio")),
+            sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
+                cache.path().join("sidecar"),
+                codestory_retrieval::SidecarRuntimeDefaults::default(),
+            ),
+            source_index_policy: codestory_contracts::workspace::SourceIndexPolicy::default(),
+        };
+        let runtime = RuntimeContext::new_agent_sidecar_with_startup(
+            &args::ProjectArgs {
+                project: project.path().to_path_buf(),
+                cache_dir: Some(cache.path().to_path_buf()),
+            },
+            &startup,
+        )
+        .unwrap();
+        fs::write(
+            runtime.project_root.join("owner.ts"),
+            "export class _Painter { draw() {} }\n",
+        )
+        .unwrap();
+        fs::write(
+            runtime.project_root.join("entry.ts"),
+            "import { _Painter as Local } from './owner.js';\nexport { Local as Painter };\n",
+        )
+        .unwrap();
+        for n in 0..12 {
+            fs::write(
+                runtime.project_root.join(format!("callback{n}.ts")),
+                "export function painter() {}\n",
+            )
+            .unwrap();
+        }
+        runtime
+            .ensure_open(args::RefreshMode::Full)
+            .expect("publish actual source-built core");
+        codestory_retrieval::test_support::publish_deterministic_dense_pinned_query_fixture(
+            &runtime.project_root,
+            &runtime.storage_path,
+            runtime.sidecar.as_raw_config_for_test(),
+        )
+        .expect("publish full lexical retrieval fixture");
+        runtime
+            .activation
+            .use_published_retrieval_fixture_for_test();
+        let mut canonical_id = None;
+        for mode in ["off"] {
+            let request = json!({"params":{"name":"search","arguments":{"project":runtime.project_root,"query":"Painter","repo_text":mode,"limit":5}}});
+            let execution = runtime
+                .public_operation
+                .run_observational_with_cancel(
+                    stdio_public_operation_name("search", &request),
+                    Arc::new(AtomicBool::new(false)),
+                    || {
+                        project_stdio_tool_execution_v3(
+                            &runtime,
+                            &mut StdioServerState::default(),
+                            &request,
+                            &PreparedStdioToolCall::Raw,
+                            "search",
+                            crate::stdio_v3::McpRevisionV3::preferred(),
+                        )
+                    },
+                )
+                .expect("actual pinned modern execution route")
+                .value;
+            let root = execution
+                .response
+                .get("result")
+                .unwrap_or_else(|| panic!("{mode}: {}", execution.response));
+            let projection: codestory_contracts::packet_projection_v3::SearchProjectionV3Dto =
+                serde_json::from_value(root.clone()).expect("closed modern schema");
+            let rows = root["evidence"].as_array().expect("actual modern rows");
+            let owner = rows
+                .iter()
+                .find(|row| {
+                    row["display_name"]
+                        .as_str()
+                        .is_some_and(|label| label.contains("exported as Painter"))
+                })
+                .unwrap_or_else(|| panic!("{mode}: {root}"));
+            assert!(owner["path"].as_str().unwrap().ends_with("owner.ts"));
+            assert_eq!(owner["start_line"], json!(1));
+            assert!(
+                owner["excerpt"]
+                    .as_str()
+                    .unwrap()
+                    .contains("class _Painter")
+            );
+            assert!(
+                owner["display_name"]
+                    .as_str()
+                    .unwrap()
+                    .contains("entry.ts:2")
+            );
+            if let Some(id) = canonical_id.as_ref() {
+                assert_eq!(&owner["symbol_id"], id);
+            } else {
+                canonical_id = Some(owner["symbol_id"].clone());
+            }
+            assert!(!projection.evidence.as_slice().is_empty());
+            let served = build_served_tool_result_v3(
+                crate::stdio_v3::McpRevisionV3::preferred(),
+                "search",
+                root,
+                None,
+            )
+            .expect("actual schema-validated result builder");
+            assert_eq!(&served["structuredContent"], root);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(
+                    served["content"][0]["text"].as_str().unwrap()
+                )
+                .unwrap(),
+                *root
+            );
+            eprintln!(
+                "modern core alias wire bytes={} payload={}",
+                serde_json::to_vec(&served).unwrap().len(),
+                served
+            );
+        }
+        let result = runtime
+            .browser
+            .search_results(SearchRequest {
+                query: "Painter".into(),
+                repo_text: SearchRepoTextMode::Off,
+                limit_per_source: 5,
+                expand_search_plan: false,
+                hybrid_weights: None,
+                hybrid_limits: None,
+            })
+            .unwrap();
+        assert_eq!(result.hits[0].display_name, "_Painter");
+        assert!(
+            result.hits[0]
+                .verification_targets
+                .iter()
+                .any(|target| target.role == "public_export" && target.line == 2)
+        );
+        let wire = serde_json::to_value(&result).unwrap();
+        assert!(
+            wire.get("public_exports").is_none(),
+            "internal typed proof is not a legacy schema extension"
+        );
+        assert!(
+            wire["hits"][0]["verification_targets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|target| target["role"] == "public_export")
+        );
+    }
+
+    #[test]
     fn native_stable_tool_outputs_match_advertised_schemas() {
         let (_project, _cache, runtime) = stdio_inspect_only_runtime();
         fs::write(
@@ -9040,9 +9280,10 @@ mod tests {
         ] {
             let request = json!({"params":{"name":tool,"arguments":arguments}});
             let prepared = match tool {
-                "affected" => {
-                    PreparedStdioToolCall::Affected(stdio_affected_request(&request).unwrap())
-                }
+                "affected" => PreparedStdioToolCall::Affected(StdioAffectedRequest {
+                    analysis: stdio_affected_request(&request).unwrap(),
+                    symbol_layout: AffectedSymbolLayout::parse(&request).unwrap(),
+                }),
                 "snippet" => {
                     PreparedStdioToolCall::Snippet(stdio_snippet_request(&request).unwrap())
                 }
@@ -9229,7 +9470,7 @@ mod tests {
         let selected = json!({"params": {"arguments": {"query": "arbitrary free query"}}});
         assert_eq!(
             stdio_tool_read_class("symbol", &selected).activation_goal(),
-            codestory_runtime::ActivationGoal::Full
+            codestory_runtime::ActivationGoal::CoreOnly
         );
         assert_eq!(
             stdio_tool_read_class("snippet", &selected).activation_goal(),
@@ -9901,6 +10142,7 @@ mod tests {
         let context = stdio_tool_call_success("context", context_packet_json(&context_answer));
 
         let search_result = codestory_contracts::api::SearchResultsDto {
+            public_exports: Default::default(),
             query: "AppController".to_string(),
             retrieval_publication: None,
             retrieval: codestory_contracts::api::RetrievalStateDto {
@@ -10019,6 +10261,182 @@ mod tests {
         );
     }
 
+    fn expand_affected_symbols(value: &mut serde_json::Value) {
+        let symbols = &mut value["impacted_symbols"];
+        let shared = symbols["shared_fields"].as_object().unwrap();
+        *symbols = serde_json::Value::Array(
+            symbols["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| {
+                    let mut record = shared.clone();
+                    for (key, value) in row.as_object().unwrap() {
+                        assert!(
+                            !record.contains_key(key),
+                            "shared and residual fields overlap"
+                        );
+                        record.insert(key.clone(), value.clone());
+                    }
+                    serde_json::Value::Object(record)
+                })
+                .collect(),
+        );
+    }
+
+    #[test]
+    fn affected_symbol_layout_is_lossless_after_caps_and_checked_for_every_revision() {
+        let base = json!({
+            "project_root":"/project", "changed_paths":["owner.rs"], "change_records":[],
+            "matched_files":[], "uncovered_inputs":[], "matched_file_count":0, "depth":2,
+            "impacted_symbols":[], "impacted_tests":[],
+            "bounds":{"requested_depth":2,"maximum_depth":8,"visited_node_count":90,
+                "visited_edge_count":100,"impacted_symbol_limit":200,"impacted_route_limit":50},
+            "completeness":{"complete":true,"confidence":"complete","direct_impact_count":60,
+                "propagated_impact_count":0,"candidate_test_count":0,"uncovered_input_count":0,
+                "unavailable_evidence_count":0,"truncated":false,"truncation_reasons":[]}
+        });
+        let repeated = (0..=STDIO_AFFECTED_SYMBOL_OUTPUT_LIMIT).map(|index| json!({
+            "node_id": format!("{}", 9007199254740993_u64 + index as u64),
+            "file_path":"src/Unicode 🦀/owner.rs", "reason":"dependent via CALL", "distance":1,
+            "unknown":{"nested":[null,true,1,1.0,"escaped \" \n"]},"line":index+1
+        })).collect::<Vec<_>>();
+        let heterogeneous = vec![
+            json!({"same":null,"different":null,"number":1,"zero":0.0,"nested":{"n":0.0}}),
+            json!({"same":null,"different":false,"number":1.0,"zero":-0.0,"nested":{"n":-0.0}}),
+            json!({"same":null,"number":true,"zero":0,"nested":{"n":0}}),
+        ];
+        for rows in [
+            vec![],
+            vec![json!({"unknown":null})],
+            heterogeneous,
+            repeated,
+        ] {
+            let mut input = base.clone();
+            input["impacted_symbols"] = json!(rows);
+            let expected = compact_stdio_affected_result(input.clone());
+            let records =
+                render_stdio_affected_result(input.clone(), AffectedSymbolLayout::Records).unwrap();
+            assert_eq!(
+                serde_json::to_vec(&records).unwrap(),
+                serde_json::to_vec(&expected).unwrap()
+            );
+            let compact =
+                render_stdio_affected_result(input, AffectedSymbolLayout::SharedFieldsV1).unwrap();
+            let mut expanded = compact.clone();
+            expand_affected_symbols(&mut expanded);
+            assert_eq!(
+                serde_json::to_vec(&expanded).unwrap(),
+                serde_json::to_vec(&records).unwrap()
+            );
+            if rows.len() > STDIO_AFFECTED_SYMBOL_OUTPUT_LIMIT {
+                assert!(
+                    serde_json::to_vec(&compact).unwrap().len()
+                        < serde_json::to_vec(&records).unwrap().len()
+                );
+                assert_eq!(
+                    compact["impacted_symbols"]["rows"]
+                        .as_array()
+                        .unwrap()
+                        .len(),
+                    50
+                );
+                assert_eq!(compact["counts"]["impacted_symbols"], 51);
+                assert_eq!(compact["completeness"]["complete"], false);
+                eprintln!(
+                    "affected layout bytes records={} compact={}",
+                    serde_json::to_vec(&records).unwrap().len(),
+                    serde_json::to_vec(&compact).unwrap().len()
+                );
+            }
+            for &revision in crate::stdio_v3::McpRevisionV3::all() {
+                for value in [&records, &compact] {
+                    let served =
+                        build_served_tool_result_v3(revision, "affected", value, None).unwrap();
+                    let text: serde_json::Value =
+                        serde_json::from_str(served["content"][0]["text"].as_str().unwrap())
+                            .unwrap();
+                    assert_eq!(text, *value);
+                    if revision.profile().structured_content {
+                        assert_eq!(served["structuredContent"], *value);
+                    } else {
+                        assert!(served.get("structuredContent").is_none());
+                    }
+                }
+            }
+        }
+        for symbols in [json!([null]), json!({"shared_fields":{},"rows":[]})] {
+            let mut invalid = base.clone();
+            invalid["impacted_symbols"] = symbols;
+            assert!(
+                render_stdio_affected_result(invalid, AffectedSymbolLayout::SharedFieldsV1)
+                    .is_err()
+            );
+        }
+        for symbols in [
+            json!({"shared_fields":[],"rows":[]}),
+            json!({"shared_fields":{},"rows":[null]}),
+            json!({"shared_fields":{},"rows":[],"hidden":[]}),
+        ] {
+            let mut invalid = base.clone();
+            invalid["impacted_symbols"] = symbols;
+            assert!(
+                build_served_tool_result_v3(
+                    crate::stdio_v3::McpRevisionV3::preferred(),
+                    "affected",
+                    &invalid,
+                    None
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn native_affected_layouts_serve_the_same_indexed_facts() {
+        let (_project, _cache, runtime) = stdio_inspect_only_runtime();
+        fs::write(
+            runtime.project_root.join("owner.rs"),
+            "pub fn entry() -> usize { helper() }\nfn helper() -> usize { 7 }\n",
+        )
+        .unwrap();
+        runtime.ensure_open(args::RefreshMode::Full).unwrap();
+        let session = StdioServerSession::new(None);
+        for &revision in crate::stdio_v3::McpRevisionV3::all() {
+            let mut original = None;
+            for layout in [None, Some("records"), Some("shared-fields-v1")] {
+                let mut request =
+                    json!({"params":{"name":"affected","arguments":{"paths":["owner.rs"]}}});
+                if let Some(layout) = layout {
+                    request["params"]["arguments"]["symbol_layout"] = json!(layout);
+                }
+                let prepared = prepare_stdio_tool_call(&session, "affected", &request).unwrap();
+                let execution = project_stdio_tool_execution_v3(
+                    &runtime,
+                    &mut StdioServerState::default(),
+                    &request,
+                    &prepared,
+                    "affected",
+                    revision,
+                )
+                .unwrap();
+                let root = &execution.response["result"];
+                let served = build_served_tool_result_v3(revision, "affected", root, None).unwrap();
+                let mut body: serde_json::Value =
+                    serde_json::from_str(served["content"][0]["text"].as_str().unwrap()).unwrap();
+                if layout == Some("shared-fields-v1") {
+                    expand_affected_symbols(&mut body);
+                }
+                assert!(!body["impacted_symbols"].as_array().unwrap().is_empty());
+                if let Some(original) = &original {
+                    assert_eq!(&body, original);
+                } else {
+                    original = Some(body);
+                }
+            }
+        }
+    }
+
     #[test]
     fn affected_transport_truncation_downgrades_stronger_nested_completeness_with_field_totals() {
         let impacted_symbols = (0..=STDIO_AFFECTED_SYMBOL_OUTPUT_LIMIT)
@@ -10121,7 +10539,7 @@ mod tests {
     }
 
     #[test]
-    fn query_resolved_graph_tools_use_the_complete_retrieval_operation() {
+    fn query_resolved_graph_tools_use_fresh_core_resolution() {
         for tool in [
             "symbol",
             "trail",
@@ -10146,7 +10564,7 @@ mod tests {
                 if tool == "snippet" {
                     "source_snippet"
                 } else {
-                    "graph_assisted"
+                    "resolution"
                 },
                 "{tool} query resolution keeps its owning publication capability"
             );
@@ -12923,6 +13341,7 @@ version = "0.11.20"
             score_breakdown: None,
         };
         let result = codestory_contracts::api::SearchResultsDto {
+            public_exports: Default::default(),
             query: "test".to_string(),
             retrieval_publication: None,
             retrieval: codestory_contracts::api::RetrievalStateDto {
@@ -12973,6 +13392,7 @@ version = "0.11.20"
         // that, and retrieval_publication was reaching the wire while only `_meta` declared it.
         let declared = crate::stdio_catalog::SEARCH_RESULTS_SCHEMA.declared_property_names();
         let dto = codestory_contracts::api::SearchResultsDto {
+            public_exports: Default::default(),
             query: "scripted".into(),
             // Must be populated: serde skips a None, so a None fixture cannot observe the field
             // reaching the wire at all.
@@ -14896,6 +15316,33 @@ version = "0.11.20"
                 Some(codestory_runtime::ActivationCapabilityState::Ready)
             );
         }
+    }
+
+    #[test]
+    fn affected_invalid_symbol_layout_refuses_before_activation() {
+        let cache = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut session = StdioServerSession::new(None);
+        session.startup.stdio_cache_root = Some(cache.path().to_path_buf());
+        for layout in [
+            json!(null),
+            json!(true),
+            json!(1),
+            json!({}),
+            json!("shared-fields-v2"),
+        ] {
+            let request = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"affected","arguments":{"project":project.path(),"paths":["owner.rs"],"symbol_layout":layout}}});
+            let response = handle_stdio_message(
+                &mut session,
+                &request.to_string(),
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap();
+            assert_eq!(response["error"]["code"], -32602, "{response}");
+            assert!(session.active_project.is_none());
+            assert!(session.retained_projects.is_empty());
+        }
+        assert_eq!(fs::read_dir(cache.path()).unwrap().count(), 0);
     }
 
     #[test]
@@ -17127,24 +17574,40 @@ version = "0.11.20"
     /// lock is held, so a read runs against a refresh that is genuinely in
     /// flight instead of one parked before it started.
     struct MidIndexingHold {
+        storage_path: PathBuf,
         gate: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        entered: Arc<tokio::sync::Notify>,
     }
 
     impl MidIndexingHold {
         fn arm(storage_path: &Path) -> Self {
             let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
-            let expected = storage_path.to_path_buf();
+            let entered = Arc::new(tokio::sync::Notify::new());
             let hook_gate = Arc::clone(&gate);
-            codestory_runtime::set_mid_indexing_test_hook(Some(Arc::new(move |path: &Path| {
-                if path == expected.as_path() {
+            let hook_entered = Arc::clone(&entered);
+            codestory_runtime::set_mid_indexing_test_hook(
+                storage_path,
+                Some(Arc::new(move |_path: &Path| {
                     let (released, changed) = &*hook_gate;
                     let mut released = released.lock().expect("mid-index gate");
+                    hook_entered.notify_one();
                     while !*released {
                         released = changed.wait(released).expect("mid-index gate");
                     }
-                }
-            })));
-            Self { gate }
+                })),
+            )
+            .expect("register owned mid-index hook");
+            Self {
+                storage_path: storage_path.to_path_buf(),
+                gate,
+                entered,
+            }
+        }
+
+        async fn wait_until_entered(&self) {
+            tokio::time::timeout(Duration::from_secs(30), self.entered.notified())
+                .await
+                .expect("indexing worker did not enter its owned hold");
         }
     }
 
@@ -17153,7 +17616,8 @@ version = "0.11.20"
             let (released, changed) = &*self.gate;
             *released.lock().expect("mid-index gate") = true;
             changed.notify_all();
-            codestory_runtime::set_mid_indexing_test_hook(None);
+            codestory_runtime::set_mid_indexing_test_hook(&self.storage_path, None)
+                .expect("remove owned mid-index hook");
         }
     }
 
@@ -17318,7 +17782,15 @@ version = "0.11.20"
             Some(&json!("fresh")),
             "a warm read with no refresh in flight reports fresh: {ground}"
         );
-        json!({"ground": result.clone(), "node_id": node_id})
+        let core_generation_id = ground
+            .pointer("/result/_meta/codestory_publication/core_publication/generation_id")
+            .and_then(serde_json::Value::as_str)
+            .expect("warm response core generation");
+        json!({
+            "ground": result.clone(),
+            "node_id": node_id,
+            "core_generation_id": core_generation_id,
+        })
     }
 
     #[tokio::test]
@@ -17337,6 +17809,14 @@ version = "0.11.20"
         // that is genuinely in flight, not one parked before indexing.
         let _hold = MidIndexingHold::arm(&fixture.storage_path);
 
+        fixture
+            .send_call(
+                "start-held-refresh",
+                "ground",
+                json!({"project": fixture.project_root, "budget": "balanced"}),
+            )
+            .await;
+        _hold.wait_until_entered().await;
         fixture
             .send_call(
                 "refresh-ground",
@@ -17378,9 +17858,10 @@ version = "0.11.20"
             live_stdio_fixture(&[("lib.rs", "pub fn source_anchor() -> u32 { 1 }\n")]).await;
         let warm = warm_fixture_and_symbol_id(&mut fixture, "source_anchor").await;
         let node_id = warm["node_id"].as_str().expect("symbol id").to_string();
-        let retained_generation = warm["ground"]["_meta"]
-            .get("codestory_publication")
-            .cloned();
+        let retained_generation = warm["core_generation_id"]
+            .as_str()
+            .expect("retained core generation")
+            .to_string();
         std::fs::write(
             fixture.project_root.join("lib.rs"),
             "pub fn source_anchor() -> u32 { 2 }\npub fn appended_marker() {}\n",
@@ -17395,6 +17876,7 @@ version = "0.11.20"
                 json!({"project": fixture.project_root, "id": node_id}),
             )
             .await;
+        _hold.wait_until_entered().await;
         let pending = fixture
             .collect_frames_for("held-snippet", Duration::from_secs(6))
             .await;
@@ -17408,9 +17890,13 @@ version = "0.11.20"
             .read_response("held-snippet", Duration::from_secs(60))
             .await;
         let snippet = &response["result"]["structuredContent"];
+        let source = snippet["snippet"].as_str().unwrap_or_else(|| {
+            panic!("snippet must serve after the refresh completes: {response}")
+        });
         assert!(
-            snippet["snippet"].as_str().is_some(),
-            "snippet must serve after the refresh completes: {response}"
+            source.contains("pub fn source_anchor() -> u32 { 2 }")
+                && source.contains("pub fn appended_marker()"),
+            "snippet must contain the changed source, not retained bytes: {response}"
         );
         let meta = &response["result"]["_meta"]["codestory_publication"];
         assert_eq!(
@@ -17423,7 +17909,13 @@ version = "0.11.20"
             json!("complete_publication"),
             "{response}"
         );
-        let _ = retained_generation;
+        assert_ne!(
+            meta["core_publication"]["generation_id"]
+                .as_str()
+                .expect("fresh core generation"),
+            retained_generation,
+            "snippet must bind the refreshed core generation: {response}"
+        );
     }
 
     #[tokio::test]
@@ -17544,6 +18036,7 @@ version = "0.11.20"
                 }),
             )
             .await;
+        _hold.wait_until_entered().await;
         let pending = fixture
             .collect_frames_for("held-exact", Duration::from_secs(6))
             .await;
@@ -17582,6 +18075,7 @@ version = "0.11.20"
                 }),
             )
             .await;
+        _hold.wait_until_entered().await;
         let pending = fixture
             .collect_frames_for("held-packet", Duration::from_secs(6))
             .await;

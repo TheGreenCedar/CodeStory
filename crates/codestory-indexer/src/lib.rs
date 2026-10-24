@@ -82,6 +82,13 @@ fn go_method_identity_work() -> usize {
     GO_METHOD_IDENTITY_WORK.with(std::cell::Cell::get)
 }
 
+// Occurrence roles are shared producer data; retain each language's local revision too.
+macro_rules! extraction_revision {
+    ($local:literal) => {
+        concat!("canonical-reference-occurrences-v1;", $local)
+    };
+}
+
 mod cache;
 pub mod cancellation;
 pub mod compilation_database;
@@ -91,6 +98,7 @@ mod language_configs;
 mod languages;
 mod native_declarators;
 mod proof_resolution;
+mod public_exports;
 
 /// SRC-C2 fence classification: lives in its own file because
 /// `codestory-indexer`'s own source is indexed by
@@ -1427,14 +1435,22 @@ impl<'a> ProjectionWriter<'a> {
     }
 
     fn accept_storage(&mut self, mut local_storage: IntermediateStorage) -> Result<()> {
-        // A verified malformed snapshot replaces the old projection with source
-        // identity only. An operational failure cannot authorize that removal.
-        let verified_malformed = !local_storage.file_content_hashes.is_empty()
-            && !local_storage.errors.is_empty()
-            && local_storage
-                .errors
-                .iter()
-                .all(|error| error.coverage_reason == Some(FileCoverageReason::Malformed));
+        // Verified format/encoding rejection replaces the old projection with
+        // source identity only. Operational failures cannot authorize removal.
+        let verified_rejected_source = !local_storage.errors.is_empty()
+            && local_storage.files.first().is_some_and(|file| {
+                local_storage
+                    .file_content_hashes
+                    .iter()
+                    .any(|hash| hash.file_id == file.id)
+                    && local_storage.errors.iter().all(|error| {
+                        error.file_id == Some(NodeId(file.id))
+                            && matches!(
+                                error.coverage_reason,
+                                Some(FileCoverageReason::Malformed | FileCoverageReason::Binary)
+                            )
+                    })
+            });
         let mut source_identity_only = false;
         if let Some((file_id, file_complete, file_path)) = local_storage
             .files
@@ -1453,7 +1469,7 @@ impl<'a> ProjectionWriter<'a> {
                 .storage
                 .get_callable_projection_states_for_file(file_id)
                 .map_err(|e| anyhow!("Storage state lookup error: {:?}", e))?;
-            let replace_file_owned_projection = verified_malformed
+            let replace_file_owned_projection = verified_rejected_source
                 || !local_storage.structural_text_projections.is_empty()
                 || local_storage
                     .files
@@ -1553,14 +1569,15 @@ impl<'a> ProjectionWriter<'a> {
                 retain_file_identity_rows(&mut local_storage, file_id, false);
                 self.stats.source_identity_only_files =
                     self.stats.source_identity_only_files.saturating_add(1);
-            } else if !file_complete && !verified_malformed {
+            } else if !file_complete && !verified_rejected_source {
                 // An unreadable, drifting, oversized, or parser-partial source is retry
                 // evidence, not proof that its previous symbols disappeared. Preserve the
                 // last verified projection and update only the file/error rows below.
                 local_storage
                     .nodes
                     .retain(|node| node.id != NodeId(file_id));
-                local_storage.file_extraction_identities.clear();
+                // Verified parser-partial extraction still records its source
+                // and producer; it does not certify the inherited graph complete.
                 self.stats.graph_projection_changed = true;
             } else {
                 let cleanup_started = Instant::now();
@@ -1954,13 +1971,16 @@ impl WorkspaceIndexer {
         let cancelled = Arc::new(AtomicBool::new(false));
         let root = self.root.clone();
         let existing_projection_setup_started = Instant::now();
-        let existing_projection_ids = plan.existing_file_ids.clone();
-        let existing_projection_file_ids = Self::existing_projection_file_ids(
-            storage,
-            &root,
-            &plan.files_to_index,
-            &existing_projection_ids,
-        )?;
+        let existing_projection_file_ids = match plan.mode {
+            // Full-refresh preparation and persistence do not consult predecessor IDs.
+            codestory_workspace::BuildMode::FullRefresh => HashSet::new(),
+            codestory_workspace::BuildMode::Incremental => Self::existing_projection_file_ids(
+                storage,
+                &root,
+                &plan.files_to_index,
+                &plan.existing_file_ids,
+            )?,
+        };
         stats.setup_existing_projection_ids_ms =
             duration_ms_u64(existing_projection_setup_started.elapsed());
         if Self::is_cancelled(cancel_token) {
@@ -3467,6 +3487,9 @@ impl WorkspaceIndexer {
                         language_config.language_name,
                         flags,
                     );
+                    if !source_utf8_exact {
+                        mark_non_utf8_parser_artifact_incomplete(&mut artifact, &content_hash);
+                    }
                     verify_cached_artifact_source(
                         &mut artifact,
                         &full_path,
@@ -3545,9 +3568,7 @@ impl WorkspaceIndexer {
                                 content_hash,
                             });
                     }
-                    if source_utf8_exact {
-                        add_current_file_extraction_identities(&mut local_storage);
-                    }
+                    add_current_file_extraction_identities(&mut local_storage);
                     Ok(PreparedIndexWork::Immediate(local_storage))
                 }
                 Ok(_) | Err(_) => {
@@ -3682,9 +3703,30 @@ impl WorkspaceIndexer {
                 },
             )
         })?;
+        // Metadata can become stale during the read. A decoder rejection must
+        // not bypass the actual raw-byte policy bound.
+        if bytes.len() as u64 > self.structural_source_byte_cap {
+            return Err(incomplete_file_storage(
+                &full_path,
+                None,
+                language,
+                codestory_contracts::graph::ErrorInfo {
+                    message: format!(
+                        "Structural source {:?} exceeds the {} byte raw source limit",
+                        path, self.structural_source_byte_cap
+                    ),
+                    file_id: None,
+                    line: None,
+                    column: None,
+                    is_fatal: false,
+                    index_step: codestory_contracts::graph::IndexStep::Indexing,
+                    coverage_reason: Some(FileCoverageReason::Oversized),
+                },
+            ));
+        }
         let content_hash = source_content_hash(&bytes);
-        let source = structural::decode_structural_source(bytes).map_err(|error| {
-            incomplete_file_storage(
+        let source = structural::decode_structural_source(&bytes).map_err(|error| {
+            let rejected = incomplete_file_storage(
                 &full_path,
                 None,
                 language,
@@ -3697,11 +3739,31 @@ impl WorkspaceIndexer {
                     index_step: codestory_contracts::graph::IndexStep::Indexing,
                     coverage_reason: Some(FileCoverageReason::Binary),
                 },
-            )
+            );
+            verify_rejected_source_snapshot(rejected, &full_path, language, &content_hash)
         })?;
+        if source.len() as u64 > self.structural_source_byte_cap {
+            return Err(incomplete_file_storage(
+                &full_path,
+                None,
+                language,
+                codestory_contracts::graph::ErrorInfo {
+                    message: format!(
+                        "Structural source {:?} exceeds the {} byte raw or decoded source limit",
+                        path, self.structural_source_byte_cap
+                    ),
+                    file_id: None,
+                    line: None,
+                    column: None,
+                    is_fatal: false,
+                    index_step: codestory_contracts::graph::IndexStep::Indexing,
+                    coverage_reason: Some(FileCoverageReason::Oversized),
+                },
+            ));
+        }
         let artifact_cache_path = index_artifact_cache_path(root, &full_path);
         let artifact_cache_key = artifact_cache_path.as_ref().and_then(|cache_path| {
-            build_structural_artifact_cache_key(cache_path, source.as_bytes(), producer)
+            build_structural_artifact_cache_key(cache_path, &bytes, producer)
         });
         stats.structural_artifact_cache.record_lookup();
         let prepared_input = || PreparedStructuralInput {
@@ -3942,7 +4004,7 @@ impl WorkspaceIndexer {
             }
         };
         let content_hash = source_content_hash(&bytes);
-        let source = match structural::decode_structural_source(bytes) {
+        let source = match structural::decode_structural_source(&bytes) {
             Ok(source) => source,
             Err(_) if structural::is_structural_candidate_path(full_path) => return Ok(None),
             Err(error) => {
@@ -3962,6 +4024,27 @@ impl WorkspaceIndexer {
                 ));
             }
         };
+        if bytes.len() as u64 > self.structural_source_byte_cap
+            || source.len() as u64 > self.structural_source_byte_cap
+        {
+            return Err(incomplete_file_storage(
+                full_path,
+                None,
+                "openapi",
+                codestory_contracts::graph::ErrorInfo {
+                    message: format!(
+                        "OpenAPI source {:?} exceeds the {} byte raw or decoded source limit",
+                        full_path, self.structural_source_byte_cap
+                    ),
+                    file_id: None,
+                    line: None,
+                    column: None,
+                    is_fatal: false,
+                    index_step: codestory_contracts::graph::IndexStep::Collection,
+                    coverage_reason: Some(FileCoverageReason::Oversized),
+                },
+            ));
+        }
         let mut projected = index_openapi_schema_file(full_path, &source).map_err(|error| {
             incomplete_file_storage(
                 full_path,
@@ -4024,22 +4107,21 @@ impl WorkspaceIndexer {
             };
 
         match index_result {
-            Ok((mut index_result, mut call_resolution_inputs, mut resolution_file)) => {
+            Ok((mut index_result, call_resolution_inputs, resolution_file)) => {
                 if let Some(file_info) = index_result.files.first_mut() {
                     file_info.modification_time = modification_time;
                 }
-                if !prepared_input.source_utf8_exact {
-                    call_resolution_inputs.clear();
-                    if let Some(file) = resolution_file.as_mut() {
-                        file.source_sha256 = prepared_input.content_hash.clone();
-                        file.lookup_input_complete = false;
-                    }
-                }
-                let artifact = CachedIndexArtifact::from_index_result_with_resolution_inputs(
+                let mut artifact = CachedIndexArtifact::from_index_result_with_resolution_inputs(
                     index_result,
                     call_resolution_inputs,
                     resolution_file,
                 );
+                if !prepared_input.source_utf8_exact {
+                    mark_non_utf8_parser_artifact_incomplete(
+                        &mut artifact,
+                        &prepared_input.content_hash,
+                    );
+                }
                 let cache_write = prepared_input
                     .artifact_cache_path
                     .as_ref()
@@ -4062,9 +4144,7 @@ impl WorkspaceIndexer {
                             content_hash: prepared_input.content_hash.clone(),
                         });
                 }
-                if prepared_input.source_utf8_exact {
-                    add_current_file_extraction_identities(&mut local_storage);
-                }
+                add_current_file_extraction_identities(&mut local_storage);
                 PreparedIndexJobResult {
                     local_storage,
                     cache_write,
@@ -4220,25 +4300,12 @@ impl WorkspaceIndexer {
                     },
                 );
                 if reason == FileCoverageReason::Malformed {
-                    match verify_source_snapshot(
+                    local_storage = verify_rejected_source_snapshot(
+                        local_storage,
                         &prepared_input.full_path,
+                        language,
                         &prepared_input.content_hash,
-                    ) {
-                        Ok(modification_time) => {
-                            let file = &mut local_storage.files[0];
-                            file.modification_time = modification_time;
-                            local_storage.file_content_hashes.push(
-                                codestory_store::FileContentHash {
-                                    file_id: file.id,
-                                    content_hash: prepared_input.content_hash.clone(),
-                                },
-                            );
-                        }
-                        Err(error) => {
-                            local_storage =
-                                changed_source_storage(&prepared_input.full_path, language, error);
-                        }
-                    }
+                    );
                 }
                 return PreparedIndexJobResult {
                     local_storage,
@@ -4341,14 +4408,39 @@ fn source_content_hash(bytes: &[u8]) -> String {
 pub fn current_file_extraction_revision(language: &str) -> Option<&'static str> {
     match language {
         "python" => Some(languages::python::CALLABLE_DECLARATION_REVISION),
-        "rust" => Some(languages::rust::CALLABLE_DECLARATION_REVISION),
+        "rust" => Some(languages::rust::DECLARATION_REVISION),
+        "bash" => Some(extraction_revision!("bash-callsite-source-order-v1")),
+        "javascript" => Some(extraction_revision!("explicit-named-public-exports-v2")),
+        "typescript" | "tsx" => Some(extraction_revision!("explicit-named-public-exports-v3")),
+        _ if languages::extraction_for_language(language).is_some() => {
+            Some(extraction_revision!(""))
+        }
         _ => None,
+    }
+}
+
+// Lossy parser views can provide partial navigation, never exact source or complete reuse.
+fn mark_non_utf8_parser_artifact_incomplete(artifact: &mut CachedIndexArtifact, raw_hash: &str) {
+    for file in &mut artifact.files {
+        file.complete = false;
+    }
+    artifact.call_resolution_inputs.clear();
+    if let Some(file) = artifact.resolution_file.as_mut() {
+        file.complete = false;
+        file.source_sha256 = raw_hash.to_string();
+        file.lookup_input_complete = false;
     }
 }
 
 fn add_current_file_extraction_identities(storage: &mut IntermediateStorage) {
     for file in &storage.files {
-        if !file.indexed || !file.complete {
+        if !file.indexed
+            || !file.complete
+                && storage
+                    .errors
+                    .iter()
+                    .any(|error| error.file_id == Some(NodeId(file.id)))
+        {
             continue;
         }
         let Some(revision) = current_file_extraction_revision(&file.language) else {
@@ -4419,6 +4511,30 @@ fn verify_source_snapshot(path: &Path, expected_hash: &str) -> Result<i64> {
     Ok(codestory_workspace::clamp_system_time_to_epoch_millis(
         after.modified()?,
     ))
+}
+
+// A stable rejection has no projection, but its raw source identity must meet
+// the same preparation and publication fences as decoded structural input.
+fn verify_rejected_source_snapshot(
+    mut storage: IntermediateStorage,
+    path: &Path,
+    language: &str,
+    content_hash: &str,
+) -> IntermediateStorage {
+    match verify_source_snapshot(path, content_hash) {
+        Ok(modification_time) => {
+            let file = &mut storage.files[0];
+            file.modification_time = modification_time;
+            storage
+                .file_content_hashes
+                .push(codestory_store::FileContentHash {
+                    file_id: file.id,
+                    content_hash: content_hash.to_owned(),
+                });
+            storage
+        }
+        Err(error) => changed_source_storage(path, language, error),
+    }
 }
 
 fn workspace_structural_source_exclusion(
@@ -4893,6 +5009,13 @@ fn rebase_cached_index_artifact(
     }
     if let Some(resolution_file) = &mut artifact.resolution_file {
         resolution_file.file_id = new_file_id;
+        if let Some(exports) = &mut resolution_file.public_exports {
+            for binding in &mut exports.bindings {
+                if let crate::public_exports::ExportTarget::Local(id) = &mut binding.target {
+                    *id = id_remap.get(id).copied().unwrap_or(*id);
+                }
+            }
+        }
         for export in &mut resolution_file.direct_exports {
             export.declaration = id_remap
                 .get(&export.declaration)
@@ -10631,7 +10754,7 @@ fn member_call_method_col(node: TsNode<'_>, source: &str, method_name: &str) -> 
     Some(node.start_position().column as u32 + method_offset as u32 + 1)
 }
 
-fn receiver_call_belongs_to_callable(node: TsNode<'_>, callable: TsNode<'_>) -> bool {
+fn receiver_callable_boundary_kinds(callable: TsNode<'_>) -> &'static [&'static str] {
     const DECLARATION_BOUNDARY_KINDS: &[&str] = &[
         "function_definition",
         "function_declaration",
@@ -10663,13 +10786,15 @@ fn receiver_call_belongs_to_callable(node: TsNode<'_>, callable: TsNode<'_>) -> 
     ];
     const BODY_BOUNDARY_KINDS: &[&str] = &["function_body"];
 
-    let boundary_kinds = if callable.kind() == "function_body" {
+    if callable.kind() == "function_body" {
         BODY_BOUNDARY_KINDS
     } else {
         DECLARATION_BOUNDARY_KINDS
-    };
+    }
+}
 
-    enclosing_node_with_kind(node, boundary_kinds)
+fn receiver_call_belongs_to_callable(node: TsNode<'_>, callable: TsNode<'_>) -> bool {
+    enclosing_node_with_kind(node, receiver_callable_boundary_kinds(callable))
         .is_some_and(|nearest| nearest.kind() == callable.kind() && same_ts_span(nearest, callable))
 }
 
@@ -11317,13 +11442,12 @@ fn definition_occurrences(
         if let (Some(start_line), Some(start_col), Some(end_line), Some(end_col)) =
             (node.start_line, node.start_col, node.end_line, node.end_col)
         {
-            let kind = if matches!(
-                canonical_roles.get(&node.id),
-                Some(CanonicalNodeRole::Declaration | CanonicalNodeRole::ForwardDeclaration)
-            ) {
-                codestory_contracts::graph::OccurrenceKind::DECLARATION
-            } else {
-                codestory_contracts::graph::OccurrenceKind::DEFINITION
+            let kind = match canonical_roles.get(&node.id) {
+                Some(CanonicalNodeRole::Reference) => OccurrenceKind::REFERENCE,
+                Some(CanonicalNodeRole::Declaration | CanonicalNodeRole::ForwardDeclaration) => {
+                    OccurrenceKind::DECLARATION
+                }
+                _ => OccurrenceKind::DEFINITION,
             };
             occurrences.push(Occurrence {
                 element_id: node.id.0,
@@ -17125,7 +17249,7 @@ fn index_file_with_resolution_inputs(
     if language_config.language_name == "python" {
         languages::python::apply_callable_declaration_envelopes(&tree, &mut final_nodes);
     } else if language_config.language_name == "rust" {
-        languages::rust::apply_callable_declaration_envelopes(&tree, &mut final_nodes);
+        languages::rust::apply_declaration_envelopes(&tree, &mut final_nodes);
     }
     let callable_projection_states =
         build_callable_projection_states(&final_nodes, &result_edges, &result_occurrences);
@@ -17615,6 +17739,17 @@ mod proof_resolution_cache_tests {
                     instance_method_names: Vec::new(),
                     java_scope: None,
                 }],
+                public_exports: Some(crate::public_exports::ExportFileInput {
+                    complete: true,
+                    bindings: vec![crate::public_exports::ExportInput {
+                        name: "PublicC".into(),
+                        local_name: "C".into(),
+                        line: 1,
+                        column: 1,
+                        direct: false,
+                        target: crate::public_exports::ExportTarget::Local(old_owner),
+                    }],
+                }),
                 direct_exports: vec![CachedDirectExport {
                     exported_name: "C".to_owned(),
                     declaration: old_owner,
@@ -17695,6 +17830,10 @@ mod proof_resolution_cache_tests {
         assert_eq!(file.classes[0].declaration, new_owner);
         assert_eq!(file.classes[0].methods[0].declaration, new_method);
         assert_eq!(file.direct_exports[0].declaration, new_owner);
+        assert_eq!(
+            file.public_exports.unwrap().bindings[0].target,
+            crate::public_exports::ExportTarget::Local(new_owner)
+        );
         assert!(!file.export_poison_all);
         assert_eq!(file.poisoned_export_names, ["unrelated"]);
     }

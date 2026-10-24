@@ -2,6 +2,58 @@
 
 ## Unreleased
 
+- Indexing avoids repeated sorting and metadata preparation while preserving published proof records and digests.
+
+- Indexing avoids duplicate proof seal checks while retaining source and graph verification.
+
+- Repository indexing avoids repeated import lookups while preserving per-file resolution.
+
+- Go indexing avoids redundant scope lookups while preserving variable shadowing and call resolution.
+
+- Failed indexing reports repeat less run metadata while retaining every progress and cancellation detail.
+
+- Full repository reindexing avoids redundant file lookups before rebuilding the index.
+
+- Bash call navigation handles commands inside prefix assignments without interrupting indexing or losing links between repeated calls on the same line. Existing Bash indexes rebuild on their next refresh.
+
+- Repository navigation stays available when a structural file has unsupported text bytes, while that file keeps explicit incomplete coverage and no source projection.
+
+- Rust struct and enum source excerpts include their fields, variants and outer attributes. Navigation keeps precise name locations, and existing Rust indexes rebuild on their next refresh.
+
+- Rust struct and enum search documents retain their declaration and comment text when source excerpts expand to include attributes and fields.
+
+- Symbol search finds declarations even when frequent call sites share the same name.
+
+- Codex can discover the grounding skill automatically again. Shared Claude Code/Codex startup hooks remain disabled.
+
+- MCP affected results offer an optional lossless shared-field layout for impacted symbols; the default record array stays unchanged.
+
+- Grounding maps stop treating known decorator and inherited-type references as local declarations. Existing parser indexes rebuild once on their next refresh.
+
+- Explicit symbol-summary generation works on current indexes and refreshes summaries when the selected model changes.
+
+- Claude Code and Codex no longer run the automatic session-start hook. CodeStory tools and the grounding skill remain available on request.
+
+- Grounding maps show production package layouts before repeating roots from the same subsystem.
+
+- Symbol search recognizes generic type definitions and keeps them ahead of incidental same-name matches.
+
+- Symbol search keeps qualified method definitions visible for unqualified names, ahead of incidental references and configuration labels.
+
+- Symbol search finds JavaScript and TypeScript classes and functions through verified named public exports, while keeping their original names and source locations. Export/import witness locations explain the match; unsupported or ambiguous bindings remain explicit.
+
+- TypeScript and TSX files parse type-only star exports, allowing independent named exports beside them to remain searchable. Type-only exports do not become value aliases.
+
+- Source-backed search and navigation stay available after indexing unchanged, partially parsed Rust or Python files, while coverage continues to report the parsing gap.
+
+- Structural source indexing and retrieval accept BOM-marked UTF-16 text, including PowerShell files, while keeping source verification tied to the original bytes. Contained aliases with supported file types remain indexable when an unsupported filename is discovered first.
+
+- Agent guidance can display caller results once when whole-number JSON formatting differs, preserving original text and metadata.
+
+- Symbol-name navigation uses the current Core index without preparing search, so symbol details, callers and trails remain available without broad retrieval.
+
+- Symbol search ranks standalone Go type declarations ahead of incidental matches with the same name, making definitions easier to find among configuration labels and references.
+
 ## 0.18.0
 
 - Packets reuse one repository identity snapshot while selecting a response, avoiding repeated Git status scans within the same request.
