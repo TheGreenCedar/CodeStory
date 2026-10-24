@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Indexing avoids duplicate proof seal checks while retaining source and graph verification.
+
 - Repository indexing avoids repeated import lookups while preserving per-file resolution.
 
 - Go indexing avoids redundant scope lookups while preserving variable shadowing and call resolution.

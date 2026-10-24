@@ -5100,11 +5100,11 @@ impl Storage {
                 "fact rows do not match their publication digest",
             ));
         }
+        // Both callers immediately authenticate each fact seal in graph validation.
         for fact in &facts {
             if fact.provenance.language_adapter == "bash" {
                 count_bash_store_resolution_work(BashStoreResolutionPhase::Replay, 1);
             }
-            validate_fact_seal(fact)?;
         }
         Ok((manifest, facts))
     }
