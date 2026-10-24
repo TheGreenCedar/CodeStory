@@ -24,8 +24,16 @@ struct StoredProofProvenanceKey {
     dependency_json: String,
 }
 
+#[cfg(test)]
+thread_local! {
+    // Counts actual key/JSON construction attempts, isolated from parallel tests.
+    static PROVENANCE_KEY_CONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl StoredProofProvenanceKey {
     fn for_fact(fact: &CallResolutionFact) -> Result<Self, StorageError> {
+        #[cfg(test)]
+        PROVENANCE_KEY_CONSTRUCTIONS.with(|work| work.set(work.get() + 1));
         let dependency_json = serde_json::to_string(&fact.provenance.dependency_file_hashes)
             .map_err(|error| {
                 proof_error(format!("failed to serialize dependency hashes: {error}"))
@@ -4500,18 +4508,28 @@ impl Storage {
             .map_err(|error| proof_error(format!("failed to serialize adapter roster: {error}")))?;
         let funnel_json = serde_json::to_string(&manifest.funnel)
             .map_err(|error| proof_error(format!("failed to serialize funnel: {error}")))?;
-        let provenance_ids = facts
-            .iter()
-            .map(StoredProofProvenanceKey::for_fact)
-            .collect::<Result<BTreeSet<_>, _>>()?
+        // Keep one full key per group and compact associations for the fact rows.
+        let mut provenance_groups = BTreeMap::new();
+        let mut fact_provenance_groups = Vec::with_capacity(facts.len());
+        for fact in &facts {
+            let next_group = provenance_groups.len();
+            let group = *provenance_groups
+                .entry(StoredProofProvenanceKey::for_fact(fact)?)
+                .or_insert(next_group);
+            fact_provenance_groups.push(group);
+        }
+        let mut canonical_provenance_ids = vec![0_i64; provenance_groups.len()];
+        let provenance_rows = provenance_groups
             .into_iter()
             .enumerate()
-            .map(|(index, key)| {
-                i64::try_from(index + 1)
-                    .map(|provenance_id| (key, provenance_id))
-                    .map_err(|_| proof_error("proof provenance count exceeds SQLite integer"))
+            .map(|(index, (key, group))| {
+                let provenance_id = i64::try_from(index + 1)
+                    .map_err(|_| proof_error("proof provenance count exceeds SQLite integer"))?;
+                // Encounter order may differ from the canonical full-key order.
+                canonical_provenance_ids[group] = provenance_id;
+                Ok((key, provenance_id))
             })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
+            .collect::<Result<Vec<_>, StorageError>>()?;
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM proof_resolution_publication", [])?;
         tx.execute("DELETE FROM proof_resolution_fact", [])?;
@@ -4523,7 +4541,7 @@ impl Storage {
                     parser_fingerprint, dependency_json
                  ) VALUES (?1, ?2, ?3, ?4, ?5)",
             )?;
-            for (provenance, provenance_id) in &provenance_ids {
+            for (provenance, provenance_id) in &provenance_rows {
                 statement.execute(params![
                     provenance_id,
                     provenance.file_id,
@@ -4548,7 +4566,7 @@ impl Storage {
                     ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24
                  )",
             )?;
-            for fact in &facts {
+            for (fact, provenance_group) in facts.iter().zip(fact_provenance_groups) {
                 if fact.provenance.language_adapter == "bash" {
                     count_bash_store_resolution_work(
                         BashStoreResolutionPhase::Publication,
@@ -4562,9 +4580,8 @@ impl Storage {
                     serde_json::to_string(&fact.evidence_chain).map_err(|error| {
                         proof_error(format!("failed to serialize typed evidence: {error}"))
                     })?;
-                let provenance_key = StoredProofProvenanceKey::for_fact(fact)?;
-                let provenance_id = provenance_ids
-                    .get(&provenance_key)
+                let provenance_id = canonical_provenance_ids
+                    .get(provenance_group)
                     .ok_or_else(|| proof_error("proof fact lost its prepared provenance group"))?;
                 statement.execute(params![
                     fact.fact_id,
@@ -5870,7 +5887,10 @@ mod publication_order_tests {
             }
         }
         let a = seal_call_resolution_fact(fact("", 1, 30, &[1], "rust"))?;
-        let b = seal_call_resolution_fact(fact("", 1, 20, &[1], "rust"))?;
+        // Earlier insertion belongs to the lexically later provenance group.
+        let mut b = fact("", 1, 20, &[1], "rust");
+        b.provenance.parser_fingerprint = "2".repeat(64);
+        let b = seal_call_resolution_fact(b)?;
         let c = seal_call_resolution_fact(fact("", 5, 50, &[5], "bash"))?;
         let d = seal_call_resolution_fact(fact("", 5, 10, &[5], "bash"))?;
         let row = |language: &str| ProofResolutionFunnelRow {
@@ -5921,8 +5941,10 @@ mod publication_order_tests {
             published_at_epoch_ms: 123,
         };
         PUBLICATION_SORT_WORK.with(|work| work.set([0; 4]));
+        PROVENANCE_KEY_CONSTRUCTIONS.with(|work| work.set(0));
         let output = store.replace_proof_resolution_projection(&publication, &input)?;
         let work = PUBLICATION_SORT_WORK.with(std::cell::Cell::get);
+        let provenance_work = PROVENANCE_KEY_CONSTRUCTIONS.with(std::cell::Cell::get);
         assert_eq!(output, expected_manifest);
         let expected_rows = vec![b.clone(), a.clone(), c.clone(), d.clone()];
         assert_eq!(store.get_proof_resolution_facts()?, expected_rows);
@@ -5940,6 +5962,48 @@ mod publication_order_tests {
                 d.fact_id.clone()
             ]
         );
+        let provenance_rows = store
+            .conn
+            .prepare(
+                "SELECT provenance_id, file_id, source_sha256, parser_fingerprint, dependency_json
+                 FROM proof_resolution_provenance ORDER BY provenance_id",
+            )?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let expected_provenance = |id, file_id, fingerprint: &str| {
+            (
+                id,
+                file_id,
+                "a".repeat(64),
+                fingerprint.repeat(64),
+                format!(
+                    r#"[{{"file_id":{file_id},"source_sha256":"{}"}}]"#,
+                    "a".repeat(64)
+                ),
+            )
+        };
+        assert_eq!(
+            provenance_rows,
+            vec![
+                expected_provenance(1, 1, "1"),
+                expected_provenance(2, 1, "2"),
+                expected_provenance(3, 5, "1"),
+            ]
+        );
+        let fact_provenance_ids = store
+            .conn
+            .prepare("SELECT provenance_id FROM proof_resolution_fact ORDER BY rowid")?
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(fact_provenance_ids, vec![2, 1, 3, 3]);
         let ordered = |ids: Vec<String>| {
             ids.into_iter()
                 .collect::<BTreeSet<_>>()
@@ -5971,6 +6035,11 @@ mod publication_order_tests {
             work,
             [1, 4, 0, 0],
             "writer must reuse one global ID order and append already ordered dependency lists"
+        );
+        eprintln!("PROOF_PUBLICATION_PROVENANCE_KEY_WORK constructions={provenance_work}");
+        assert_eq!(
+            provenance_work, 4,
+            "each writer fact must construct its exact provenance key once"
         );
         Ok(())
     }

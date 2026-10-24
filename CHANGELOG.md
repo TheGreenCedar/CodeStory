@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Indexing avoids repeated proof-publication sorting while preserving published records and digests.
+- Indexing avoids repeated sorting and metadata preparation while preserving published proof records and digests.
 
 - Indexing avoids duplicate proof seal checks while retaining source and graph verification.
 
