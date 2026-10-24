@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Go indexing avoids redundant scope lookups while preserving variable shadowing and call resolution.
+
 - Failed indexing reports repeat less run metadata while retaining every progress and cancellation detail.
 
 - Full repository reindexing avoids redundant file lookups before rebuilding the index.
