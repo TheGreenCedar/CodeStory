@@ -10754,7 +10754,7 @@ fn member_call_method_col(node: TsNode<'_>, source: &str, method_name: &str) -> 
     Some(node.start_position().column as u32 + method_offset as u32 + 1)
 }
 
-fn receiver_call_belongs_to_callable(node: TsNode<'_>, callable: TsNode<'_>) -> bool {
+fn receiver_callable_boundary_kinds(callable: TsNode<'_>) -> &'static [&'static str] {
     const DECLARATION_BOUNDARY_KINDS: &[&str] = &[
         "function_definition",
         "function_declaration",
@@ -10786,13 +10786,15 @@ fn receiver_call_belongs_to_callable(node: TsNode<'_>, callable: TsNode<'_>) -> 
     ];
     const BODY_BOUNDARY_KINDS: &[&str] = &["function_body"];
 
-    let boundary_kinds = if callable.kind() == "function_body" {
+    if callable.kind() == "function_body" {
         BODY_BOUNDARY_KINDS
     } else {
         DECLARATION_BOUNDARY_KINDS
-    };
+    }
+}
 
-    enclosing_node_with_kind(node, boundary_kinds)
+fn receiver_call_belongs_to_callable(node: TsNode<'_>, callable: TsNode<'_>) -> bool {
+    enclosing_node_with_kind(node, receiver_callable_boundary_kinds(callable))
         .is_some_and(|nearest| nearest.kind() == callable.kind() && same_ts_span(nearest, callable))
 }
 
