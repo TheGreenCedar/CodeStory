@@ -40,6 +40,9 @@ use tree_sitter::{Node as TsNode, Tree};
 #[cfg(test)]
 thread_local! {
     static GO_NAVIGATION_RESOLUTION_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GO_PACKAGE_OWNER_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GO_LOCAL_OWNER_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GO_LOCAL_SCOPE_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[inline]
@@ -520,12 +523,14 @@ fn collect_go_package_function_call_specs(
     edges: &mut Vec<ManualReceiverCallSpec>,
 ) {
     walk_tree_nodes(callable, &mut |node| {
-        if !receiver_call_belongs_to_callable(node, callable) {
-            return;
-        }
         let Some((receiver_name, method_name)) = selector_call(node, context.source) else {
             return;
         };
+        #[cfg(test)]
+        GO_PACKAGE_OWNER_LOOKUPS.with(|work| work.set(work.get().saturating_add(1)));
+        if !receiver_call_belongs_to_callable(node, callable) {
+            return;
+        }
         let method_col = member_call_method_col(node, context.source, &method_name);
         let key = ReceiverCallSiteKey {
             receiver_name: receiver_name.clone(),
@@ -592,6 +597,27 @@ fn collect_go_local_composite_receiver_call_specs(
         .and_then(|receiver| go_receiver_variable_name(receiver, source));
     walk_tree_nodes(callable, &mut |node| {
         count_go_navigation_resolution_work(1);
+        // Keep calls, capture identifiers and binding facts; other nodes still
+        // have their descendants visited by walk_tree_nodes.
+        if !matches!(
+            node.kind(),
+            "call_expression"
+                | "identifier"
+                | "short_var_declaration"
+                | "assignment_statement"
+                | "var_spec"
+                | "const_spec"
+                | "type_spec"
+                | "range_clause"
+                | "receive_statement"
+                | "type_switch_guard"
+                | "type_switch_statement"
+                | "unary_expression"
+        ) {
+            return;
+        }
+        #[cfg(test)]
+        GO_LOCAL_OWNER_LOOKUPS.with(|work| work.set(work.get().saturating_add(1)));
         if !receiver_call_belongs_to_callable(node, callable) {
             return;
         }
@@ -602,6 +628,8 @@ fn collect_go_local_composite_receiver_call_specs(
                 method_name,
             });
         }
+        #[cfg(test)]
+        GO_LOCAL_SCOPE_LOOKUPS.with(|work| work.set(work.get().saturating_add(1)));
         let Some(scope_end) = go_navigation_binding_scope(node, callable) else {
             return;
         };
@@ -1982,6 +2010,65 @@ fn go_concrete_result_owner(type_node: TsNode<'_>, source: &str) -> Option<Strin
 mod complexity_tests {
     use super::*;
     use tree_sitter::Parser;
+
+    #[test]
+    fn go_navigation_ancestry_ignores_noncontributing_expression_nodes() {
+        let measure = |depth: usize| {
+            let source = format!(
+                concat!(
+                    "package proof\nimport pkg \"example.com/worker\"\n",
+                    "type Worker struct{{}}\nfunc (w *Worker) Run() {{}}\n",
+                    "func caller() {{\n  worker := &Worker{{}}\n",
+                    "  worker.Run()\n  pkg.New()\n  _ = {}{}0{}{}\n}}\n",
+                ),
+                " ".repeat(64 - depth),
+                "(".repeat(depth),
+                ")".repeat(depth),
+                " ".repeat(64 - depth),
+            );
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_go::LANGUAGE.into())
+                .expect("Go grammar");
+            let tree = parser.parse(&source, None).expect("Go source");
+            assert!(!tree.root_node().has_error());
+            GO_PACKAGE_OWNER_LOOKUPS.with(|work| work.set(0));
+            GO_LOCAL_OWNER_LOOKUPS.with(|work| work.set(0));
+            GO_LOCAL_SCOPE_LOOKUPS.with(|work| work.set(0));
+            let specs = receiver_call_specs(&tree, &source);
+            let lookups = (
+                GO_PACKAGE_OWNER_LOOKUPS.with(std::cell::Cell::get),
+                GO_LOCAL_OWNER_LOOKUPS.with(std::cell::Cell::get),
+                GO_LOCAL_SCOPE_LOOKUPS.with(std::cell::Cell::get),
+            );
+            assert_eq!(specs.len(), 2, "both navigation paths must contribute");
+            assert!(specs.iter().any(|spec| spec.receiver_name == "worker"
+                && spec.owner_name == "Worker"
+                && spec.method_name == "Run"
+                && spec.owner_module.is_none()
+                && spec.binding_marker.is_none()));
+            assert!(specs.iter().any(|spec| spec.receiver_name == "pkg"
+                && spec.owner_module.as_deref() == Some("example.com/worker")
+                && spec.method_name == "New"
+                && spec.binding_marker.as_deref() == Some(PACKAGE_FUNCTION_CALLSITE_MARKER)));
+            // Debug includes every spec field, preserving order, spans and flags.
+            let complete_specs = format!("{specs:#?}");
+            eprintln!("GO_NAVIGATION_ANCESTRY_LOOKUPS {depth} {lookups:?}");
+            eprintln!(
+                "GO_NAVIGATION_ANCESTRY_FIXTURE {depth} {}",
+                serde_json::to_string(&complete_specs).expect("complete specs")
+            );
+            (lookups, complete_specs)
+        };
+        let shallow = measure(0);
+        let nested = measure(64);
+        assert_eq!(shallow.1, nested.1, "complete navigation specs changed");
+        assert!(shallow.0.0 > 0 && shallow.0.1 > 0 && shallow.0.2 > 0);
+        assert_eq!(
+            shallow.0, nested.0,
+            "irrelevant parentheses added navigation ancestry"
+        );
+    }
 
     fn measured_receiver_work(binding_count: usize, call_count: usize) -> usize {
         let mut source = String::from(

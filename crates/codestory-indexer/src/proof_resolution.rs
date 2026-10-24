@@ -32,6 +32,7 @@ thread_local! {
     static RUST_RESOLUTION_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static GO_RESOLUTION_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static GO_BINDING_ANCESTRY_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GO_DECLARED_NAME_ANCESTRY_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PYTHON_RESOLUTION_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static C_CPP_RESOLUTION_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static RUBY_PHP_RESOLUTION_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -7983,9 +7984,6 @@ fn go_callables_declaring_name(
 ) -> HashSet<usize> {
     let mut result = HashSet::new();
     walk_nodes(root, &mut |node| {
-        let Some(callable) = go_enclosing_callable(node, returned_closures) else {
-            return;
-        };
         let declared = match node.kind() {
             "parameter_declaration" | "variadic_parameter_declaration" => {
                 let boundary = node
@@ -8029,7 +8027,12 @@ fn go_callables_declaring_name(
                 .any(|name| name == wanted),
             _ => false,
         };
-        if declared {
+        if !declared {
+            return;
+        }
+        #[cfg(test)]
+        GO_DECLARED_NAME_ANCESTRY_LOOKUPS.with(|work| work.set(work.get().saturating_add(1)));
+        if let Some(callable) = go_enclosing_callable(node, returned_closures) {
             result.insert(callable.id());
         }
     });
@@ -22279,6 +22282,7 @@ mod go_complexity_tests {
                     "package proof\n",
                     "type Worker struct{{}}\n",
                     "func (w *Worker) Run() {{}}\n",
+                    "func shadow() {{ var new int; _ = new }}\n",
                     "func caller() {{\n",
                     "  worker := &Worker{{}}\n",
                     "  worker.Run()\n",
@@ -22298,9 +22302,12 @@ mod go_complexity_tests {
             let tree = parser.parse(&source, None).expect("Go syntax tree");
             assert!(!tree.root_node().has_error());
             GO_BINDING_ANCESTRY_LOOKUPS.with(|work| work.set(0));
+            GO_DECLARED_NAME_ANCESTRY_LOOKUPS.with(|work| work.set(0));
             let index = GoResolutionIndex::build(&tree, &source, NodeId(1), &[]);
             let lookups = GO_BINDING_ANCESTRY_LOOKUPS.with(std::cell::Cell::get);
+            let declared_lookups = GO_DECLARED_NAME_ANCESTRY_LOOKUPS.with(std::cell::Cell::get);
             eprintln!("GO_BINDING_ANCESTRY_LOOKUPS {depth} {lookups}");
+            eprintln!("GO_DECLARED_NAME_ANCESTRY_LOOKUPS {depth} {declared_lookups}");
             assert_eq!(index.calls.len(), 3, "fixture must retain three calls");
             let mut callable_spans = HashMap::new();
             walk_nodes(tree.root_node(), &mut |node| {
@@ -22308,6 +22315,26 @@ mod go_complexity_tests {
                     callable_spans.insert(node.id(), (node.start_byte(), node.end_byte()));
                 }
             });
+            let closures = GoReturnedClosureIndex::prepare(tree.root_node());
+            let owners = go_callables_declaring_name(tree.root_node(), &source, "new", &closures);
+            let mut cursor = tree.root_node().walk();
+            let shadow = tree
+                .root_node()
+                .named_children(&mut cursor)
+                .find(|node| {
+                    node.child_by_field_name("name")
+                        .and_then(|name| node_text(name, &source))
+                        == Some("shadow")
+                })
+                .expect("named shadow owner");
+            assert_eq!(owners, HashSet::from([shadow.id()]));
+            let absent =
+                go_callables_declaring_name(tree.root_node(), &source, "never_declared", &closures);
+            assert!(absent.is_empty());
+            let owner_spans = owners
+                .iter()
+                .map(|id| callable_spans[id])
+                .collect::<Vec<_>>();
             let mut bindings = index
                 .binding_decisions
                 .iter()
@@ -22358,7 +22385,8 @@ mod go_complexity_tests {
             // Retain each fixture's actual records for exact RED/GREEN review.
             eprintln!(
                 "GO_BINDING_ANCESTRY_FIXTURE {depth} {}",
-                serde_json::to_string(&(&bindings, &calls, &file)).expect("fixture records")
+                serde_json::to_string(&(&bindings, &calls, &file, &owner_spans, &absent))
+                    .expect("fixture records")
             );
             assert_eq!(file.source_sha256, source_hash);
             file.source_sha256.clear();
@@ -22366,7 +22394,14 @@ mod go_complexity_tests {
                 assert_eq!(call.callsite.source_sha256, source_hash);
                 call.callsite.source_sha256.clear();
             }
-            (lookups, bindings, calls, file, source_hash)
+            (
+                lookups,
+                bindings,
+                calls,
+                file,
+                source_hash,
+                declared_lookups,
+            )
         };
         let shallow = measure(0);
         let nested = measure(64);
@@ -22387,6 +22422,11 @@ mod go_complexity_tests {
         assert_eq!(
             shallow.0, nested.0,
             "irrelevant parentheses added first-pass ancestry lookups"
+        );
+        assert!(shallow.5 > 0, "declaring-name ancestry must be measured");
+        assert_eq!(
+            shallow.5, nested.5,
+            "irrelevant parentheses added declaring-name ancestry"
         );
     }
 
