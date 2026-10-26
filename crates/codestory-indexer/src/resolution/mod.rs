@@ -1206,6 +1206,160 @@ impl ResolutionPass {
         sql::invalidate_go_return_method_resolutions(storage.get_connection())
     }
 
+    /// Finish only Go callable-value references. The package context and
+    /// declaration index are the same native/module identities used by calls;
+    /// no CALL job, semantic name fallback or invocation proof is involved.
+    pub(crate) fn finalize_go_callable_value_references(
+        &self,
+        storage: &Storage,
+        cancel_token: Option<&CancellationToken>,
+    ) -> Result<()> {
+        Self::check_cancelled(cancel_token)?;
+        let conn = storage.get_connection();
+        let rows: Vec<(i64, i64, i64, String)> = {
+            let mut statement = conn.prepare(
+                "SELECT e.id, e.file_node_id, e.target_node_id, n.canonical_id
+                 FROM edge e JOIN node n ON n.id=e.target_node_id
+                 WHERE e.kind=?1 AND n.canonical_id LIKE 'go-value:%' ORDER BY e.id",
+            )?;
+            let mapped = statement.query_map([EdgeKind::USAGE as i32], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?;
+            mapped.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let candidates = CandidateIndex::load_with_import_bindings(
+            conn,
+            &[NodeKind::FUNCTION as i32, NodeKind::METHOD as i32],
+        )?;
+        let complete: HashSet<i64> = storage
+            .get_files()?
+            .into_iter()
+            .filter(|file| file.language == "go" && file.complete)
+            .map(|file| file.id)
+            .collect();
+        let mut resolved = HashMap::<(i64, Option<String>, String, bool), Option<i64>>::new();
+        let mut update = conn.prepare(
+            "UPDATE edge SET resolved_target_node_id=?2,
+             resolved_source_node_id=CASE WHEN ?2 IS NULL THEN NULL ELSE source_node_id END,
+             confidence=CASE WHEN ?2 IS NULL THEN NULL ELSE 1.0 END,
+             certainty=CASE WHEN ?2 IS NULL THEN NULL ELSE ?3 END,
+             candidate_target_node_ids=NULL WHERE id=?1",
+        )?;
+        let mut copy_occurrence = conn.prepare(
+            "INSERT OR IGNORE INTO occurrence
+             (element_id,kind,file_node_id,start_line,start_col,end_line,end_col)
+             SELECT ?1,kind,file_node_id,start_line,start_col,end_line,end_col
+             FROM occurrence WHERE element_id=?2 AND kind=?3",
+        )?;
+        for (edge, file, reference, canonical) in rows {
+            Self::check_cancelled(cancel_token)?;
+            let Some(payload) = canonical.strip_prefix("go-value:") else {
+                continue;
+            };
+            let Ok((_, _, _, target)) =
+                serde_json::from_str::<(String, u32, u32, crate::languages::go::GoValueTarget)>(
+                    payload,
+                )
+            else {
+                continue;
+            };
+            let key = (
+                file,
+                target.owner.clone(),
+                target.name.clone(),
+                target.unresolved,
+            );
+            let target_id = *resolved.entry(key).or_insert_with(|| {
+                if target.unresolved || !complete.contains(&file) {
+                    return None;
+                }
+                let package = self
+                    .go_context
+                    .as_ref()
+                    .and_then(|context| context.packages_by_file_node_id.get(&file));
+                let expected = target.owner.as_ref().map_or_else(
+                    || target.name.clone(),
+                    |owner| format!("{owner}.{}", target.name),
+                );
+                let mut matches = candidates
+                    .exact_map
+                    .get(&expected)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|offset| candidates.nodes.get(*offset))
+                    .filter(|node| {
+                        node.is_declaration
+                            && node.serialized_name == expected
+                            && node.kind
+                                == if target.owner.is_some() {
+                                    NodeKind::METHOD as i32
+                                } else {
+                                    NodeKind::FUNCTION as i32
+                                }
+                    })
+                    .filter_map(|node| {
+                        let declaring_file = node.file_node_id?;
+                        if !complete.contains(&declaring_file) {
+                            return None;
+                        }
+                        if let Some(package) = package {
+                            let context = self.go_context.as_ref()?;
+                            if context
+                                .ambiguous_import_paths
+                                .contains(&package.import_path)
+                            {
+                                return None;
+                            }
+                            let declaring =
+                                context.packages_by_file_node_id.get(&declaring_file)?;
+                            if declaring.import_path != package.import_path
+                                || declaring.package_name != package.package_name
+                                || (!package.is_test_file && declaring.is_test_file)
+                            {
+                                return None;
+                            }
+                            if let Some(owner) = &target.owner {
+                                // Interface signatures have no concrete method
+                                // declaration in the existing return catalogue.
+                                context
+                                    .return_declarations
+                                    .get(&GoReturnDeclarationKey {
+                                        import_path: package.import_path.clone(),
+                                        package_name: package.package_name.clone(),
+                                        owner: Some(owner.clone()),
+                                        function: target.name.clone(),
+                                    })?
+                                    .as_ref()?;
+                            }
+                        } else if declaring_file != file {
+                            return None;
+                        }
+                        Some(node.id)
+                    })
+                    .collect::<Vec<_>>();
+                matches.sort_unstable();
+                matches.dedup();
+                matches.first().copied().filter(|_| matches.len() == 1)
+            });
+            update.execute(params![
+                edge,
+                target_id,
+                ResolutionCertainty::Certain.as_str()
+            ])?;
+            // Occurrences must be addressable by a public consumer's exact
+            // edge identity, not stranded on a resolved placeholder node.
+            copy_occurrence.execute(params![
+                edge,
+                reference,
+                codestory_contracts::graph::OccurrenceKind::REFERENCE as i32
+            ])?;
+        }
+        Ok(())
+    }
+
     fn find_go_package_function_readonly(
         &self,
         candidates: &CandidateIndex,

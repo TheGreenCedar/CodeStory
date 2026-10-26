@@ -2145,3 +2145,6 @@ fn public_export_type_star_grammar_preserves_value_authority() -> anyhow::Result
     );
     Ok(())
 }
+
+#[path = "fidelity_regression/go_callable_value_references.rs"]
+mod go_callable_value_references;

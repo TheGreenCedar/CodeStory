@@ -2185,6 +2185,9 @@ impl WorkspaceIndexer {
         } else {
             None
         };
+        if let Some(resolver) = prepared_resolver.as_ref() {
+            resolver.finalize_go_callable_value_references(storage, cancel_token)?;
+        }
         if (stats.graph_projection_changed || go_return_inputs_changed)
             && (had_edges
                 || expanded_resolution_scope_files > 0
@@ -8826,6 +8829,112 @@ fn append_manual_type_argument_edges(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn append_go_callable_value_references(
+    tree: &Tree,
+    source: &str,
+    file_name: &str,
+    file_id: NodeId,
+    nodes: &mut HashMap<NodeId, Node>,
+    roles: &mut HashMap<NodeId, CanonicalNodeRole>,
+    edges: &mut Vec<Edge>,
+    occurrences: &mut Vec<Occurrence>,
+    keys: &mut HashSet<EdgeDedupKey>,
+    flags: IndexFeatureFlags,
+) {
+    // Snapshot only original callable identities. Placeholder insertion below
+    // cannot grow this lookup or make per-reference work depend on node count.
+    let mut owners = HashMap::<(GraphNodeSpan, String), NodeId>::new();
+    for node in nodes.values() {
+        count_manual_receiver_lookup_work(1);
+        if !matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD) {
+            continue;
+        }
+        let (Some(start_line), Some(start_col), Some(end_line), Some(end_col)) =
+            (node.start_line, node.start_col, node.end_line, node.end_col)
+        else {
+            continue;
+        };
+        let span = GraphNodeSpan {
+            start_line,
+            start_col,
+            end_line,
+            end_col,
+        };
+        for name in [
+            Some(node.serialized_name.as_str()),
+            Some(short_member_name(&node.serialized_name)),
+            node.qualified_name.as_deref(),
+            node.qualified_name.as_deref().map(short_member_name),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            count_manual_receiver_lookup_work(1);
+            owners
+                .entry((span, name.to_string()))
+                .and_modify(|id| *id = (*id).min(node.id))
+                .or_insert(node.id);
+        }
+    }
+    for usage in languages::go::callable_value_uses(tree, source) {
+        count_manual_receiver_lookup_work(1);
+        let Some(owner) = owners
+            .get(&(usage.source_span, usage.source_name.clone()))
+            .copied()
+        else {
+            continue;
+        };
+        let span = usage.span;
+        let Ok(payload) =
+            serde_json::to_string(&(file_name, span.start_line, span.start_col, &usage.target))
+        else {
+            continue;
+        };
+        let canonical = format!("go-value:{payload}");
+        let id = NodeId(generate_id(&canonical));
+        nodes.insert(
+            id,
+            Node {
+                id,
+                kind: NodeKind::UNKNOWN,
+                serialized_name: usage.target.name,
+                canonical_id: Some(canonical),
+                file_node_id: Some(file_id),
+                start_line: Some(span.start_line),
+                start_col: Some(span.start_col),
+                end_line: Some(span.end_line),
+                end_col: Some(span.end_col),
+                ..Default::default()
+            },
+        );
+        roles.insert(id, CanonicalNodeRole::Reference);
+        occurrences.push(Occurrence {
+            element_id: id.0,
+            kind: OccurrenceKind::REFERENCE,
+            location: SourceLocation {
+                file_node_id: file_id,
+                start_line: span.start_line,
+                start_col: span.start_col,
+                end_line: span.end_line,
+                end_col: span.end_col,
+            },
+        });
+        let mut edge = Edge {
+            source: owner,
+            target: id,
+            kind: EdgeKind::USAGE,
+            file_node_id: Some(file_id),
+            line: Some(span.start_line),
+            ..Default::default()
+        };
+        if keys.insert(edge_dedup_key(&edge, flags)) {
+            edge.id = EdgeId(generate_edge_id_for_edge(&edge, flags));
+            edges.push(edge);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn append_manual_usage_edges(
     language_name: &str,
     is_tsx_file: bool,
@@ -11712,7 +11821,8 @@ fn node_needs_declaration_ordinal(node: &Node) -> bool {
 
 fn preserved_canonical_id(node: &Node) -> Option<&str> {
     node.canonical_id.as_deref().filter(|value| {
-        value.starts_with("openapi:endpoint:")
+        value.starts_with("go-value:")
+            || value.starts_with("openapi:endpoint:")
             || value.starts_with("route_endpoint:")
             || value.starts_with("tauri:command:")
             || value.starts_with("payload:collection:")
@@ -17109,6 +17219,20 @@ fn index_file_with_resolution_inputs(
         flags,
         &mut callsite_ordinals,
     );
+    if language_config.language_name == "go" {
+        append_go_callable_value_references(
+            &tree,
+            source,
+            &file_name,
+            file_id,
+            &mut unique_nodes,
+            &mut canonical_role_by_node_id,
+            &mut result_edges,
+            &mut result_occurrences,
+            &mut edge_keys,
+            flags,
+        );
+    }
     append_manual_type_usage_edges(
         language_config.language_name,
         &tree,

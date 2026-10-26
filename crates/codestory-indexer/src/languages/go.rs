@@ -84,7 +84,7 @@ pub(crate) const PACKAGE_FUNCTION_IMPORT_SET_PREFIX: &str = "syntax:go-package-f
 pub(crate) const RETURN_PATH_OWNER_PREFIX: &str = "go-return-path:";
 
 pub(crate) const INITIALIZER_CALL_REVISION: &str =
-    extraction_revision!("go-package-initializer-calls-v1");
+    extraction_revision!("go-callable-value-references-v4");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PackageInitializerCall {
@@ -212,6 +212,9 @@ impl GoReturnPath {
         })
     }
 }
+
+mod value_uses;
+pub(crate) use value_uses::{GoValueTarget, callable_value_uses};
 
 const GRAPH_QUERY: &str = include_str!("../../rules/go.scm");
 
@@ -756,14 +759,19 @@ where
     }
 }
 
-fn collect_go_local_composite_receiver_call_specs(
-    callable: TsNode<'_>,
-    call_source: ManualReceiverSource<'_>,
+fn go_navigation_facts<'tree>(
+    callable: TsNode<'tree>,
     context: &GoCallableResolutionContext<'_>,
-    local_binding_callsites: &mut HashSet<ReceiverCallSiteKey>,
-    edges: &mut Vec<ManualReceiverCallSpec>,
+    include_values: bool,
+) -> (
+    Vec<GoNavigationCall<'tree>>,
+    Vec<GoNavigationBindingInterval>,
 ) {
     let source = context.source;
+    let type_origins = include_values.then(|| value_uses::TypeOrigins::prepare(callable, source));
+    let parameter_types = include_values
+        .then(|| collect_go_parameter_types(callable, source))
+        .unwrap_or_default();
     let mut calls = Vec::new();
     let mut intervals = Vec::new();
     let mut top_level_return_bindings = HashMap::<String, GoReturnPath>::new();
@@ -777,6 +785,9 @@ fn collect_go_local_composite_receiver_call_specs(
         if !matches!(
             node.kind(),
             "call_expression"
+                | "selector_expression"
+                | "parameter_declaration"
+                | "variadic_parameter_declaration"
                 | "identifier"
                 | "short_var_declaration"
                 | "assignment_statement"
@@ -791,7 +802,7 @@ fn collect_go_local_composite_receiver_call_specs(
         ) {
             return;
         }
-        if !ancestors.belongs_to(callable) {
+        if !include_values && !ancestors.belongs_to(callable) {
             return;
         }
         if let Some((receiver_name, method_name)) = selector_call(node, source) {
@@ -801,7 +812,49 @@ fn collect_go_local_composite_receiver_call_specs(
                 method_name,
             });
         }
+        if include_values && value_uses::selector_value(node).is_some() {
+            if let Some((receiver_name, method_name)) = value_uses::selector_names(node, source) {
+                calls.push(GoNavigationCall {
+                    node,
+                    receiver_name,
+                    method_name,
+                });
+            }
+        }
         match node.kind() {
+            "parameter_declaration" | "variadic_parameter_declaration" if include_values => {
+                let Some(type_node) = node.child_by_field_name("type") else {
+                    return;
+                };
+                let Some((start_byte, end_byte)) = go_value_parameter_visibility_span(node) else {
+                    return;
+                };
+                let owner = trimmed_node_text(type_node, source)
+                    .as_deref()
+                    .and_then(|surface| {
+                        go_receiver_owner_from_type(surface, context.import_bindings)
+                    });
+                let owner = type_origins.as_ref().map_or_else(
+                    || owner.clone(),
+                    |origins| origins.retain(owner.clone(), type_node.start_byte()),
+                );
+                let mut cursor = node.walk();
+                for name_node in node
+                    .named_children(&mut cursor)
+                    .take_while(|name| name.start_byte() < type_node.start_byte())
+                {
+                    let Some(name) = normalized_receiver_variable(name_node, source) else {
+                        continue;
+                    };
+                    intervals.push(GoNavigationBindingInterval {
+                        name,
+                        start_byte,
+                        end_byte,
+                        binding_priority: GO_NAVIGATION_DECLARATION_PRIORITY,
+                        owner: owner.clone(),
+                    });
+                }
+            }
             "short_var_declaration" | "assignment_statement" => {
                 let scope_end = if node.kind() == "assignment_statement" {
                     callable.end_byte()
@@ -872,6 +925,15 @@ fn collect_go_local_composite_receiver_call_specs(
                                 })
                             })
                     };
+                    let owner = if let Some(origins) = type_origins.as_ref() {
+                        let origin = right
+                            .get(index)
+                            .or_else(|| right.first())
+                            .map_or(node.start_byte(), |value| value.start_byte());
+                        origins.retain(owner, origin)
+                    } else {
+                        owner
+                    };
                     if top_level_binding {
                         if let Some(path) = owner
                             .as_ref()
@@ -909,6 +971,10 @@ fn collect_go_local_composite_receiver_call_specs(
                     .and_then(|raw_type| {
                         go_receiver_owner_from_type(raw_type, context.import_bindings)
                     });
+                let owner = type_origins.as_ref().map_or_else(
+                    || owner.clone(),
+                    |origins| origins.retain(owner.clone(), type_node.start_byte()),
+                );
                 let mut cursor = node.walk();
                 for name_node in node
                     .named_children(&mut cursor)
@@ -1002,6 +1068,12 @@ fn collect_go_local_composite_receiver_call_specs(
         let Some(name) = normalized_receiver_variable(node, source) else {
             return;
         };
+        if include_values
+            && (parameter_types.contains_key(&name)
+                || method_receiver_name.as_deref() == Some(name.as_str()))
+        {
+            return;
+        }
         // Capturing a statically declared method receiver does not change its
         // Go type outside that closure. Keep nested closure calls fail closed,
         // and keep real local shadow intervals above, without erasing the
@@ -1024,6 +1096,18 @@ fn collect_go_local_composite_receiver_call_specs(
             owner: None,
         });
     });
+    (calls, intervals)
+}
+
+fn collect_go_local_composite_receiver_call_specs(
+    callable: TsNode<'_>,
+    call_source: ManualReceiverSource<'_>,
+    context: &GoCallableResolutionContext<'_>,
+    local_binding_callsites: &mut HashSet<ReceiverCallSiteKey>,
+    edges: &mut Vec<ManualReceiverCallSpec>,
+) {
+    let source = context.source;
+    let (calls, intervals) = go_navigation_facts(callable, context, false);
     let decisions = go_navigation_binding_decisions(
         callable.start_byte(),
         callable.end_byte(),
@@ -1515,13 +1599,29 @@ fn go_builtin_new_owner(
 }
 
 fn go_callable_name_visibility(callable: TsNode<'_>, source: &str) -> GoNameVisibilityIndex {
+    go_name_visibility(callable, source, false)
+}
+
+fn go_value_name_visibility(callable: TsNode<'_>, source: &str) -> GoNameVisibilityIndex {
+    go_name_visibility(callable, source, true)
+}
+
+fn go_name_visibility(
+    callable: TsNode<'_>,
+    source: &str,
+    value_parameters: bool,
+) -> GoNameVisibilityIndex {
     let mut spans = HashMap::<String, Vec<(usize, usize)>>::new();
     walk_tree_nodes(callable, &mut |node| {
         count_go_navigation_resolution_work(1);
         let (names, start_byte, end_byte) = match node.kind() {
             "parameter_declaration" | "variadic_parameter_declaration" => {
-                let Some((start_byte, end_byte)) = go_parameter_visibility_span(node, callable)
-                else {
+                let scope = if value_parameters {
+                    go_value_parameter_visibility_span(node)
+                } else {
+                    go_parameter_visibility_span(node, callable)
+                };
+                let Some((start_byte, end_byte)) = scope else {
                     return;
                 };
                 let type_start = node
@@ -1599,6 +1699,31 @@ fn go_callable_name_visibility(callable: TsNode<'_>, source: &str) -> GoNameVisi
         })
         .collect();
     GoNameVisibilityIndex { names }
+}
+
+/// Formal names become locals only in the body of the declaration that
+/// directly owns their exact parameter list. Function types and interface
+/// signatures cannot contribute locals to an enclosing executable body.
+fn go_value_parameter_visibility_span(node: TsNode<'_>) -> Option<(usize, usize)> {
+    count_go_navigation_resolution_work(6);
+    let list = node
+        .parent()
+        .filter(|parent| parent.kind() == "parameter_list")?;
+    let owner = list.parent().filter(|owner| {
+        matches!(
+            owner.kind(),
+            "function_declaration" | "method_declaration" | "func_literal"
+        )
+    })?;
+    if !["parameters", "receiver", "result"].iter().any(|field| {
+        owner
+            .child_by_field_name(field)
+            .is_some_and(|parameters| parameters.id() == list.id())
+    }) {
+        return None;
+    }
+    let body = owner.child_by_field_name("body")?;
+    Some((body.start_byte(), body.end_byte()))
 }
 
 fn go_parameter_visibility_span(
