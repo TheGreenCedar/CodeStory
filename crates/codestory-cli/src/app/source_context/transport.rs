@@ -192,7 +192,7 @@ fn encode(raw: &[u8]) -> String {
     out
 }
 fn decode(value: &str) -> Option<Vec<u8>> {
-    if value.len() % 4 != 0 {
+    if !value.len().is_multiple_of(4) {
         return None;
     }
     let mut out = Vec::new();
@@ -674,15 +674,17 @@ pub(super) fn capture(payload: &Payload) -> anyhow::Result<()> {
     drop(private);
     let _ = stdout.flush();
     let _ = stderr.flush();
-    if status.success() && !forward_failed && stdout_count <= 1024 * 1024 {
-        if let Some(request) = rows::request(&payload.project, &rows.records()) {
-            let response = codestory_runtime::search_source_context::search_source_context(
-                &request,
-                &Default::default(),
-            );
-            let _ = stdout.write_all(&render(&response, true));
-            let _ = stdout.flush();
-        }
+    if status.success()
+        && !forward_failed
+        && stdout_count <= 1024 * 1024
+        && let Some(request) = rows::request(&payload.project, &rows.records())
+    {
+        let response = codestory_runtime::search_source_context::search_source_context(
+            &request,
+            &Default::default(),
+        );
+        let _ = stdout.write_all(&render(&response, true));
+        let _ = stdout.flush();
     }
     finish(status)
 }

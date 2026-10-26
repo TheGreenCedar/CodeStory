@@ -24,7 +24,7 @@ pub(super) struct Payload {
 
 impl Payload {
     fn decode(hex: &str) -> Option<Self> {
-        if hex.len() > 65536 || hex.len() % 2 != 0 {
+        if hex.len() > 65536 || !hex.len().is_multiple_of(2) {
             return None;
         }
         let raw = hex
