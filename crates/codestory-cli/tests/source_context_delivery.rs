@@ -276,6 +276,91 @@ fn captured_rust_rg_rows_append_the_exact_owner_after_the_original_command() {
 }
 
 #[test]
+fn actual_single_rust_operand_with_and_without_h_delivers_the_same_owner() {
+    let (_temp, root) = project();
+    let body = "fn build() {\n    let value = 1;\n}\n";
+    fs::write(root.join("source.rs"), body).unwrap();
+    for (flags, prefix) in [
+        ("-Hn", "source.rs:2:    let value = 1;\nDONE\n"),
+        ("-n", "2:    let value = 1;\nDONE\n"),
+    ] {
+        let script = format!(
+            "rg {flags} --color=never --no-heading 'let value' source.rs; printf 'DONE\\n'"
+        );
+        let encoded = payload(&root, &script);
+        let output = invoke(
+            &["internal-source-context", "capture", "--payload", &encoded],
+            b"",
+            &[],
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+        assert!(output.stdout.starts_with(prefix.as_bytes()));
+        let extra = std::str::from_utf8(&output.stdout[prefix.len()..]).unwrap();
+        assert!(
+            extra.contains(body),
+            "actual {flags} source rows must bind the single .rs operand"
+        );
+    }
+}
+
+#[test]
+fn actual_child_config_environment_controls_eligibility_even_after_shell_unsets_it() {
+    let (_temp, root) = project();
+    let early = format!("fn early() {{\n{}}}\n", "    red();\n".repeat(80));
+    let late = "fn late() {\n    blue();\n}\n";
+    fs::write(root.join("a.rs"), &early).unwrap();
+    fs::write(root.join("z.rs"), late).unwrap();
+    fs::write(root.join("rg-config"), "--ignore-case\n").unwrap();
+    let query = "rg --sort path -Hn --color=never --no-heading 'red|blue' a.rs z.rs";
+    // The successful raw query is identical in both cases. The config's
+    // existence makes effective flags unknown, even though it does not change
+    // these lowercase matches. Later shell exports cannot replace child proof.
+    for (setup, expected_late) in [
+        ("export RIPGREP_CONFIG_PATH=rg-config;", false),
+        ("unset RIPGREP_CONFIG_PATH;", true),
+    ] {
+        let script = format!(
+            "{setup} {query}; unset RIPGREP_CONFIG_PATH; printf 'ORIGINAL-COMMAND-DONE\\n'"
+        );
+        let encoded = payload(&root, &script);
+        let output = invoke(
+            &["internal-source-context", "capture", "--payload", &encoded],
+            b"",
+            &[],
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.starts_with("a.rs:2:    red();\n"));
+        let marker = "ORIGINAL-COMMAND-DONE\n";
+        let at = text.find(marker).unwrap() + marker.len();
+        assert_eq!(
+            text[..at].lines().count(),
+            82,
+            "all81 raw rows and final marker must survive"
+        );
+        let extra = &text[at..];
+        assert_eq!(
+            extra.contains(late),
+            expected_late,
+            "eligibility must use the actual rg child's config environment, not later/root state"
+        );
+        if expected_late {
+            assert!(extra.contains(&early));
+        }
+    }
+}
+
+#[test]
 fn capture_preserves_pipeline_substitution_and_file_redirection_consumers() {
     let (_temp, root) = project();
     let script = "printf 'first\\nsecond\\n' | /usr/bin/head -n 1; value=$(printf 'sub'); printf '%s' \"$value\"; printf 'file-only' > saved; printf 'err-only' >&2";

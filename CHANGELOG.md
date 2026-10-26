@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Optional Codex source context can append bounded, verified Python and Rust declarations after numbered searches when the executor's non-interactive zsh/login contract is explicit or declared at startup. Unknown callers retain their ordinary path, and pipelines keep the original search output.
+- Optional Codex source context can append bounded, verified Python and Rust declarations after numbered searches when the executor's non-interactive zsh/login contract is explicit or declared at startup. Multi-term searches can include declarations from later matches, and single-file Rust searches no longer require a filename prefix. Unknown callers retain their ordinary path, and pipelines keep the original search output.
 
 - Indexing avoids repeated sorting and metadata preparation while preserving published proof records and digests.
 
