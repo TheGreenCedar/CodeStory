@@ -96,8 +96,8 @@ pub(super) fn run(command: InternalSourceContextCommand) -> anyhow::Result<()> {
     }
 }
 
-/// Same per-unit identity framing as the source prototype. Runtime owns optional
-/// bundle ordering; all framing/separators/coverage share the existing2KiB.
+/// Same per-unit identity framing and whole-unit first-seen order as the source
+/// prototype. Metadata, including all framing/separators/coverage, shares2KiB.
 fn render(response: &SourceContextResponse, captured: bool) -> Vec<u8> {
     if response.status != SourceContextStatus::BoundedCurrentSource || response.units.is_empty() {
         return Vec::new();
@@ -146,81 +146,33 @@ fn render(response: &SourceContextResponse, captured: bool) -> Vec<u8> {
     let mut source = 0usize;
     let mut kept = 0usize;
     let mut omitted = 0usize;
-    // Ordinary responses keep their exact existing per-unit first-seen path.
-    // Eligible responses carry whole-primary/partial-header dependencies from
-    // runtime; admission is atomic under BOTH display allowances.
-    let groups: Vec<Vec<usize>> = if let Some(selection) = &response.selection {
-        let mut groups = Vec::new();
-        for bundle in &selection.bundles {
-            let Some(primary) = response.units.get(bundle.primary_unit_index) else {
-                return Vec::new();
-            };
-            if primary.kind == "ancestor_header_context" {
-                return Vec::new();
-            }
-            let mut group = vec![bundle.primary_unit_index];
-            for &index in &bundle.required_header_indices {
-                if response
-                    .units
-                    .get(index)
-                    .is_none_or(|unit| unit.kind != "ancestor_header_context")
-                {
-                    return Vec::new();
-                }
-                if !group.contains(&index) {
-                    group.push(index);
-                }
-            }
-            groups.push(group);
-        }
-        groups
-    } else {
-        (0..response.units.len()).map(|index| vec![index]).collect()
-    };
-    let mut emitted = std::collections::BTreeSet::new();
-    for group in groups {
-        let fresh: Vec<_> = group
-            .into_iter()
-            .filter(|index| !emitted.contains(index))
-            .collect();
-        let mut framed = Vec::new();
-        let mut group_source = 0usize;
-        let mut group_metadata = 0usize;
-        for &index in &fresh {
-            let unit = &response.units[index];
-            let path = serde_json::to_string(&unit.path).unwrap_or_default();
-            let header = format!(
-                "\n[source {path}; sha256={}; physical_lines={}-{}; {}; exact_bytes={}]\n",
-                unit.source_sha256,
-                unit.start_line,
-                unit.end_line,
-                unit.kind,
-                unit.body.len()
-            );
-            let separator = usize::from(!unit.body.ends_with('\n'));
-            group_source += unit.body.len();
-            group_metadata += header.len() + separator;
-            framed.push((index, header, separator));
-        }
-        if source + group_source > SOURCE_CONTEXT_BOUNDS.display_source_bytes
-            || metadata + group_metadata + reserve > SOURCE_CONTEXT_BOUNDS.display_metadata_bytes
+    for unit in &response.units {
+        let path = serde_json::to_string(&unit.path).unwrap_or_default();
+        let header = format!(
+            "\n[source {path}; sha256={}; physical_lines={}-{}; {}; exact_bytes={}]\n",
+            unit.source_sha256,
+            unit.start_line,
+            unit.end_line,
+            unit.kind,
+            unit.body.len()
+        );
+        let separator = usize::from(!unit.body.ends_with('\n'));
+        if source + unit.body.len() > SOURCE_CONTEXT_BOUNDS.display_source_bytes
+            || metadata + header.len() + separator + reserve
+                > SOURCE_CONTEXT_BOUNDS.display_metadata_bytes
         {
+            omitted += 1;
             continue;
         }
-        for (index, header, separator) in framed {
-            let unit = &response.units[index];
-            output.extend_from_slice(header.as_bytes());
-            output.extend_from_slice(unit.body.as_bytes());
-            if separator != 0 {
-                output.push(b'\n');
-            }
-            emitted.insert(index);
-            kept += 1;
+        output.extend_from_slice(header.as_bytes());
+        output.extend_from_slice(unit.body.as_bytes());
+        if separator != 0 {
+            output.push(b'\n');
         }
-        metadata += group_metadata;
-        source += group_source;
+        metadata += header.len() + separator;
+        source += unit.body.len();
+        kept += 1;
     }
-    omitted += response.units.len() - kept;
     if kept == 0 {
         return Vec::new();
     }
@@ -230,138 +182,4 @@ fn render(response: &SourceContextResponse, captured: bool) -> Vec<u8> {
     }
     output.extend_from_slice(tail.as_bytes());
     output
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use codestory_contracts::source_context::{
-        SourceContextBundle, SourceContextCoverage, SourceContextSelection, SourceContextUnit,
-    };
-    use sha2::{Digest, Sha256};
-
-    fn unit(path: &str, source: &str, first: usize, last: usize, kind: &str) -> SourceContextUnit {
-        let lines: Vec<_> = source.split_inclusive('\n').collect();
-        let start = lines[..first - 1].iter().map(|s| s.len()).sum();
-        let end = lines[..last].iter().map(|s| s.len()).sum();
-        let body = &source[start..end];
-        SourceContextUnit {
-            path: path.into(),
-            source_sha256: format!("{:x}", Sha256::digest(source.as_bytes())),
-            start_line: first,
-            end_line: last,
-            start_byte: start,
-            end_byte: end,
-            kind: kind.into(),
-            body: body.into(),
-            body_sha256: format!("{:x}", Sha256::digest(body.as_bytes())),
-        }
-    }
-    fn response(units: Vec<SourceContextUnit>) -> SourceContextResponse {
-        SourceContextResponse {
-            status: SourceContextStatus::BoundedCurrentSource,
-            units,
-            declines: Vec::new(),
-            coverage: SourceContextCoverage {
-                observations_received: 2,
-                observations_considered: 2,
-                ..Default::default()
-            },
-            bounds: SOURCE_CONTEXT_BOUNDS,
-            current_post_search_snapshot: true,
-            exhaustive_search: false,
-            atomic_publication: false,
-            indexed_proof: false,
-            selection: None,
-        }
-    }
-
-    #[test]
-    fn runtime_unit_cost_equals_the_actual_existing_formatter_with_utf8_and_no_final_lf() {
-        let source = "fn build() {\n    let value = \"雪🙂\";\n}";
-        let item = unit("quoted\"/雪.rs", source, 1, 3, "complete_function_item");
-        let bytes = render(&response(vec![item.clone()]), false);
-        let begin = bytes.windows(9).position(|s| s == b"\n[source ").unwrap();
-        let end = begin + bytes[begin..].windows(2).position(|s| s == b"]\n").unwrap() + 2;
-        let actual = end - begin + source.len() + 1;
-        assert_eq!(
-            codestory_runtime::search_source_context::source_context_unit_cost(&item),
-            actual,
-            "rank cost must track the real formatter, not a separate framing convention"
-        );
-    }
-
-    #[test]
-    fn eligible_bundle_admission_never_leaves_a_header_when_its_primary_cannot_fit() {
-        let large = format!(
-            "fn large() {{\n    let value = \"{}\";\n}}\n",
-            "x".repeat(11000)
-        );
-        let header = "impl Spare {\n";
-        let small = format!(
-            "    fn small() {{\n        let value = \"{}\";\n    }}\n",
-            "y".repeat(2000)
-        );
-        let spare = format!("{header}{small}}}\n");
-        let mut packet = response(vec![
-            unit("large.rs", &large, 1, 3, "complete_function_item"),
-            unit("spare.rs", &spare, 1, 1, "ancestor_header_context"),
-            unit("spare.rs", &spare, 2, 4, "complete_function_item"),
-        ]);
-        packet.selection = Some(SourceContextSelection {
-            observation_indices: vec![0, 1],
-            bundles: vec![
-                SourceContextBundle {
-                    primary_unit_index: 0,
-                    required_header_indices: vec![],
-                },
-                SourceContextBundle {
-                    primary_unit_index: 2,
-                    required_header_indices: vec![1],
-                },
-            ],
-        });
-        let bytes = render(&packet, false);
-        let text = String::from_utf8(bytes).unwrap();
-        assert!(text.contains(&large));
-        assert!(
-            !text.contains(header),
-            "partial header must stay with its declined primary"
-        );
-        assert!(!text.contains(&small));
-        assert!(large.len() <= 12288 && text.len() - large.len() <= 2048);
-
-        // All bodies are tiny: only the shared metadata allowance can refuse
-        // the second bundle. Its header alone still fits after a valid bundle.
-        let valid = "fn valid() {}\n";
-        let meta_header = "impl Pending {\n";
-        let pending = "    fn pending() {}\n";
-        let combined = format!("{meta_header}{pending}}}\n");
-        let first_path = format!("{}.rs", "a".repeat(400));
-        let second_path = format!("{}.rs", "b".repeat(400));
-        let items = vec![
-            unit(&first_path, valid, 1, 1, "complete_function_item"),
-            unit(&second_path, &combined, 1, 1, "ancestor_header_context"),
-            unit(&second_path, &combined, 2, 2, "complete_function_item"),
-        ];
-        let control = String::from_utf8(render(&response(items[..2].to_vec()), false)).unwrap();
-        assert!(
-            control.contains(valid) && control.contains(meta_header),
-            "valid bundle plus bare header fits metadata; no blanket-empty oracle"
-        );
-        let mut metadata_packet = response(items);
-        metadata_packet.selection = packet.selection.clone();
-        let metadata_text = String::from_utf8(render(&metadata_packet, false)).unwrap();
-        assert!(
-            metadata_text.contains(valid),
-            "the earlier valid bundle must survive metadata exhaustion"
-        );
-        assert!(
-            !metadata_text.contains(meta_header),
-            "metadata refusal must not leave an orphan header"
-        );
-        assert!(!metadata_text.contains(pending));
-        assert!(valid.len() + meta_header.len() + pending.len() < 12288);
-        assert!(metadata_text.len() - valid.len() <= 2048);
-    }
 }

@@ -57,11 +57,6 @@ command finishes. Existing pipelines and redirections receive the original
 search bytes. This uses the already installed matching CLI; the hook does not
 provision a runtime, build an index, or call a model.
 
-For supported multi-term searches, context can include complete declarations
-from later captured matches. A declaration and the scope headers returned with
-it are kept as one group; a group that cannot fit is omitted in full. Single-file Rust searches
-use the usual numbered output without requiring a filename prefix.
-
 If the host omits shell or login metadata, the hook leaves input unchanged.
 An operator may set `CODESTORY_SOURCE_CONTEXT_ZSH_LOGIN=1` in the hook's startup
 environment only when the executor has fixed `/bin/zsh` and login-enabled
@@ -76,7 +71,6 @@ unsupported file languages, unavailable CLI, and exhausted bounds retain the raw
 Rust context covers functions, trait signatures, and enclosing `impl`, trait and
 module items with attached outer attributes or docs. It does not expand macros
 or establish type or runtime behavior.
-Host output limits can still truncate a combined tool response.
 Other shells, interactive/TTY requests and other hosts keep their normal path.
 
 ## Update

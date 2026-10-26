@@ -93,8 +93,6 @@ enum Frame {
         argv: Vec<String>,
         cwd: String,
         real_pid: u32,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        config_path_absent: Option<bool>,
     },
     Data {
         id: String,
@@ -228,7 +226,6 @@ pub(super) struct Record {
     pub stdout: Vec<u8>,
     pub code: i32,
     pub overflow: bool,
-    pub config_path_absent: Option<bool>,
 }
 struct Pending {
     record: Record,
@@ -305,7 +302,6 @@ impl PrivateRows {
                 argv,
                 cwd,
                 real_pid,
-                config_path_absent,
             } => {
                 if id.is_empty()
                     || id.len() > 32
@@ -325,7 +321,6 @@ impl PrivateRows {
                         stdout: Vec::new(),
                         code: -1,
                         overflow: false,
-                        config_path_absent,
                     },
                     done: false,
                 });
@@ -434,7 +429,6 @@ pub(super) fn rg(operands: Vec<OsString>) -> anyhow::Result<()> {
     unsafe {
         libc::fcntl(sender.fd, libc::F_SETFD, libc::FD_CLOEXEC);
     }
-    let config_path_absent = config_absence_at_spawn();
     let mut child = command.stdout(Stdio::piped()).spawn()?;
     let id = std::process::id().to_string();
     let actual = operands
@@ -447,19 +441,14 @@ pub(super) fn rg(operands: Vec<OsString>) -> anyhow::Result<()> {
     if let (Some(argv), Some(cwd), Some(native), Some(real)) =
         (actual, cwd, native(Path::new(&real)), real.to_str())
     {
-        let maximum = sender.maximum;
-        sender.send(&bounded_start(
-            Frame::Start {
-                id: id.clone(),
-                real: real.to_owned(),
-                native,
-                argv,
-                cwd,
-                real_pid: child.id(),
-                config_path_absent,
-            },
-            maximum,
-        ));
+        sender.send(&Frame::Start {
+            id: id.clone(),
+            real: real.to_owned(),
+            native,
+            argv,
+            cwd,
+            real_pid: child.id(),
+        });
     } else {
         sender.enabled = false;
     }
@@ -507,26 +496,6 @@ pub(super) fn rg(operands: Vec<OsString>) -> anyhow::Result<()> {
         complete: sender.enabled,
     });
     finish(status)
-}
-
-fn config_absence_at_spawn() -> Option<bool> {
-    // This process is the actual rg child boundary. Capture only absence, never
-    // the config path/value, before spawning the command with this environment.
-    Some(std::env::var_os("RIPGREP_CONFIG_PATH").is_none())
-}
-
-fn bounded_start(mut frame: Frame, maximum: usize) -> Frame {
-    if serde_json::to_vec(&frame).is_ok_and(|raw| raw.len().saturating_add(1) > maximum) {
-        if let Frame::Start {
-            config_path_absent, ..
-        } = &mut frame
-        {
-            // Optional features must not make a previously admissible atomic
-            // observation disappear. Unknown config retains ordinary behavior.
-            *config_path_absent = None;
-        }
-    }
-    frame
 }
 
 pub(super) fn capture(payload: &Payload) -> anyhow::Result<()> {
@@ -719,74 +688,6 @@ pub(super) fn capture(payload: &Payload) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn private_start_config_attestation_is_optional_unknown_and_strictly_typed() {
-        let old = serde_json::json!({"kind":"start","id":"one","real":"/rg","native":[1,2],"argv":["-n","red|blue","source.rs"],"cwd":"/project","real_pid":12});
-        let parsed: Frame = serde_json::from_value(old.clone()).unwrap();
-        assert!(matches!(
-            &parsed,
-            Frame::Start {
-                config_path_absent: None,
-                ..
-            }
-        ));
-        assert_eq!(serde_json::to_value(parsed).unwrap(), old);
-        let mut known = old.clone();
-        known["config_path_absent"] = serde_json::json!(true);
-        assert!(matches!(
-            serde_json::from_value::<Frame>(known).unwrap(),
-            Frame::Start {
-                config_path_absent: Some(true),
-                ..
-            }
-        ));
-        let mut bad = old;
-        bad["config_path_absent"] = serde_json::json!("unknown");
-        assert!(serde_json::from_value::<Frame>(bad).is_err());
-    }
-
-    #[test]
-    fn optional_attestation_cannot_overflow_a_previously_valid_atomic_start_frame() {
-        let make = |argument: String, config_path_absent| Frame::Start {
-            id: "one".into(),
-            real: "/rg".into(),
-            native: [1, 2],
-            argv: vec![argument],
-            cwd: "/project".into(),
-            real_pid: 12,
-            config_path_absent,
-        };
-        let empty = serde_json::to_vec(&make(String::new(), None))
-            .unwrap()
-            .len()
-            + 1;
-        let argument = "x".repeat(4096 - empty);
-        let old = make(argument.clone(), None);
-        assert_eq!(serde_json::to_vec(&old).unwrap().len() + 1, 4096);
-        let known = make(argument.clone(), Some(true));
-        assert!(serde_json::to_vec(&known).unwrap().len() + 1 > 4096);
-        let bounded = bounded_start(known, 4096);
-        assert!(matches!(
-            &bounded,
-            Frame::Start {
-                config_path_absent: None,
-                ..
-            }
-        ));
-        assert_eq!(
-            serde_json::to_value(bounded).unwrap(),
-            serde_json::to_value(old).unwrap(),
-            "keep the original argv and frame instead of clipping or dropping observations"
-        );
-        assert!(matches!(
-            bounded_start(make("red|blue".into(), Some(true)), 4096),
-            Frame::Start {
-                config_path_absent: Some(true),
-                ..
-            }
-        ));
-    }
 
     #[test]
     fn replaced_private_writer_is_refused_before_descriptor_flags_change() {
