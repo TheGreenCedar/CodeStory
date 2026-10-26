@@ -27,6 +27,7 @@ struct StoredProofProvenanceKey {
 #[cfg(test)]
 thread_local! {
     // Counts actual key/JSON construction attempts, isolated from parallel tests.
+    static DEPENDENCY_CANONICAL_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PROVENANCE_KEY_CONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -253,6 +254,10 @@ fn parse_canonical_json<T>(value: &str, label: &str) -> Result<T, String>
 where
     T: serde::de::DeserializeOwned + serde::Serialize,
 {
+    #[cfg(test)]
+    if label == "dependency" {
+        DEPENDENCY_CANONICAL_DECODES.with(|work| work.set(work.get() + 1));
+    }
     let parsed: T = serde_json::from_str(value)
         .map_err(|error| format!("stored {label} JSON is invalid: {error}"))?;
     let canonical = serde_json::to_string(&parsed)
@@ -2867,6 +2872,7 @@ impl ProofResolutionValidationContext {
 
 fn parse_stored_proof_resolution_fact(
     row: &rusqlite::Row<'_>,
+    last_dependency: &mut Option<(String, Vec<DependencyFileHash>)>,
 ) -> Result<CallResolutionFact, StorageError> {
     let callee_form_text: String = row.get(10)?;
     let status_text: String = row.get(14)?;
@@ -2881,8 +2887,17 @@ fn parse_stored_proof_resolution_fact(
         .ok_or_else(|| proof_error("stored reason is outside the closed domain"))?;
     let evidence_chain: Vec<ResolutionEvidence> =
         parse_canonical_json(&evidence_json, "evidence").map_err(proof_error)?;
-    let dependency_file_hashes: Vec<DependencyFileHash> =
-        parse_canonical_json(&dependency_json, "dependency").map_err(proof_error)?;
+    let dependency_file_hashes = if let Some((_, dependencies)) = last_dependency
+        .as_ref()
+        .filter(|(raw, _)| raw == &dependency_json)
+    {
+        dependencies.clone()
+    } else {
+        let dependencies: Vec<DependencyFileHash> =
+            parse_canonical_json(&dependency_json, "dependency").map_err(proof_error)?;
+        *last_dependency = Some((dependency_json, dependencies.clone()));
+        dependencies
+    };
     let fact = CallResolutionFact {
         fact_id: row.get(0)?,
         edge_id: row.get::<_, Option<i64>>(1)?.map(EdgeId),
@@ -3083,8 +3098,9 @@ impl Storage {
             None => stmt.query([])?,
         };
         let mut facts = Vec::new();
+        let mut last_dependency = None;
         while let Some(row) = rows.next()? {
-            let fact = parse_stored_proof_resolution_fact(row)?;
+            let fact = parse_stored_proof_resolution_fact(row, &mut last_dependency)?;
             if edge_id.is_some() {
                 validate_fact_seal(&fact)?;
             }
@@ -3109,8 +3125,12 @@ impl Storage {
         )?;
         let mut rows = statement.query([])?;
         let mut facts = Vec::new();
+        let mut last_dependency = None;
         while let Some(row) = rows.next()? {
-            facts.push(parse_stored_proof_resolution_fact(row)?);
+            facts.push(parse_stored_proof_resolution_fact(
+                row,
+                &mut last_dependency,
+            )?);
         }
         Ok(facts)
     }
@@ -3123,6 +3143,7 @@ impl Storage {
             return Ok(Vec::new());
         }
         let mut facts = Vec::with_capacity(fact_ids.len());
+        let mut last_dependency = None;
         for chunk in fact_ids.chunks(400) {
             let placeholders = numbered_placeholders(1, chunk.len());
             let sql = format!(
@@ -3142,7 +3163,7 @@ impl Storage {
             let mut statement = self.conn.prepare(&sql)?;
             let mut rows = statement.query(params_from_iter(chunk.iter()))?;
             while let Some(row) = rows.next()? {
-                let fact = parse_stored_proof_resolution_fact(row)?;
+                let fact = parse_stored_proof_resolution_fact(row, &mut last_dependency)?;
                 validate_fact_seal(&fact)?;
                 facts.push(fact);
             }
@@ -6041,6 +6062,316 @@ mod publication_order_tests {
             provenance_work, 4,
             "each writer fact must construct its exact provenance key once"
         );
+        Ok(())
+    }
+
+    fn dependency_decoding_fixture(
+        pattern: &[bool],
+        language: &str,
+    ) -> Result<(Storage, Vec<CallResolutionFact>), StorageError> {
+        let store = Storage::new_in_memory()?;
+        store.insert_file(&FileInfo {
+            id: 1,
+            path: "input.go".into(),
+            language: language.into(),
+            modification_time: 0,
+            indexed: true,
+            complete: true,
+            line_count: 1,
+            file_role: FileRole::Source,
+        })?;
+        store.insert_node(&Node {
+            id: NodeId(12),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "caller".into(),
+            ..Default::default()
+        })?;
+        let mut facts = Vec::new();
+        for (index, &second_group) in pattern.iter().enumerate() {
+            let dependencies: &[i64] = if second_group { &[1, 2] } else { &[1] };
+            let fact =
+                seal_call_resolution_fact(fact("", 1, index as u64 + 1, dependencies, language))?;
+            let provenance_id = if second_group { 2 } else { 1 };
+            store.conn.execute(
+                "INSERT OR IGNORE INTO proof_resolution_provenance
+                 (provenance_id,file_id,source_sha256,parser_fingerprint,dependency_json)
+                 VALUES (?1,1,?2,?3,?4)",
+                params![
+                    provenance_id,
+                    fact.callsite.source_sha256,
+                    fact.provenance.parser_fingerprint,
+                    serde_json::to_string(&fact.provenance.dependency_file_hashes).unwrap()
+                ],
+            )?;
+            store.conn.execute(
+                "INSERT INTO proof_resolution_fact
+                 (fact_id,edge_id,raw_edge_target_id,raw_callsite_identity,file_id,provenance_id,
+                  start_byte,end_byte_exclusive,line,column,callee_form,raw_target,caller_node_id,
+                  target_node_id,status,reason,evidence_json,lookup_domain_complete,producer,
+                  fact_schema_version,algorithm,language_adapter,language_adapter_version,evidence_digest)
+                 VALUES (?1,NULL,NULL,NULL,1,?2,?3,?4,1,1,'identifier','unbound',12,NULL,
+                         'missing_binding','missing_binding','[]',1,'codestory-internal',1,
+                         'exact-call-resolution-v1',?5,'test-v1',?6)",
+                params![fact.fact_id, provenance_id, fact.callsite.start_byte as i64,
+                        fact.callsite.end_byte_exclusive as i64, language, fact.provenance.evidence_sha256],
+            )?;
+            facts.push(fact);
+        }
+        Ok((store, facts))
+    }
+
+    fn dependency_decoding_legacy_columns(store: &Storage) -> Result<(), StorageError> {
+        store.conn.execute_batch(
+            "ALTER TABLE proof_resolution_fact ADD COLUMN source_sha256 TEXT;
+             ALTER TABLE proof_resolution_fact ADD COLUMN parser_fingerprint TEXT;
+             ALTER TABLE proof_resolution_fact ADD COLUMN dependency_json TEXT;
+             UPDATE proof_resolution_fact SET
+               source_sha256=(SELECT p.source_sha256 FROM proof_resolution_provenance p WHERE p.provenance_id=proof_resolution_fact.provenance_id),
+               parser_fingerprint=(SELECT p.parser_fingerprint FROM proof_resolution_provenance p WHERE p.provenance_id=proof_resolution_fact.provenance_id),
+               dependency_json=(SELECT p.dependency_json FROM proof_resolution_provenance p WHERE p.provenance_id=proof_resolution_fact.provenance_id);"
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn dependency_decoding_reuses_consecutive_bytes_in_current_and_legacy_readers()
+    -> Result<(), StorageError> {
+        for legacy in [false, true] {
+            let (store, expected) =
+                dependency_decoding_fixture(&[false, false, true, true, false, false], "go")?;
+            if legacy {
+                dependency_decoding_legacy_columns(&store)?;
+            }
+            for _ in 0..2 {
+                DEPENDENCY_CANONICAL_DECODES.set(0);
+                let mut actual = if legacy {
+                    store.read_legacy_v32_proof_resolution_facts()?
+                } else {
+                    store.read_proof_resolution_facts(None)?
+                };
+                assert_eq!(actual, expected);
+                assert_eq!(
+                    DEPENDENCY_CANONICAL_DECODES.get(),
+                    3,
+                    "A,A,B,B,A,A requires three actual canonical dependency decodes, legacy={legacy}"
+                );
+                actual[0].provenance.dependency_file_hashes[0]
+                    .source_sha256
+                    .clear();
+                assert_eq!(
+                    actual[1], expected[1],
+                    "facts must own independent dependency vectors"
+                );
+            }
+        }
+        let (store, mut expected) = dependency_decoding_fixture(&[false, false], "go")?;
+        expected[1].provenance.parser_fingerprint = "2".repeat(64);
+        expected[1] = seal_call_resolution_fact(expected[1].clone())?;
+        store.conn.execute(
+            "INSERT INTO proof_resolution_provenance
+             (provenance_id,file_id,source_sha256,parser_fingerprint,dependency_json)
+             SELECT 2,file_id,source_sha256,?1,dependency_json
+             FROM proof_resolution_provenance WHERE provenance_id=1",
+            [&expected[1].provenance.parser_fingerprint],
+        )?;
+        store.conn.execute(
+            "UPDATE proof_resolution_fact SET provenance_id=2,fact_id=?1,evidence_digest=?2
+             WHERE start_byte=?3",
+            params![
+                expected[1].fact_id,
+                expected[1].provenance.evidence_sha256,
+                expected[1].callsite.start_byte as i64
+            ],
+        )?;
+        DEPENDENCY_CANONICAL_DECODES.set(0);
+        let actual = store.read_proof_resolution_facts(None)?;
+        assert_eq!(actual, expected);
+        for fact in &actual {
+            validate_fact_seal(fact)?;
+        }
+        assert_eq!(
+            DEPENDENCY_CANONICAL_DECODES.get(),
+            1,
+            "identical canonical dependency bytes must reuse decoding across distinct provenance IDs and parser fingerprints"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dependency_decoding_preserves_by_id_chunk_order_and_checks_every_seal()
+    -> Result<(), StorageError> {
+        let (store, mut expected) = dependency_decoding_fixture(&vec![false; 402], "go")?;
+        let ids = expected
+            .iter()
+            .rev()
+            .map(|fact| fact.fact_id.clone())
+            .collect::<Vec<_>>();
+        expected.sort_by(|left, right| left.fact_id.cmp(&right.fact_id));
+        DEPENDENCY_CANONICAL_DECODES.set(0);
+        assert_eq!(store.read_proof_resolution_facts_by_ids(&ids)?, expected);
+        assert_eq!(
+            DEPENDENCY_CANONICAL_DECODES.get(),
+            1,
+            "one invocation retains its last payload across the400-ID chunk boundary"
+        );
+        assert!(store.read_proof_resolution_facts_by_ids(&[])?.is_empty());
+        store.conn.execute(
+            "UPDATE proof_resolution_fact SET evidence_digest=?1 WHERE fact_id=?2",
+            params!["0".repeat(64), expected.last().unwrap().fact_id],
+        )?;
+        let error = store
+            .read_proof_resolution_facts_by_ids(&ids)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("evidence digest or fact id mismatch"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dependency_decoding_refuses_changed_raw_bytes_and_preserves_error_order()
+    -> Result<(), StorageError> {
+        for malformed in [
+            "[".to_owned(),
+            format!(
+                " {}",
+                serde_json::to_string(&vec![DependencyFileHash {
+                    file_id: FileId(1),
+                    source_sha256: "a".repeat(64)
+                }])
+                .unwrap()
+            ),
+        ] {
+            let (store, _) = dependency_decoding_fixture(&[false, false, true], "go")?;
+            store.conn.execute(
+                "UPDATE proof_resolution_provenance SET dependency_json=?1 WHERE provenance_id=2",
+                [&malformed],
+            )?;
+            let error = store
+                .read_proof_resolution_facts(None)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("stored dependency JSON"), "{error}");
+            store.conn.execute(
+                "UPDATE proof_resolution_fact SET evidence_json='[' WHERE provenance_id=2",
+                [],
+            )?;
+            let error = store
+                .read_proof_resolution_facts(None)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("stored evidence JSON"),
+                "evidence must fail before dependency: {error}"
+            );
+        }
+        let (store, expected) = dependency_decoding_fixture(&[false, false], "go")?;
+        assert_eq!(store.read_proof_resolution_facts(None)?, expected);
+        let changed = vec![DependencyFileHash {
+            file_id: FileId(1),
+            source_sha256: "b".repeat(64),
+        }];
+        store.conn.execute(
+            "UPDATE proof_resolution_provenance SET dependency_json=?1 WHERE provenance_id=1",
+            [serde_json::to_string(&changed).unwrap()],
+        )?;
+        DEPENDENCY_CANONICAL_DECODES.set(0);
+        let actual = store.read_proof_resolution_facts(None)?;
+        assert_eq!(actual[0].provenance.dependency_file_hashes, changed);
+        assert_eq!(
+            DEPENDENCY_CANONICAL_DECODES.get(),
+            1,
+            "a separate read must parse changed bytes even under unchanged IDs"
+        );
+        let ids = expected
+            .iter()
+            .map(|fact| fact.fact_id.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            store.read_proof_resolution_facts_by_ids(&ids).is_err(),
+            "decoding does not authorize changed dependencies"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dependency_decoding_does_not_authorize_another_adapters_dependency_order()
+    -> Result<(), StorageError> {
+        let (store, _) = dependency_decoding_fixture(&[true, true], "bash")?;
+        let dependencies = vec![
+            DependencyFileHash {
+                file_id: FileId(2),
+                source_sha256: "a".repeat(64),
+            },
+            DependencyFileHash {
+                file_id: FileId(1),
+                source_sha256: "a".repeat(64),
+            },
+        ];
+        store.conn.execute(
+            "UPDATE proof_resolution_provenance SET dependency_json=?1",
+            [serde_json::to_string(&dependencies).unwrap()],
+        )?;
+        let mut facts = store.read_proof_resolution_facts(None)?;
+        for fact in &mut facts {
+            *fact = seal_call_resolution_fact(fact.clone())?;
+            store.conn.execute("UPDATE proof_resolution_fact SET fact_id=?1,evidence_digest=?2 WHERE start_byte=?3", params![fact.fact_id, fact.provenance.evidence_sha256, fact.callsite.start_byte as i64])?;
+        }
+        let ids = facts
+            .iter()
+            .map(|fact| fact.fact_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(store.read_proof_resolution_facts_by_ids(&ids)?.len(), 2);
+        store.conn.execute(
+            "UPDATE proof_resolution_fact SET language_adapter='go' WHERE fact_id=?1",
+            [ids.iter().max().unwrap()],
+        )?;
+        let error = store
+            .read_proof_resolution_facts_by_ids(&ids)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("noncanonical"),
+            "cached decoding must not bypass adapter shape checks: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "manual read-only typed-fact equivalence and actual decoder-work receipt"]
+    fn dependency_decoding_corpus_receipt() -> Result<(), Box<dyn std::error::Error>> {
+        let database = std::env::var("CODESTORY_PROOF_CORPUS_DB")?;
+        let output_root = std::path::PathBuf::from(std::env::var("CODESTORY_PROOF_CORPUS_OUTPUT")?);
+        let store = Storage::open_immutable_generation(database)?;
+        DEPENDENCY_CANONICAL_DECODES.set(0);
+        let facts = store.read_proof_resolution_facts(None)?;
+        let decodes = DEPENDENCY_CANONICAL_DECODES.get();
+        let mut hasher = Sha256::new();
+        let mut serialized_bytes = 0_u64;
+        for fact in &facts {
+            let bytes = serde_json::to_vec(fact)?;
+            hasher.update((bytes.len() as u64).to_be_bytes());
+            hasher.update(&bytes);
+            serialized_bytes += bytes.len() as u64;
+        }
+        let manifest = store
+            .get_proof_resolution_publication()?
+            .ok_or("proof manifest absent")?;
+        let receipt = serde_json::json!({
+            "fact_count": facts.len(), "ordered_length_delimited_typed_fact_sha256": format!("{:x}", hasher.finalize()),
+            "serialized_fact_bytes": serialized_bytes, "actual_dependency_canonical_decodes": decodes,
+            "publication": format!("{:?}", store.get_complete_index_publication()?),
+            "manifest": format!("{manifest:?}"), "manifest_fact_count": manifest.fact_count,
+            "manifest_fact_digest": manifest.fact_digest,
+        });
+        let output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(output_root.join("dependency-decoding-corpus.json"))?;
+        serde_json::to_writer_pretty(output, &receipt)?;
+        eprintln!("{receipt}");
         Ok(())
     }
 }

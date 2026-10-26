@@ -15598,7 +15598,7 @@ fn public_export_projection_identity_and_transaction_faults() -> Result<(), Stor
         target_source_sha256: Some(hash),
         status: PublicExportAliasStatus::Bound,
     };
-    storage.replace_public_export_aliases(&publication, &[alias.clone()], true)?;
+    storage.replace_public_export_aliases(&publication, std::slice::from_ref(&alias), true)?;
     assert_eq!(
         storage.public_export_aliases("PublicRun")?.rows,
         vec![alias.clone()]
@@ -15611,7 +15611,7 @@ fn public_export_projection_identity_and_transaction_faults() -> Result<(), Stor
     assert!(!previous_producer.ready);
     assert!(!previous_producer.complete);
     assert!(previous_producer.rows.is_empty());
-    storage.replace_public_export_aliases(&publication, &[alias.clone()], true)?;
+    storage.replace_public_export_aliases(&publication, std::slice::from_ref(&alias), true)?;
     storage
         .conn
         .execute("DELETE FROM index_artifact_cache", [])?;
