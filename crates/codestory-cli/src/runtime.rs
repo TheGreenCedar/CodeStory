@@ -1671,6 +1671,7 @@ mod tests {
             canonicalize_configuration_path(&second_cache).expect("second cache identity");
         assert_ne!(first_cache, second_cache);
         let startup = |cache_root: &Path| crate::config::CliStartupConfig {
+            mcp_result_display: Default::default(),
             user_home: None,
             allow_sensitive_project_root: false,
             project_network_config_allowed: true,
@@ -1757,6 +1758,7 @@ mod tests {
         let cache = temp.path().join("cache");
         fs::create_dir_all(&project).expect("create project");
         let startup = crate::config::CliStartupConfig {
+            mcp_result_display: Default::default(),
             user_home: None,
             allow_sensitive_project_root: false,
             project_network_config_allowed: false,
@@ -1801,6 +1803,7 @@ mod tests {
             codestory_retrieval::SidecarRuntimeDefaults::default(),
         );
         let startup = |byte_cap| crate::config::CliStartupConfig {
+            mcp_result_display: Default::default(),
             user_home: None,
             allow_sensitive_project_root: false,
             project_network_config_allowed: false,
@@ -1840,6 +1843,7 @@ mod tests {
         fs::create_dir_all(&project).expect("create project");
         fs::create_dir_all(&cache).expect("create cache");
         let startup = crate::config::CliStartupConfig {
+            mcp_result_display: Default::default(),
             user_home: None,
             allow_sensitive_project_root: false,
             project_network_config_allowed: true,
@@ -2257,6 +2261,7 @@ mod tests {
         fs::create_dir_all(&project).expect("create project");
         symlink(&project, &alias).expect("create project alias");
         let startup = crate::config::CliStartupConfig {
+            mcp_result_display: Default::default(),
             user_home: None,
             allow_sensitive_project_root: false,
             project_network_config_allowed: true,

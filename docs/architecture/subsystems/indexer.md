@@ -177,6 +177,15 @@ recomputes only this package-function resolution class so unchanged Go callers
 cannot retain stale targets. This is local navigation evidence, not `go.work`,
 `replace`, external dependency, return-type, or closure type-flow resolution.
 
+Go package variable initializers retain ordinary `CALL` edges owned by the
+existing `FILE` node, with each callee's physical callsite. Only AST-proven
+initializer value expressions qualify; nested eager argument calls qualify,
+while calls inside function literal bodies do not. Local variable initializers
+keep their named callable owner. This adds navigation without declaring
+initializer variables callable or granting exact-call proof. A Go-local
+extraction revision invalidates unchanged older file projections and parser
+artifacts through the existing producer compatibility checks.
+
 This keeps parse and extract logic in the indexer while leaving persistence and snapshot ownership in the store.
 
 ## Extension Points

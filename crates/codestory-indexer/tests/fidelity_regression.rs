@@ -1202,6 +1202,242 @@ fn test_nested_call_attribution_follows_enclosing_callable() -> anyhow::Result<(
 }
 
 #[test]
+fn go_package_initializer_calls_are_file_owned_without_deferred_body_calls() -> anyhow::Result<()> {
+    let source = r#"package startup
+
+type action func()
+func wrap(fn action) action { return fn }
+func build() action { return deferred }
+func combine(left, right action) action { return left }
+func deferred() {}
+var first = wrap(func() {
+    deferred()
+})
+var inline = wrap(func() { deferred() })
+var reference = wrap(deferred)
+var (
+    grouped = wrap(build())
+    nested = combine(wrap(build()), wrap(build()))
+)
+var sameA, sameB = wrap(deferred), wrap(deferred)
+var held = func() { deferred() }
+func ordinary() { var local = wrap(deferred); _ = local; wrap(deferred); deferred() }; var adjacent = wrap(func() { deferred() })
+"#;
+    let (nodes, edges) = index_single_file("initializers.go", source)?;
+    let files: Vec<_> = nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::FILE)
+        .collect();
+    assert_eq!(
+        files.len(),
+        1,
+        "the real file node must own package initialization"
+    );
+    let file = files[0];
+    let by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+    let named_function = |name: &str| {
+        let matches: Vec<_> = nodes
+            .iter()
+            .filter(|node| {
+                node.kind == NodeKind::FUNCTION && is_matching_name(&node.serialized_name, name)
+            })
+            .collect();
+        assert_eq!(matches.len(), 1, "expected one declared function {name}");
+        matches[0]
+    };
+    let function_name = |id| {
+        ["wrap", "build", "combine", "deferred", "ordinary"]
+            .into_iter()
+            .find(|name| named_function(name).id == id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "CALL target must be an actual declared function: {:?}",
+                    by_id.get(&id)
+                )
+            })
+    };
+    let functions: Vec<_> = nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::FUNCTION)
+        .collect();
+    assert_eq!(
+        functions.len(),
+        5,
+        "initializer bindings and function literals must not fabricate FUNCTION nodes: {functions:?}"
+    );
+    for binding in [
+        "first",
+        "inline",
+        "reference",
+        "grouped",
+        "nested",
+        "sameA",
+        "sameB",
+        "held",
+        "adjacent",
+    ] {
+        assert!(
+            !has_node_with_kind(&nodes, NodeKind::FUNCTION, binding),
+            "{binding} is a variable, not a callable declaration"
+        );
+    }
+    let file_calls: Vec<_> = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL && edge.effective_source() == file.id)
+        .collect();
+    assert_eq!(
+        file_calls.len(),
+        13,
+        "package initializer calls must survive real WorkspaceIndexer persistence as FILE-owned edges; callbacks/reference arguments add no calls. Calls: {:?}",
+        describe_call_edges(&edges, &nodes)
+    );
+    let mut observed = std::collections::BTreeMap::new();
+    let mut callsites = HashSet::new();
+    for edge in &file_calls {
+        assert_eq!(
+            edge.source, file.id,
+            "no fabricated callable owns initialization"
+        );
+        assert_eq!(edge.file_node_id, Some(file.id));
+        assert_ne!(edge.source, edge.target);
+        let target = edge.effective_target();
+        assert_eq!(by_id[&target].kind, NodeKind::FUNCTION);
+        *observed
+            .entry((
+                edge.line.expect("initializer CALL needs its physical line"),
+                function_name(target),
+            ))
+            .or_insert(0usize) += 1;
+        assert!(
+            callsites.insert(
+                edge.callsite_identity
+                    .as_deref()
+                    .expect("each initializer CALL needs a distinct callsite identity")
+            ),
+            "same-line calls must not collapse: {edge:?}"
+        );
+    }
+    let line_of = |prefix: &str| -> u32 {
+        source
+            .lines()
+            .position(|line| line.trim_start().starts_with(prefix))
+            .unwrap() as u32
+            + 1
+    };
+    let mut expected = std::collections::BTreeMap::new();
+    for (prefix, callee, count) in [
+        ("var first =", "wrap", 1),
+        ("var inline =", "wrap", 1),
+        ("var reference =", "wrap", 1),
+        ("grouped =", "wrap", 1),
+        ("grouped =", "build", 1),
+        ("nested =", "combine", 1),
+        ("nested =", "wrap", 2),
+        ("nested =", "build", 2),
+        ("var sameA, sameB =", "wrap", 2),
+        ("func ordinary()", "wrap", 1),
+    ] {
+        expected.insert((line_of(prefix), callee), count);
+    }
+    assert_eq!(
+        observed, expected,
+        "nested arguments, grouped declarations and distinct same-line initializers retain the actual evaluated callsites; deferred literal bodies are excluded"
+    );
+    let ordinary = named_function("ordinary");
+    let mut ordinary_calls = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL && edge.effective_source() == ordinary.id)
+        .map(|edge| {
+            assert_eq!(edge.line, Some(line_of("func ordinary()")));
+            function_name(edge.effective_target())
+        })
+        .collect::<Vec<_>>();
+    ordinary_calls.sort_unstable();
+    assert_eq!(
+        ordinary_calls,
+        ["deferred", "wrap", "wrap"],
+        "local var initializers and ordinary calls retain their function owner"
+    );
+    assert_no_self_call_edges("Go package initialization", &edges);
+    Ok(())
+}
+
+#[test]
+fn go_package_initializer_selectors_preserve_unresolved_target_policy() -> anyhow::Result<()> {
+    let source = r#"package startup
+import external "example.invalid/library"
+type holder struct{}
+func (h holder) Build() int { return 1 }
+func Build() int { return 2 }
+func wrap(value int) int { return value }
+var imported = external.Build(wrap(1))
+var object holder
+var selected = object.Build()
+func ordinary() { var external holder; var local = external.Build(); _ = local }
+"#;
+    let (nodes, edges) = index_single_file("selectors.go", source)?;
+    let by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+    let file = nodes
+        .iter()
+        .find(|node| node.kind == NodeKind::FILE)
+        .unwrap();
+    let file_calls: Vec<_> = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL && edge.effective_source() == file.id)
+        .collect();
+    assert_eq!(
+        file_calls.len(),
+        3,
+        "outer selectors and nested eager argument calls survive: {:?}",
+        describe_call_edges(&edges, &nodes)
+    );
+    let selectors: Vec<_> = file_calls
+        .iter()
+        .filter(|edge| {
+            edge.callsite_identity
+                .as_deref()
+                .is_some_and(|site| site.contains("syntax:go-selector-call"))
+        })
+        .collect();
+    assert_eq!(selectors.len(), 2);
+    for edge in selectors {
+        assert_eq!(edge.source, file.id);
+        assert_eq!(edge.file_node_id, Some(file.id));
+        assert_eq!(
+            edge.resolved_target, None,
+            "FILE ownership cannot invent receiver/import binding: {edge:?}"
+        );
+        assert_eq!(by_id[&edge.effective_target()].kind, NodeKind::UNKNOWN);
+        assert!(matches!(edge.line, Some(7 | 9)));
+    }
+    let wrap = file_calls
+        .iter()
+        .find(|edge| is_matching_name(&by_id[&edge.effective_target()].serialized_name, "wrap"))
+        .unwrap();
+    assert_eq!(wrap.line, Some(7));
+    assert_eq!(by_id[&wrap.effective_target()].kind, NodeKind::FUNCTION);
+    let ordinary = nodes
+        .iter()
+        .find(|node| {
+            node.kind == NodeKind::FUNCTION && is_matching_name(&node.serialized_name, "ordinary")
+        })
+        .unwrap();
+    let local_calls: Vec<_> = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL && edge.effective_source() == ordinary.id)
+        .collect();
+    assert_eq!(
+        local_calls.len(),
+        1,
+        "shadowed local receiver remains callable-owned"
+    );
+    assert_eq!(local_calls[0].line, Some(10));
+    assert!(!file_calls.iter().any(|edge| edge.line == Some(10)));
+    assert_no_self_call_edges("Go initializer selectors", &edges);
+    Ok(())
+}
+
+#[test]
 fn test_rust_struct_enum_and_local_bindings_are_indexed() -> anyhow::Result<()> {
     let (nodes, _) = index_single_file("locals.rs", RUST_SOURCE)?;
     assert!(has_node_name(&nodes, "MemoryRepository"));

@@ -175,7 +175,7 @@ pub(crate) fn revision_native_tool_result_unchecked_v3(
     let text = serde_json::to_string(root)
         .map_err(|error| StdioV3InternalError::Serialization(error.to_string()))?;
     if revision.profile().structured_content {
-        Ok(json!({
+        let mut result = json!({
             "content": [{"type":"text","text":text}],
             "structuredContent": root,
             "isError": false,
@@ -186,7 +186,14 @@ pub(crate) fn revision_native_tool_result_unchecked_v3(
                     "minimum_compatible_schema_version": codestory_contracts::wire::MINIMUM_COMPATIBLE_PUBLICATION_STAMP_SCHEMA_VERSION
                 }
             }
-        }))
+        });
+        if revision.json_text_only() {
+            result
+                .as_object_mut()
+                .expect("tool result object")
+                .remove("structuredContent");
+        }
+        Ok(result)
     } else {
         Ok(json!({
             "content": [{"type":"text","text":text}],
@@ -236,6 +243,65 @@ mod tests {
     ) -> codestory_contracts::call_path_public::PublicCallPathResultDto {
         codestory_runtime::public_call_path::project_public_verification_result(root)
             .expect("project public verification result")
+    }
+
+    #[test]
+    fn codex_json_text_preserves_exact_payload_metadata_and_modern_validation() {
+        let root = json!({"signed":i64::MIN,"unsigned":u64::MAX,"float":165.0,
+            "negative_zero":-0.0,"source":"café 🦀\r\nlast line","limits":["unchanged"]});
+        let text = serde_json::to_string(&root).unwrap();
+        assert!(text.contains("-9223372036854775808"));
+        assert!(text.contains("18446744073709551615"));
+        assert!(text.contains("165.0"));
+        assert!(text.contains("-0.0"));
+        for revision in McpRevisionV3::all() {
+            let selected =
+                revision.with_result_display(super::super::McpResultDisplay::CodexJsonText);
+            let baseline = revision_native_tool_result_with_schema_v3(
+                *revision,
+                &root,
+                &json!({"type":"object"}),
+            )
+            .unwrap();
+            let actual = revision_native_tool_result_with_schema_v3(
+                selected,
+                &root,
+                &json!({"type":"object"}),
+            )
+            .unwrap();
+            let mut expected = baseline.clone();
+            if revision.profile().structured_content {
+                expected
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("structuredContent");
+                assert!(
+                    revision_native_tool_result_with_schema_v3(
+                        selected,
+                        &root,
+                        &json!({"type":"string"})
+                    )
+                    .is_err(),
+                    "display profile must retain canonical output validation"
+                );
+                assert!(
+                    serde_json::to_vec(&actual).unwrap().len()
+                        < serde_json::to_vec(&baseline).unwrap().len()
+                );
+            }
+            assert_eq!(actual, expected);
+            assert_eq!(actual["content"][0]["text"], text);
+            assert!(actual.get("structuredContent").is_none());
+            assert_eq!(selected.as_str(), revision.as_str());
+            assert_eq!(
+                selected.profile().batch_policy,
+                revision.profile().batch_policy
+            );
+        }
+        assert_eq!(
+            semantic_tool_error_v3("exact failure"),
+            json!({"content":[{"type":"text","text":"exact failure"}],"isError":true})
+        );
     }
 
     fn resolution_fact_id(evidence_sha256: &str) -> String {

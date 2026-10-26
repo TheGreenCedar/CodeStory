@@ -44,6 +44,7 @@ thread_local! {
     static GO_LOCAL_OWNER_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static GO_LOCAL_SCOPE_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static GO_LOCAL_CONTEXT_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GO_INITIALIZER_CLASSIFICATION_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static GO_CAPTURE_PARENT_HOPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -67,11 +68,11 @@ fn go_navigation_resolution_work() -> usize {
 
 use super::LanguageExtraction;
 use crate::{
-    CompiledLanguageRules, LanguageRuleset, ManualMemberEdgeSpec, ManualReceiverCallSpec,
-    ManualReceiverSource, OptionalReceiverOwnerBinding, ReceiverCallSiteKey, ReceiverOwnerBinding,
-    collect_receiver_call_specs_in_callable, declaration_name, descendant_by_field_name,
-    enclosing_node_with_kind, member_call_method_col, normalize_parameter_name,
-    normalized_receiver_variable, receiver_call_belongs_to_callable,
+    CompiledLanguageRules, GraphNodeSpan, LanguageRuleset, ManualMemberEdgeSpec,
+    ManualReceiverCallSpec, ManualReceiverSource, OptionalReceiverOwnerBinding,
+    ReceiverCallSiteKey, ReceiverOwnerBinding, collect_receiver_call_specs_in_callable,
+    declaration_name, descendant_by_field_name, enclosing_node_with_kind, member_call_method_col,
+    normalize_parameter_name, normalized_receiver_variable, receiver_call_belongs_to_callable,
     receiver_callable_boundary_kinds, receiver_callsite_key, same_ts_span, trimmed_node_text,
     ts_node_graph_span, walk_tree_nodes,
 };
@@ -81,6 +82,84 @@ pub(crate) const MEMBER_CALLSITE_MARKER: &str = "syntax:go-selector-call";
 pub(crate) const PACKAGE_FUNCTION_CALLSITE_MARKER: &str = "syntax:go-package-function";
 pub(crate) const PACKAGE_FUNCTION_IMPORT_SET_PREFIX: &str = "syntax:go-package-function:";
 pub(crate) const RETURN_PATH_OWNER_PREFIX: &str = "go-return-path:";
+
+pub(crate) const INITIALIZER_CALL_REVISION: &str =
+    extraction_revision!("go-package-initializer-calls-v1");
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PackageInitializerCall {
+    Evaluated,
+    DeferredLiteralBody,
+}
+
+/// Prepare exact graph-callee ownership in one AST pass. Named callable and
+/// literal boundaries travel with the traversal, rather than being rediscovered
+/// by walking every captured call's ancestors.
+pub(crate) fn package_initializer_calls(
+    tree: &Tree,
+) -> HashMap<GraphNodeSpan, PackageInitializerCall> {
+    #[derive(Clone, Copy)]
+    enum Scope {
+        Outside,
+        Declaration,
+        Value(PackageInitializerCall),
+    }
+    let mut calls = HashMap::new();
+    let mut pending = vec![(tree.root_node(), Scope::Outside)];
+    while let Some((node, mut scope)) = pending.pop() {
+        #[cfg(test)]
+        GO_INITIALIZER_CLASSIFICATION_WORK.with(|work| work.set(work.get().saturating_add(1)));
+        match node.kind() {
+            "function_declaration" | "method_declaration" => scope = Scope::Outside,
+            "func_literal" if matches!(scope, Scope::Value(_)) => {
+                scope = Scope::Value(PackageInitializerCall::DeferredLiteralBody);
+            }
+            _ => {}
+        }
+        if node.kind() == "call_expression"
+            && let Scope::Value(classification) = scope
+            && let Some(function) = node.child_by_field_name("function")
+        {
+            // Match go.scm capture addresses exactly: a selector's graph node
+            // uses its field identifier, not the whole receiver expression.
+            let callee = match function.kind() {
+                "identifier" => Some(function),
+                "selector_expression" => function.child_by_field_name("field"),
+                _ => None,
+            };
+            if let Some(callee) = callee {
+                calls.insert(ts_node_graph_span(callee), classification);
+            }
+        }
+        let value_id = if node.kind() == "var_spec" && matches!(scope, Scope::Declaration) {
+            node.child_by_field_name("value").map(|value| value.id())
+        } else {
+            None
+        };
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            #[cfg(test)]
+            GO_INITIALIZER_CLASSIFICATION_WORK.with(|work| work.set(work.get().saturating_add(1)));
+            let child_scope = if node.kind() == "source_file" && child.kind() == "var_declaration" {
+                Scope::Declaration
+            } else if matches!(scope, Scope::Declaration) {
+                if matches!(node.kind(), "var_declaration" | "var_spec_list")
+                    && matches!(child.kind(), "var_spec" | "var_spec_list")
+                {
+                    Scope::Declaration
+                } else if value_id == Some(child.id()) {
+                    Scope::Value(PackageInitializerCall::Evaluated)
+                } else {
+                    Scope::Outside
+                }
+            } else {
+                scope
+            };
+            pending.push((child, child_scope));
+        }
+    }
+    calls
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GoReturnPath {
@@ -2116,6 +2195,73 @@ fn go_concrete_result_owner(type_node: TsNode<'_>, source: &str) -> Option<Strin
 mod complexity_tests {
     use super::*;
     use tree_sitter::Parser;
+
+    #[test]
+    fn package_initializer_classification_is_linear_for_nested_calls() {
+        let mut measured = Vec::new();
+        for depth in [32, 64, 128] {
+            let nested = format!("{}0{}", "wrap(".repeat(depth), ")".repeat(depth));
+            let source = format!(
+                "package startup\nvar eager = {nested}\nvar held = wrap(func() {{ _ = {nested}; external.Skip() }})\nvar selected = external.Make()\nfunc ordinary() {{ var local = {nested}; _ = local }}\n"
+            );
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_go::LANGUAGE.into())
+                .expect("Go grammar");
+            let tree = parser.parse(&source, None).expect("Go source");
+            assert!(!tree.root_node().has_error());
+            GO_INITIALIZER_CLASSIFICATION_WORK.with(|work| work.set(0));
+            let calls = package_initializer_calls(&tree);
+            let work = GO_INITIALIZER_CLASSIFICATION_WORK.with(std::cell::Cell::get);
+            assert_eq!(
+                calls
+                    .values()
+                    .filter(|scope| **scope == PackageInitializerCall::Evaluated)
+                    .count(),
+                depth + 2
+            );
+            assert_eq!(
+                calls
+                    .values()
+                    .filter(|scope| **scope == PackageInitializerCall::DeferredLiteralBody)
+                    .count(),
+                depth + 1
+            );
+            assert!(
+                calls.keys().all(|span| span.start_line < 5),
+                "local initializer calls cannot acquire FILE ownership"
+            );
+            for (line, field, expected) in [
+                (3, "Skip", PackageInitializerCall::DeferredLiteralBody),
+                (4, "Make", PackageInitializerCall::Evaluated),
+            ] {
+                let col = source.lines().nth(line - 1).unwrap().find(field).unwrap() as u32 + 1;
+                let span = GraphNodeSpan {
+                    start_line: line as u32,
+                    start_col: col,
+                    end_line: line as u32,
+                    end_col: col + field.len() as u32,
+                };
+                assert_eq!(
+                    calls.get(&span),
+                    Some(&expected),
+                    "selector classification must use go.scm's field capture span"
+                );
+            }
+            assert!(work > depth, "the visited-work counter must be active");
+            assert!(
+                work <= 64 * depth + 256,
+                "nested call trees must have bounded linear work: depth={depth}, work={work}"
+            );
+            measured.push(work);
+        }
+        for pair in measured.windows(2) {
+            assert!(
+                pair[1] <= 2 * pair[0],
+                "doubling nested eager, deferred and local trees must not multiply ancestry work: {measured:?}"
+            );
+        }
+    }
 
     #[test]
     fn go_navigation_ancestry_ignores_noncontributing_expression_nodes() {

@@ -45,6 +45,7 @@ type ConfigResult<T> = std::result::Result<T, ConfigError>;
 
 #[derive(Debug, Clone)]
 pub(crate) struct CliStartupConfig {
+    pub(crate) mcp_result_display: crate::stdio_v3::McpResultDisplay,
     pub(crate) user_home: Option<PathBuf>,
     pub(crate) allow_sensitive_project_root: bool,
     pub(crate) project_network_config_allowed: bool,
@@ -57,6 +58,11 @@ impl CliStartupConfig {
     pub(crate) fn from_process_env() -> Self {
         crate::sidecar_runtime::prepare_cache_access();
         Self {
+            mcp_result_display: crate::stdio_v3::McpResultDisplay::from_env_value(
+                std::env::var("CODESTORY_MCP_RESULT_DISPLAY")
+                    .ok()
+                    .as_deref(),
+            ),
             user_home: std::env::var_os("USERPROFILE")
                 .or_else(|| std::env::var_os("HOME"))
                 .map(PathBuf::from),
@@ -425,6 +431,27 @@ mod tests {
     }
 
     #[test]
+    fn codex_json_text_selector_requires_exact_explicit_value() {
+        assert_eq!(
+            crate::stdio_v3::McpResultDisplay::from_env_value(Some("codex-json-text-v1")),
+            crate::stdio_v3::McpResultDisplay::CodexJsonText
+        );
+        for value in [
+            None,
+            Some(""),
+            Some("Codex"),
+            Some(" codex-json-text-v1"),
+            Some("codex-json-text-v1 "),
+            Some("unrecognized"),
+        ] {
+            assert_eq!(
+                crate::stdio_v3::McpResultDisplay::from_env_value(value),
+                crate::stdio_v3::McpResultDisplay::Mirrors
+            );
+        }
+    }
+
+    #[test]
     fn source_index_policy_parses_only_positive_process_values() {
         assert_eq!(
             source_index_policy_from_env_value(Some(" 65536 ")).byte_cap,
@@ -596,6 +623,7 @@ summary_model = "trusted/model"
 
     fn isolated_startup() -> CliStartupConfig {
         CliStartupConfig {
+            mcp_result_display: Default::default(),
             user_home: None,
             allow_sensitive_project_root: false,
             project_network_config_allowed: false,

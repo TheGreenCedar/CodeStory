@@ -184,6 +184,7 @@ mod repo_text;
 mod root_rank;
 mod route_coverage;
 mod search_evidence;
+pub mod search_source_context;
 mod search_intent;
 mod search_plan;
 mod search_publication;

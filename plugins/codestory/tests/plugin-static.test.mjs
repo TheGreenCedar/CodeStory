@@ -212,6 +212,29 @@ function familyWireFixture(body, { revision = preferredRevision, surface = "fami
   return { ...result, frames: result.stdout.trim() ? result.stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line)) : [], trace: trace ? JSON.parse(trace.slice(13)) : null };
 }
 
+test("Codex JSON text profile captures local display while delegated bytes stay lossless", () => {
+  for (const revision of Object.keys(generatedCatalog.revisionProfiles)) {
+    const rawReply = '{"jsonrpc":"2.0","id":"work","result":{"content":[{"type":"text","text":"exact"},{"type":"image","data":"AA==","mimeType":"image/png"}],"isError":true,"_meta":{"kept":9007199254740993,"fraction":0.1234567890123456789012345}}}';
+    const probe = familyWireFixture(`
+      init();send({jsonrpc:'2.0',id:'before',method:'tools/call',params:{name:'describe',arguments:{operation:'search',project:${JSON.stringify(repoRoot)}}}});
+      process.env.CODESTORY_MCP_RESULT_DISPLAY='';
+      send({jsonrpc:'2.0',id:'after',method:'tools/call',params:{name:'describe',arguments:{operation:'search',project:${JSON.stringify(repoRoot)}}}});
+      send({jsonrpc:'2.0',id:'preparing',method:'tools/call',params:{name:'call',arguments:{operation:'status',arguments:{project:${JSON.stringify(repoRoot)}}}}});
+      ready=true;send({jsonrpc:'2.0',id:'work',method:'tools/call',params:{name:'call',arguments:{operation:'search',arguments:{project:${JSON.stringify(repoRoot)},query:'fixture',repo_text:'off',limit:5}}}});ack();
+      child.stdout.write(${JSON.stringify(rawReply)}+'\\n');
+    `, { revision, setup: "process.env.CODESTORY_MCP_RESULT_DISPLAY='codex-json-text-v1';" });
+    assert.equal(probe.status, 0, probe.stderr);
+    for (const id of ["before", "after", "preparing"]) {
+      const result = probe.frames.find((frame) => frame.id === id)?.result;
+      assert.ok(result, id);
+      assert.equal(Object.hasOwn(result, "structuredContent"), false, id);
+      const payload = JSON.parse(result.content[0].text);
+      if (id !== "preparing") assert.equal(Object.hasOwn(payload.tool, "outputSchema"), false);
+    }
+    assert.equal(probe.stdout.split(/\r?\n/u).includes(rawReply), true, "relay must preserve unsafe integers, numeric lexemes, errors, metadata and nonduplicate blocks verbatim");
+  }
+});
+
 test("family-v1 keeps listing and describe local and lowers only canonical calls", (t) => {
   for (const [revision, profile] of Object.entries(generatedCatalog.revisionProfiles)) {
     const call = { jsonrpc: "2.0", id: "work", method: "tools/call", params: { name: "call", arguments: { operation: "search", arguments: { project: repoRoot, query: "fixture", repo_text: "off", limit: 5 } }, _meta: { kept: true } } };
@@ -2375,8 +2398,8 @@ test("plugin metadata maps skill and direct stdio server", async () => {
 
   assert.equal(manifest.name, "codestory");
   assert.equal(manifest.skills, "./skills/");
-  assert.equal(manifest.hooks, "./hooks/claude-codex-hooks.json");
-  assert.equal(manifest.mcpServers, "./.mcp.json");
+  assert.equal(manifest.hooks, "./hooks/codex-source-context-hooks.json");
+  assert.equal(manifest.mcpServers, "./mcp.codex.json");
   assert.equal(manifest.interface.capabilities.includes("Read"), true);
   assert.equal(
     manifest.interface.capabilities.includes(["Lifecycle", "hooks"].join(" ")),
@@ -4524,7 +4547,7 @@ test("multi-project stdio ignores mutable active-workspace state", async () => {
   const launcher = await readFile(join(pluginRoot, "scripts", "codestory-mcp.cjs"), "utf8");
   const transport = await readFile(join(repoRoot, "crates", "codestory-cli", "src", "stdio_transport.rs"), "utf8");
 
-  assert.match(launcher, /function stdioRuntimeEnv\(resolved, runtimeCwd\)/u);
+  assert.match(launcher, /function stdioRuntimeEnv\(resolved, runtimeCwd, compactResults = codexJsonTextResults\)/u);
   assert.match(launcher, /CODESTORY_PLUGIN_MULTI_PROJECT: '1'/u);
   assert.doesNotMatch(launcher, /CODESTORY_PLUGIN_PROJECT_ROOT:/u);
   assert.match(launcher, /\['serve', '--stdio', '--multi-project', '--refresh', 'none'\]/u);
@@ -9451,6 +9474,7 @@ test("portable plugin core and thin host adapters preserve their own contracts",
     "$schema",
     "author",
     "description",
+    "extensions",
     "homepage",
     "keywords",
     "license",
@@ -9459,6 +9483,10 @@ test("portable plugin core and thin host adapters preserve their own contracts",
     "version",
   ].sort());
   assert.deepEqual(Object.keys(portableManifest.author).sort(), ["name", "url"]);
+  assert.deepEqual(Object.keys(portableManifest.extensions), ["com.openai"]);
+  assert.deepEqual(Object.keys(portableManifest.extensions["com.openai"]).sort(), ["hooks", "interface"]);
+  assert.equal(portableManifest.extensions["com.openai"].hooks, "./hooks/codex-source-context-hooks.json");
+
 
   const cursorManifest = JSON.parse(
     await readFile(join(pluginRoot, ".cursor-plugin", "plugin.json"), "utf8"),
@@ -9514,7 +9542,14 @@ test("portable plugin core and thin host adapters preserve their own contracts",
     await readFile(join(pluginRoot, ".claude-plugin", "plugin.json"), "utf8"),
   );
   const legacyMcp = JSON.parse(await readFile(join(pluginRoot, ".mcp.json"), "utf8"));
-  assert.equal(codexManifest.mcpServers, "./.mcp.json");
+  assert.equal(codexManifest.mcpServers, "./mcp.codex.json");
+  assert.deepEqual(portableManifest.extensions["com.openai"].interface, codexManifest.interface);
+  const codexMcp = JSON.parse(await readFile(join(pluginRoot, "mcp.codex.json"), "utf8"));
+  assert.deepEqual(codexMcp, {
+    ...legacyMcp,
+    mcpServers: { codestory: { ...legacyMcp.mcpServers.codestory,
+      env: { CODESTORY_MCP_RESULT_DISPLAY: "codex-json-text-v1" } } },
+  });
   assert.equal(Object.hasOwn(claudeManifest, "mcpServers"), false);
   assert.deepEqual(legacyMcp.mcpServers.codestory, {
     command: "node",
@@ -9820,4 +9855,35 @@ test("markdown link checker passes for shipped doc surfaces", () => {
     encoding: "utf8",
   });
   assert.equal(result.status, 0, result.stderr || result.stdout);
+});
+
+test("native Codex client negotiates the existing JSON text profile once unless explicitly configured", () => {
+  const cases = [
+    { name: "codex-mcp-client", mode: null, compact: true },
+    { name: "other-client", mode: null, compact: false },
+    { name: "Codex-mcp-client", mode: null, compact: false },
+    { name: "codex-mcp-client", mode: "", compact: false },
+    { name: "codex-mcp-client", mode: "portable", compact: false },
+    { name: "other-client", mode: "codex-json-text-v1", compact: true },
+  ];
+  for (const { name, mode, compact } of cases) {
+    const setup = mode === null ? "delete process.env.CODESTORY_MCP_RESULT_DISPLAY;" : `process.env.CODESTORY_MCP_RESULT_DISPLAY=${JSON.stringify(mode)};`;
+    const delegated = '{"jsonrpc":"2.0","id":"delegated","result":{"content":[{"type":"text","text":"literal"}],"structuredContent":{"untouched":true},"_meta":{"native":9007199254740993}}}';
+    const probe = familyWireFixture(`
+      send({jsonrpc:'2.0',id:'init',method:'initialize',params:{protocolVersion:${JSON.stringify(preferredRevision)},clientInfo:{name:${JSON.stringify(name)},version:'fixture'}}});
+      send({jsonrpc:'2.0',id:'before',method:'tools/call',params:{name:'describe',arguments:{operation:'search',project:${JSON.stringify(repoRoot)}}}});
+      process.env.CODESTORY_MCP_RESULT_DISPLAY=${JSON.stringify(compact ? "" : "codex-json-text-v1")};
+      send({jsonrpc:'2.0',id:'again',method:'initialize',params:{protocolVersion:${JSON.stringify(preferredRevision)},clientInfo:{name:${JSON.stringify(name === "codex-mcp-client" ? "other-client" : "codex-mcp-client")},version:'fixture'}}});
+      send({jsonrpc:'2.0',id:'after',method:'tools/call',params:{name:'describe',arguments:{operation:'search',project:${JSON.stringify(repoRoot)}}}});
+      ready=true;send({jsonrpc:'2.0',id:'delegated',method:'tools/call',params:{name:'call',arguments:{operation:'search',arguments:{project:${JSON.stringify(repoRoot)},query:'fixture',repo_text:'off',limit:5}}}});ack();
+      child.stdout.write(${JSON.stringify(delegated)}+'\\n');
+    `, { setup });
+    assert.equal(probe.status, 0, probe.stderr);
+    for (const id of ["before", "after"]) {
+      const result = probe.frames.find(frame => frame.id === id)?.result;
+      assert.ok(result, `${name}/${String(mode)}/${id}`);
+      assert.equal(Object.hasOwn(result, "structuredContent"), !compact, `${name}/${String(mode)}/${id}`);
+    }
+    assert.equal(probe.stdout.split(/\r?\n/u).includes(delegated), true, "delegated structural content and numeric lexemes remain lossless");
+  }
 });

@@ -88,6 +88,7 @@ pub(crate) mod resolution;
 mod search_command;
 mod server;
 mod source_commands;
+mod source_context;
 
 #[cfg(test)]
 use agent_context::{
@@ -244,6 +245,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
         Command::GenerateCompletions(cmd) => server::run_generate_completions(cmd),
         Command::Retrieval(cmd) => retrieval::run_retrieval(cmd),
         Command::InternalOwnedDelete(cmd) => lifecycle::run_internal_owned_delete(cmd),
+        Command::InternalSourceContext(cmd) => source_context::run(cmd),
         Command::InternalSessionContext(cmd) => ground_smoke::run_session_context(cmd),
         Command::InternalDirtyHook(cmd) => dirty_hooks::run_internal_dirty_hook(cmd),
         Command::InternalEmbeddingServer => {

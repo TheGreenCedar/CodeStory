@@ -785,16 +785,61 @@ impl PerUserEmbeddingClient {
         lost_server_instance_id: Option<&str>,
     ) -> Result<ValidatedEmbeddingConnection> {
         let budgets = self.transport.budgets();
+        let connect_started_at_ns = self.transport.clock().now_ns();
+        let mut idle_drain = false;
         let mut spawned_at_ns = None;
         let mut owner_recovery_started_at_ns = None;
         let mut capacity_retry_started_at_ns = None;
         let mut spawn_attempt = None;
-        let wait_for_convergence = |started_at_ns| -> Result<()> {
+        let remaining_idle_drain = || -> Result<Duration> {
+            if let Some(control) = control {
+                control.check()?;
+            }
+            let remaining = budgets.connect.saturating_sub(elapsed_since(
+                self.transport.clock().as_ref(),
+                connect_started_at_ns,
+            ));
+            if remaining.is_zero() {
+                return Err(PerUserEmbeddingError {
+                    code: "embedding_server_draining".into(),
+                    message: "the embedding owner upgrade did not converge within the original connect budget".into(),
+                    retry_class: "after_owner_idle".into(),
+                    retry_after_ms: duration_ms(budgets.retry_after),
+                    retry_condition: "the draining owner exits and a compatible owner becomes available".into(),
+                    capacity: None,
+                }.into());
+            }
+            control
+                .map(|control| control.remaining(remaining))
+                .transpose()
+                .map(|bounded| bounded.unwrap_or(remaining))
+        };
+        let sleep_during_idle_drain = |duration: Duration| -> Result<()> {
+            let started_at_ns = self.transport.clock().now_ns();
+            loop {
+                if let Some(control) = control {
+                    control.check()?;
+                }
+                let remaining = duration.saturating_sub(elapsed_since(
+                    self.transport.clock().as_ref(),
+                    started_at_ns,
+                ));
+                if remaining.is_zero() {
+                    return Ok(());
+                }
+                self.transport.clock().sleep(remaining.min(CONNECTION_POLL));
+            }
+        };
+        let wait_for_convergence = |started_at_ns, idle_drain| -> Result<()> {
             if let Some(control) = control {
                 control.check()?;
             }
             let elapsed = elapsed_since(self.transport.clock().as_ref(), started_at_ns);
-            let remaining = budgets.spawn.saturating_sub(elapsed);
+            let remaining = if idle_drain {
+                remaining_idle_drain()?
+            } else {
+                budgets.spawn.saturating_sub(elapsed)
+            };
             if remaining.is_zero() {
                 // The server it was waiting for keeps converging after this budget expires, so the
                 // next request usually connects. Reporting it as terminal turned an ordinary slow
@@ -814,9 +859,12 @@ impl PerUserEmbeddingClient {
                 .map(|control| control.remaining(remaining))
                 .transpose()?
                 .unwrap_or(remaining);
-            self.transport
-                .clock()
-                .sleep(budgets.retry_after.min(remaining));
+            let delay = budgets.retry_after.min(remaining);
+            if idle_drain {
+                sleep_during_idle_drain(delay)?;
+            } else {
+                self.transport.clock().sleep(delay);
+            }
             Ok(())
         };
         loop {
@@ -829,17 +877,40 @@ impl PerUserEmbeddingClient {
                     started_at_ns,
                 ))
             });
+            let local_budget = capacity_remaining.unwrap_or(budgets.connect);
+            let local_budget = if idle_drain {
+                local_budget.min(remaining_idle_drain()?)
+            } else {
+                local_budget
+            };
             let connect_budget = control
-                .map(|control| control.remaining(capacity_remaining.unwrap_or(budgets.connect)))
+                .map(|control| control.remaining(local_budget))
                 .transpose()?
-                .unwrap_or_else(|| capacity_remaining.unwrap_or(budgets.connect));
+                .unwrap_or(local_budget);
+            // Preserve separate initial transport/Hello bounds. Once a drain
+            // is committed, both must fit the original entry window remaining.
+            let connect_deadline = if idle_drain {
+                Some(arm_exchange_deadline(
+                    self.transport.clock(),
+                    connect_budget,
+                )?)
+            } else {
+                None
+            };
             match self
                 .transport
                 .connect(intent, connect_budget, spawn_attempt.as_ref())
                 .map_err(anyhow::Error::new)?
             {
                 EmbeddingConnectOutcome::Connected(mut stream) => {
-                    let _deadline = arm_exchange_deadline(self.transport.clock(), connect_budget)?;
+                    let _hello_deadline = if connect_deadline.is_none() {
+                        Some(arm_exchange_deadline(
+                            self.transport.clock(),
+                            connect_budget,
+                        )?)
+                    } else {
+                        None
+                    };
                     let transport_identity = stream.transport_identity().clone();
                     let executable = self.transport.executable_identity();
                     let snapshot = match hello(
@@ -855,7 +926,22 @@ impl PerUserEmbeddingClient {
                         {
                             let recovery_started_at_ns = owner_recovery_started_at_ns
                                 .get_or_insert_with(|| self.transport.clock().now_ns());
-                            wait_for_convergence(*recovery_started_at_ns)?;
+                            wait_for_convergence(*recovery_started_at_ns, idle_drain)?;
+                            continue;
+                        }
+                        Err(error)
+                            if intent == EmbeddingConnectIntent::Activate
+                                && may_spawn
+                                && transport_identity.peer_verified
+                                && error.downcast_ref::<PerUserEmbeddingError>().is_some_and(
+                                    |typed| {
+                                        typed.code == "embedding_server_draining"
+                                            && typed.retry_class == "after_owner_idle"
+                                    },
+                                ) =>
+                        {
+                            idle_drain = true;
+                            wait_for_convergence(connect_started_at_ns, true)?;
                             continue;
                         }
                         Err(error) if retryable_handshake_capacity(&error).is_some() => {
@@ -863,10 +949,13 @@ impl PerUserEmbeddingClient {
                                 .expect("matched handshake capacity has retry state");
                             let started_at_ns = *capacity_retry_started_at_ns
                                 .get_or_insert_with(|| self.transport.clock().now_ns());
-                            let remaining = budgets.connect.saturating_sub(elapsed_since(
+                            let mut remaining = budgets.connect.saturating_sub(elapsed_since(
                                 self.transport.clock().as_ref(),
                                 started_at_ns,
                             ));
+                            if idle_drain {
+                                remaining = remaining.min(remaining_idle_drain()?);
+                            }
                             if remaining.is_zero() {
                                 return Err(error);
                             }
@@ -879,7 +968,11 @@ impl PerUserEmbeddingClient {
                             if retry_after >= remaining {
                                 return Err(error);
                             }
-                            self.transport.clock().sleep(retry_after);
+                            if idle_drain {
+                                sleep_during_idle_drain(retry_after)?;
+                            } else {
+                                self.transport.clock().sleep(retry_after);
+                            }
                             continue;
                         }
                         Err(error) => return Err(error),
@@ -887,17 +980,23 @@ impl PerUserEmbeddingClient {
                     if let Some(control) = control {
                         control.check()?;
                     }
+                    if idle_drain {
+                        remaining_idle_drain()?;
+                    }
                     if lost_server_instance_id
                         .is_some_and(|lost| snapshot.process.server_instance_id == lost)
                     {
                         let recovery_started_at_ns = owner_recovery_started_at_ns
                             .get_or_insert_with(|| self.transport.clock().now_ns());
-                        wait_for_convergence(*recovery_started_at_ns)?;
+                        wait_for_convergence(*recovery_started_at_ns, idle_drain)?;
                         continue;
                     }
                     return Ok(ValidatedEmbeddingConnection { stream, snapshot });
                 }
                 EmbeddingConnectOutcome::NoOwner if may_spawn && spawned_at_ns.is_none() => {
+                    if idle_drain {
+                        remaining_idle_drain()?;
+                    }
                     spawn_attempt = Some(
                         self.transport
                             .spawn_exact_current_exe()
@@ -923,17 +1022,21 @@ impl PerUserEmbeddingClient {
                 EmbeddingConnectOutcome::NoOwner => {
                     let spawned_at_ns =
                         spawned_at_ns.expect("an activating retry follows an exact-exe spawn");
-                    wait_for_convergence(spawned_at_ns)?;
+                    wait_for_convergence(spawned_at_ns, idle_drain)?;
                 }
                 EmbeddingConnectOutcome::OwnerUnresponsive(error) => {
+                    if idle_drain {
+                        wait_for_convergence(connect_started_at_ns, true)?;
+                        continue;
+                    }
                     if let Some(spawned_at_ns) = spawned_at_ns {
-                        wait_for_convergence(spawned_at_ns)?;
+                        wait_for_convergence(spawned_at_ns, false)?;
                         continue;
                     }
                     if lost_server_instance_id.is_some() {
                         let recovery_started_at_ns = owner_recovery_started_at_ns
                             .get_or_insert_with(|| self.transport.clock().now_ns());
-                        wait_for_convergence(*recovery_started_at_ns)?;
+                        wait_for_convergence(*recovery_started_at_ns, false)?;
                         continue;
                     }
                     return Err(PerUserEmbeddingError {

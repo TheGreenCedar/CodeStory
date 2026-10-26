@@ -320,6 +320,14 @@ pub(super) enum ScriptOutcome {
     HelloLoss,
     HelloCapacity,
     HelloHandlerCapacity,
+    HelloError {
+        code: &'static str,
+        retry_class: &'static str,
+    },
+    ClockedHello {
+        clock: Arc<TestClock>,
+        delay: Duration,
+    },
     Capacity,
     TimedBulk {
         hello_delay: Duration,
@@ -447,6 +455,26 @@ impl ScriptStream {
         &self,
         request_id: &str,
     ) -> io::Result<Option<(EmbeddingProtocolResponse, Vec<u8>)>> {
+        if let ScriptOutcome::ClockedHello { ref clock, delay } = self.outcome {
+            clock.sleep(delay);
+        }
+        if let ScriptOutcome::HelloError { code, retry_class } = self.outcome {
+            return Ok(Some((
+                failure_response(
+                    request_id,
+                    EmbeddingProtocolError {
+                        code: code.into(),
+                        message: "scripted owner upgrade refusal".into(),
+                        retry_class: retry_class.into(),
+                        retry_after_ms: 1,
+                        retry_condition: "the incompatible owner releases lifetime authority"
+                            .into(),
+                        capacity: None,
+                    },
+                ),
+                Vec::new(),
+            )));
+        }
         if matches!(self.outcome, ScriptOutcome::HelloLoss) {
             return Ok(None);
         }
@@ -563,6 +591,8 @@ impl ScriptStream {
                 )))
             }
             ScriptOutcome::HelloLoss
+            | ScriptOutcome::ClockedHello { .. }
+            | ScriptOutcome::HelloError { .. }
             | ScriptOutcome::HelloCapacity
             | ScriptOutcome::HelloHandlerCapacity => {
                 Err(io::Error::other("query reached handshake-only stream"))

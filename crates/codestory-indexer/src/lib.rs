@@ -108,6 +108,7 @@ mod public_exports;
 mod projection_fence_tests;
 pub mod resolution;
 pub mod semantic;
+pub mod source_units;
 pub mod structural;
 pub mod symbol_table;
 pub mod template_pipeline;
@@ -4409,6 +4410,7 @@ pub fn current_file_extraction_revision(language: &str) -> Option<&'static str> 
     match language {
         "python" => Some(languages::python::CALLABLE_DECLARATION_REVISION),
         "rust" => Some(languages::rust::DECLARATION_REVISION),
+        "go" => Some(languages::go::INITIALIZER_CALL_REVISION),
         "bash" => Some(extraction_revision!("bash-callsite-source-order-v1")),
         "javascript" => Some(extraction_revision!("explicit-named-public-exports-v2")),
         "typescript" | "tsx" => Some(extraction_revision!("explicit-named-public-exports-v3")),
@@ -16870,6 +16872,12 @@ fn index_file_with_resolution_inputs(
         }
     }
 
+    let go_initializer_calls = if language_config.language_name == "go" {
+        languages::go::package_initializer_calls(&tree)
+    } else {
+        HashMap::new()
+    };
+
     // 2. Second pass: Create edges using tree-sitter-graph output
     let mut edge_keys: HashSet<EdgeDedupKey> = HashSet::new();
     let mut callsite_ordinals: HashMap<(NodeId, Option<u32>), u32> = HashMap::new();
@@ -16946,6 +16954,20 @@ fn index_file_with_resolution_inputs(
                 ..Default::default()
             };
             let callee_span = graph_capture_spans.get(&sink_ref).copied();
+            if edge.kind == EdgeKind::CALL
+                && edge.source == edge.target
+                && language_config.language_name == "go"
+                && let Some(scope) = callee_span.and_then(|span| go_initializer_calls.get(&span))
+            {
+                match scope {
+                    languages::go::PackageInitializerCall::Evaluated => {
+                        edge.source = file_id;
+                        edge.resolved_source = Some(file_id);
+                        col = callee_span.map(|span| span.start_col);
+                    }
+                    languages::go::PackageInitializerCall::DeferredLiteralBody => continue,
+                }
+            }
             if edge.kind == EdgeKind::CALL && is_script {
                 if edge.source == edge.target
                     && let Some(scope) = callee_span

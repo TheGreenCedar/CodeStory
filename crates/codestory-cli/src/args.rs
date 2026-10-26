@@ -129,6 +129,8 @@ pub(crate) enum Command {
     Retrieval(RetrievalCommand),
     #[command(name = "internal-owned-delete", hide = true)]
     InternalOwnedDelete(InternalOwnedDeleteCommand),
+    #[command(name = "internal-source-context", hide = true)]
+    InternalSourceContext(InternalSourceContextCommand),
     #[command(name = "internal-session-context", hide = true)]
     InternalSessionContext(InternalSessionContextCommand),
     #[command(name = "internal-dirty-hook", hide = true)]
@@ -175,6 +177,33 @@ pub(crate) enum InternalDirtyHookAction {
     Install,
     Uninstall,
     Status,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct InternalSourceContextCommand {
+    #[command(subcommand)]
+    pub(crate) mode: InternalSourceContextMode,
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum InternalSourceContextMode {
+    Context,
+    Capture {
+        #[arg(long)]
+        payload: String,
+    },
+    Rg {
+        #[arg(last = true, allow_hyphen_values = true)]
+        operands: Vec<std::ffi::OsString>,
+    },
+    Setup {
+        #[arg(long)]
+        payload: String,
+        #[arg(long)]
+        rg: PathBuf,
+        #[arg(long)]
+        original_path: std::ffi::OsString,
+    },
 }
 
 #[derive(Args, Debug)]

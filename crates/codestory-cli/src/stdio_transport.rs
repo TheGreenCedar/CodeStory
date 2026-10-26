@@ -1364,6 +1364,9 @@ struct StdioServerSession {
 
 impl StdioServerSession {
     fn new(runtime: Option<RuntimeContext>) -> Self {
+        let startup = crate::config::process_startup_config();
+        let protocol_v3 = crate::stdio_v3::NativeSessionV3::negotiate(None)
+            .with_result_display(startup.mcp_result_display);
         Self {
             project_required: runtime.is_none(),
             active_project: runtime.map(|runtime| StdioProjectSession {
@@ -1375,9 +1378,9 @@ impl StdioServerSession {
                 state: StdioServerState::default(),
             }),
             retained_projects: VecDeque::new(),
-            startup: crate::config::process_startup_config(),
+            startup,
             tainted_project: None,
-            protocol_v3: crate::stdio_v3::NativeSessionV3::negotiate(None),
+            protocol_v3,
             diagnostics_v3: Arc::new(std::sync::Mutex::new(
                 crate::stdio_v3::DiagnosticsRegistryV3::new(),
             )),
@@ -1767,7 +1770,8 @@ fn handle_stdio_request(
                 request
                     .pointer("/params/protocolVersion")
                     .and_then(|value| value.as_str()),
-            );
+            )
+            .with_result_display(session.startup.mcp_result_display);
             let mut result = session.protocol_v3.initialize_result();
             result["_meta"]["codestory_publication"] =
                 crate::runtime::codestory_publication_meta(None, None, None, None, None);
@@ -2840,11 +2844,13 @@ impl StdioPacketRepresentationPlanV3 {
         )
         .ok()?;
         let bytes = v3_serialize_call_tool_result(&result).ok()?;
-        Some(
-            serde_json::json!({"revision":self.revision.as_str(), "publication_meta":self.publication_meta,
+        let mut payload = serde_json::json!({"revision":self.revision.as_str(), "publication_meta":self.publication_meta,
             "wall_expiry_epoch_ms":self.wall_expiry_epoch_ms,
-            "projection":projection, "measured_result":result, "measured_bytes":bytes.len(), "cache_hit":false}),
-        )
+            "projection":projection, "measured_result":result, "measured_bytes":bytes.len(), "cache_hit":false});
+        if self.revision.json_text_only() {
+            payload["result_display"] = serde_json::json!("codex-json-text-v1");
+        }
+        Some(payload)
     }
 
     fn measure(
@@ -2879,8 +2885,13 @@ impl StdioPacketRepresentationPlanV3 {
         let expiry_bytes = serde_json::to_vec(&self.wall_expiry_epoch_ms)
             .map_err(|error| ApiError::internal(error.to_string()))?
             .len();
+        let display = if self.revision.json_text_only() {
+            ":codex-json-text-v1"
+        } else {
+            ""
+        };
         Ok(format!(
-            "packet-representation/v1:{}:{metadata_bytes}:{expiry_bytes}",
+            "packet-representation/v1:{}{display}:{metadata_bytes}:{expiry_bytes}",
             self.revision.as_str()
         ))
     }
@@ -9088,6 +9099,7 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
         let startup = crate::config::CliStartupConfig {
+            mcp_result_display: Default::default(),
             user_home: None,
             allow_sensitive_project_root: false,
             project_network_config_allowed: false,
@@ -11027,6 +11039,7 @@ mod tests {
 
     fn stdio_multi_project_startup(cache: &Path) -> crate::config::CliStartupConfig {
         crate::config::CliStartupConfig {
+            mcp_result_display: Default::default(),
             user_home: None,
             allow_sensitive_project_root: false,
             project_network_config_allowed: false,
@@ -11036,6 +11049,43 @@ mod tests {
                 codestory_retrieval::SidecarRuntimeDefaults::default(),
             ),
             source_index_policy: codestory_contracts::workspace::SourceIndexPolicy::default(),
+        }
+    }
+
+    #[test]
+    fn codex_json_text_session_keeps_captured_profile_across_projects() {
+        let cache = tempfile::tempdir().unwrap();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut session = StdioServerSession::new(None);
+        session.startup = stdio_multi_project_startup(cache.path());
+        session.startup.mcp_result_display = crate::stdio_v3::McpResultDisplay::CodexJsonText;
+        let initialized = handle_stdio_message(&mut session,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#, &cancel).unwrap();
+        assert_eq!(initialized["result"]["protocolVersion"], "2025-06-18");
+        for project in [first.path(), second.path(), first.path()] {
+            session.select_project(project.to_str()).unwrap();
+            let response = handle_stdio_message(
+                &mut session,
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+                &cancel,
+            )
+            .unwrap();
+            let tools = response["result"]["tools"].as_array().unwrap();
+            assert!(!tools.is_empty());
+            assert!(tools.iter().all(|tool| tool.get("outputSchema").is_none()));
+            let result = build_served_tool_result_v3(
+                session.protocol_v3.negotiated_revision(),
+                "status",
+                &serde_json::json!({"status":"fixture"}),
+                None,
+            );
+            assert!(
+                result.is_err(),
+                "modern validation must survive project switching"
+            );
+            assert!(session.protocol_v3.negotiated_revision().json_text_only());
         }
     }
 
@@ -14492,6 +14542,7 @@ version = "0.11.20"
         let project = tempfile::tempdir().expect("project");
         let cache = tempfile::tempdir().expect("cache");
         let startup = crate::config::CliStartupConfig {
+            mcp_result_display: Default::default(),
             user_home: None,
             allow_sensitive_project_root: false,
             project_network_config_allowed: false,
@@ -14545,6 +14596,7 @@ version = "0.11.20"
         let project = tempfile::tempdir().expect("project");
         let cache = tempfile::tempdir().expect("cache");
         let startup = crate::config::CliStartupConfig {
+            mcp_result_display: Default::default(),
             user_home: None,
             allow_sensitive_project_root: false,
             project_network_config_allowed: false,
@@ -14682,6 +14734,7 @@ version = "0.11.20"
         let project = tempfile::tempdir().expect("project");
         let cache = tempfile::tempdir().expect("cache");
         let startup = crate::config::CliStartupConfig {
+            mcp_result_display: Default::default(),
             user_home: None,
             allow_sensitive_project_root: false,
             project_network_config_allowed: false,
@@ -15062,6 +15115,7 @@ version = "0.11.20"
         let project_e = tempfile::tempdir().expect("project e");
         let mut session = StdioServerSession::new(None);
         session.startup = crate::config::CliStartupConfig {
+            mcp_result_display: Default::default(),
             user_home: None,
             allow_sensitive_project_root: false,
             project_network_config_allowed: false,
@@ -15164,6 +15218,7 @@ version = "0.11.20"
             .collect::<Vec<_>>();
         let mut session = StdioServerSession::new(None);
         session.startup = crate::config::CliStartupConfig {
+            mcp_result_display: Default::default(),
             user_home: None,
             allow_sensitive_project_root: false,
             project_network_config_allowed: false,
@@ -15355,6 +15410,7 @@ version = "0.11.20"
             .expect("write source");
         let mut session = StdioServerSession::new(None);
         session.startup = crate::config::CliStartupConfig {
+            mcp_result_display: Default::default(),
             user_home: None,
             allow_sensitive_project_root: false,
             project_network_config_allowed: false,
@@ -15473,6 +15529,7 @@ version = "0.11.20"
         let config_path = project.path().join(".codestory.toml");
         let mut session = StdioServerSession::new(None);
         session.startup = crate::config::CliStartupConfig {
+            mcp_result_display: Default::default(),
             user_home: None,
             allow_sensitive_project_root: false,
             project_network_config_allowed: false,
@@ -15567,6 +15624,7 @@ version = "0.11.20"
         ]);
         let mut session = StdioServerSession::new(None);
         session.startup = crate::config::CliStartupConfig {
+            mcp_result_display: Default::default(),
             user_home: None,
             allow_sensitive_project_root: false,
             project_network_config_allowed: false,
@@ -15669,6 +15727,7 @@ version = "0.11.20"
         ]);
         let mut session = StdioServerSession::new(None);
         session.startup = crate::config::CliStartupConfig {
+            mcp_result_display: Default::default(),
             user_home: None,
             allow_sensitive_project_root: false,
             project_network_config_allowed: false,
@@ -15754,6 +15813,7 @@ version = "0.11.20"
         ]);
         let mut session = StdioServerSession::new(None);
         session.startup = crate::config::CliStartupConfig {
+            mcp_result_display: Default::default(),
             user_home: None,
             allow_sensitive_project_root: false,
             project_network_config_allowed: false,
@@ -15836,6 +15896,7 @@ version = "0.11.20"
         let mut session = StdioServerSession::new(None);
         session.proof_fixture = true;
         session.startup = crate::config::CliStartupConfig {
+            mcp_result_display: Default::default(),
             user_home: None,
             allow_sensitive_project_root: false,
             project_network_config_allowed: false,
@@ -15952,6 +16013,7 @@ version = "0.11.20"
         }
         let mut session = StdioServerSession::new(None);
         session.startup = crate::config::CliStartupConfig {
+            mcp_result_display: Default::default(),
             user_home: None,
             allow_sensitive_project_root: false,
             project_network_config_allowed: false,
@@ -16127,6 +16189,7 @@ version = "0.11.20"
         git(&["commit", "-qm", "ready lease fixture"]);
         let mut session = StdioServerSession::new(None);
         session.startup = crate::config::CliStartupConfig {
+            mcp_result_display: Default::default(),
             user_home: None,
             allow_sensitive_project_root: false,
             project_network_config_allowed: false,
@@ -16332,6 +16395,7 @@ version = "0.11.20"
 
         let mut session = StdioServerSession::new(None);
         session.startup = crate::config::CliStartupConfig {
+            mcp_result_display: Default::default(),
             user_home: None,
             allow_sensitive_project_root: false,
             project_network_config_allowed: false,
@@ -16444,6 +16508,7 @@ version = "0.11.20"
 
         let mut session = StdioServerSession::new(None);
         session.startup = crate::config::CliStartupConfig {
+            mcp_result_display: Default::default(),
             user_home: None,
             allow_sensitive_project_root: false,
             project_network_config_allowed: false,
@@ -16560,6 +16625,7 @@ version = "0.11.20"
         let cold_cache_root = parent.path().join("not-created");
         let mut session = StdioServerSession::new(None);
         session.startup = crate::config::CliStartupConfig {
+            mcp_result_display: Default::default(),
             user_home: None,
             allow_sensitive_project_root: false,
             project_network_config_allowed: false,
@@ -16644,6 +16710,7 @@ version = "0.11.20"
         )
         .expect("write context target fixture");
         let startup = crate::config::CliStartupConfig {
+            mcp_result_display: Default::default(),
             user_home: None,
             allow_sensitive_project_root: false,
             project_network_config_allowed: false,
@@ -16750,6 +16817,7 @@ version = "0.11.20"
 
         let mut session = StdioServerSession::new(None);
         session.startup = crate::config::CliStartupConfig {
+            mcp_result_display: Default::default(),
             user_home: None,
             allow_sensitive_project_root: false,
             project_network_config_allowed: false,
@@ -17450,6 +17518,7 @@ version = "0.11.20"
         std::fs::write(project.path().join("lib.rs"), "pub fn anchor() {}\n").expect("source");
         let mut session = StdioServerSession::new(None);
         session.startup = crate::config::CliStartupConfig {
+            mcp_result_display: Default::default(),
             user_home: None,
             allow_sensitive_project_root: false,
             project_network_config_allowed: false,
@@ -18335,7 +18404,10 @@ mod representation_budget_tests {
         let payload = &stdio["payload"];
         let plan = StdioPacketRepresentationPlanV3 {
             revision: crate::stdio_v3::McpRevisionV3::parse(payload["revision"].as_str().unwrap())
-                .unwrap(),
+                .unwrap()
+                .with_result_display(crate::stdio_v3::McpResultDisplay::from_env_value(
+                    payload["result_display"].as_str(),
+                )),
             publication_meta: payload["publication_meta"].clone(),
             wall_expiry_epoch_ms: payload["wall_expiry_epoch_ms"].as_u64().unwrap(),
         };
@@ -18386,9 +18458,14 @@ mod representation_budget_tests {
         );
         let replay = plan.replay_payload(&adapter_projection).unwrap();
         assert_eq!(replay["measured_result"], payload["measured_result"]);
+        let served_root: serde_json::Value = serde_json::from_str(
+            payload["served_result"]["content"][0]["text"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
         root["diagnostics"]["reference"]["uri"] =
-            payload["served_result"]["structuredContent"]["diagnostics"]["reference"]["uri"]
-                .clone();
+            served_root["diagnostics"]["reference"]["uri"].clone();
         let served = build_served_tool_result_v3(
             plan.revision,
             "packet",
@@ -18436,7 +18513,10 @@ mod representation_budget_tests {
         let payload = &stdio["payload"];
         let plan = StdioPacketRepresentationPlanV3 {
             revision: crate::stdio_v3::McpRevisionV3::parse(payload["revision"].as_str().unwrap())
-                .unwrap(),
+                .unwrap()
+                .with_result_display(crate::stdio_v3::McpResultDisplay::from_env_value(
+                    payload["result_display"].as_str(),
+                )),
             publication_meta: payload["publication_meta"].clone(),
             wall_expiry_epoch_ms: payload["wall_expiry_epoch_ms"].as_u64().unwrap(),
         };
@@ -18463,9 +18543,14 @@ mod representation_budget_tests {
         let projection = serde_json::from_value(typed).unwrap();
         let measured = plan.measure(&projection).unwrap();
         assert!(measured <= 16_384);
+        let served_root: serde_json::Value = serde_json::from_str(
+            payload["served_result"]["content"][0]["text"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
         root["diagnostics"]["reference"]["uri"] =
-            payload["served_result"]["structuredContent"]["diagnostics"]["reference"]["uri"]
-                .clone();
+            served_root["diagnostics"]["reference"]["uri"].clone();
         let served = build_served_tool_result_v3(
             plan.revision,
             "packet",
@@ -18747,7 +18832,10 @@ mod representation_budget_tests {
         let payload = &stdio["payload"];
         let plan = StdioPacketRepresentationPlanV3 {
             revision: crate::stdio_v3::McpRevisionV3::parse(payload["revision"].as_str().unwrap())
-                .unwrap(),
+                .unwrap()
+                .with_result_display(crate::stdio_v3::McpResultDisplay::from_env_value(
+                    payload["result_display"].as_str(),
+                )),
             publication_meta: payload["publication_meta"].clone(),
             wall_expiry_epoch_ms: payload["wall_expiry_epoch_ms"].as_u64().unwrap(),
         };
@@ -19298,12 +19386,62 @@ mod representation_budget_tests {
     }
 
     #[test]
-    fn replay_cost_plan_survives_json_and_rebuilds_exact_server_frame() {
+    fn codex_json_text_packet_measurement_uses_actual_single_payload_and_separate_cache() {
         let request = request();
         let (packet, _) = fixture::default_packet(hydrated_pages(), &request);
         let product = fixture::project_packet(&request, &packet, |_| Ok(0)).unwrap();
-        for revision in crate::stdio_v3::McpRevisionV3::all() {
-            let mut original = plan(*revision);
+        for revision in [
+            crate::stdio_v3::McpRevisionV3::June2025,
+            crate::stdio_v3::McpRevisionV3::November2025,
+        ] {
+            let baseline = plan(revision);
+            let single = plan(
+                revision.with_result_display(crate::stdio_v3::McpResultDisplay::CodexJsonText),
+            );
+            assert_ne!(
+                baseline.cache_cost_identity().unwrap(),
+                single.cache_cost_identity().unwrap()
+            );
+            let payload = single.replay_payload(&product.projection).unwrap();
+            let result = &payload["measured_result"];
+            assert!(result.get("structuredContent").is_none());
+            assert_eq!(payload["result_display"], "codex-json-text-v1");
+            assert_eq!(
+                single.measure(&product.projection).unwrap(),
+                v3_serialize_call_tool_result(result).unwrap().len()
+            );
+            assert!(
+                single.measure(&product.projection).unwrap()
+                    < baseline.measure(&product.projection).unwrap()
+            );
+            let mut expected =
+                baseline.replay_payload(&product.projection).unwrap()["measured_result"].clone();
+            expected
+                .as_object_mut()
+                .unwrap()
+                .remove("structuredContent");
+            assert_eq!(*result, expected);
+            assert_eq!(
+                result["_meta"]["codestory_publication"],
+                single.publication_meta
+            );
+        }
+    }
+
+    #[test]
+    fn codex_json_text_replay_cost_plan_survives_json_and_rebuilds_exact_server_frame() {
+        let request = request();
+        let (packet, _) = fixture::default_packet(hydrated_pages(), &request);
+        let product = fixture::project_packet(&request, &packet, |_| Ok(0)).unwrap();
+        for revision in crate::stdio_v3::McpRevisionV3::all()
+            .iter()
+            .copied()
+            .chain([
+                crate::stdio_v3::McpRevisionV3::June2025JsonText,
+                crate::stdio_v3::McpRevisionV3::November2025JsonText,
+            ])
+        {
+            let mut original = plan(revision);
             original.publication_meta["refresh"]["phase"] =
                 serde_json::json!("quotes\\\"\n café 🦀");
             original.wall_expiry_epoch_ms = u64::MAX;
@@ -19314,7 +19452,12 @@ mod representation_budget_tests {
                 revision: crate::stdio_v3::McpRevisionV3::parse(
                     saved["revision"].as_str().unwrap(),
                 )
-                .unwrap(),
+                .unwrap()
+                .with_result_display(
+                    crate::stdio_v3::McpResultDisplay::from_env_value(
+                        saved["result_display"].as_str(),
+                    ),
+                ),
                 publication_meta: saved["publication_meta"].clone(),
                 wall_expiry_epoch_ms: saved["wall_expiry_epoch_ms"].as_u64().unwrap(),
             };
@@ -19323,7 +19466,12 @@ mod representation_budget_tests {
                 restored.measure(&projection).unwrap(),
                 saved["measured_bytes"].as_u64().unwrap() as usize
             );
-            assert_eq!(restored.replay_payload(&projection).unwrap(), capsule);
+            let rebuilt = restored.replay_payload(&projection).unwrap();
+            assert_eq!(rebuilt, capsule);
+            assert_eq!(
+                serde_json::to_vec(&rebuilt).unwrap(),
+                serde_json::to_vec(&capsule).unwrap()
+            );
             let retained = v3_serialize_call_tool_result(&saved["measured_result"]).unwrap();
             assert_eq!(
                 retained.len(),
@@ -19336,7 +19484,11 @@ mod representation_budget_tests {
             )
             .unwrap();
             if revision.profile().structured_content {
-                assert_eq!(mirrored, saved["measured_result"]["structuredContent"]);
+                if revision.json_text_only() {
+                    assert!(saved["measured_result"].get("structuredContent").is_none());
+                } else {
+                    assert_eq!(mirrored, saved["measured_result"]["structuredContent"]);
+                }
                 assert_eq!(
                     saved["measured_result"]["_meta"]["codestory_publication"],
                     original.publication_meta

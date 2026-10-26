@@ -21,6 +21,9 @@ const {
 const pluginRoot = path.dirname(__dirname);
 const launchCwd = workerData?.codestoryLaunchCwd || process.cwd();
 const mcpToolSurface = process.env.CODESTORY_MCP_TOOL_SURFACE || 'named';
+const explicitResultDisplay = Object.hasOwn(process.env, 'CODESTORY_MCP_RESULT_DISPLAY')
+  ? process.env.CODESTORY_MCP_RESULT_DISPLAY : null;
+const codexJsonTextResults = explicitResultDisplay === 'codex-json-text-v1';
 const binaryName = process.platform === 'win32' ? 'codestory-cli.exe' : 'codestory-cli';
 function positiveDurationEnv(name, fallback) {
   const raw = process.env[name];
@@ -4213,7 +4216,7 @@ function failOpenToolResult(tool, status, argumentsValue = {}) {
   return result;
 }
 
-function revisionNativeFailOpenToolResult(revision, toolResult) {
+function revisionNativeFailOpenToolResult(revision, toolResult, compact = codexJsonTextResults) {
   const root = toolResult?.structuredContent;
   const isError = toolResult?.isError === true || !isPlainObject(root);
   const text = JSON.stringify(
@@ -4229,7 +4232,7 @@ function revisionNativeFailOpenToolResult(revision, toolResult) {
   }
   return {
     content: [{ type: 'text', text }],
-    structuredContent: root,
+    ...(compact ? {} : { structuredContent: root }),
     isError: false,
     _meta: {
       'com.thegreencedar.codestory/protocolRevision': revision,
@@ -4677,6 +4680,8 @@ function runFailOpenMcp(status, options = {}) {
   let handoffDispatch = null;
   let handoffValidated = false;
   let initializeRequest = null;
+  let displayBound = false;
+  let compactResults = codexJsonTextResults;
   let negotiatedProtocol = null;
   let v3Session = null;
   let initializedNotification = null;
@@ -4707,7 +4712,7 @@ function runFailOpenMcp(status, options = {}) {
     if (!shouldHandoff) {
       return null;
     }
-    handoff = options.startRuntime(liveStatus);
+    handoff = options.startRuntime(liveStatus, { compactResults });
     const activeHandoff = handoff;
     handoffStderrObservation = null;
     handoffFailureHandled = false;
@@ -4949,7 +4954,7 @@ function runFailOpenMcp(status, options = {}) {
       notifyRuntimeReady();
       return null;
     }
-    if (request.method === 'initialize' && request.id !== undefined) {
+    if (request.method === 'initialize' && request.id !== undefined && !displayBound) {
       initializeRequest = request;
     }
     if (familySurface && (request.method === 'tools/list' || request.method === 'tools/call')) {
@@ -4987,11 +4992,13 @@ function runFailOpenMcp(status, options = {}) {
             ?? catalog.wireContract.discoveryContracts[v3Session?.negotiated ?? managedCliMcpProtocolVersion],
           plugin_version: resolvedVersionForStatus(currentStatus()),
           cli_version: pinnedCliVersion(),
-          tool: canonicalTool,
+          tool: compactResults
+            ? Object.fromEntries(Object.entries(canonicalTool).filter(([key]) => key !== 'outputSchema'))
+            : canonicalTool,
         };
         return jsonrpcResult(request.id, revisionNativeFailOpenToolResult(
           v3Session?.negotiated ?? managedCliMcpProtocolVersion,
-          { structuredContent: description },
+          { structuredContent: description }, compactResults,
         ));
       }
       const precise = losslessDiscoveryFrame(rawLine);
@@ -5028,6 +5035,13 @@ function runFailOpenMcp(status, options = {}) {
       } catch (error) {
         response = jsonrpcError(request.id, -32603, safeFailureToken(error.message, 'discovery_contract_invalid'));
         return response;
+      }
+      if (!displayBound) {
+        compactResults = explicitResultDisplay === null
+          ? request.params?.clientInfo?.name === 'codex-mcp-client'
+          : codexJsonTextResults;
+        displayBound = true;
+        initializeRequest = request;
       }
       response = jsonrpcResult(request.id, {
         protocolVersion: negotiatedProtocol.negotiated,
@@ -5099,7 +5113,7 @@ function runFailOpenMcp(status, options = {}) {
             request.id,
             revisionNativeFailOpenToolResult(
               negotiatedProtocol?.negotiated ?? managedCliMcpProtocolVersion,
-              failOpenToolResult(toolName, currentStatus(), argumentsValue),
+              failOpenToolResult(toolName, currentStatus(), argumentsValue), compactResults,
             ),
           );
       }
@@ -5230,9 +5244,10 @@ function rememberLaunch(resolved, runtimeCwd = process.cwd()) {
   }
 }
 
-function stdioRuntimeEnv(resolved, runtimeCwd) {
+function stdioRuntimeEnv(resolved, runtimeCwd, compactResults = codexJsonTextResults) {
   return {
     ...process.env,
+    CODESTORY_MCP_RESULT_DISPLAY: compactResults ? 'codex-json-text-v1' : '',
     CODESTORY_PLUGIN_VERSION: resolved.version || '',
     CODESTORY_PLUGIN_ROOT: pluginRoot,
     CODESTORY_PLUGIN_LAUNCH_CWD: launchCwd,
@@ -5256,14 +5271,14 @@ function stdioRuntimeEnv(resolved, runtimeCwd) {
   };
 }
 
-function spawnStdioRuntime(resolved, runtimeCwd, stdio) {
+function spawnStdioRuntime(resolved, runtimeCwd, stdio, compactResults = codexJsonTextResults) {
   const correlationId = runtimeCorrelationId();
   const child = spawnCodeStoryCli(resolved.path, ['serve', '--stdio', '--multi-project', '--refresh', 'none'], {
     cwd: runtimeCwd,
     stdio,
     windowsHide: true,
     env: {
-      ...stdioRuntimeEnv(resolved, runtimeCwd),
+      ...stdioRuntimeEnv(resolved, runtimeCwd, compactResults),
       CODESTORY_LOG_CORRELATION_ID: correlationId,
     },
   });
@@ -5307,7 +5322,7 @@ async function main() {
     });
     diagnostic = runFailOpenMcp(() => status, {
       shouldHandoff: () => Boolean(ready),
-      startRuntime: () => spawnStdioRuntime(ready, runtimeCwd, ['pipe', 'pipe', 'pipe']),
+      startRuntime: (_status, { compactResults } = {}) => spawnStdioRuntime(ready, runtimeCwd, ['pipe', 'pipe', 'pipe'], compactResults),
       onRuntimeFailure: (failure) => {
         const failed = ready;
         ready = null;
@@ -5362,7 +5377,7 @@ async function main() {
   let handoffReady = true;
   runFailOpenMcp(() => status, {
     shouldHandoff: () => handoffReady,
-    startRuntime: () => spawnStdioRuntime(resolved, runtimeCwd, ['pipe', 'pipe', 'pipe']),
+    startRuntime: (_status, { compactResults } = {}) => spawnStdioRuntime(resolved, runtimeCwd, ['pipe', 'pipe', 'pipe'], compactResults),
     onRuntimeFailure: (failure) => {
       handoffReady = false;
       const reason = failure.reasonCode === 'runtime_wire_contract_skew'

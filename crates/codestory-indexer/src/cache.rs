@@ -1003,6 +1003,189 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    fn go_key_with_extraction_revision(root: &Path, source: &[u8], revision: &str) -> String {
+        let config = crate::get_language_for_ext("go").unwrap();
+        let flags = crate::index_feature_flags();
+        let mut state = FNV_OFFSET_BASIS;
+        mix_str(&mut state, "index-artifact");
+        mix_u32(&mut state, INDEX_ARTIFACT_CACHE_VERSION);
+        mix_path(&mut state, Path::new("initializers.go")).unwrap();
+        mix_bytes(&mut state, source);
+        mix_str(&mut state, config.language_name);
+        mix_str(&mut state, config.graph_query);
+        mix_optional_str(&mut state, config.tags_query);
+        mix_str(&mut state, revision);
+        mix_str(&mut state, "go-method-receiver-capture-v1");
+        mix_str(&mut state, "go-member-export-access-v1");
+        mix_str(&mut state, "framework-route-declaration-identity-v1");
+        mix_bool(&mut state, flags.legacy_edge_identity);
+        mix_bool(&mut state, flags.lazy_graph_execution);
+        mix_compilation_info(&mut state, root, None).unwrap();
+        format!("v{INDEX_ARTIFACT_CACHE_VERSION}:{state:016x}")
+    }
+
+    #[test]
+    fn go_initializer_calls_replace_old_producer_and_cache_then_remove_cleanly()
+    -> anyhow::Result<()> {
+        use codestory_contracts::events::EventBus;
+        use codestory_contracts::graph::{EdgeKind, NodeKind};
+        use codestory_store::Store;
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let path = root.join("initializers.go");
+        let source = "package startup\nfunc wrap() int { return 1 }\nvar value = wrap()\n";
+        std::fs::write(&path, source)?;
+        let mut store = Store::new_in_memory()?;
+        let indexer = crate::WorkspaceIndexer::new(root.to_path_buf());
+        let refresh = |store: &Store, paths| -> anyhow::Result<_> {
+            Ok(codestory_workspace::RefreshInfo {
+                mode: codestory_workspace::BuildMode::Incremental,
+                files_to_index: paths,
+                files_to_remove: vec![],
+                existing_file_ids: store
+                    .get_files()?
+                    .into_iter()
+                    .map(|file| (file.path, file.id))
+                    .collect(),
+            })
+        };
+        let plan = refresh(&store, vec![path.clone()])?;
+        indexer.run_incremental(&mut store, &plan, &EventBus::new(), None)?;
+        let file_id = store.get_files()?[0].id;
+        let current_revision = crate::current_file_extraction_revision("go").unwrap();
+        let previous_revision = extraction_revision!("");
+        assert_ne!(current_revision, previous_revision);
+        let current_key =
+            go_key_with_extraction_revision(root, source.as_bytes(), current_revision);
+        let previous_key =
+            go_key_with_extraction_revision(root, source.as_bytes(), previous_revision);
+        let config = crate::get_language_for_ext("go").unwrap();
+        let flags = crate::index_feature_flags();
+        assert_eq!(
+            Some(current_key.clone()),
+            build_index_artifact_cache_key(
+                root,
+                Path::new("initializers.go"),
+                source.as_bytes(),
+                &config,
+                None,
+                flags.legacy_edge_identity,
+                flags.lazy_graph_execution
+            )
+        );
+        assert_ne!(current_key, previous_key);
+        // Model the old producer's real omission in both durable graph and
+        // cached artifact, under its exact pre-change extraction/key identity.
+        let blob = store
+            .get_index_artifact_cache(Path::new("initializers.go"), &current_key)?
+            .expect("first parse stores its artifact");
+        let mut old_artifact = decode_index_artifact(&blob)?;
+        let artifact_files: Vec<_> = old_artifact
+            .nodes
+            .iter()
+            .filter(|node| node.kind == NodeKind::FILE)
+            .map(|node| node.id)
+            .collect();
+        let before = old_artifact.edges.len();
+        old_artifact.edges.retain(|edge| {
+            edge.kind != EdgeKind::CALL || !artifact_files.contains(&edge.effective_source())
+        });
+        assert_eq!(before - old_artifact.edges.len(), 1);
+        store.upsert_index_artifact_cache(
+            Path::new("initializers.go"),
+            &previous_key,
+            &encode_index_artifact(&old_artifact)?,
+        )?;
+        store.get_connection().execute(
+            "DELETE FROM edge WHERE source_node_id = ?1 AND kind = ?2",
+            (file_id, EdgeKind::CALL as i32),
+        )?;
+        store.get_connection().execute(
+            "UPDATE file_extraction_identity SET extraction_revision = ?1 WHERE file_id = ?2",
+            (previous_revision, file_id),
+        )?;
+        assert!(!store.file_extraction_identity_matches(file_id, "go", current_revision)?);
+        let mismatches = store.files_with_extraction_revision_mismatch("go", current_revision)?;
+        assert_eq!(
+            mismatches,
+            vec![file_id],
+            "unchanged old Go source must be selected for repair"
+        );
+        let selected = store
+            .get_files()?
+            .into_iter()
+            .filter(|file| mismatches.contains(&file.id))
+            .map(|file| file.path)
+            .collect();
+        let plan = refresh(&store, selected)?;
+        let repaired = indexer.run_incremental(&mut store, &plan, &EventBus::new(), None)?;
+        assert_eq!(
+            repaired.artifact_cache_hits, 0,
+            "old cached omission cannot replay as current"
+        );
+        assert_eq!(repaired.artifact_cache_misses, 1);
+        assert!(store.file_extraction_identity_matches(file_id, "go", current_revision)?);
+        assert!(
+            store
+                .files_with_extraction_revision_mismatch("go", current_revision)?
+                .is_empty()
+        );
+        let calls = |store: &Store| -> anyhow::Result<Vec<_>> {
+            let nodes = store
+                .get_nodes()?
+                .into_iter()
+                .map(|node| (node.id, node))
+                .collect::<HashMap<_, _>>();
+            let mut calls = store
+                .get_edges()?
+                .into_iter()
+                .filter(|edge| edge.kind == EdgeKind::CALL)
+                .map(|edge| {
+                    (
+                        nodes[&edge.effective_source()].kind,
+                        nodes[&edge.effective_target()].serialized_name.clone(),
+                        edge.line,
+                        edge.callsite_identity,
+                    )
+                })
+                .collect::<Vec<_>>();
+            calls.sort_by(|left, right| left.1.cmp(&right.1).then(left.2.cmp(&right.2)));
+            Ok(calls)
+        };
+        let expected = calls(&store)?;
+        assert_eq!(expected.len(), 1);
+        assert_eq!(expected[0].0, NodeKind::FILE);
+        assert_eq!(expected[0].2, Some(3));
+        let plan = refresh(&store, vec![path.clone()])?;
+        let cached = indexer.run_incremental(&mut store, &plan, &EventBus::new(), None)?;
+        assert_eq!(cached.artifact_cache_hits, 1);
+        assert_eq!(
+            calls(&store)?,
+            expected,
+            "warm cache replay preserves the repaired graph"
+        );
+        let mut fresh = Store::new_in_memory()?;
+        let plan = refresh(&fresh, vec![path.clone()])?;
+        indexer.run_incremental(&mut fresh, &plan, &EventBus::new(), None)?;
+        assert_eq!(
+            calls(&fresh)?,
+            expected,
+            "fresh and repaired/cached graph identities agree"
+        );
+        std::fs::write(
+            &path,
+            "package startup\nfunc wrap() int { return 1 }\nvar value = 1\n",
+        )?;
+        let plan = refresh(&store, vec![path])?;
+        indexer.run_incremental(&mut store, &plan, &EventBus::new(), None)?;
+        assert!(
+            calls(&store)?.is_empty(),
+            "removing the initializer call removes its stale FILE edge"
+        );
+        assert!(store.get_errors(None)?.is_empty());
+        Ok(())
+    }
+
     #[test]
     fn legacy_class_inventory_keeps_empty_refusal_metadata_serialization() -> anyhow::Result<()> {
         let legacy = br#"{"name":"Worker","declaration":41,"methods":[{"name":"target","declaration":42,"cross_module_visible":true}],"cross_module_visible":true,"runtime_closed":false,"super_name":null}"#;
