@@ -582,3 +582,85 @@ fn source_context_open_swap_child() {
     raw(&response);
     println!("mode={mode} actual_swap=1 outside_read_handles=0 outside_bytes=0");
 }
+
+#[test]
+fn go_and_python_units_share_verified_literal_order_hashes_and_one_compile_per_file() {
+    let fixture = Fixture::new();
+    let body = "// Echo 雪\r\nfunc Echo() string {\r\n    return \"🙂\"\r\n}";
+    let go = format!("package sample\r\n{body}");
+    let python = "def build():\n    return 1\n";
+    fixture.write("pkg/source.go", &go);
+    fixture.write("source.py", python);
+    let response = run(&fixture.request(vec![
+        observed("pkg/source.go", 4, &go),
+        observed("source.py", 2, python),
+        observed("pkg/source.go", 2, &go),
+    ]));
+    assert_eq!(response.status, Status::BoundedCurrentSource);
+    assert_eq!(response.units.len(), 2);
+    assert_eq!(response.units[0].path, "pkg/source.go");
+    assert_eq!(response.units[0].body, body);
+    assert_eq!(response.units[0].kind, "complete_function_declaration");
+    assert_eq!(
+        (response.units[0].start_line, response.units[0].end_line),
+        (2, 5)
+    );
+    assert_eq!(
+        response.units[0].body,
+        go[response.units[0].start_byte..response.units[0].end_byte]
+    );
+    assert_eq!(
+        response.units[0].source_sha256,
+        format!("{:x}", Sha256::digest(go.as_bytes()))
+    );
+    assert_eq!(
+        response.units[0].body_sha256,
+        format!("{:x}", Sha256::digest(body.as_bytes()))
+    );
+    assert_eq!(response.units[1].body, python);
+    assert_eq!(response.coverage.files_read, 2);
+    assert_eq!(response.coverage.files_compiled, 2);
+    assert_eq!(
+        response.coverage.source_read_bytes,
+        (go.len() + python.len()) * 2
+    );
+    assert!(
+        response.current_post_search_snapshot
+            && !response.indexed_proof
+            && !response.atomic_publication
+            && !response.exhaustive_search
+    );
+}
+
+#[test]
+fn go_source_mismatch_and_actual_final_drift_clear_all_extra_units() {
+    let fixture = Fixture::new();
+    let go = "package sample\nfunc Build() {\n    println(1)\n}\n";
+    let python = "def build():\n    return 1\n";
+    fixture.write("source.go", go);
+    fixture.write("source.py", python);
+    let mut wrong = observed("source.go", 3, go);
+    wrong.text = "    println(2)".into();
+    let mismatch = run(&fixture.request(vec![observed("source.py", 2, python), wrong]));
+    raw(&mismatch);
+    assert!(has_reason(&mismatch, Reason::ObservedRowMismatch));
+    let stages = Rc::new(Cell::new(0));
+    let seen = stages.clone();
+    let path = fixture.root.join("source.go");
+    let _guard = HookGuard::install(move |stage| {
+        if matches!(stage, SourceContextTestStage::BeforeFinalRecheck) {
+            seen.set(seen.get() + 1);
+            fs::write(&path, "package sample\nfunc Build() {\n    println(2)\n}\n").unwrap();
+        }
+    });
+    let drift = run(&fixture.request(vec![
+        observed("source.py", 2, python),
+        observed("source.go", 3, go),
+    ]));
+    assert!(
+        stages.get() > 0,
+        "actual final source recheck stage must execute"
+    );
+    raw(&drift);
+    assert!(has_reason(&drift, Reason::SourceDrift));
+}

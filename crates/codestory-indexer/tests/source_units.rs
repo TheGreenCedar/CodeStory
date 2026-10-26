@@ -670,7 +670,7 @@ fn language_dispatch_preserves_python_and_rejects_unsupported_extensions() {
         "complete_AsyncFunctionDef",
         source,
     );
-    for extension in ["go", "txt", "RS", ""] {
+    for extension in ["js", "txt", "RS", ""] {
         assert_eq!(
             compile_source_units(
                 extension,

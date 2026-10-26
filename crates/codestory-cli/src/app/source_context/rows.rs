@@ -73,7 +73,7 @@ fn single_file(args: &[String]) -> Option<Option<String>> {
         && !operands[0].starts_with('=')
         && Path::new(&operands[0])
             .extension()
-            .is_some_and(|x| x == "py")
+            .is_some_and(|x| x == "py" || x == "rs" || x == "go")
     {
         Some(operands.remove(0))
     } else {

@@ -160,7 +160,7 @@ fn collect(
             relative
                 .extension()
                 .and_then(|extension| extension.to_str()),
-            Some("py" | "rs")
+            Some("py" | "rs" | "go")
         ) {
             decline(response, Some(index), Reason::UnsupportedSource);
             continue;

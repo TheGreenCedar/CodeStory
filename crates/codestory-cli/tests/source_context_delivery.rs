@@ -388,3 +388,87 @@ fn hidden_route_does_not_change_public_help_or_accept_unknown_modes() {
     let invalid = invoke(&["internal-source-context", "unknown-mode"], b"", &[]);
     assert!(!invalid.status.success());
 }
+
+#[test]
+fn captured_single_supported_operand_with_and_without_h_delivers_exact_owner_after_raw_completion()
+{
+    let (_temp, root) = project();
+    let cases = [
+        (
+            "source.go",
+            "package sample\n",
+            "// Build a value.\nfunc Build() {\n    value := \"literal source\"\n    _ = value\n}\n",
+            4usize,
+            2usize,
+            6usize,
+            "complete_function_declaration",
+        ),
+        (
+            "source.rs",
+            "",
+            "/// Build a value.\nfn build() {\n    let value = \"literal source\";\n    let _ = value;\n}\n",
+            3,
+            1,
+            5,
+            "complete_function_item",
+        ),
+        (
+            "source.py",
+            "",
+            "def build():\n    value = 'literal source'\n    return value\n",
+            2,
+            1,
+            3,
+            "complete_FunctionDef",
+        ),
+    ];
+    for (name, leading, body, hit, first, last, kind) in cases {
+        let source = format!("{leading}{body}");
+        fs::write(root.join(name), &source).unwrap();
+        let matched = source
+            .split_inclusive('\n')
+            .nth(hit - 1)
+            .unwrap()
+            .strip_suffix('\n')
+            .unwrap();
+        for flags in ["-Hn", "-n"] {
+            let script = format!(
+                "rg {flags} --color=never --no-heading 'literal source' {name} | /usr/bin/head -n 1; printf 'ORIGINAL-COMMAND-DONE\\n'"
+            );
+            let encoded = payload(&root, &script);
+            let output = invoke(
+                &["internal-source-context", "capture", "--payload", &encoded],
+                b"",
+                &[],
+            );
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(output.stderr.is_empty());
+            let prefix = if flags == "-Hn" {
+                format!("{name}:{hit}:{matched}\nORIGINAL-COMMAND-DONE\n")
+            } else {
+                format!("{hit}:{matched}\nORIGINAL-COMMAND-DONE\n")
+            };
+            assert!(
+                output.stdout.starts_with(prefix.as_bytes()),
+                "raw stdout changed: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            let text = String::from_utf8(output.stdout).unwrap();
+            assert_eq!(
+                text.matches(body).count(),
+                1,
+                "{name} {flags} must reach the existing verified runtime source path"
+            );
+            assert!(text.find(body).unwrap() >= prefix.len());
+            assert!(
+                text.contains(&format!("physical_lines={first}-{last}")) && text.contains(kind)
+            );
+            assert!(text.contains(&format!("exact_bytes={}", body.len())));
+            assert!(body.len() <= 12288 && text.len() - prefix.len() - body.len() <= 2048);
+        }
+    }
+}

@@ -1,4 +1,4 @@
-//! Exact physical source units selected from a supplied Python or Rust buffer.
+//! Exact physical source units selected from a supplied Python, Rust or Go buffer.
 //!
 //! This boundary does not read files or produce graph evidence. Callers own
 //! source identity and any subsequent admission, deduplication or rendering.
@@ -60,7 +60,9 @@ pub enum SourceUnitError {
 
 /// Compile exact physical source units for a supported file extension.
 /// Named Python callable/class and Rust function/impl/trait/module owners use
-/// the smallest enclosing supported extent. At most two ancestor headers are
+/// the smallest enclosing supported extent. Go supplies only named function and
+/// method owners with a body, including immediately attached comments.
+/// At most two ancestor headers are
 /// partial context, each bounded to 1024 bytes. No macro expansion or graph
 /// semantics are inferred. Source/work allowances are shared across calls.
 pub fn compile_source_units(
@@ -70,7 +72,7 @@ pub fn compile_source_units(
     budget: &mut SourceUnitBudget,
     cancellation: &CancellationToken,
 ) -> Result<Vec<SourceUnitSelection>, SourceUnitError> {
-    if !matches!(extension, "py" | "rs") {
+    if !matches!(extension, "py" | "rs" | "go") {
         return Err(SourceUnitError::UnsupportedSyntax);
     }
     if cancellation.is_cancelled() {
@@ -153,12 +155,13 @@ pub fn compile_source_units(
         return Err(SourceUnitError::MalformedSource);
     }
 
-    let candidates = if extension == "rs" {
-        collect_rust_candidates(tree.root_node(), source, &mut work)?
+    let braced = matches!(extension, "rs" | "go");
+    let candidates = if braced {
+        collect_braced_candidates(tree.root_node(), source, extension == "go", &mut work)?
     } else {
         collect_candidates(tree.root_node(), &mut work)?
     };
-    let by_line = index_lines(&candidates, starts.len(), extension == "rs", &mut work)?;
+    let by_line = index_lines(&candidates, starts.len(), braced, &mut work)?;
     let mut selections = Vec::new();
     for &line in match_lines {
         work.charge(1)?;
@@ -248,6 +251,8 @@ struct Candidate {
     parent: Option<usize>,
     callable: bool,
     top_level: bool,
+    /// A complete physical envelope cannot contain another root declaration.
+    admissible: bool,
     kind: &'static str,
 }
 
@@ -319,6 +324,7 @@ fn collect_candidates(
                 parent: parent_owner,
                 callable,
                 top_level,
+                admissible: true,
                 kind: python_kind(node)?,
             });
             Some(id)
@@ -372,23 +378,31 @@ fn collect_candidates(
     Ok(candidates)
 }
 
-struct RustFrame<'tree> {
+struct BracedFrame<'tree> {
     node: Node<'tree>,
     owner: Option<usize>,
     /// Outer attributes/doc comments awaiting the next item in this scope.
     envelope: Option<usize>,
+    /// Go comment adjacency is tracked once per direct sibling, without scanning
+    /// prior source or walking ancestors for every comment/observation.
+    envelope_end: Option<usize>,
+    last_direct_end: Option<usize>,
+    /// Last noncomment root declaration and its optional named-owner candidate.
+    /// Noncallable package/import/type/var siblings participate equally.
+    last_declaration: Option<(usize, Option<usize>)>,
 }
 
-/// Rust owns its complete closing punctuation, unlike Python's last-statement
+/// Rust and Go own their complete closing punctuation, unlike Python's last-statement
 /// endpoint. Carry pending outer envelopes and the nearest named owner through
 /// one traversal; token trees and closures never create fabricated functions.
-fn collect_rust_candidates(
+fn collect_braced_candidates(
     root: Node<'_>,
     source: &str,
+    go: bool,
     work: &mut Work<'_>,
 ) -> Result<Vec<Candidate>, SourceUnitError> {
     let mut candidates: Vec<Candidate> = Vec::new();
-    let mut frames: Vec<RustFrame<'_>> = Vec::new();
+    let mut frames: Vec<BracedFrame<'_>> = Vec::new();
     let mut cursor = root.walk();
     'walk: loop {
         work.charge(1)?;
@@ -402,7 +416,53 @@ fn collect_rust_candidates(
         let kind = node.kind();
         let parent_owner = frames.last().and_then(|frame| frame.owner);
         let mut start = node.start_position().row + 1;
-        if let Some(parent) = frames.last_mut()
+        let mut admissible = true;
+        let mut root_declaration_end = None;
+        if go {
+            if let Some(parent) = frames.last_mut()
+                && parent.node.kind() == "source_file"
+            {
+                work.charge(1)?;
+                let position = node.end_position();
+                let end = position.row + usize::from(position.column != 0);
+                if kind == "comment" {
+                    // A trailing comment on a previous declaration's physical
+                    // row belongs to that row, not the following callable.
+                    if parent.last_direct_end.is_none_or(|last| last < start) {
+                        if parent.envelope_end != start.checked_sub(1) {
+                            parent.envelope = Some(start);
+                        }
+                        parent.envelope_end = Some(end);
+                    } else {
+                        parent.envelope = None;
+                        parent.envelope_end = None;
+                    }
+                } else if node.is_named() {
+                    work.charge(1)?;
+                    // AST siblings can be byte-disjoint but share a physical
+                    // row. Invalidate the entire neighboring owner envelopes,
+                    // including earlier body/doc hits, for ALL declarations.
+                    if let Some((last_end, previous_owner)) = parent.last_declaration
+                        && last_end >= start
+                    {
+                        admissible = false;
+                        if let Some(id) = previous_owner {
+                            candidates[id].admissible = false;
+                        }
+                    }
+                    root_declaration_end = Some(end);
+                    if parent.envelope_end == start.checked_sub(1) {
+                        start = parent.envelope.take().unwrap_or(start);
+                    } else {
+                        parent.envelope = None;
+                    }
+                    parent.envelope_end = None;
+                }
+                if node.end_byte() > node.start_byte() {
+                    parent.last_direct_end = Some(parent.last_direct_end.unwrap_or(0).max(end));
+                }
+            }
+        } else if let Some(parent) = frames.last_mut()
             && matches!(
                 parent.node.kind(),
                 "source_file" | "declaration_list" | "block"
@@ -429,7 +489,12 @@ fn collect_rust_candidates(
                 }
             }
         }
-        let candidate = if let Some(unit_kind) = rust_kind(kind) {
+        let unit_kind = if go {
+            go_kind(kind).filter(|_| node.child_by_field_name("body").is_some())
+        } else {
+            rust_kind(kind)
+        };
+        let candidate = if let Some(unit_kind) = unit_kind {
             if candidates
                 .last()
                 .is_some_and(|candidate| candidate.start > start)
@@ -450,16 +515,24 @@ fn collect_rust_candidates(
                 parent: parent_owner,
                 callable: true,
                 top_level: parent_owner.is_none(),
+                admissible,
                 kind: unit_kind,
             });
             Some(id)
         } else {
             None
         };
-        frames.push(RustFrame {
+        if let Some(end) = root_declaration_end {
+            let parent = frames.last_mut().ok_or(SourceUnitError::MalformedSource)?;
+            parent.last_declaration = Some((end, candidate));
+        }
+        frames.push(BracedFrame {
             node,
             owner: candidate.or(parent_owner),
             envelope: None,
+            envelope_end: None,
+            last_direct_end: None,
+            last_declaration: None,
         });
         if cursor.goto_first_child() {
             continue;
@@ -476,6 +549,14 @@ fn collect_rust_candidates(
         }
     }
     Ok(candidates)
+}
+
+fn go_kind(kind: &str) -> Option<&'static str> {
+    match kind {
+        "function_declaration" => Some("complete_function_declaration"),
+        "method_declaration" => Some("complete_method_declaration"),
+        _ => None,
+    }
 }
 
 fn rust_kind(kind: &str) -> Option<&'static str> {
@@ -533,18 +614,20 @@ fn python_kind(node: Node<'_>) -> Result<&'static str, SourceUnitError> {
 fn index_lines(
     candidates: &[Candidate],
     lines: usize,
-    rust: bool,
+    braced: bool,
     work: &mut Work<'_>,
 ) -> Result<Vec<Option<usize>>, SourceUnitError> {
     let mut ambiguous = vec![false; lines];
-    if rust {
+    if braced {
         // Disjoint sibling items can share one physical row. A row-only match
         // cannot choose either. This is one candidate pass, never per-hit work.
         let mut previous: Vec<Option<usize>> = vec![None; candidates.len() + 1];
         for (id, candidate) in candidates.iter().enumerate() {
             work.charge(1)?;
             let scope = candidate.parent.map_or(0, |parent| parent + 1);
-            if previous[scope].is_some_and(|prior| candidates[prior].end >= candidate.start) {
+            if let Some(prior) = previous[scope]
+                && candidates[prior].end >= candidate.start
+            {
                 ambiguous[candidate.start - 1] = true;
             }
             if let Some(parent) = candidate.parent {
@@ -567,7 +650,7 @@ fn index_lines(
         while next < candidates.len() && candidates[next].start <= line {
             work.charge(1)?;
             let candidate = &candidates[next];
-            if candidate.callable {
+            if candidate.callable && candidate.admissible {
                 work.charge(heap_work(callables.len()))?;
                 callables.push(Reverse((
                     candidate.end - candidate.start,
@@ -575,7 +658,7 @@ fn index_lines(
                     candidate.end,
                 )));
             }
-            if candidate.top_level {
+            if candidate.top_level && candidate.admissible {
                 statements.push_back(next);
             }
             next += 1;
@@ -616,3 +699,7 @@ fn unit(start: usize, end: usize, kind: &str, starts: &[usize], ends: &[usize]) 
         kind: kind.to_owned(),
     }
 }
+
+#[cfg(test)]
+#[path = "source_units_go_tests.rs"]
+mod go_tests;
