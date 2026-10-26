@@ -118,8 +118,7 @@ fn collect(
         SourceContextDeclineReason as Reason, SourceContextUnit,
     };
     use codestory_indexer::source_units::{
-        SourceUnitBudget, SourceUnitError, SourceUnitGap, SourceUnitSelection,
-        compile_python_source_units,
+        SourceUnitBudget, SourceUnitError, SourceUnitGap, SourceUnitSelection, compile_source_units,
     };
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, BTreeSet};
@@ -157,10 +156,12 @@ fn collect(
                 continue;
             }
         };
-        if relative
-            .extension()
-            .is_none_or(|extension| extension != "py")
-        {
+        if !matches!(
+            relative
+                .extension()
+                .and_then(|extension| extension.to_str()),
+            Some("py" | "rs")
+        ) {
             decline(response, Some(index), Reason::UnsupportedSource);
             continue;
         }
@@ -240,7 +241,12 @@ fn collect(
         spend(&mut budget, cancellation, read.bytes.len())?;
         let sha256 = format!("{:x}", Sha256::digest(&read.bytes));
         response.coverage.files_compiled += 1;
-        match compile_python_source_units(text, &lines, &mut budget, cancellation) {
+        let extension = input
+            .relative
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .ok_or(Reason::UnsupportedSource)?;
+        match compile_source_units(extension, text, &lines, &mut budget, cancellation) {
             Ok(selections) => {
                 for (&index, selection) in input.observations.iter().zip(selections) {
                     selected[index] = Some((file_index, selection));

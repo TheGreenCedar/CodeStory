@@ -108,7 +108,7 @@ fn render(response: &SourceContextResponse, captured: bool) -> Vec<u8> {
         "supplied physical-row observations"
     };
     let summary = format!(
-        "\n[exact enclosing Python context; current post-search snapshot; {provenance}; omitted/dropped/incomplete observations UNKNOWN; not atomic, exhaustive or indexed proof]\n"
+        "\n[exact enclosing source context; current post-search snapshot; {provenance}; omitted/dropped/incomplete observations UNKNOWN; not atomic, exhaustive or indexed proof]\n"
     );
     let mut reasons: Vec<(String, usize)> = Vec::new();
     for decline in &response.declines {

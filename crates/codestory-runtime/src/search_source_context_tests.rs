@@ -157,6 +157,93 @@ fn crlf_unicode_and_unterminated_eof_are_literal_not_reformatted() {
 }
 
 #[test]
+fn rust_and_python_observations_share_order_deduplication_and_verified_source() {
+    let fixture = Fixture::new();
+    let rust =
+        "// 雪\r\n#[inline]\r\nfn first() {\r\n    let text = \"🙂\";\r\n}\r\nfn second() {}";
+    let python = "def build():\n    return 1\n";
+    fixture.write("pkg/source.rs", rust);
+    fixture.write("pkg/source.py", python);
+    let absolute = fixture.root.join("pkg/source.rs");
+    let mut request = fixture.request(vec![
+        observed(absolute.to_str().unwrap(), 6, rust),
+        observed("source.py", 2, python),
+        observed("source.rs", 4, rust),
+        observed("source.rs", 6, rust),
+    ]);
+    request.cwd = fixture.root.join("pkg").to_str().unwrap().to_owned();
+    let response = run(&request);
+    assert_eq!(response.status, Status::BoundedCurrentSource);
+    assert!(
+        response.declines.is_empty(),
+        "supported Rust must reach compilation"
+    );
+    assert_eq!(response.units.len(), 3);
+    assert_eq!(response.units[0].body, "fn second() {}");
+    assert_eq!(response.units[1].body, python);
+    assert_eq!(
+        response.units[2].body,
+        "#[inline]\r\nfn first() {\r\n    let text = \"🙂\";\r\n}\r\n"
+    );
+    assert_eq!(
+        (response.units[0].start_line, response.units[0].end_line),
+        (6, 6)
+    );
+    assert_eq!(
+        (response.units[2].start_line, response.units[2].end_line),
+        (2, 5)
+    );
+    for unit in &response.units {
+        let source = if unit.path.ends_with(".rs") {
+            rust
+        } else {
+            python
+        };
+        assert_eq!(unit.body, source[unit.start_byte..unit.end_byte]);
+        assert_eq!(
+            unit.source_sha256,
+            format!("{:x}", Sha256::digest(source.as_bytes()))
+        );
+        assert_eq!(
+            unit.body_sha256,
+            format!("{:x}", Sha256::digest(unit.body.as_bytes()))
+        );
+    }
+    assert_eq!(response.units[0].kind, "complete_function_item");
+    assert_eq!(response.units[1].kind, "complete_FunctionDef");
+    assert_eq!(response.coverage.files_read, 2);
+    assert_eq!(response.coverage.files_compiled, 2);
+    assert_eq!(
+        response.coverage.source_read_bytes,
+        (rust.len() + python.len()) * 2
+    );
+    assert!(response.current_post_search_snapshot);
+    assert!(!response.exhaustive_search && !response.atomic_publication && !response.indexed_proof);
+}
+
+#[test]
+fn rust_refuses_malformed_owners_and_oversized_whole_units_without_clipping() {
+    let fixture = Fixture::new();
+    fixture.write("broken.rs", "fn valid() {}\nfn broken() {\n");
+    let broken = run(&fixture.request(vec![observed(
+        "broken.rs",
+        1,
+        "fn valid() {}\nfn broken() {\n",
+    )]));
+    raw(&broken);
+    assert!(has_reason(&broken, Reason::MalformedSource));
+    let body = format!(
+        "fn build() {{\n    let text = \"{}\";\n}}\n",
+        "x".repeat(SOURCE_CONTEXT_BOUNDS.display_source_bytes)
+    );
+    fixture.write("large.rs", &body);
+    let large = run(&fixture.request(vec![observed("large.rs", 1, &body)]));
+    raw(&large);
+    assert!(has_reason(&large, Reason::UnitTooLarge));
+    assert!(large.coverage.source_read_bytes <= SOURCE_CONTEXT_BOUNDS.aggregate_read_bytes);
+}
+
+#[test]
 fn one_observed_row_mismatch_invalidates_all_extra_units() {
     let fixture = Fixture::new();
     let first = "def first():\n    return 1\n";

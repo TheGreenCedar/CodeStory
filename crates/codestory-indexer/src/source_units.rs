@@ -1,4 +1,4 @@
-//! Exact physical source units selected from a supplied Python buffer.
+//! Exact physical source units selected from a supplied Python or Rust buffer.
 //!
 //! This boundary does not read files or produce graph evidence. Callers own
 //! source identity and any subsequent admission, deduplication or rendering.
@@ -26,7 +26,7 @@ pub struct SourceUnit {
     pub end_byte: usize,
     pub start_line: usize,
     pub end_line: usize,
-    /// Python AST-compatible complete node kind, or `ancestor_header_context`.
+    /// Complete source AST kind, or `ancestor_header_context`.
     pub kind: String,
 }
 
@@ -58,20 +58,21 @@ pub enum SourceUnitError {
     Cancelled,
 }
 
-/// Select the smallest complete Python callable/class containing each hit,
-/// otherwise the sole containing top-level statement. Decorators belong to
-/// their declaration. At most two nearest callable/class ancestor headers are
-/// returned in outer-to-inner order, each bounded to the established 1024 bytes.
-///
-/// Work and source-byte allowances are shared across calls, never reset here.
-/// Parse, traversal and request processing must be cooperatively bounded; an
-/// unavailable, malformed, cancelled or exhausted compilation returns no units.
-pub fn compile_python_source_units(
+/// Compile exact physical source units for a supported file extension.
+/// Named Python callable/class and Rust function/impl/trait/module owners use
+/// the smallest enclosing supported extent. At most two ancestor headers are
+/// partial context, each bounded to 1024 bytes. No macro expansion or graph
+/// semantics are inferred. Source/work allowances are shared across calls.
+pub fn compile_source_units(
+    extension: &str,
     source: &str,
     match_lines: &[usize],
     budget: &mut SourceUnitBudget,
     cancellation: &CancellationToken,
 ) -> Result<Vec<SourceUnitSelection>, SourceUnitError> {
+    if !matches!(extension, "py" | "rs") {
+        return Err(SourceUnitError::UnsupportedSyntax);
+    }
     if cancellation.is_cancelled() {
         return Err(SourceUnitError::Cancelled);
     }
@@ -103,7 +104,8 @@ pub fn compile_python_source_units(
     }
 
     let mut parser = Parser::new();
-    let language = crate::get_language_for_ext("py").ok_or(SourceUnitError::ParserUnavailable)?;
+    let language =
+        crate::get_language_for_ext(extension).ok_or(SourceUnitError::ParserUnavailable)?;
     parser
         .set_language(&language.language)
         .map_err(|_| SourceUnitError::ParserUnavailable)?;
@@ -151,8 +153,12 @@ pub fn compile_python_source_units(
         return Err(SourceUnitError::MalformedSource);
     }
 
-    let candidates = collect_candidates(tree.root_node(), &mut work)?;
-    let by_line = index_lines(&candidates, starts.len(), &mut work)?;
+    let candidates = if extension == "rs" {
+        collect_rust_candidates(tree.root_node(), source, &mut work)?
+    } else {
+        collect_candidates(tree.root_node(), &mut work)?
+    };
+    let by_line = index_lines(&candidates, starts.len(), extension == "rs", &mut work)?;
     let mut selections = Vec::new();
     for &line in match_lines {
         work.charge(1)?;
@@ -366,6 +372,123 @@ fn collect_candidates(
     Ok(candidates)
 }
 
+struct RustFrame<'tree> {
+    node: Node<'tree>,
+    owner: Option<usize>,
+    /// Outer attributes/doc comments awaiting the next item in this scope.
+    envelope: Option<usize>,
+}
+
+/// Rust owns its complete closing punctuation, unlike Python's last-statement
+/// endpoint. Carry pending outer envelopes and the nearest named owner through
+/// one traversal; token trees and closures never create fabricated functions.
+fn collect_rust_candidates(
+    root: Node<'_>,
+    source: &str,
+    work: &mut Work<'_>,
+) -> Result<Vec<Candidate>, SourceUnitError> {
+    let mut candidates: Vec<Candidate> = Vec::new();
+    let mut frames: Vec<RustFrame<'_>> = Vec::new();
+    let mut cursor = root.walk();
+    'walk: loop {
+        work.charge(1)?;
+        if frames.len() >= work.budget.max_depth {
+            return Err(SourceUnitError::DepthExceeded);
+        }
+        let node = cursor.node();
+        if node.is_error() || node.is_missing() {
+            return Err(SourceUnitError::MalformedSource);
+        }
+        let kind = node.kind();
+        let parent_owner = frames.last().and_then(|frame| frame.owner);
+        let mut start = node.start_position().row + 1;
+        if let Some(parent) = frames.last_mut()
+            && matches!(
+                parent.node.kind(),
+                "source_file" | "declaration_list" | "block"
+            )
+        {
+            work.charge(1)?;
+            let prefix = source
+                .as_bytes()
+                .get(node.start_byte()..)
+                .unwrap_or_default();
+            let outer_doc = (prefix.starts_with(b"///") && !prefix.starts_with(b"////"))
+                || (prefix.starts_with(b"/**") && !prefix.starts_with(b"/***"));
+            match kind {
+                "attribute_item" => {
+                    parent.envelope.get_or_insert(start);
+                }
+                "line_comment" | "block_comment" if outer_doc => {
+                    parent.envelope.get_or_insert(start);
+                }
+                "line_comment" | "block_comment"
+                    if !prefix.starts_with(b"//!") && !prefix.starts_with(b"/*!") => {}
+                _ => {
+                    start = parent.envelope.take().unwrap_or(start);
+                }
+            }
+        }
+        let candidate = if let Some(unit_kind) = rust_kind(kind) {
+            if candidates
+                .last()
+                .is_some_and(|candidate| candidate.start > start)
+            {
+                return Err(SourceUnitError::UnsupportedSyntax);
+            }
+            let body = node.child_by_field_name("body");
+            let position = node.end_position();
+            let id = candidates.len();
+            candidates.push(Candidate {
+                start,
+                end: position.row + usize::from(position.column != 0),
+                declaration_line: node.start_position().row + 1,
+                // Rust partial headers include the opening brace, including
+                // multiline generic/where clauses, but none of the body items.
+                first_body_line: body.map(|body| body.start_position().row + 2),
+                body_id: body.map(|body| body.id()),
+                parent: parent_owner,
+                callable: true,
+                top_level: parent_owner.is_none(),
+                kind: unit_kind,
+            });
+            Some(id)
+        } else {
+            None
+        };
+        frames.push(RustFrame {
+            node,
+            owner: candidate.or(parent_owner),
+            envelope: None,
+        });
+        if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            work.charge(1)?;
+            frames.pop().ok_or(SourceUnitError::MalformedSource)?;
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                break 'walk;
+            }
+        }
+    }
+    Ok(candidates)
+}
+
+fn rust_kind(kind: &str) -> Option<&'static str> {
+    Some(match kind {
+        "function_item" => "complete_function_item",
+        "function_signature_item" => "complete_function_signature_item",
+        "impl_item" => "complete_impl_item",
+        "trait_item" => "complete_trait_item",
+        "mod_item" => "complete_mod_item",
+        _ => return None,
+    })
+}
+
 fn python_kind(node: Node<'_>) -> Result<&'static str, SourceUnitError> {
     let asynchronous = node.child(0).is_some_and(|n| n.kind() == "async");
     Ok(match node.kind() {
@@ -410,8 +533,31 @@ fn python_kind(node: Node<'_>) -> Result<&'static str, SourceUnitError> {
 fn index_lines(
     candidates: &[Candidate],
     lines: usize,
+    rust: bool,
     work: &mut Work<'_>,
 ) -> Result<Vec<Option<usize>>, SourceUnitError> {
+    let mut ambiguous = vec![false; lines];
+    if rust {
+        // Disjoint sibling items can share one physical row. A row-only match
+        // cannot choose either. This is one candidate pass, never per-hit work.
+        let mut previous: Vec<Option<usize>> = vec![None; candidates.len() + 1];
+        for (id, candidate) in candidates.iter().enumerate() {
+            work.charge(1)?;
+            let scope = candidate.parent.map_or(0, |parent| parent + 1);
+            if previous[scope].is_some_and(|prior| candidates[prior].end >= candidate.start) {
+                ambiguous[candidate.start - 1] = true;
+            }
+            if let Some(parent) = candidate.parent {
+                if candidate.start == candidates[parent].declaration_line {
+                    ambiguous[candidate.start - 1] = true;
+                }
+                if candidate.end == candidates[parent].end {
+                    ambiguous[candidate.end - 1] = true;
+                }
+            }
+            previous[scope] = Some(id);
+        }
+    }
     let mut by_line = Vec::new();
     let mut callables = BinaryHeap::new();
     let mut statements: VecDeque<usize> = VecDeque::new();
@@ -452,7 +598,7 @@ fn index_lines(
             .peek()
             .map(|Reverse((_, id, _))| *id)
             .or_else(|| (statements.len() == 1).then(|| statements[0]));
-        by_line.push(owner);
+        by_line.push(if ambiguous[line - 1] { None } else { owner });
     }
     Ok(by_line)
 }

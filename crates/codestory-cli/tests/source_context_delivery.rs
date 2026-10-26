@@ -239,6 +239,43 @@ fn captured_actual_rg_rows_enrich_only_after_original_consumer_and_final_marker(
 }
 
 #[test]
+fn captured_rust_rg_rows_append_the_exact_owner_after_the_original_command() {
+    let (_temp, root) = project();
+    let body =
+        "/// Build a value.\n#[inline]\nfn build() {\n    let value = \"literal source\";\n}\n";
+    fs::write(root.join("source.rs"), body).unwrap();
+    let script = "rg -Hn --color=never --no-heading 'let value' source.rs | /usr/bin/head -n 1; printf 'ORIGINAL-COMMAND-DONE\\n'";
+    let encoded = payload(&root, script);
+    let output = invoke(
+        &["internal-source-context", "capture", "--payload", &encoded],
+        b"",
+        &[],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let prefix = b"source.rs:4:    let value = \"literal source\";\nORIGINAL-COMMAND-DONE\n";
+    assert!(
+        output.stdout.starts_with(prefix),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(
+        text.matches(body).count(),
+        1,
+        "Rust must reach verified runtime selection through the unchanged transport"
+    );
+    assert!(text.find(body).unwrap() >= prefix.len());
+    assert!(text.contains("physical_lines=1-5") && text.contains("complete_function_item"));
+    assert!(text.contains(&format!("exact_bytes={}", body.len())));
+    assert!(body.len() <= 12288 && text.len() - prefix.len() - body.len() <= 2048);
+}
+
+#[test]
 fn capture_preserves_pipeline_substitution_and_file_redirection_consumers() {
     let (_temp, root) = project();
     let script = "printf 'first\\nsecond\\n' | /usr/bin/head -n 1; value=$(printf 'sub'); printf '%s' \"$value\"; printf 'file-only' > saved; printf 'err-only' >&2";

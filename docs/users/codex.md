@@ -52,7 +52,7 @@ are in the [user guide](README.md#first-use).
 
 Source context is optional. When the executor explicitly reports a
 non-interactive `/bin/zsh` login-shell request, the Codex plugin can append
-complete Python declarations around numbered `rg` matches after the original
+complete Python and Rust declarations around numbered `rg` matches after the original
 command finishes. Existing pipelines and redirections receive the original
 search bytes. This uses the already installed matching CLI; the hook does not
 provision a runtime, build an index, or call a model.
@@ -67,7 +67,10 @@ explicit conflicting fields always retain the ordinary path.
 Context is bounded to 12 KiB of literal source and 2 KiB of framing. It describes
 rechecked current files, with gaps and limits, rather than an atomic repository
 snapshot or an exhaustive search. Unsupported commands, changed source,
-non-Python files, unavailable CLI, and exhausted bounds retain the raw output.
+unsupported file languages, unavailable CLI, and exhausted bounds retain the raw output.
+Rust context covers functions, trait signatures, and enclosing `impl`, trait and
+module items with attached outer attributes or docs. It does not expand macros
+or establish type or runtime behavior.
 Other shells, interactive/TTY requests and other hosts keep their normal path.
 
 ## Update
