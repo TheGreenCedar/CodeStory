@@ -71,9 +71,14 @@ fn named_metadata(parent: &File, value: &OsStr) -> Result<libc::stat, Reason> {
 }
 
 fn same_file(named: &libc::stat, opened: &Metadata) -> bool {
+    #[cfg(target_os = "linux")]
+    let device = named.st_dev;
+    // Preserve the existing conversion of signed native identity fields elsewhere.
+    #[cfg(not(target_os = "linux"))]
+    let device = named.st_dev as u64;
     named.st_mode & libc::S_IFMT == libc::S_IFREG
-        && named.st_dev as u64 == opened.dev()
-        && named.st_ino as u64 == opened.ino()
+        && device == opened.dev()
+        && named.st_ino == opened.ino()
 }
 
 fn stamp(m: &Metadata) -> (u64, i64, i64, i64, i64) {
@@ -159,7 +164,7 @@ impl Directory {
         Ok(())
     }
 
-    fn from_absolute(&self, path: &Path) -> Result<PathBuf, Reason> {
+    fn relative_path_from_absolute(&self, path: &Path) -> Result<PathBuf, Reason> {
         if !path.is_absolute() || path.components().any(|p| matches!(p, Component::ParentDir)) {
             return Err(Reason::InvalidPath);
         }
@@ -186,7 +191,9 @@ impl Directory {
     }
 
     pub fn cwd(&self, path: &Path, cancellation: &CancellationToken) -> Result<PathBuf, Reason> {
-        let relative = self.from_absolute(path).map_err(|_| Reason::InvalidCwd)?;
+        let relative = self
+            .relative_path_from_absolute(path)
+            .map_err(|_| Reason::InvalidCwd)?;
         self.directory(&relative, cancellation).map_err(|reason| {
             if reason == Reason::Cancelled {
                 reason
@@ -200,7 +207,7 @@ impl Directory {
 
     pub fn source_path(&self, cwd: &Path, path: &Path) -> Result<PathBuf, Reason> {
         let relative = if path.is_absolute() {
-            self.from_absolute(path)?
+            self.relative_path_from_absolute(path)?
         } else {
             cwd.join(relative_parts(path)?)
         };
