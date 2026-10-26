@@ -59,7 +59,7 @@ impl CliStartupConfig {
         crate::sidecar_runtime::prepare_cache_access();
         Self {
             mcp_result_display: crate::stdio_v3::McpResultDisplay::from_env_value(
-                std::env::var("CODESTORY_MCP_RESULT_DISPLAY")
+                std::env::var(config_registry::MCP_RESULT_DISPLAY_ENV)
                     .ok()
                     .as_deref(),
             ),

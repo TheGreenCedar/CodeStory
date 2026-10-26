@@ -398,7 +398,7 @@ fn source_context_test_stage(stage: SourceContextTestStage<'_>) {
 }
 
 #[cfg(all(test, unix))]
-#[path = "search_source_context_tests.rs"]
+#[path = "search_source_context/tests.rs"]
 mod tests;
 
 #[cfg(all(test, not(unix)))]

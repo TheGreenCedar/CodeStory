@@ -1,5 +1,6 @@
 //! Once-through Unix rg tee and outer capture. No source reads or shell parser.
 use super::{Payload, render, rows};
+use codestory_contracts::config_registry;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
@@ -12,11 +13,12 @@ use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-const FD: &str = "CODESTORY_SOURCE_CONTEXT_FD";
-const PIPE_ID: &str = "CODESTORY_SOURCE_CONTEXT_PIPE_ID";
-const REAL: &str = "CODESTORY_SOURCE_CONTEXT_BOUND_RG";
-const ORIGINAL_PATH: &str = "CODESTORY_SOURCE_CONTEXT_ORIGINAL_PATH";
-const CLI: &str = "CODESTORY_SOURCE_CONTEXT_CLI";
+const FD: &str = config_registry::SOURCE_CONTEXT_FD_ENV;
+const PIPE_ID: &str = config_registry::SOURCE_CONTEXT_PIPE_ID_ENV;
+const REAL: &str = config_registry::SOURCE_CONTEXT_BOUND_RG_ENV;
+const ORIGINAL_PATH: &str = config_registry::SOURCE_CONTEXT_ORIGINAL_PATH_ENV;
+const CLI: &str = config_registry::SOURCE_CONTEXT_CLI_ENV;
+const READY: &str = config_registry::SOURCE_CONTEXT_READY_ENV;
 const IPC_MAX: usize = 262144;
 const CHILD_MAX: usize = 65536;
 
@@ -391,7 +393,7 @@ pub(super) fn setup(encoded: &str, real: &Path, original_path: &OsStr) -> anyhow
         });
     }
     println!(
-        "export {REAL}={}\nexport {ORIGINAL_PATH}={}\nexport CODESTORY_SOURCE_CONTEXT_READY=1",
+        "export {REAL}={}\nexport {ORIGINAL_PATH}={}\nexport {READY}=1",
         quote(real_text),
         quote(original)
     );
@@ -522,7 +524,7 @@ pub(super) fn capture(payload: &Payload) -> anyhow::Result<()> {
     // command is a literal contiguous suffix and is never parsed or replayed.
     let prelude = if asset {
         format!(
-            "unset CODESTORY_SOURCE_CONTEXT_READY\nexport {REAL}=\"$(builtin whence -p rg)\"\nif [[ \"$CODESTORY_SOURCE_CONTEXT_BOUND_RG\" = /* && -x \"$CODESTORY_SOURCE_CONTEXT_BOUND_RG\" ]]; then\nexport {CLI}={}\neval \"$({} internal-source-context setup --payload {} --rg \"$CODESTORY_SOURCE_CONTEXT_BOUND_RG\" --original-path \"$PATH\")\"\nif [[ \"$CODESTORY_SOURCE_CONTEXT_READY\" = 1 ]]; then\nexport PATH={}:\"$PATH\"\nrehash\nfi\nfi\n",
+            "unset {READY}\nexport {REAL}=\"$(builtin whence -p rg)\"\nif [[ \"${REAL}\" = /* && -x \"${REAL}\" ]]; then\nexport {CLI}={}\neval \"$({} internal-source-context setup --payload {} --rg \"${REAL}\" --original-path \"$PATH\")\"\nif [[ \"${READY}\" = 1 ]]; then\nexport PATH={}:\"$PATH\"\nrehash\nfi\nfi\n",
             quote(cli_text),
             quote(cli_text),
             encoded,
