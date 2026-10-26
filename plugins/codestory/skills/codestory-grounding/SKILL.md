@@ -15,6 +15,8 @@ Keep complete results and metadata; the full wrapper is safe. Filter mirrors onl
 
 Use sufficient source for claims; preserve source/publication identities, freshness, ambiguity, truncation and gaps. Availability is not sufficiency. Missing edges or partial, stale, capped or missing results prove no absence or exhaustive counts. Graph relations are not runtime proof; distinguish source claims from runtime observations.
 
+Complete, exact source bodies in ordinary tool results, with file hashes and physical ranges, count as source already read. Reuse them for covered claims; fetch missing context, changed source or specific verification as needed. Preserve freshness, gaps and limits, and perform required executable and runtime checks.
+
 Tools own preparation; follow returned retry hints. Do not repair shared state. A failed call does not end authorized investigation.
 
 Use [GUIDE.md](GUIDE.md) for needed unfamiliar or complex detail, not routinely for known operations.
