@@ -769,9 +769,11 @@ fn go_navigation_facts<'tree>(
 ) {
     let source = context.source;
     let type_origins = include_values.then(|| value_uses::TypeOrigins::prepare(callable, source));
-    let parameter_types = include_values
-        .then(|| collect_go_parameter_types(callable, source))
-        .unwrap_or_default();
+    let parameter_types = if include_values {
+        collect_go_parameter_types(callable, source)
+    } else {
+        Default::default()
+    };
     let mut calls = Vec::new();
     let mut intervals = Vec::new();
     let mut top_level_return_bindings = HashMap::<String, GoReturnPath>::new();
@@ -812,14 +814,15 @@ fn go_navigation_facts<'tree>(
                 method_name,
             });
         }
-        if include_values && value_uses::selector_value(node).is_some() {
-            if let Some((receiver_name, method_name)) = value_uses::selector_names(node, source) {
-                calls.push(GoNavigationCall {
-                    node,
-                    receiver_name,
-                    method_name,
-                });
-            }
+        if include_values
+            && value_uses::selector_value(node).is_some()
+            && let Some((receiver_name, method_name)) = value_uses::selector_names(node, source)
+        {
+            calls.push(GoNavigationCall {
+                node,
+                receiver_name,
+                method_name,
+            });
         }
         match node.kind() {
             "parameter_declaration" | "variadic_parameter_declaration" if include_values => {

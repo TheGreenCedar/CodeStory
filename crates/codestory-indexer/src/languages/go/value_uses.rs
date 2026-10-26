@@ -49,9 +49,9 @@ impl TypeOrigins {
                     }) else {
                         return;
                     };
-                    if !declaration
+                    if declaration
                         .child_by_field_name("type_parameters")
-                        .is_some_and(|parameters| parameters.id() == list.id())
+                        .is_none_or(|parameters| parameters.id() != list.id())
                     {
                         return;
                     }

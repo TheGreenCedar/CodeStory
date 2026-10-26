@@ -289,16 +289,17 @@ fn collect_candidates(
         let parent_owner = parent.and_then(|f| f.active_owner);
         let top_level =
             parent.is_some_and(|f| f.node.kind() == "module" || (f.top_level_wrapper && callable));
-        if let Some(owner) = parent.and_then(|f| f.body_owner) {
-            if kind != "comment" && candidates[owner].first_body_line.is_none() {
-                let statement = if kind == "decorated_definition" {
-                    node.child_by_field_name("definition")
-                        .ok_or(SourceUnitError::UnsupportedSyntax)?
-                } else {
-                    node
-                };
-                candidates[owner].first_body_line = Some(statement.start_position().row + 1);
-            }
+        if let Some(owner) = parent.and_then(|f| f.body_owner)
+            && kind != "comment"
+            && candidates[owner].first_body_line.is_none()
+        {
+            let statement = if kind == "decorated_definition" {
+                node.child_by_field_name("definition")
+                    .ok_or(SourceUnitError::UnsupportedSyntax)?
+            } else {
+                node
+            };
+            candidates[owner].first_body_line = Some(statement.start_position().row + 1);
         }
         let candidate = if callable
             || (top_level && node.is_named() && !matches!(kind, "comment" | "decorated_definition"))
@@ -331,10 +332,10 @@ fn collect_candidates(
         } else {
             None
         };
-        if kind == "except_group_clause" {
-            if let Some(id) = parent.and_then(|f| f.candidate) {
-                candidates[id].kind = "complete_TryStar";
-            }
+        if kind == "except_group_clause"
+            && let Some(id) = parent.and_then(|f| f.candidate)
+        {
+            candidates[id].kind = "complete_TryStar";
         }
         let body_owner = if kind == "block" {
             parent_owner.filter(|&id| candidates[id].body_id == Some(node.id()))
