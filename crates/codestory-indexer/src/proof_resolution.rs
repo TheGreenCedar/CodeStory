@@ -9,7 +9,9 @@ use crate::cache::{
 };
 use crate::source_content_hash;
 use anyhow::{Context, Result, anyhow};
-use codestory_contracts::graph::{Edge, EdgeId, EdgeKind, Node, NodeId, NodeKind};
+use codestory_contracts::graph::{
+    Edge, EdgeId, EdgeKind, Node, NodeId, NodeKind, is_script_property_callable_canonical_id,
+};
 use codestory_contracts::proof_resolution::{
     CallResolutionFact, CalleeForm, DependencyFileHash, EXACT_CALL_RESOLUTION_ALGORITHM,
     ExactCallsite, ExactCallsiteCorrelationFailure, ExactSyntaxCallsiteCorrelationInput, FileId,
@@ -10031,7 +10033,12 @@ impl<'tree> JavascriptResolutionIndex<'tree> {
         {
             if let Some(line) = node.start_line {
                 let name = graph_leaf_name(&node.serialized_name).to_string();
-                if matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD) {
+                if matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                    && !node
+                        .canonical_id
+                        .as_deref()
+                        .is_some_and(is_script_property_callable_canonical_id)
+                {
                     callable_nodes
                         .entry((line, name.clone()))
                         .or_default()

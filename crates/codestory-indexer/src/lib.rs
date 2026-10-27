@@ -15,7 +15,8 @@ use anyhow::{Result, anyhow};
 use codestory_contracts::graph::{
     AccessKind, CallableProjectionState, Edge, EdgeId, EdgeKind, FileCoverageReason, Node, NodeId,
     NodeKind, Occurrence, OccurrenceKind, RUST_ORDINAL_CANONICAL_ID_PREFIX, ResolutionCertainty,
-    SourceLocation,
+    SCRIPT_ORDINAL_CANONICAL_ID_PREFIX, SCRIPT_PROPERTY_CALLABLE_CANONICAL_ID_PREFIX,
+    SourceLocation, is_script_property_callable_canonical_id, source_ordinal_canonical_id_parts,
 };
 use codestory_contracts::language_support::normalize_extension;
 use codestory_contracts::workspace::{OversizedSourceExclusionCandidate, SourceIndexPolicy};
@@ -4415,8 +4416,13 @@ pub fn current_file_extraction_revision(language: &str) -> Option<&'static str> 
         "rust" => Some(languages::rust::DECLARATION_REVISION),
         "go" => Some(languages::go::INITIALIZER_CALL_REVISION),
         "bash" => Some(extraction_revision!("bash-callsite-source-order-v1")),
-        "javascript" => Some(extraction_revision!("explicit-named-public-exports-v2")),
-        "typescript" | "tsx" => Some(extraction_revision!("explicit-named-public-exports-v3")),
+        "javascript" => Some(extraction_revision!(
+            "script-ordinal-and-property-callable-v4"
+        )),
+        "typescript" | "tsx" => Some(extraction_revision!(
+            "script-ordinal-and-property-callable-v5"
+        )),
+        "vue" | "svelte" | "astro" => Some(extraction_revision!("template-script-ordinal-v1")),
         _ if languages::extraction_for_language(language).is_some() => {
             Some(extraction_revision!(""))
         }
@@ -7386,13 +7392,13 @@ fn cpp_named_type_text(node: Option<TsNode<'_>>, source: &str) -> Option<String>
 fn tsx_owner_name(mut node: TsNode<'_>, source: &str) -> Option<String> {
     while let Some(parent) = node.parent() {
         match parent.kind() {
-            "function_declaration" | "method_definition" => {
+            "function_declaration" | "generator_function_declaration" | "method_definition" => {
                 return parent
                     .child_by_field_name("name")
                     .and_then(|name| node_source_text(name, source))
                     .map(|name| name.trim().to_string());
             }
-            "arrow_function" | "function_expression" => {
+            "arrow_function" | "function_expression" | "generator_function" => {
                 return parent
                     .parent()
                     .and_then(|owner| tsx_callable_binding_name(owner, source));
@@ -7461,10 +7467,13 @@ fn jsx_attribute_target_name(node: TsNode<'_>, source: &str) -> Option<String> {
         .filter(|name| !name.is_empty())
 }
 
-fn collect_tsx_jsx_usage_edges(tree: &Tree, source: &str) -> Vec<ManualEdgeSpec> {
+fn collect_tsx_jsx_usage_edges(tree: &Tree, source: &str) -> Vec<(ManualEdgeSpec, GraphNodeSpan)> {
     let mut edges = Vec::new();
     walk_tree_nodes(tree.root_node(), &mut |node| {
         let Some(source_name) = tsx_owner_name(node, source) else {
+            return;
+        };
+        let Some(source_span) = javascript_enclosing_callable(node).map(ts_node_graph_span) else {
             return;
         };
         let line = Some(node.start_position().row as u32 + 1);
@@ -7473,22 +7482,28 @@ fn collect_tsx_jsx_usage_edges(tree: &Tree, source: &str) -> Vec<ManualEdgeSpec>
                 if let Some(name) = jsx_element_name(node, source)
                     .filter(|name| is_probable_jsx_component_name(name))
                 {
-                    edges.push(ManualEdgeSpec {
-                        source_name,
-                        target_name: name,
-                        kind: EdgeKind::CALL,
-                        line,
-                    });
+                    edges.push((
+                        ManualEdgeSpec {
+                            source_name,
+                            target_name: name,
+                            kind: EdgeKind::CALL,
+                            line,
+                        },
+                        source_span,
+                    ));
                 }
             }
             "jsx_attribute" => {
                 if let Some(name) = jsx_attribute_target_name(node, source) {
-                    edges.push(ManualEdgeSpec {
-                        source_name,
-                        target_name: name,
-                        kind: EdgeKind::USAGE,
-                        line,
-                    });
+                    edges.push((
+                        ManualEdgeSpec {
+                            source_name,
+                            target_name: name,
+                            kind: EdgeKind::USAGE,
+                            line,
+                        },
+                        source_span,
+                    ));
                 }
             }
             _ => {}
@@ -7546,22 +7561,31 @@ fn js_new_expression_constructor_name(node: TsNode<'_>, source: &str) -> Option<
         })
 }
 
-fn collect_javascript_static_call_edges(tree: &Tree, source: &str) -> Vec<ManualEdgeSpec> {
+fn collect_javascript_static_call_edges(
+    tree: &Tree,
+    source: &str,
+) -> Vec<(ManualEdgeSpec, GraphNodeSpan)> {
     let mut edges = Vec::new();
     walk_tree_nodes(tree.root_node(), &mut |node| {
         let Some(source_name) = tsx_owner_name(node, source) else {
+            return;
+        };
+        let Some(source_span) = javascript_enclosing_callable(node).map(ts_node_graph_span) else {
             return;
         };
         let line = Some(node.start_position().row as u32 + 1);
         match node.kind() {
             "new_expression" => {
                 if let Some(target_name) = js_new_expression_constructor_name(node, source) {
-                    edges.push(ManualEdgeSpec {
-                        source_name,
-                        target_name,
-                        kind: EdgeKind::CALL,
-                        line,
-                    });
+                    edges.push((
+                        ManualEdgeSpec {
+                            source_name,
+                            target_name,
+                            kind: EdgeKind::CALL,
+                            line,
+                        },
+                        source_span,
+                    ));
                 }
             }
             "call_expression" => {
@@ -7575,12 +7599,15 @@ fn collect_javascript_static_call_edges(tree: &Tree, source: &str) -> Vec<Manual
                     return;
                 }
                 if let Some(target_name) = js_member_object_identifier(function_node, source) {
-                    edges.push(ManualEdgeSpec {
-                        source_name,
-                        target_name,
-                        kind: EdgeKind::CALL,
-                        line,
-                    });
+                    edges.push((
+                        ManualEdgeSpec {
+                            source_name,
+                            target_name,
+                            kind: EdgeKind::CALL,
+                            line,
+                        },
+                        source_span,
+                    ));
                 }
             }
             _ => {}
@@ -8731,6 +8758,9 @@ where
     let mut matches = nodes
         .values()
         .filter(|node| predicate(node.kind))
+        // A property name is neither a lexical target nor an exact body-owner
+        // witness. Property CALL sources are selected by their syntax spans.
+        .filter(|node| !is_script_property_callable(node))
         .filter(|node| {
             node.serialized_name == name
                 || short_member_name(&node.serialized_name) == name
@@ -8751,6 +8781,12 @@ where
             .then_with(|| left.id.cmp(&right.id))
     });
     matches.first().map(|node| node.id)
+}
+
+fn is_script_property_callable(node: &Node) -> bool {
+    node.canonical_id
+        .as_deref()
+        .is_some_and(is_script_property_callable_canonical_id)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8949,26 +8985,46 @@ fn append_manual_usage_edges(
 ) {
     let mut specs = Vec::new();
     if is_tsx_file {
-        specs.extend(collect_tsx_jsx_usage_edges(tree, source));
+        specs.extend(
+            collect_tsx_jsx_usage_edges(tree, source)
+                .into_iter()
+                .map(|(spec, span)| (spec, Some(span))),
+        );
     }
     if is_javascript_like_language(language_name) {
-        specs.extend(collect_javascript_static_call_edges(tree, source));
+        specs.extend(
+            collect_javascript_static_call_edges(tree, source)
+                .into_iter()
+                .map(|(spec, span)| (spec, Some(span))),
+        );
     }
     if language_name == "rust" {
-        specs.extend(collect_rust_macro_call_edges(tree, source));
+        specs.extend(
+            collect_rust_macro_call_edges(tree, source)
+                .into_iter()
+                .map(|spec| (spec, None)),
+        );
     }
     if language_name == "python" {
-        specs.extend(languages::python::decorator_call_specs(tree, source));
+        specs.extend(
+            languages::python::decorator_call_specs(tree, source)
+                .into_iter()
+                .map(|spec| (spec, None)),
+        );
     }
     if language_name == "ruby" {
-        specs.extend(collect_ruby_bare_call_edges(tree, source));
+        specs.extend(
+            collect_ruby_bare_call_edges(tree, source)
+                .into_iter()
+                .map(|spec| (spec, None)),
+        );
     }
     if specs.is_empty() {
         return;
     }
 
-    for spec in specs {
-        let Some(source_id) = unique_node_id_by_name(unique_nodes, &spec.source_name, |kind| {
+    for (spec, source_span) in specs {
+        let source_kind = |kind| {
             if language_name == "python" {
                 matches!(
                     kind,
@@ -8977,7 +9033,14 @@ fn append_manual_usage_edges(
             } else {
                 matches!(kind, NodeKind::FUNCTION | NodeKind::METHOD)
             }
-        }) else {
+        };
+        let source_id = match source_span {
+            Some(span) => {
+                node_id_by_name_and_span(unique_nodes, &spec.source_name, span, source_kind)
+            }
+            None => unique_node_id_by_name(unique_nodes, &spec.source_name, source_kind),
+        };
+        let Some(source_id) = source_id else {
             continue;
         };
         let target_id = match spec.kind {
@@ -10562,7 +10625,9 @@ impl PreparedMemberTargetIndex {
             let Some(target) = nodes.get(&edge.target) else {
                 continue;
             };
-            if !matches!(target.kind, NodeKind::FUNCTION | NodeKind::METHOD) {
+            if !matches!(target.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                || is_script_property_callable(target)
+            {
                 continue;
             }
             let prepared = PreparedMemberTarget {
@@ -11884,7 +11949,7 @@ fn canonical_node_ordinals(
     nodes: &[Node],
     canonical_roles: &HashMap<NodeId, CanonicalNodeRole>,
 ) -> HashMap<NodeId, usize> {
-    let mut nodes_by_name: HashMap<String, Vec<&Node>> = HashMap::new();
+    let mut nodes_by_name: HashMap<(bool, String), Vec<&Node>> = HashMap::new();
     for node in nodes {
         if preserved_canonical_id(node).is_some() || !node_needs_declaration_ordinal(node) {
             continue;
@@ -11893,7 +11958,11 @@ fn canonical_node_ordinals(
             .qualified_name
             .clone()
             .unwrap_or_else(|| node.serialized_name.clone());
-        nodes_by_name.entry(qualified_name).or_default().push(node);
+        // Property declarations must not consume ordinary lexical ordinals.
+        nodes_by_name
+            .entry((is_script_property_callable(node), qualified_name))
+            .or_default()
+            .push(node);
     }
     let mut ordinals = HashMap::new();
     for nodes in nodes_by_name.values_mut() {
@@ -11953,17 +12022,29 @@ fn canonicalize_nodes_with_file_identity(
                 } else {
                     // Cached nodes retain their role-ordered ordinal even though
                     // the cache does not retain the extraction role map.
-                    let cached_rust_ordinal = (language_name == "rust"
-                        && node.canonical_id.as_deref().is_some_and(|id| {
-                            id.starts_with(RUST_ORDINAL_CANONICAL_ID_PREFIX)
-                        }))
-                    .then(|| canonical_declaration_ordinal(&node))
-                    .flatten();
-                    let ordinal = cached_rust_ordinal
+                    let property_callable = is_script_property_callable(&node);
+                    let assigned_namespace = node.canonical_id.as_deref()
+                        .map(source_ordinal_canonical_id_parts)
+                        .map_or("", |(namespace, _)| namespace);
+                    let assigned_script_ordinal = assigned_namespace == SCRIPT_ORDINAL_CANONICAL_ID_PREFIX;
+                    let cached_ordinal = if language_name == "rust"
+                        && assigned_namespace == RUST_ORDINAL_CANONICAL_ID_PREFIX
+                    {
+                        canonical_declaration_ordinal(&node)
+                    } else if canonical_roles.is_empty() && (property_callable || assigned_script_ordinal) {
+                        assigned_source_declaration_ordinal(&node)
+                    } else {
+                        None
+                    };
+                    let ordinal = cached_ordinal
                         .or_else(|| ordinals_by_node.get(&node.id).copied())
                         .unwrap_or(0);
-                    let prefix = if language_name == "rust" {
+                    let prefix = if property_callable {
+                        SCRIPT_PROPERTY_CALLABLE_CANONICAL_ID_PREFIX
+                    } else if language_name == "rust" {
                         RUST_ORDINAL_CANONICAL_ID_PREFIX
+                    } else if assigned_script_ordinal || is_javascript_like_language(language_name) {
+                        SCRIPT_ORDINAL_CANONICAL_ID_PREFIX
                     } else {
                         ""
                     };
@@ -12196,6 +12277,20 @@ fn canonical_declaration_ordinal(node: &Node) -> Option<usize> {
         .1
         .parse()
         .ok()
+}
+
+fn assigned_source_declaration_ordinal(node: &Node) -> Option<usize> {
+    let (namespace, key) = source_ordinal_canonical_id_parts(node.canonical_id.as_deref()?);
+    if namespace.is_empty() {
+        return None;
+    }
+    let (path_and_name, ordinal) = key.rsplit_once(DECLARATION_ORDINAL_SEPARATOR)?;
+    let name = node
+        .qualified_name
+        .as_deref()
+        .unwrap_or(&node.serialized_name);
+    path_and_name.ends_with(&format!(":{name}")).then_some(())?;
+    ordinal.parse().ok()
 }
 
 fn should_replace_reference_candidate(candidate: &Node, current: &Node) -> bool {
@@ -13088,6 +13183,7 @@ fn index_template_file(
         &local_storage.edges,
         &local_storage.occurrences,
     );
+    add_current_file_extraction_identities(&mut local_storage);
     Ok(local_storage)
 }
 
@@ -15465,7 +15561,11 @@ fn find_framework_route_handler(
     }
     let matches = nodes
         .values()
-        .filter(|node| is_callable_kind(node.kind) && node_matches_name(node, terminal))
+        .filter(|node| {
+            is_callable_kind(node.kind)
+                && !is_script_property_callable(node)
+                && node_matches_name(node, terminal)
+        })
         .collect::<Vec<_>>();
     let mut same_file_matches = matches
         .iter()
@@ -15507,6 +15607,7 @@ fn find_registered_tauri_command_function(
         .values()
         .filter(|node| {
             is_callable_kind(node.kind)
+                && !is_script_property_callable(node)
                 && !node
                     .canonical_id
                     .as_deref()
@@ -16671,6 +16772,7 @@ fn index_file_with_resolution_inputs(
         let mut access_kind: Option<AccessKind> = None;
         let mut canonical_role = CanonicalNodeRole::Unspecified;
         let mut rust_impl_expr = false;
+        let mut script_property_callable = false;
 
         for (attr, val) in node_data.attributes.iter() {
             match attr.as_str() {
@@ -16691,6 +16793,7 @@ fn index_file_with_resolution_inputs(
                     }
                 }
                 "rust_impl_expr" => rust_impl_expr = true,
+                "script_property_callable" => script_property_callable = true,
                 _ => {}
             }
         }
@@ -16737,6 +16840,10 @@ fn index_file_with_resolution_inputs(
 
         if !kind_str.is_empty() && !name_str.is_empty() {
             let mut kind = node_kind_from_graph_kind(kind_str.as_str());
+            let script_property_callable = script_property_callable
+                && matches!(language_config.language_name, "javascript" | "typescript")
+                && kind == NodeKind::METHOD
+                && canonical_role == CanonicalNodeRole::Definition;
             if language_config.language_name == "python"
                 && kind == NodeKind::VARIABLE
                 && languages::python::is_constant_name(&name_str)
@@ -16810,7 +16917,8 @@ fn index_file_with_resolution_inputs(
                 token_line: start_line,
                 token_col: start_col_1,
             };
-            if span_policy == NodeSpanPolicy::Definition
+            if !script_property_callable
+                && span_policy == NodeSpanPolicy::Definition
                 && let Some(definition) =
                     tag_definitions.take(&name_str, start_line, Some(start_col_1))
             {
@@ -16832,7 +16940,8 @@ fn index_file_with_resolution_inputs(
                     end_col_1 = end_col_1.max(definition.end_col);
                 }
             }
-            if span_policy == NodeSpanPolicy::Definition
+            if !script_property_callable
+                && span_policy == NodeSpanPolicy::Definition
                 && let Some(override_span) = declaration_span_overrides.get(&declaration_span_key)
             {
                 start_line = override_span.start_line;
@@ -16849,6 +16958,11 @@ fn index_file_with_resolution_inputs(
                 format!("{}:{}:{}:{}", file_name, name_str, start_line, start_col_1)
             } else {
                 format!("{}:{}:{}", file_name, name_str, start_line)
+            };
+            let canonical_seed = if script_property_callable {
+                format!("{SCRIPT_PROPERTY_CALLABLE_CANONICAL_ID_PREFIX}{canonical_seed}")
+            } else {
+                canonical_seed
             };
             let nid = NodeId(generate_id(&canonical_seed));
             graph_to_node_id.insert(node_id, nid);
@@ -16921,6 +17035,7 @@ fn index_file_with_resolution_inputs(
                     kind,
                     serialized_name: name_str,
                     qualified_name: qualified_name_override,
+                    canonical_id: script_property_callable.then_some(canonical_seed),
                     start_line: Some(start_line),
                     start_col: Some(start_col_1),
                     end_line: Some(end_line_1),

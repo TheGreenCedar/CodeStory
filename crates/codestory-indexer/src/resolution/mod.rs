@@ -13,7 +13,10 @@ use crate::semantic::{
     detect_resolver_language as semantic_detect_resolver_language,
 };
 use anyhow::Result;
-use codestory_contracts::graph::{EdgeKind, NodeKind, ResolutionCertainty};
+use codestory_contracts::graph::{
+    EdgeKind, NodeKind, ResolutionCertainty, SCRIPT_PROPERTY_CALLABLE_CANONICAL_ID_PREFIX,
+    is_script_property_callable_canonical_id,
+};
 use codestory_store::{StorageError, Store as Storage};
 use rayon::prelude::*;
 #[cfg(test)]
@@ -2410,16 +2413,22 @@ impl PreparedResolutionState {
         telemetry.import_candidate_index_ms = duration_ms_u64(import_candidate_started.elapsed());
 
         let (call_semantic_index, import_semantic_index) = if flags.enable_semantic {
+            let property_callable_ids = CandidateIndex::load_script_property_callable_ids(conn)?;
             let call_semantic_started = Instant::now();
-            let call_semantic_index =
-                SemanticCandidateIndex::load(conn, semantic_candidate_kinds(EdgeKind::CALL))?;
+            let call_semantic_index = SemanticCandidateIndex::load_excluding(
+                conn,
+                semantic_candidate_kinds(EdgeKind::CALL),
+                &property_callable_ids,
+            )?;
             telemetry.call_semantic_index_ms = duration_ms_u64(call_semantic_started.elapsed());
 
             let import_semantic_started = Instant::now();
+            let mut import_excluded_ids = import_occurrence_node_ids.clone();
+            import_excluded_ids.extend(property_callable_ids);
             let import_semantic_index = SemanticCandidateIndex::load_excluding(
                 conn,
                 semantic_candidate_kinds(EdgeKind::IMPORT),
-                &import_occurrence_node_ids,
+                &import_excluded_ids,
             )?;
             telemetry.import_semantic_index_ms = duration_ms_u64(import_semantic_started.elapsed());
             (call_semantic_index, import_semantic_index)
@@ -2623,7 +2632,7 @@ impl CandidateIndex {
         let rebound_method_ids = Self::load_rebound_python_method_ids(conn)?;
         let kind_clause = kind_clause(kinds);
         let query = format!(
-            "SELECT n.id, n.file_node_id, n.kind, n.serialized_name, n.qualified_name, file_node.serialized_name
+            "SELECT n.id, n.file_node_id, n.kind, n.serialized_name, n.qualified_name, file_node.serialized_name, n.canonical_id
              FROM node n
              LEFT JOIN node file_node ON file_node.id = n.file_node_id
              WHERE n.kind IN ({})
@@ -2635,28 +2644,46 @@ impl CandidateIndex {
             let serialized_name: String = row.get(3)?;
             let file_path: Option<String> = row.get(5)?;
             let id = row.get(0)?;
-            Ok(CandidateNode {
-                id,
-                file_node_id: row.get(1)?,
-                kind: row.get(2)?,
-                normalized_file_path: file_path.as_deref().and_then(normalize_resolution_path),
-                file_path,
-                serialized_name_ascii_lower: serialized_name.to_ascii_lowercase(),
-                serialized_name,
-                qualified_name: row.get(4)?,
-                is_declaration: !reference_node_ids.contains(&id),
-            })
+            let canonical_id: Option<String> = row.get(6)?;
+            Ok((
+                CandidateNode {
+                    id,
+                    file_node_id: row.get(1)?,
+                    kind: row.get(2)?,
+                    normalized_file_path: file_path.as_deref().and_then(normalize_resolution_path),
+                    file_path,
+                    serialized_name_ascii_lower: serialized_name.to_ascii_lowercase(),
+                    serialized_name,
+                    qualified_name: row.get(4)?,
+                    is_declaration: !reference_node_ids.contains(&id),
+                },
+                canonical_id,
+            ))
         })?;
 
         let mut nodes = Vec::new();
         for row in rows {
-            let node = row?;
-            if !rebound_method_ids.contains(&node.id) {
+            let (node, canonical_id) = row?;
+            if !rebound_method_ids.contains(&node.id)
+                && !canonical_id
+                    .as_deref()
+                    .is_some_and(is_script_property_callable_canonical_id)
+            {
                 nodes.push(node);
             }
         }
 
         Ok(nodes)
+    }
+
+    fn load_script_property_callable_ids(conn: &rusqlite::Connection) -> Result<HashSet<i64>> {
+        let mut stmt =
+            conn.prepare("SELECT id FROM node WHERE substr(canonical_id, 1, length(?1)) = ?1")?;
+        let rows = stmt.query_map(
+            params![SCRIPT_PROPERTY_CALLABLE_CANONICAL_ID_PREFIX],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(rows.collect::<rusqlite::Result<HashSet<_>>>()?)
     }
 
     fn load_rebound_python_method_ids(conn: &rusqlite::Connection) -> Result<HashSet<i64>> {

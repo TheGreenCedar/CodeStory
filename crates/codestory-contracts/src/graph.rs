@@ -22,6 +22,35 @@ pub const STRUCTURAL_COLLECTION_CANONICAL_ID_PREFIXES: &[&str] = &["payload:coll
 /// duplicate declaration captures. Legacy ordinals must never alias these keys.
 pub const RUST_ORDINAL_CANONICAL_ID_PREFIX: &str = "rust-ordinal-v2:";
 
+/// Role-ordered JavaScript/TypeScript identities, including embedded template
+/// scripts. Legacy ordinals could be reassigned by roleless remapping and must
+/// never alias these declaration/reference keys.
+pub const SCRIPT_ORDINAL_CANONICAL_ID_PREFIX: &str = "script-ordinal-v1:";
+
+/// Source identity domain for static JavaScript/TypeScript object-property
+/// callables. These declarations own their bodies but introduce no lexical
+/// function binding. Their authored names remain in the ordinary name fields.
+pub const SCRIPT_PROPERTY_CALLABLE_CANONICAL_ID_PREFIX: &str = "script-property-callable-v1:";
+
+pub fn is_script_property_callable_canonical_id(canonical_id: &str) -> bool {
+    canonical_id.starts_with(SCRIPT_PROPERTY_CALLABLE_CANONICAL_ID_PREFIX)
+}
+
+/// Split a source-ordinal identity's declared namespace from its path/name key.
+/// Unknown namespaces retain the existing unprefixed interpretation.
+pub fn source_ordinal_canonical_id_parts(canonical_id: &str) -> (&str, &str) {
+    for prefix in [
+        RUST_ORDINAL_CANONICAL_ID_PREFIX,
+        SCRIPT_ORDINAL_CANONICAL_ID_PREFIX,
+        SCRIPT_PROPERTY_CALLABLE_CANONICAL_ID_PREFIX,
+    ] {
+        if let Some(key) = canonical_id.strip_prefix(prefix) {
+            return (prefix, key);
+        }
+    }
+    ("", canonical_id)
+}
+
 pub mod access;
 pub mod definition;
 pub mod error;

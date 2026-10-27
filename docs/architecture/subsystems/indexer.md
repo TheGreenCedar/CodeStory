@@ -64,6 +64,17 @@ collected against the inner function before that displayed range is expanded.
 Decorator callee references remain graph nodes but cannot act as lexical
 callers for argument expressions; canonical declarations, including one-line
 functions, remain eligible owners.
+
+JavaScript and TypeScript functions assigned to static identifier-keyed object
+properties own their source bodies without introducing lexical function
+bindings. Their identities use a separate property-callable namespace; ordinary
+script declarations and references use a versioned, role-ordered namespace.
+Cache replay and embedded-template remapping preserve assigned ordinals while
+rebasing paths. Legacy identifiers cannot alias the new identities, and bookmark
+migration retains the store's existing source-evidence requirements. Extraction
+revisions refresh existing JavaScript, TypeScript, TSX, Vue, Svelte and Astro
+files through the normal runtime refresh path.
+
 Rust struct and enum display ranges include their fields, variants and attached
 outer attributes. These ranges expand after precise name occurrences, stable
 type identities and call ownership have been collected; enum variants keep

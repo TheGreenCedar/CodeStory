@@ -23132,3 +23132,509 @@ fn test_go_implicit_import_must_use_declared_package_name() -> anyhow::Result<()
     assert_unresolved_go_package_call(&nodes, &edges, "Caller", "Target");
     Ok(())
 }
+
+#[test]
+fn test_static_object_property_callable_owners_preserve_source_identity() -> anyhow::Result<()> {
+    let mut cases = Vec::new();
+    for extension in ["js", "ts", "tsx"] {
+        for (name, head) in [
+            ("pair function", "function ()"),
+            ("pair async function", "async function ()"),
+            ("pair arrow", "() =>"),
+            ("pair async arrow", "async () =>"),
+            ("pair generator", "function* ()"),
+        ] {
+            cases.push((
+                format!("owner.{extension}"), name,
+                format!("function target() {{}}\nexport default {{\n  request: {head} {{\n    target();\n  }},\n}};\n"),
+                vec![("request", 3, 12, 5, 4, 4)], Vec::new(), false,
+            ));
+        }
+        cases.push((
+            format!("owner.{extension}"), "shorthand method control",
+            "function target() {}\nexport default {\n  async request() {\n    target();\n  },\n};\n".to_string(),
+            vec![("request", 3, 3, 5, 4, 4)], Vec::new(), false,
+        ));
+        cases.push((
+            format!("owner.{extension}"),
+            "member assignment control",
+            "function target() {}\nconst api = {};\napi.request = function () {\n  target();\n};\n"
+                .to_string(),
+            vec![("request", 3, 15, 5, 2, 4)],
+            Vec::new(),
+            false,
+        ));
+        cases.push((
+            format!("owner.{extension}"), "separate objects private name and free call",
+            "function target() {}\nfunction inner() {}\nfunction request() { target(); }\nconst first = {\n  request: function inner() {\n    inner();\n    target();\n  },\n};\nconst second = {\n  request: () => {\n    target();\n  },\n};\nfunction run() { request(); }\n".to_string(),
+            vec![("request", 3, 1, 3, 33, 3), ("request", 5, 12, 8, 4, 7), ("request", 11, 12, 13, 4, 12)],
+            Vec::new(), true,
+        ));
+        cases.push((
+            format!("owner.{extension}"), "dynamic property and unrelated callback never borrow outer owner",
+            "function target() {}\nfunction outer() {\n  const api = {\n    [key]: function () {\n      target();\n    },\n  };\n  [1].forEach(function () {\n    target();\n  });\n}\n".to_string(),
+            Vec::new(), vec![(5, 4, 12, 6, 6), (9, 8, 15, 10, 4)], false,
+        ));
+    }
+    cases.push((
+        "Owner.vue".to_string(), "admitted Vue JavaScript script through template blanking",
+        "<template><button /></template>\n<script>\nfunction target() {}\nexport default {\n  methods: {\n    request: async function () {\n      target();\n    },\n  },\n};\n</script>\n".to_string(),
+        vec![("request", 6, 14, 8, 6, 7)], Vec::new(), false,
+    ));
+
+    let mut failures = Vec::new();
+    for (filename, case_name, source, owners, anonymous_calls, check_lexical_binding) in cases {
+        let outcome = std::panic::catch_unwind(|| -> anyhow::Result<()> {
+            let (nodes, edges) = index_single_file(&filename, &source)?;
+            let by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+            let target = nodes
+                .iter()
+                .find(|node| {
+                    matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                        && node.serialized_name == "target"
+                })
+                .expect("ordinary target declaration must remain represented");
+            let mut owner_ids = HashSet::new();
+            for (name, start_line, start_col, end_line, end_col, call_line) in &owners {
+                let found = nodes
+                    .iter()
+                    .filter(|node| {
+                        matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                            && is_matching_name(&node.serialized_name, name)
+                            && (node.start_line, node.start_col, node.end_line, node.end_col)
+                                == (
+                                    Some(*start_line),
+                                    Some(*start_col),
+                                    Some(*end_line),
+                                    Some(*end_col),
+                                )
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    found.len(),
+                    1,
+                    "{filename}/{case_name}: missing or ambiguous {name} at {start_line}:{start_col}-{end_line}:{end_col}. Nodes: {nodes:#?}"
+                );
+                let owner = found[0];
+                assert!(
+                    owner_ids.insert(owner.id),
+                    "distinct source declarations shared one ID"
+                );
+                assert!(
+                    snippet_for_node(&source, owner).is_some_and(|body| body.contains("target();")),
+                    "{filename}/{case_name}: callable span lost its body"
+                );
+                let column = source
+                    .lines()
+                    .nth(*call_line as usize - 1)
+                    .and_then(|line| line.find("target("))
+                    .expect("fixture target call") as u32
+                    + 1;
+                let calls = edges
+                    .iter()
+                    .filter(|edge| {
+                        edge.kind == EdgeKind::CALL
+                            && edge.line == Some(*call_line)
+                            && edge
+                                .callsite_identity
+                                .as_deref()
+                                .and_then(parse_canonical_callsite_identity)
+                                .is_some_and(|identity| identity.column_or_ordinal == column)
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    calls.len(),
+                    1,
+                    "{filename}/{case_name}: exact callsite missing or duplicated: {:?}",
+                    describe_call_edges(&edges, &nodes)
+                );
+                assert_eq!(
+                    calls[0].source, owner.id,
+                    "{filename}/{case_name}: CALL borrowed another declaration's owner"
+                );
+                assert_eq!(
+                    calls[0].effective_target(),
+                    target.id,
+                    "{filename}/{case_name}: ordinary lexical target changed"
+                );
+            }
+            for (call_line, start_line, start_col, end_line, end_col) in &anonymous_calls {
+                for call in edges
+                    .iter()
+                    .filter(|edge| edge.kind == EdgeKind::CALL && edge.line == Some(*call_line))
+                {
+                    let owner = by_id.get(&call.source).expect("stored source exists");
+                    assert!(matches!(owner.kind, NodeKind::FUNCTION | NodeKind::METHOD));
+                    assert_eq!(
+                        (
+                            owner.start_line,
+                            owner.start_col,
+                            owner.end_line,
+                            owner.end_col
+                        ),
+                        (
+                            Some(*start_line),
+                            Some(*start_col),
+                            Some(*end_line),
+                            Some(*end_col)
+                        ),
+                        "{filename}/{case_name}: unrepresented anonymous callable borrowed an outer owner: {call:#?}"
+                    );
+                }
+            }
+            if !anonymous_calls.is_empty() {
+                assert!(
+                    !nodes.iter().any(|node| {
+                        matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                            && is_matching_name(&node.serialized_name, "key")
+                    }),
+                    "{filename}/{case_name}: computed key was invented as a static callable name"
+                );
+            }
+            if check_lexical_binding {
+                let global_request = nodes
+                    .iter()
+                    .find(|node| {
+                        matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                            && node.serialized_name == "request"
+                            && node.start_line == Some(3)
+                    })
+                    .expect("free request declaration retained");
+                let global_inner = nodes
+                    .iter()
+                    .find(|node| {
+                        matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                            && node.serialized_name == "inner"
+                            && node.start_line == Some(2)
+                    })
+                    .expect("unrelated global inner retained");
+                let free_call = edges
+                    .iter()
+                    .filter(|edge| edge.kind == EdgeKind::CALL && edge.line == Some(15))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    free_call.len(),
+                    1,
+                    "{filename}/{case_name}: free call census"
+                );
+                assert_eq!(
+                    free_call[0].effective_target(),
+                    global_request.id,
+                    "{filename}/{case_name}: object property hijacked or obscured a free lexical call"
+                );
+                assert!(
+                    !nodes.iter().any(|node| {
+                        matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                            && is_matching_name(&node.serialized_name, "inner")
+                            && node.start_line == Some(5)
+                    }),
+                    "{filename}/{case_name}: private expression name leaked as a public declaration"
+                );
+                assert!(
+                    !edges.iter().any(|edge| {
+                        edge.kind == EdgeKind::CALL
+                            && edge.line == Some(6)
+                            && edge.effective_target() == global_inner.id
+                    }),
+                    "{filename}/{case_name}: private recursive call rebound to global inner"
+                );
+            }
+            Ok(())
+        });
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => failures.push(format!("{filename}/{case_name}: {error:#}")),
+            Err(payload) => {
+                let message = payload
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| payload.downcast_ref::<&str>().copied())
+                    .unwrap_or("non-string panic payload");
+                failures.push(format!("{filename}/{case_name}: {message}"));
+            }
+        }
+    }
+    anyhow::ensure!(
+        failures.is_empty(),
+        "{} static object callable fixture(s) failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    Ok(())
+}
+
+#[test]
+fn test_object_property_callable_identity_does_not_shift_ordinary_declarations()
+-> anyhow::Result<()> {
+    for extension in ["js", "ts", "tsx", "vue"] {
+        let root = tempdir()?;
+        let filename = format!("owner.{extension}");
+        let ordinary = "function request() { helper(); }\nfunction helper() {}\nfunction run() { request(); }\n";
+        let baseline = format!("const api = {{}};\n{ordinary}");
+        let added = format!(
+            "const api = {{ request: function () {{ helper(); }} }}; const other = {{ request: () => {{ helper(); }} }};\n{ordinary}"
+        );
+        let wrap = |source: &str| {
+            if extension == "vue" {
+                format!("<script>\n{source}</script>\n")
+            } else {
+                source.to_string()
+            }
+        };
+        let offset = u32::from(extension == "vue");
+        let (before, _) = index_files_at_root(root.path(), &[(&filename, &wrap(&baseline))])?;
+        let (after, edges) = index_files_at_root(root.path(), &[(&filename, &wrap(&added))])?;
+        for (name, line) in [("request", 2), ("helper", 3), ("run", 4)] {
+            let find = |nodes: &[Node]| {
+                nodes
+                    .iter()
+                    .find(|node| {
+                        matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                            && node.serialized_name == name
+                            && node.start_line == Some(line + offset)
+                    })
+                    .cloned()
+                    .expect("ordinary declaration remains represented")
+            };
+            let old = find(&before);
+            let new = find(&after);
+            assert_eq!(
+                (new.id, new.canonical_id),
+                (old.id, old.canonical_id),
+                "{extension}: a new same-spelled property shifted ordinary {name} identity"
+            );
+        }
+        let properties = after
+            .iter()
+            .filter(|node| {
+                matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                    && is_matching_name(&node.serialized_name, "request")
+                    && node.start_line == Some(1 + offset)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            properties.len(),
+            2,
+            "{extension}: both property declarations must exist"
+        );
+        assert_ne!(properties[0].id, properties[1].id);
+        assert_ne!(properties[0].canonical_id, properties[1].canonical_id);
+        for property in properties {
+            assert!(property.canonical_id.is_some());
+            assert!(
+                edges
+                    .iter()
+                    .any(|edge| edge.kind == EdgeKind::CALL && edge.source == property.id),
+                "{extension}: a source-distinct property lost its own body CALL"
+            );
+        }
+        let ordinary_request = after
+            .iter()
+            .find(|node| node.serialized_name == "request" && node.start_line == Some(2 + offset))
+            .unwrap();
+        let run = after
+            .iter()
+            .find(|node| node.serialized_name == "run")
+            .unwrap();
+        let calls = edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::CALL && edge.source == run.id)
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].effective_target(),
+            ordinary_request.id,
+            "{extension}: property declarations polluted the ordinary lexical target"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_object_property_callable_target_refresh_preserves_unchanged_imported_caller()
+-> anyhow::Result<()> {
+    for extension in ["js", "ts"] {
+        let root = tempdir()?;
+        let owner_path = root.path().join(format!("owner.{extension}"));
+        let caller_path = root.path().join(format!("caller.{extension}"));
+        fs::write(
+            &caller_path,
+            "import { request } from './owner';\nexport function run() { request(); }\n",
+        )?;
+        let ordinary =
+            "const api = {};\nexport function request() { helper(); }\nfunction helper() {}\n";
+        let added = "const api = { request: function () { helper(); } };\nexport function request() { helper(); }\nfunction helper() {}\n";
+        let property_only = "const api = { request: function () { helper(); } };\nfunction helper() {}\nexport default api;\n";
+        let mut store = Storage::new_in_memory()?;
+        let indexer = WorkspaceIndexer::new(root.path().to_path_buf());
+        let mut original_target = None;
+        let mut original_caller = None;
+        for (phase, source, resolves, warm) in [
+            ("ordinary", ordinary, true, false),
+            ("property added in target only", added, true, false),
+            ("warm target with property", added, true, true),
+            (
+                "ordinary export removed from target only",
+                property_only,
+                false,
+                false,
+            ),
+            ("warm property-only target", property_only, false, true),
+        ] {
+            fs::write(&owner_path, source)?;
+            let first = original_target.is_none();
+            let refresh = codestory_workspace::RefreshInfo {
+                mode: codestory_workspace::BuildMode::Incremental,
+                files_to_index: if first {
+                    vec![owner_path.clone(), caller_path.clone()]
+                } else {
+                    vec![owner_path.clone()]
+                },
+                files_to_remove: vec![],
+                existing_file_ids: store
+                    .get_files()?
+                    .into_iter()
+                    .map(|file| (file.path, file.id))
+                    .collect(),
+            };
+            let stats = indexer.run_incremental(&mut store, &refresh, &EventBus::new(), None)?;
+            assert!(
+                store.get_errors(None)?.is_empty(),
+                "{extension}/{phase}: indexing errors"
+            );
+            if warm {
+                assert_eq!(
+                    stats.artifact_cache_hits, 1,
+                    "{extension}/{phase}: actual warm parser artifact replay"
+                );
+            }
+            let nodes = store.get_nodes()?;
+            let edges = store.get_edges()?;
+            let run = nodes
+                .iter()
+                .find(|node| {
+                    node.serialized_name == "run"
+                        && matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                })
+                .unwrap();
+            if let Some(id) = original_caller {
+                assert_eq!(run.id, id, "unchanged caller identity");
+            } else {
+                original_caller = Some(run.id);
+            }
+            let calls = edges
+                .iter()
+                .filter(|edge| edge.kind == EdgeKind::CALL && edge.source == run.id)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                calls.len(),
+                1,
+                "{extension}/{phase}: caller must retain its CALL placeholder or target"
+            );
+            if resolves {
+                let target = nodes
+                    .iter()
+                    .find(|node| {
+                        node.serialized_name == "request"
+                            && node.start_line == Some(2)
+                            && matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                    })
+                    .unwrap();
+                if let Some((id, canonical)) = original_target.as_ref() {
+                    assert_eq!((target.id, &target.canonical_id), (*id, canonical));
+                } else {
+                    original_target = Some((target.id, target.canonical_id.clone()));
+                }
+                assert_eq!(
+                    calls[0].effective_target(),
+                    target.id,
+                    "{extension}/{phase}: property hijacked imported named export"
+                );
+            } else {
+                let property = nodes
+                    .iter()
+                    .find(|node| {
+                        is_matching_name(&node.serialized_name, "request")
+                            && node.start_line == Some(1)
+                            && matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                    })
+                    .expect("retained property declaration");
+                assert_ne!(
+                    calls[0].effective_target(),
+                    property.id,
+                    "{extension}/{phase}: missing named export rebound to object property"
+                );
+                assert_eq!(
+                    calls[0].resolved_target, None,
+                    "{extension}/{phase}: stale ordinary target survived refresh"
+                );
+                assert!(
+                    !nodes
+                        .iter()
+                        .any(|node| Some(node.id) == original_target.as_ref().map(|(id, _)| *id))
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_object_property_callable_owns_qualified_member_call_without_inventing_dispatch()
+-> anyhow::Result<()> {
+    for extension in ["js", "ts", "tsx", "vue"] {
+        let script = "function remove() {}\nexport default {\n  request: async function () {\n    await api.share.remove();\n  },\n};\n";
+        let source = if extension == "vue" {
+            format!("<script>\n{script}</script>\n")
+        } else {
+            script.to_string()
+        };
+        let offset = u32::from(extension == "vue");
+        let (nodes, edges) = index_single_file(&format!("Share.{extension}"), &source)?;
+        let owner = nodes
+            .iter()
+            .find(|node| {
+                matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                    && is_matching_name(&node.serialized_name, "request")
+                    && (node.start_line, node.start_col, node.end_line, node.end_col)
+                        == (Some(3 + offset), Some(12), Some(5 + offset), Some(4))
+            })
+            .expect("property function expression owns its exact source span");
+        let calls = edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::CALL && edge.line == Some(4 + offset))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            calls.len(),
+            1,
+            "{extension}: qualified body call must remain stored"
+        );
+        let call = calls[0];
+        assert_eq!(
+            call.source, owner.id,
+            "{extension}: qualified CALL source owner"
+        );
+        let raw_target = nodes.iter().find(|node| node.id == call.target).unwrap();
+        assert_eq!(raw_target.kind, NodeKind::UNKNOWN);
+        assert_eq!(raw_target.serialized_name, "remove");
+        assert_eq!(
+            (raw_target.start_line, raw_target.start_col),
+            (Some(4 + offset), Some(21))
+        );
+        let identity = call
+            .callsite_identity
+            .as_deref()
+            .and_then(parse_canonical_callsite_identity)
+            .expect("qualified CALL identity");
+        assert_eq!(
+            (identity.line, identity.column_or_ordinal),
+            (4 + offset, 21)
+        );
+        assert_eq!(
+            call.resolved_target, None,
+            "{extension}: unknown receiver must not resolve to same-spelled free remove"
+        );
+        assert_ne!(call.certainty, Some(ResolutionCertainty::Certain));
+    }
+    Ok(())
+}

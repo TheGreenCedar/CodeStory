@@ -37,7 +37,7 @@
 //! has to identify code on its own, and an `outline` signature (a callable
 //! whose body projected nothing, leaving only kind and line count) cannot.
 
-use codestory_contracts::graph::RUST_ORDINAL_CANONICAL_ID_PREFIX;
+use codestory_contracts::graph::source_ordinal_canonical_id_parts;
 use serde::{Deserialize, Serialize};
 
 use crate::annotations::AnnotationBookmark;
@@ -271,15 +271,19 @@ pub fn resolve_bookmark(
 
     match unique_candidate(index.candidates_by_anchor_tuple(file_identity, qualified_name, kind)?) {
         CandidateSet::Unique(candidate) => {
-            let enters_rust_epoch = candidate
+            let candidate_epoch = candidate
                 .canonical_id
                 .as_deref()
-                .is_some_and(|id| id.starts_with(RUST_ORDINAL_CANONICAL_ID_PREFIX))
-                && !bookmark
-                    .canonical_id
-                    .as_deref()
-                    .is_some_and(|id| id.starts_with(RUST_ORDINAL_CANONICAL_ID_PREFIX));
-            if enters_rust_epoch {
+                .map(source_ordinal_canonical_id_parts)
+                .map_or("", |(epoch, _)| epoch);
+            let bookmark_epoch = bookmark
+                .canonical_id
+                .as_deref()
+                .map(source_ordinal_canonical_id_parts)
+                .map_or("", |(epoch, _)| epoch);
+            let enters_source_epoch =
+                !candidate_epoch.is_empty() && candidate_epoch != bookmark_epoch;
+            if enters_source_epoch {
                 let discrimination = bookmark
                     .last_known_evidence
                     .as_ref()

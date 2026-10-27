@@ -687,7 +687,7 @@ mod extraction_identity_tests {
             }
         }
         flush(&mut store, &previous);
-        assert_eq!(retry_ids(&store), HashSet::from([4, 5]));
+        assert_eq!(retry_ids(&store), HashSet::from([4, 5, 6]));
         flush(&mut store, &identities);
         assert!(retry_ids(&store).is_empty());
         store
@@ -707,5 +707,92 @@ mod extraction_identity_tests {
             )
             .unwrap();
         assert_eq!(retry_ids(&store), HashSet::from([2]));
+    }
+
+    #[test]
+    fn real_template_extraction_identity_requeues_unchanged_sources_without_a_refresh_loop() {
+        for (extension, source) in [
+            (
+                "vue",
+                "<template><button /></template>\n<script>\nfunction run() { helper(); }\nfunction helper() {}\n</script>\n",
+            ),
+            (
+                "svelte",
+                "<script>\nfunction run() { helper(); }\nfunction helper() {}\n</script>\n<button />\n",
+            ),
+            (
+                "astro",
+                "---\nfunction run() { helper(); }\nfunction helper() {}\n---\n<button />\n",
+            ),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join(format!("Page.{extension}"));
+            std::fs::write(&path, source).unwrap();
+            let mut store = Store::new_in_memory().unwrap();
+            let indexer = codestory_indexer::WorkspaceIndexer::new(root.path().to_path_buf());
+            let reindex = |store: &mut Store| {
+                indexer
+                    .run_incremental(
+                        store,
+                        &codestory_workspace::RefreshInfo {
+                            mode: codestory_workspace::BuildMode::Incremental,
+                            files_to_index: vec![path.clone()],
+                            files_to_remove: vec![],
+                            existing_file_ids: HashMap::new(),
+                        },
+                        &codestory_contracts::events::EventBus::new(),
+                        None,
+                    )
+                    .unwrap();
+            };
+            reindex(&mut store);
+            let file = store
+                .get_file_by_path(&path)
+                .unwrap()
+                .expect("real template indexed");
+            let revision = codestory_indexer::current_file_extraction_revision(&file.language)
+                .expect("admitted template surface has an extraction revision");
+            assert!(
+                store
+                    .file_extraction_identity_matches(file.id, &file.language, revision)
+                    .unwrap(),
+                "{extension}: actual template publication must stamp current extraction identity"
+            );
+            let retries = |store: &Store| {
+                workspace_refresh_inputs(store)
+                    .unwrap()
+                    .stored_files
+                    .into_iter()
+                    .filter(|file| file.retry_required)
+                    .map(|file| file.id)
+                    .collect::<HashSet<_>>()
+            };
+            assert!(
+                retries(&store).is_empty(),
+                "{extension}: current source must start clean"
+            );
+            for mutation in [
+                "DELETE FROM file_extraction_identity",
+                "UPDATE file_extraction_identity SET extraction_revision = 'legacy-template-extraction'",
+            ] {
+                store.get_connection().execute_batch(mutation).unwrap();
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+                assert_eq!(
+                    retries(&store),
+                    HashSet::from([file.id]),
+                    "{extension}: unchanged template with missing/old extraction identity must be selected for refresh"
+                );
+                reindex(&mut store);
+                assert!(
+                    store
+                        .file_extraction_identity_matches(file.id, &file.language, revision)
+                        .unwrap()
+                );
+                assert!(
+                    retries(&store).is_empty(),
+                    "{extension}: successful unchanged reindex must clear extraction retry"
+                );
+            }
+        }
     }
 }

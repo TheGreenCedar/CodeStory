@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- JavaScript and TypeScript navigation recognizes functions stored in named object properties and keeps calls attached to the right source body, including scripts embedded in templates.
+
+- JavaScript and TypeScript source links stay stable across cached indexing and template refreshes. Existing indexes refresh automatically. Old links are rejected rather than silently redirected; bookmarks move only when source evidence supports the match, and unmatched bookmarks keep their notes.
+
 - Python navigation avoids links to methods that class code replaces or removes, and leaves object types unresolved when they depend only on a conditionally defined factory.
 
 - Packets leave more room for source evidence by skipping indexed whole files that cannot fit the response, while retaining navigation and clear limits.
