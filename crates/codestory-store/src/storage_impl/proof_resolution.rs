@@ -5765,7 +5765,7 @@ fn record_publication_sort(dependency_list: bool, elements: usize) {
 }
 
 #[cfg(test)]
-mod publication_order_tests {
+mod tests {
     use super::*;
     use codestory_contracts::graph::{Node, NodeId, NodeKind};
 
