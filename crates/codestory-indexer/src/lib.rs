@@ -9374,6 +9374,34 @@ fn append_manual_receiver_call_edges(
         );
     }
 
+    let rebound_methods = (language_name == "python")
+        .then(|| languages::python::rebound_class_method_spans(tree, source));
+    if let Some(rebound_methods) = rebound_methods.as_ref() {
+        for edge in result_edges.iter_mut() {
+            if edge.kind == EdgeKind::MEMBER
+                && unique_nodes.get(&edge.target).is_some_and(|target| {
+                    rebound_methods.contains(&GraphNodeSpan {
+                        start_line: target.start_line.unwrap_or(0),
+                        start_col: target.start_col.unwrap_or(0),
+                        end_line: target.end_line.unwrap_or(0),
+                        end_col: target.end_col.unwrap_or(0),
+                    })
+                })
+            {
+                let marker = languages::python::REBOUND_CLASS_METHOD_MEMBER_MARKER;
+                match edge.callsite_identity.as_mut() {
+                    Some(identity) => {
+                        if !identity.split('|').any(|part| part == marker) {
+                            identity.push('|');
+                            identity.push_str(marker);
+                        }
+                    }
+                    None => edge.callsite_identity = Some(marker.to_string()),
+                }
+            }
+        }
+    }
+
     let context_manager_alias_callsites = if language_name == "python" {
         languages::python::context_manager_alias_callsites(tree, source)
     } else {
@@ -10522,6 +10550,13 @@ impl PreparedMemberTargetIndex {
         for edge in edges {
             count_manual_receiver_lookup_work(1);
             if edge.kind != EdgeKind::MEMBER {
+                continue;
+            }
+            if edge.callsite_identity.as_deref().is_some_and(|identity| {
+                identity
+                    .split('|')
+                    .any(|part| part == languages::python::REBOUND_CLASS_METHOD_MEMBER_MARKER)
+            }) {
                 continue;
             }
             let Some(target) = nodes.get(&edge.target) else {

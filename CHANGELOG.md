@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Python navigation avoids links to methods that class code replaces or removes, and leaves object types unresolved when they depend only on a conditionally defined factory.
+
 - Packets leave more room for source evidence by skipping indexed whole files that cannot fit the response, while retaining navigation and clear limits.
 
 - Go reference navigation includes statically resolved function and method values, including handlers passed to registration functions. These references stay distinct from calls, and existing Go indexes refresh automatically.

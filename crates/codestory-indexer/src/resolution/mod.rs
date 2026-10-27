@@ -2620,6 +2620,7 @@ impl CandidateIndex {
 
     fn load_nodes(conn: &rusqlite::Connection, kinds: &[i32]) -> Result<Vec<CandidateNode>> {
         let reference_node_ids = Self::load_reference_node_ids(conn)?;
+        let rebound_method_ids = Self::load_rebound_python_method_ids(conn)?;
         let kind_clause = kind_clause(kinds);
         let query = format!(
             "SELECT n.id, n.file_node_id, n.kind, n.serialized_name, n.qualified_name, file_node.serialized_name
@@ -2649,10 +2650,39 @@ impl CandidateIndex {
 
         let mut nodes = Vec::new();
         for row in rows {
-            nodes.push(row?);
+            let node = row?;
+            if !rebound_method_ids.contains(&node.id) {
+                nodes.push(node);
+            }
         }
 
         Ok(nodes)
+    }
+
+    fn load_rebound_python_method_ids(conn: &rusqlite::Connection) -> Result<HashSet<i64>> {
+        let has_edges = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'edge')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !has_edges {
+            return Ok(HashSet::new());
+        }
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT target_node_id FROM edge
+             WHERE kind = ?1 AND instr('|' || callsite_identity || '|', ?2) > 0",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                EdgeKind::MEMBER as i32,
+                format!(
+                    "|{}|",
+                    crate::languages::python::REBOUND_CLASS_METHOD_MEMBER_MARKER
+                ),
+            ],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(rows.collect::<rusqlite::Result<HashSet<_>>>()?)
     }
 
     fn load_reference_node_ids(conn: &rusqlite::Connection) -> Result<HashSet<i64>> {

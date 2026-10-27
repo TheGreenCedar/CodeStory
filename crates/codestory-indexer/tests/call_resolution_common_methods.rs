@@ -988,6 +988,642 @@ class Worker:
 }
 
 #[test]
+fn test_python_self_receiver_respects_class_method_bindings() -> anyhow::Result<()> {
+    let cases = [
+        (
+            "normal method",
+            "class C:\n    def update(self):\n        pass\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "unrelated class assignment",
+            "class Other:\n    update = None\nclass C:\n    def update(self):\n        pass\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "method-local assignment",
+            "class C:\n    def update(self):\n        pass\n    def run(self):\n        update = None\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "assignment before final method definition",
+            "class C:\n    update = None\n    def update(self):\n        pass\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "deletion before final method definition",
+            "class C:\n    update = 7\n    del update\n    def update(self):\n        pass\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "unrelated class attribute",
+            "class C:\n    def update(self):\n        pass\n    other = 7\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "annotation without value preserves method",
+            "class C:\n    def update(self):\n        pass\n    update: object\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "nested class write preserves outer method",
+            "class C:\n    def update(self):\n        pass\n    class Inner:\n        def update(self):\n            pass\n        update = 7\n        def inner_run(self):\n            self.update()\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "normal annotated factory receiver",
+            "class C:\n    def update(self):\n        pass\nclass Factory:\n    def make(self) -> C:\n        return C()\n    def run(self):\n        value = self.make()\n        value.update()\n",
+            true,
+            None,
+        ),
+        (
+            "normal imported owner",
+            "class C:\n    def update(self):\n        pass\n",
+            true,
+            Some("from owner import C\ndef run(value: C):\n    value.update()\n"),
+        ),
+        (
+            "repeated method definitions remain unresolved",
+            "class C:\n    def update(self):\n        pass\n    def update(self):\n        pass\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "later lambda replaces method",
+            "class C:\n    def update(self):\n        pass\n    update = lambda self: None\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "later noncallable replaces method",
+            "class C:\n    def update(self):\n        pass\n    update = None\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "class namespace deletion removes method binding",
+            "class C:\n    def update(self):\n        pass\n    del update\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "conditional later write",
+            "class C:\n    def update(self):\n        pass\n    if flag:\n        update = lambda self: None\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "annotation with value replaces method",
+            "class C:\n    def update(self):\n        pass\n    update: object = 7\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "nested class overwritten method",
+            "class C:\n    def update(self):\n        pass\n    class Inner:\n        def update(self):\n            pass\n        update = 7\n        def run(self):\n            self.update()\n    def outer_run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "overwritten factory cannot supply receiver type",
+            "class C:\n    def update(self):\n        pass\nclass Factory:\n    def make(self) -> C:\n        return C()\n    make = lambda self: None\n    def run(self):\n        value = self.make()\n        value.update()\n",
+            false,
+            None,
+        ),
+        (
+            "imported owner overwritten method",
+            "class C:\n    def update(self):\n        pass\n    update = 7\n",
+            false,
+            Some("from owner import C\ndef run(value: C):\n    value.update()\n"),
+        ),
+        (
+            "independent method-local exception alias preserves method",
+            "class C:\n    def update(self):\n        pass\n    def helper(self):\n        try:\n            raise ValueError()\n        except ValueError as update:\n            pass\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "independent exception alias before final method definition",
+            "class C:\n    try:\n        raise ValueError()\n    except ValueError as update:\n        pass\n    def update(self):\n        pass\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "independent exception alias removes final class method binding",
+            "class C:\n    def update(self):\n        pass\n    try:\n        raise ValueError()\n    except ValueError as update:\n        pass\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "independent match capture replaces final class method binding",
+            "class C:\n    def update(self):\n        pass\n    match 7:\n        case update:\n            pass\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "independent starred target replaces final class method binding",
+            "class C:\n    def update(self):\n        pass\n    *update, = (7,)\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: handler exit removes same-name definition",
+            "class C:\n    def update(self):\n        pass\n    try:\n        raise ValueError()\n    except ValueError as update:\n        def update(self):\n            pass\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: except star alias removes binding",
+            "class C:\n    def update(self):\n        pass\n    try:\n        raise ExceptionGroup(\"x\", [ValueError()])\n    except* ValueError as update:\n        pass\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: nested match capture",
+            "class C:\n    def update(self):\n        pass\n    match subject:\n        case [(_, update)]:\n            pass\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: match as capture",
+            "class C:\n    def update(self):\n        pass\n    match subject:\n        case [other] as update:\n            pass\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: match star capture",
+            "class C:\n    def update(self):\n        pass\n    match subject:\n        case [*update]:\n            pass\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: match dictionary rest capture",
+            "class C:\n    def update(self):\n        pass\n    match subject:\n        case {\"x\": _, **update}:\n            pass\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: match keyword value capture",
+            "class C:\n    def update(self):\n        pass\n    match subject:\n        case Shape(value=update):\n            pass\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: match nested keyword value capture",
+            "class C:\n    def update(self):\n        pass\n    match subject:\n        case Shape(value=[update]):\n            pass\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: match union captures",
+            "class C:\n    def update(self):\n        pass\n    match subject:\n        case [update] | (update,):\n            pass\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: match wildcard reference role",
+            "class C:\n    def update(self):\n        pass\n    match subject:\n        case _:\n            pass\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "namespace inventory: match literal reference role",
+            "class C:\n    def update(self):\n        pass\n    match subject:\n        case \"update\":\n            pass\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "namespace inventory: match dotted value reference role",
+            "class C:\n    def update(self):\n        pass\n    match subject:\n        case Tokens.update:\n            pass\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "namespace inventory: match class head reference role",
+            "class C:\n    def update(self):\n        pass\n    match subject:\n        case update():\n            pass\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "namespace inventory: match keyword label reference role",
+            "class C:\n    def update(self):\n        pass\n    match subject:\n        case Shape(update=_):\n            pass\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "namespace inventory: match dictionary key reference role",
+            "class C:\n    def update(self):\n        pass\n    match subject:\n        case {Tokens.update: _}:\n            pass\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "namespace inventory: match wildcard star role",
+            "class C:\n    def update(self):\n        pass\n    match subject:\n        case [*_]:\n            pass\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "namespace inventory: chain assignment target",
+            "class C:\n    def update(self):\n        pass\n    other = update = 7\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: starred nested assignment target",
+            "class C:\n    def update(self):\n        pass\n    (other, [*update]) = (1, [7])\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: for destructured starred target",
+            "class C:\n    def update(self):\n        pass\n    for other, *update in values:\n        pass\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: with destructured starred target",
+            "class C:\n    def update(self):\n        pass\n    with manager as (other, *update):\n        pass\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: for attribute target preserves class",
+            "class C:\n    def update(self):\n        pass\n    for holder.update in values:\n        pass\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "namespace inventory: with attribute target preserves class",
+            "class C:\n    def update(self):\n        pass\n    with manager as holder.update:\n        pass\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "namespace inventory: plain dotted import target",
+            "class C:\n    def update(self):\n        pass\n    import update.module\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: import alias target",
+            "class C:\n    def update(self):\n        pass\n    import package as update\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: from import alias target",
+            "class C:\n    def update(self):\n        pass\n    from package import thing as update\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: import module name reference role",
+            "class C:\n    def update(self):\n        pass\n    from update import other\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "namespace inventory: type alias plain target wrapper",
+            "class C:\n    def update(self):\n        pass\n    type update = int\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: type alias generic target wrapper",
+            "class C:\n    def update(self):\n        pass\n    type update[T] = list[T]\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: type alias right side reference role",
+            "class C:\n    def update(self):\n        pass\n    type Alias = update\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "namespace inventory: type parameter own namespace",
+            "class C:\n    def update(self):\n        pass\n    type Alias[update] = int\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "namespace inventory: multiple bare deletion",
+            "class C:\n    def update(self):\n        pass\n    other = 7\n    del update, other\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: attribute deletion preserves class",
+            "class C:\n    def update(self):\n        pass\n    del holder.update\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "namespace inventory: subscript deletion preserves class",
+            "class C:\n    def update(self):\n        pass\n    del holder[update]\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "namespace inventory: comprehension iteration namespaces",
+            "class C:\n    def update(self):\n        pass\n    other = ([update for update in values], {update for update in values}, {update: update for update in values}, (update for update in values))\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "namespace inventory: function default named expression",
+            "class C:\n    def update(self):\n        pass\n    def other(value=(update := 7)):\n        pass\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: lambda default named expression",
+            "class C:\n    def update(self):\n        pass\n    other = lambda value=(update := 7): None\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: lambda body deferred namespace",
+            "class C:\n    def update(self):\n        pass\n    other = lambda: (update := 7)\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "namespace inventory: nested class base named expression",
+            "class C:\n    def update(self):\n        pass\n    class Other((update := Base)):\n        pass\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: final definition supersedes header named expression",
+            "class C:\n    def update(self, value=(update := 7)):\n        pass\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "namespace inventory: global redirects candidate definition",
+            "class C:\n    global update\n    def update(self):\n        pass\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: unrelated global preserves candidate",
+            "class C:\n    def update(self):\n        pass\n    global other\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "namespace inventory: ordinary nested local class owner",
+            "def enclosing():\n    class C:\n        def update(self):\n            pass\n        def run(self):\n            self.update()\n    return C\n",
+            true,
+            None,
+        ),
+        (
+            "namespace inventory: nonlocal redirects candidate definition",
+            "def enclosing():\n    update = 7\n    class C:\n        nonlocal update\n        def update(self):\n            pass\n        def run(self):\n            self.update()\n    return C\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: nested class definition replaces method",
+            "class C:\n    def update(self):\n        pass\n    class update:\n        pass\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: from import unaliased target",
+            "class C:\n    def update(self):\n        pass\n    from package import update\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: conditional factory overwritten before receiver inference",
+            "class C:\n    def update(self):\n        pass\nclass Factory:\n    if True:\n        def make(self) -> C:\n            return C()\n    make = lambda self: None\n    def run(self):\n        value = self.make()\n        value.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: conditional factory without unconditional reset",
+            "class C:\n    def update(self):\n        pass\nclass Factory:\n    if flag:\n        def make(self) -> C:\n            return C()\n    def run(self):\n        value = self.make()\n        value.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: unrelated conditional method preserves ordinary target",
+            "class C:\n    def update(self):\n        pass\n    if flag:\n        def other(self):\n            pass\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+    ];
+
+    let mut failures = Vec::new();
+    for (case_name, source, expect_resolved, imported_caller) in cases {
+        let outcome = std::panic::catch_unwind(|| -> anyhow::Result<()> {
+            let (nodes, edges) = if let Some(caller) = imported_caller {
+                index_files(&[("owner.py", source), ("workflow.py", caller)])?
+            } else {
+                index_single_file("workflow.py", source)?
+            };
+            let expected_declarations = source
+                .lines()
+                .enumerate()
+                .filter_map(|(index, line)| {
+                    line.trim_start()
+                        .starts_with("def update(")
+                        .then_some(index as u32 + 1)
+                })
+                .collect::<Vec<_>>();
+            let mut retained_declarations = nodes
+                .iter()
+                .filter(|node| {
+                    matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                        && is_matching_name(&node.serialized_name, "update")
+                })
+                .filter_map(|node| node.start_line)
+                .collect::<Vec<_>>();
+            retained_declarations.sort_unstable();
+            assert_eq!(
+                retained_declarations, expected_declarations,
+                "Case `{case_name}`: retain every original update declaration and source span, including repeated defs. Nodes: {nodes:?}"
+            );
+            assert_ordinary_call_census(case_name, &nodes, &edges, "run", "update", 1);
+            if expect_resolved {
+                assert_resolved_call_to_method_owner(
+                    case_name, &nodes, &edges, "run", "C", "update",
+                );
+            }
+
+            let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+            let call = edges
+                .iter()
+                .find(|edge| {
+                    edge.kind == EdgeKind::CALL
+                        && node_by_id
+                            .get(&edge.source)
+                            .is_some_and(|source| is_matching_name(&source.serialized_name, "run"))
+                        && node_by_id.get(&edge.target).is_some_and(|target| {
+                            is_matching_name(&target.serialized_name, "update")
+                        })
+                })
+                .expect("ordinary CALL census already proved the run call exists");
+            let target = node_by_id
+                .get(&call.effective_target())
+                .expect("stored CALL effective target must exist");
+            let targets_method = matches!(target.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                && is_matching_name(&target.serialized_name, "update");
+            if case_name.starts_with("namespace inventory:") && !expect_resolved {
+                assert!(
+                    !targets_method,
+                    "Case `{case_name}`: stale FunctionDef is still selected: {target:?}; edge: {call:?}. Calls: {:?}",
+                    describe_call_edges(&edges, &nodes)
+                );
+                return Ok(());
+            }
+            assert_eq!(
+                targets_method,
+                expect_resolved,
+                "Case `{case_name}`: unexpected effective CALL target {target:?}; edge: {call:?}. Calls: {:?}",
+                describe_call_edges(&edges, &nodes)
+            );
+            if expect_resolved {
+                assert_eq!(
+                    call.certainty,
+                    Some(ResolutionCertainty::Certain),
+                    "Case `{case_name}`: supported self receiver must retain Certain resolution: {call:?}"
+                );
+            } else {
+                assert_eq!(
+                    call.resolved_target, None,
+                    "Case `{case_name}`: overwritten or repeated method must remain unresolved: {call:?}"
+                );
+                assert_ne!(
+                    call.certainty,
+                    Some(ResolutionCertainty::Certain),
+                    "Case `{case_name}`: unresolved class binding must not be Certain: {call:?}"
+                );
+            }
+            Ok(())
+        });
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => failures.push(format!("Case `{case_name}`: {error:#}")),
+            Err(payload) => {
+                let message = payload
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| payload.downcast_ref::<&str>().copied())
+                    .unwrap_or("non-string panic payload");
+                failures.push(format!("Case `{case_name}`: {message}"));
+            }
+        }
+    }
+    anyhow::ensure!(
+        failures.is_empty(),
+        "{} method-binding fixture(s) failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    Ok(())
+}
+
+#[test]
+fn test_python_imported_method_binding_refresh_clears_unchanged_caller() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let owner_path = dir.path().join("owner.py");
+    let caller_path = dir.path().join("workflow.py");
+    fs::write(
+        &caller_path,
+        "from owner import C\ndef run(value: C):\n    value.update()\n",
+    )?;
+    let normal = "class C:\n    def update(self):\n        pass\n";
+    let rebound = "class C:\n    def update(self):\n        pass\n    update = 7\n";
+    let mut storage = Storage::new_in_memory()?;
+    let indexer = WorkspaceIndexer::new(dir.path().to_path_buf());
+    let event_bus = EventBus::new();
+    let mut original_method = None;
+    for (phase, source, expect_resolved) in [
+        ("initial imported method", normal, true),
+        ("only target file changed", rebound, false),
+        ("same-revision repeated target refresh", rebound, false),
+    ] {
+        fs::write(&owner_path, source)?;
+        indexer.run_incremental(
+            &mut storage,
+            &codestory_workspace::RefreshInfo {
+                mode: codestory_workspace::BuildMode::Incremental,
+                files_to_index: if original_method.is_none() {
+                    vec![owner_path.clone(), caller_path.clone()]
+                } else {
+                    vec![owner_path.clone()]
+                },
+                files_to_remove: vec![],
+                existing_file_ids: HashMap::new(),
+            },
+            &event_bus,
+            None,
+        )?;
+        let errors = storage.get_errors(None)?;
+        anyhow::ensure!(errors.is_empty(), "{phase}: indexing errors: {errors:?}");
+        let nodes = storage.get_nodes()?;
+        let edges = storage.get_edges()?;
+        assert_ordinary_call_census(phase, &nodes, &edges, "run", "update", 1);
+        let method = nodes
+            .iter()
+            .find(|node| {
+                matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                    && is_matching_owned_method(&node.serialized_name, "C", "update")
+            })
+            .expect("overwritten method declaration must remain navigable");
+        if let Some(original) = original_method {
+            assert_eq!(
+                method.id, original,
+                "{phase}: preserve declaration identity"
+            );
+        } else {
+            original_method = Some(method.id);
+        }
+        let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+        let call = edges
+            .iter()
+            .find(|edge| {
+                edge.kind == EdgeKind::CALL
+                    && node_by_id
+                        .get(&edge.source)
+                        .is_some_and(|source| is_matching_name(&source.serialized_name, "run"))
+            })
+            .expect("CALL census proved the unchanged caller exists");
+        assert_eq!(
+            call.effective_target() == method.id,
+            expect_resolved,
+            "{phase}: unchanged caller must not keep the overwritten target: {call:?}"
+        );
+        if expect_resolved {
+            assert_eq!(
+                call.certainty,
+                Some(ResolutionCertainty::Certain),
+                "{phase}: {call:?}"
+            );
+        } else {
+            assert_eq!(call.resolved_target, None, "{phase}: {call:?}");
+            assert_ne!(
+                call.certainty,
+                Some(ResolutionCertainty::Certain),
+                "{phase}: {call:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn test_python_self_receiver_shadowing_import_does_not_resolve_to_import() -> anyhow::Result<()> {
     let external_source = r#"
 class Widget:
