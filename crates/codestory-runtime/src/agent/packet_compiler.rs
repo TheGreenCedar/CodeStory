@@ -62,6 +62,8 @@ pub(crate) struct PreparedPacketCompilationV1 {
     #[serde(skip)]
     published_file_sources: Vec<PacketHydratedSourceRangeV1>,
     file_navigation_paths: HashMap<String, String>,
+    #[serde(skip)]
+    metadata_excluded_identities: BTreeSet<String>,
     // Complete-line alternatives are made during the same authenticated read.
     // They remain private runtime witnesses, never compiler question inputs.
     source_page_alternatives: BTreeMap<usize, Vec<PacketHydratedSourceRangeV1>>,
@@ -91,6 +93,7 @@ impl PreparedPacketCompilationV1 {
             source_refusals: Vec::new(),
             published_file_sources: Vec::new(),
             file_navigation_paths: HashMap::new(),
+            metadata_excluded_identities: BTreeSet::new(),
             source_page_alternatives: BTreeMap::new(),
             requested_source_identities: BTreeSet::new(),
             requested_source_minimum_ends: BTreeMap::new(),
@@ -118,6 +121,7 @@ impl PreparedPacketCompilationV1 {
     }
     pub(crate) fn default_product(&self) -> RepositoryDerivedCompilationV1 {
         let mut product = compile_repository_evidence(&self.input);
+        self.suppress_metadata_continuations(&mut product);
         attach_file_navigation_paths(&mut product.support, &self.file_navigation_paths);
         product
     }
@@ -126,6 +130,7 @@ impl PreparedPacketCompilationV1 {
         self,
         mut product: RepositoryDerivedCompilationV1,
     ) -> FrozenPacketCompilationV1 {
+        self.suppress_metadata_continuations(&mut product);
         attach_file_navigation_paths(&mut product.support, &self.file_navigation_paths);
         FrozenPacketCompilationV1 {
             product,
@@ -138,16 +143,26 @@ impl PreparedPacketCompilationV1 {
         }
     }
 
+    fn suppress_metadata_continuations(&self, product: &mut RepositoryDerivedCompilationV1) {
+        product.continuation.retain(|selector| {
+            !self
+                .metadata_excluded_identities
+                .contains(&selector.stable_identity)
+        });
+    }
+
     pub(crate) fn apply_proposal(
         &self,
         packet: &mut AgentPacketDto,
         request: Option<&AgentPacketRequestDto>,
         product: &RepositoryDerivedCompilationV1,
     ) {
+        let mut product = product.clone();
+        self.suppress_metadata_continuations(&mut product);
         apply_compilation_state(
             packet,
             request,
-            product,
+            &product,
             &self.publication,
             &self.source_refusals,
             &self.input.sources,
@@ -851,7 +866,14 @@ pub(crate) fn prepare_packet_compilation(
     }
     let mut admission_gaps = session.gaps();
     let storage = controller.open_storage_read_only()?;
+    let early_refusals = session.early_whole_file_refusals();
     let mut source_refusals = Vec::new();
+    if !early_refusals.is_empty() {
+        source_refusals.push(format!(
+            "Published whole-file metadata exclusions: {}; source-row caps exceeded; navigation only; excluded files received no source admissions or source ranges.",
+            early_refusals.len(),
+        ));
+    }
     let mut ranges =
         authenticated_continuation_ranges(controller, project_id, probe_resolutions, publication)?;
     let requested_identities = ranges.keys().cloned().collect::<BTreeSet<_>>();
@@ -929,7 +951,7 @@ pub(crate) fn prepare_packet_compilation(
     session.reserve_source_pages_with_demands(&ranges.keys().cloned().collect(), &demands);
     let admissions = session.receipts();
     let mut source_page_alternatives = BTreeMap::new();
-    let (authenticated_admissions, mut sources, file_navigation_paths) =
+    let (authenticated_admissions, mut sources, mut file_navigation_paths) =
         hydrate_admitted_sources_with_ranges(
             controller,
             &storage,
@@ -939,6 +961,12 @@ pub(crate) fn prepare_packet_compilation(
             &mut source_refusals,
             &mut source_page_alternatives,
         )?;
+    let metadata_excluded_identities = early_refusals.keys().cloned().collect();
+    file_navigation_paths.extend(
+        early_refusals
+            .into_iter()
+            .map(|(identity, (path, _))| (identity, path)),
+    );
     let source_paths = sources
         .iter()
         .map(|source| source.path.clone())
@@ -1016,6 +1044,7 @@ pub(crate) fn prepare_packet_compilation(
         source_refusals,
         published_file_sources,
         file_navigation_paths,
+        metadata_excluded_identities,
         source_page_alternatives,
         requested_source_identities,
         requested_source_minimum_ends,
@@ -1078,6 +1107,7 @@ pub(crate) fn replay_prepare_from_sealed_admissions(
         source_refusals: refusals,
         published_file_sources: Vec::new(),
         file_navigation_paths: navigation,
+        metadata_excluded_identities: BTreeSet::new(),
         source_page_alternatives: alternatives,
         requested_source_identities: std::collections::BTreeSet::new(),
         requested_source_minimum_ends: BTreeMap::new(),
@@ -1243,7 +1273,7 @@ fn apply_compilation_state(
         && packet.disposition.kind == codestory_contracts::api::PacketDispositionKindDto::Supported
     {
         packet.disposition =
-            PacketDispositionDto::not_established("an admitted source could not be delivered");
+            PacketDispositionDto::not_established("bounded source delivery is incomplete");
     }
     packet
         .disposition
@@ -6980,6 +7010,7 @@ mod tests {
             source_refusals: Vec::new(),
             published_file_sources: Vec::new(),
             file_navigation_paths: HashMap::new(),
+            metadata_excluded_identities: BTreeSet::new(),
             source_page_alternatives: BTreeMap::new(),
             requested_source_identities: BTreeSet::new(),
             requested_source_minimum_ends: BTreeMap::new(),

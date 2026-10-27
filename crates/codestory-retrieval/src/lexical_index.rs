@@ -592,6 +592,8 @@ fn lexical_component_set_binding(component_set: &LexicalComponentSet) -> String 
 
 #[derive(Debug, Clone)]
 pub struct LexicalHit {
+    pub whole_file_length_evidence: Option<crate::candidate::WholeFileLengthEvidence>,
+    pub(crate) raw_decoded_bytes: Option<u64>,
     pub path: String,
     pub source: LexicalDocumentSource,
     pub node_id: Option<String>,
@@ -2168,7 +2170,30 @@ fn search_lexical_component_set(
     if cancelled() {
         bail!("lexical search cancelled");
     }
+    let artifacts = lexical_component_set_artifacts(shard_dir, component_set);
+    let before = (payload == LexicalHitPayload::DescriptorOnly)
+        .then(|| ArtifactSeal::observe_all(&artifacts).ok())
+        .flatten()
+        .filter(|seals| {
+            seals.iter().all(|seal| {
+                !seal.is_present() || seal.fidelity() == Some(SealFidelity::InodeChangeTracked)
+            })
+        });
+    let manifest_matches = before.is_some()
+        && read_lexical_component_set(
+            shard_dir,
+            Some(&component_set.generation),
+            Some(&component_set.sidecar_input_hash),
+        )?
+        .as_ref()
+            == Some(component_set);
     validate_lexical_component_set_files(shard_dir, component_set)?;
+    let receipt_key = shard_dir.join(LEXICAL_COMPONENT_SET_FILE);
+    let sealed_before = before.is_some()
+        && manifest_matches
+        && LEXICAL_COMPONENT_SET_RECEIPTS
+            .reuse_sealed(&receipt_key, &artifacts)
+            .is_some();
     let mut latest = HashMap::<String, Option<usize>>::new();
     for (index, delta) in component_set.deltas.iter().enumerate() {
         for key in &delta.upsert_keys {
@@ -2262,6 +2287,44 @@ fn search_lexical_component_set(
     let mut seen = HashSet::new();
     hits.retain(|hit| seen.insert(lexical_hit_identity(hit)));
     hits.truncate(limit);
+    // A cache verdict alone cannot close the validation-to-query interval.
+    let unchanged = sealed_before
+        && ArtifactSeal::observe_all(&artifacts).ok().as_ref() == before.as_ref()
+        && LEXICAL_COMPONENT_SET_RECEIPTS
+            .reuse_sealed(&receipt_key, &artifacts)
+            .is_some();
+    if unchanged && payload == LexicalHitPayload::DescriptorOnly {
+        let seals = Arc::new(before.expect("sealed observations"));
+        for hit in &mut hits {
+            if hit.source != LexicalDocumentSource::LexicalSource
+                || hit.node_id.is_some()
+                || hit.symbol_name.is_some()
+                || hit.start_line.is_some()
+                || hit.target.is_some()
+                || hit.source_excerpt.is_some()
+            {
+                continue;
+            }
+            let Some(decoded_bytes) = hit.raw_decoded_bytes else {
+                continue;
+            };
+            let key = lexical_hit_document_key(hit)?;
+            let owner = match latest.get(&key) {
+                None => &component_set.base.file_name,
+                Some(Some(index)) => &component_set.deltas[*index].component.file_name,
+                Some(None) => continue,
+            };
+            hit.whole_file_length_evidence =
+                Some(crate::candidate::WholeFileLengthEvidence::sealed(
+                    hit.path.clone(),
+                    &component_set.generation,
+                    &component_set.sidecar_input_hash,
+                    owner.clone(),
+                    decoded_bytes,
+                    Arc::clone(&seals),
+                ));
+        }
+    }
     Ok(hits)
 }
 
@@ -2575,6 +2638,8 @@ fn search_lexical_index_on_connection_excluding(
                 (None, None, None)
             };
             hits.push(LexicalHit {
+                whole_file_length_evidence: None,
+                raw_decoded_bytes: candidate.raw_decoded_bytes,
                 score: lexical_policy_score(
                     scope.lexical_policy,
                     lexical_sublane_score(sublane_ranks, query_shape),
@@ -2630,6 +2695,7 @@ enum LexicalCandidateOrder {
 
 #[derive(Debug, Clone)]
 struct LexicalCandidate {
+    raw_decoded_bytes: Option<u64>,
     /// Retained for Full-path / debug identity; descriptor coverage no longer
     /// re-queries FTS by rowid after the lane MATCH.
     #[allow(dead_code)]
@@ -2777,6 +2843,10 @@ fn lexical_candidate_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Lexic
     document.call_neighborhood = decoded_call_neighborhood(row, 9, document.node_id.as_deref())?;
     document.encoded_source_sha256 = read_encoded_source_hash(row, 10, document.source)?;
     Ok(LexicalCandidate {
+        raw_decoded_bytes: match row.get_ref(11)? {
+            rusqlite::types::ValueRef::Integer(value) => u64::try_from(value).ok(),
+            _ => None,
+        },
         row_id: row.get(0)?,
         document,
         normalized_path: row.get(3)?,
@@ -2937,7 +3007,14 @@ fn query_fts_candidates(
     };
     let sql = sql.replacen(
         "d.source, d.node_id, d.symbol_name, d.start_line",
-        &format!("d.source, d.node_id, d.symbol_name, d.start_line, {annotation}, {raw_hash}"),
+        &format!(
+            "d.source, d.node_id, d.symbol_name, d.start_line, {annotation}, {raw_hash}, {}",
+            if representation.schema_version >= LEXICAL_DATABASE_SCHEMA_V3 {
+                "d.content_decoded_bytes"
+            } else {
+                "NULL"
+            }
+        ),
         1,
     );
     let mut statement = connection.prepare_cached(&sql)?;
@@ -3050,7 +3127,14 @@ fn query_exact_candidates(
     };
     let sql = sql.replacen(
         "d.source, d.node_id, d.symbol_name, d.start_line",
-        &format!("d.source, d.node_id, d.symbol_name, d.start_line, {annotation}, {raw_hash}"),
+        &format!(
+            "d.source, d.node_id, d.symbol_name, d.start_line, {annotation}, {raw_hash}, {}",
+            if representation.schema_version >= LEXICAL_DATABASE_SCHEMA_V3 {
+                "d.content_decoded_bytes"
+            } else {
+                "NULL"
+            }
+        ),
         1,
     );
     let mut statement = connection.prepare_cached(&sql)?;
@@ -8005,6 +8089,223 @@ mod tests {
     }
 
     #[test]
+    fn whole_file_eligibility_authority_is_live_whole_file_only_and_cannot_serde_or_merge_resurrect()
+     {
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("shards");
+        let mut candidates = Vec::new();
+        for (generation, content) in [("first", "needle ".repeat(80)), ("second", "needle".into())]
+        {
+            let prepared = prepared_documents(vec![source_document("opaque.ini", &content)]);
+            build_prepared_lexical_shard(&data, generation, &prepared, "input", None, || Ok(()))
+                .unwrap();
+            let shard = shard_dir_for(&data, generation);
+            for query in ["needle", "\"opaque.ini\""] {
+                let mut hits =
+                    search_lexical_index_descriptors_with_cancel(&shard, "input", query, 4, || {
+                        false
+                    })
+                    .unwrap();
+                assert_eq!(
+                    hits.len(),
+                    1,
+                    "both FTS and exact recall must exercise the real row"
+                );
+                let candidate =
+                    crate::lexical_client::lexical_hit_to_candidate_bound(hits.remove(0), "input")
+                        .unwrap();
+                assert_eq!(
+                    candidate.whole_file_decoded_bytes(generation, "input"),
+                    Some(content.len() as u64)
+                );
+                assert_eq!(candidate.whole_file_decoded_bytes("other", "input"), None);
+                assert_eq!(
+                    candidate.whole_file_decoded_bytes(generation, "other"),
+                    None
+                );
+                let mut json = serde_json::to_value(&candidate).unwrap();
+                assert!(json.get("whole_file_length_evidence").is_none());
+                json["whole_file_length_evidence"] =
+                    serde_json::json!({"decoded_bytes": 513, "trusted": true});
+                let imported: crate::CandidateHit = serde_json::from_value(json).unwrap();
+                assert_eq!(imported.whole_file_decoded_bytes(generation, "input"), None);
+                for mutation in ["path", "node", "symbol", "line"] {
+                    let mut changed = candidate.clone();
+                    match mutation {
+                        "path" => changed.file_path = "other.ini".into(),
+                        "node" => changed.node_id = Some("7".into()),
+                        "symbol" => changed.symbol_name = Some("needle".into()),
+                        _ => changed.start_line = Some(1),
+                    }
+                    assert_eq!(
+                        changed.whole_file_decoded_bytes(generation, "input"),
+                        None,
+                        "{mutation}"
+                    );
+                }
+                if query == "needle" {
+                    candidates.push(candidate);
+                }
+            }
+        }
+        let first = candidates[0].clone();
+        let unknown: crate::CandidateHit =
+            serde_json::from_value(serde_json::to_value(&first).unwrap()).unwrap();
+        let compatible = crate::executor::replay_fuse_published_calls(vec![
+            unknown,
+            first.clone(),
+            first.clone(),
+        ]);
+        assert_eq!(compatible.len(), 1);
+        assert_eq!(
+            compatible[0].whole_file_decoded_bytes("first", "input"),
+            Some(560)
+        );
+        let conflicted = crate::executor::replay_fuse_published_calls(vec![
+            first.clone(),
+            candidates[1].clone(),
+            first,
+        ]);
+        assert_eq!(conflicted.len(), 1);
+        assert_eq!(
+            conflicted[0].whole_file_decoded_bytes("first", "input"),
+            None
+        );
+        assert_eq!(
+            conflicted[0].whole_file_decoded_bytes("second", "input"),
+            None
+        );
+    }
+
+    #[test]
+    fn whole_file_eligibility_scalar_edit_between_validation_and_query_has_no_authority() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let temp = TempDir::new().unwrap();
+        let data = temp.path().join("shards");
+        let prepared = prepared_documents(vec![source_document("opaque.ini", "needle")]);
+        build_prepared_lexical_shard(&data, "generation", &prepared, "input", None, || Ok(()))
+            .unwrap();
+        let shard = shard_dir_for(&data, "generation");
+        let set = read_lexical_component_set(&shard, Some("generation"), Some("input"))
+            .unwrap()
+            .unwrap();
+        validate_lexical_component_set_files(&shard, &set).unwrap();
+        let database = shard.join(&set.base.file_name);
+        let reuses = LEXICAL_SHARD_RECEIPTS.stats(&database).unwrap().reuses;
+        let mutated = Arc::new(AtomicBool::new(false));
+        let changed = Arc::clone(&mutated);
+        let hits = search_lexical_index_descriptors_with_cancel(&shard, "input", "needle", 4, move || {
+            if LEXICAL_SHARD_RECEIPTS.stats(&database).is_some_and(|stats| stats.reuses > reuses)
+                && !changed.swap(true, Ordering::SeqCst)
+            {
+                make_test_file_writable(&database);
+                let writer = Connection::open(&database).unwrap();
+                writer.execute_batch("DROP TRIGGER lexical_documents_no_update; UPDATE lexical_documents SET content_decoded_bytes = 513;").unwrap();
+            }
+            false
+        }).expect("unchanged metadata still permits the baseline descriptor query");
+        assert!(
+            mutated.load(Ordering::SeqCst),
+            "fault must land after component validation"
+        );
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].raw_decoded_bytes,
+            Some(513),
+            "query must actually observe the forged scalar"
+        );
+        let candidate = crate::lexical_client::lexical_hit_to_candidate_bound(
+            hits.into_iter().next().unwrap(),
+            "input",
+        )
+        .unwrap();
+        assert_eq!(
+            candidate.whole_file_decoded_bytes("generation", "input"),
+            None
+        );
+    }
+
+    #[test]
+    fn whole_file_eligibility_component_seal_rejects_forged_decoded_length() {
+        for (content, forged_length) in [("needle".to_string(), 513_i64), ("needle ".repeat(80), 1)]
+        {
+            let temp = TempDir::new().unwrap();
+            let data = temp.path().join("shards");
+            let prepared = prepared_documents(vec![source_document("opaque.ini", &content)]);
+            build_prepared_lexical_shard(&data, "generation", &prepared, "input", None, || Ok(()))
+                .unwrap();
+            let shard = shard_dir_for(&data, "generation");
+            let components = read_lexical_component_set(&shard, Some("generation"), Some("input"))
+                .unwrap()
+                .unwrap();
+            validate_lexical_component_set_files(&shard, &components).unwrap();
+            let database = shard.join(&components.base.file_name);
+            make_test_file_writable(&database);
+            let connection = Connection::open(&database).unwrap();
+            let metadata_before = validate_open_database_metadata(
+                &connection,
+                &shard,
+                "generation",
+                "input",
+                None,
+                &|| false,
+            )
+            .unwrap();
+            let hash_before: String = connection
+                .query_row("SELECT document_hash FROM lexical_documents", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            // Mutate only the derived scalar in an owned real publication. The
+            // content hash and metadata envelope do not authenticate this value.
+            connection
+                .execute_batch("DROP TRIGGER lexical_documents_no_update")
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE lexical_documents SET content_decoded_bytes = ?1",
+                    [forged_length],
+                )
+                .unwrap();
+            let metadata_after = validate_open_database_metadata(
+                &connection,
+                &shard,
+                "generation",
+                "input",
+                None,
+                &|| false,
+            )
+            .unwrap();
+            let hash_after: String = connection
+                .query_row("SELECT document_hash FROM lexical_documents", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(metadata_before, metadata_after);
+            assert_eq!(hash_before, hash_after);
+            let error = verify_open_database_contents(&connection, &|| false).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("length"),
+                "the scalar itself must fail decoded-content validation: {error:#}"
+            );
+            drop(connection);
+            assert!(
+                search_lexical_index_with_policy_cancel(
+                    &shard,
+                    "input",
+                    "needle",
+                    1,
+                    LexicalHitPayload::DescriptorOnly,
+                    LexicalAdmissionPolicy::BroadQuestionV1,
+                    || false,
+                )
+                .is_err(),
+                "a prior seal must not authorize a length scalar after its owning bytes change"
+            );
+        }
+    }
+
+    #[test]
     fn descriptor_search_never_materializes_the_stored_source_body() {
         let connection = Connection::open_in_memory().expect("in-memory lexical database");
         connection
@@ -8154,6 +8455,7 @@ mod tests {
                 )
                 .expect("FTS row");
             candidates.push(LexicalCandidate {
+                raw_decoded_bytes: None,
                 row_id: index,
                 document: source_document(&path, ""),
                 normalized_path: path,
@@ -10069,6 +10371,8 @@ mod tests {
                             (None, None, None)
                         };
                     LexicalHit {
+                        whole_file_length_evidence: None,
+                        raw_decoded_bytes: None,
                         call_neighborhood: None,
                         path: document.path.clone(),
                         source: document.source,

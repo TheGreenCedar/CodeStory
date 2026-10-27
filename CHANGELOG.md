@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Packets leave more room for source evidence by skipping indexed whole files that cannot fit the response, while retaining navigation and clear limits.
+
 - Go reference navigation includes statically resolved function and method values, including handlers passed to registration functions. These references stay distinct from calls, and existing Go indexes refresh automatically.
 
 - Optional Codex source context can append bounded, verified Python and Rust declarations and Go functions and methods after numbered searches when the executor's non-interactive zsh/login contract is explicit or declared at startup. Unknown callers retain their ordinary path, and pipelines keep the original search output.
