@@ -23638,3 +23638,227 @@ fn test_object_property_callable_owns_qualified_member_call_without_inventing_di
     }
     Ok(())
 }
+
+#[test]
+fn test_default_trail_preserves_source_qualified_and_repository_common_name_calls()
+-> anyhow::Result<()> {
+    use codestory_contracts::graph::{TrailCallerScope, TrailConfig, TrailDirection, TrailMode};
+    struct Case {
+        label: &'static str,
+        extension: &'static str,
+        source: String,
+        owner_span: (u32, u32, u32, u32),
+        callsite: (u32, u32),
+        terminal: &'static str,
+        resolved_declaration: Option<(&'static str, u32)>,
+        default_visible: bool,
+    }
+    let mut cases = Vec::new();
+    for extension in ["js", "ts", "tsx", "vue"] {
+        let script = "function remove() {}\nexport default {\n  request: async function () {\n    await api.share.remove();\n  },\n};\n";
+        let offset = u32::from(extension == "vue");
+        cases.push(Case {
+            label: "qualified API call with unrelated free remove",
+            extension,
+            source: if extension == "vue" {
+                format!("<script>\n{script}</script>\n")
+            } else {
+                script.into()
+            },
+            owner_span: (3 + offset, 12, 5 + offset, 4),
+            callsite: (4 + offset, 21),
+            terminal: "remove",
+            resolved_declaration: None,
+            default_visible: true,
+        });
+    }
+    cases.extend([
+        Case {
+            label: "ordinary qualified API filter",
+            extension: "js",
+            source: "function request() {\n  api.catalog.filter();\n}\n".into(),
+            owner_span: (1, 1, 3, 2),
+            callsite: (2, 15),
+            terminal: "filter",
+            resolved_declaration: None,
+            default_visible: true,
+        },
+        Case {
+            label: "JS low-confidence bare common-name boundary",
+            extension: "js",
+            source: "function remove() {}\nfunction request() {\n  remove();\n}\nexport {};\n"
+                .into(),
+            owner_span: (2, 1, 4, 2),
+            callsite: (3, 3),
+            terminal: "remove",
+            resolved_declaration: None,
+            default_visible: false,
+        },
+        Case {
+            label: "certain repository filter",
+            extension: "ts",
+            source: "function filter() {}\nfunction request() {\n  filter();\n}\n".into(),
+            owner_span: (2, 1, 4, 2),
+            callsite: (3, 3),
+            terminal: "filter",
+            resolved_declaration: Some(("filter", 1)),
+            default_visible: true,
+        },
+        Case {
+            label: "unresolved free len utility control",
+            extension: "js",
+            source: "function request() {\n  len();\n}\n".into(),
+            owner_span: (1, 1, 3, 2),
+            callsite: (2, 3),
+            terminal: "len",
+            resolved_declaration: None,
+            default_visible: false,
+        },
+        Case {
+            label: "unresolved free filter utility control",
+            extension: "ts",
+            source: "function request() {\n  filter();\n}\n".into(),
+            owner_span: (1, 1, 3, 2),
+            callsite: (2, 3),
+            terminal: "filter",
+            resolved_declaration: None,
+            default_visible: false,
+        },
+    ]);
+    let mut failures = Vec::new();
+    for case in cases {
+        let outcome = std::panic::catch_unwind(|| -> anyhow::Result<()> {
+            let root = tempdir()?;
+            let path = root.path().join(format!("workflow.{}", case.extension));
+            fs::write(&path, &case.source)?;
+            let mut store = Storage::new_in_memory()?;
+            WorkspaceIndexer::new(root.path().to_path_buf()).run_incremental(
+                &mut store,
+                &codestory_workspace::RefreshInfo {
+                    mode: codestory_workspace::BuildMode::Incremental,
+                    files_to_index: vec![path],
+                    files_to_remove: vec![],
+                    existing_file_ids: HashMap::new(),
+                },
+                &EventBus::new(),
+                None,
+            )?;
+            let errors = store.get_errors(None)?;
+            anyhow::ensure!(errors.is_empty(), "indexing errors: {errors:?}");
+            let nodes = store.get_nodes()?;
+            let owner = nodes
+                .iter()
+                .find(|node| {
+                    matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                        && node.serialized_name == "request"
+                        && (node.start_line, node.start_col, node.end_line, node.end_col)
+                            == (
+                                Some(case.owner_span.0),
+                                Some(case.owner_span.1),
+                                Some(case.owner_span.2),
+                                Some(case.owner_span.3),
+                            )
+                })
+                .expect("the authored callable must retain its exact source span");
+            let edges = store.get_edges()?;
+            let calls = edges
+                .iter()
+                .filter(|edge| {
+                    edge.kind == EdgeKind::CALL
+                        && edge.source == owner.id
+                        && edge.line == Some(case.callsite.0)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(calls.len(), 1, "raw stored CALL census: {edges:#?}");
+            let call = calls[0];
+            let raw_target = nodes.iter().find(|node| node.id == call.target).unwrap();
+            assert_eq!(raw_target.serialized_name, case.terminal);
+            let identity = call
+                .callsite_identity
+                .as_deref()
+                .and_then(parse_canonical_callsite_identity)
+                .expect("source CALL identity");
+            assert_eq!((identity.line, identity.column_or_ordinal), case.callsite);
+            if let Some((name, line)) = case.resolved_declaration {
+                let target = nodes
+                    .iter()
+                    .find(|node| {
+                        node.kind == NodeKind::FUNCTION
+                            && node.serialized_name == name
+                            && node.start_line == Some(line)
+                    })
+                    .unwrap();
+                assert_eq!(
+                    call.resolved_target,
+                    Some(target.id),
+                    "repository target must actually resolve"
+                );
+                assert_eq!(call.certainty, Some(ResolutionCertainty::Certain));
+            } else {
+                assert_eq!(raw_target.kind, NodeKind::UNKNOWN);
+                assert_eq!(
+                    call.resolved_target, None,
+                    "unknown receiver/free utility must remain unresolved"
+                );
+                assert_ne!(call.certainty, Some(ResolutionCertainty::Certain));
+            }
+            let config = TrailConfig {
+                root_id: owner.id,
+                mode: TrailMode::Neighborhood,
+                target_id: None,
+                depth: 1,
+                direction: TrailDirection::Outgoing,
+                caller_scope: TrailCallerScope::ProductionOnly,
+                edge_filter: vec![EdgeKind::CALL],
+                show_utility_calls: true,
+                node_filter: vec![],
+                max_nodes: 50,
+            };
+            let shown = store.get_trail(&config)?;
+            let shown_call = shown
+                .edges
+                .iter()
+                .find(|edge| edge.id == call.id)
+                .expect("utility-enabled trail must retain the actual stored source CALL");
+            assert_eq!(shown_call.source, owner.id);
+            assert_eq!(shown_call.effective_target(), call.effective_target());
+            assert_eq!(shown_call.resolved_target, call.resolved_target);
+            assert_eq!(shown_call.certainty, call.certainty);
+            assert!(!shown.truncated);
+            let default = store.get_trail(&TrailConfig {
+                show_utility_calls: false,
+                ..config
+            })?;
+            assert_eq!(
+                default.edges.iter().any(|edge| edge.id == call.id),
+                case.default_visible,
+                "{}/{}: default utility filtering changed source/API or repository call visibility; trail={default:#?}",
+                case.extension,
+                case.label
+            );
+            assert!(!default.truncated);
+            Ok(())
+        });
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                failures.push(format!("{}/{}: {error:#}", case.extension, case.label))
+            }
+            Err(payload) => {
+                let message = payload
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| payload.downcast_ref::<&str>().copied())
+                    .unwrap_or("non-string panic payload");
+                failures.push(format!("{}/{}: {message}", case.extension, case.label));
+            }
+        }
+    }
+    anyhow::ensure!(
+        failures.is_empty(),
+        "{} default-trail fixture(s) failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    Ok(())
+}

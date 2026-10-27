@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Call navigation keeps receiver calls such as `api.remove()` and resolved repository calls visible when their names match common utility functions.
+
 - JavaScript and TypeScript navigation recognizes functions stored in named object properties and keeps calls attached to the right source body, including scripts embedded in templates.
 
 - JavaScript and TypeScript source links stay stable across cached indexing and template refreshes. Existing indexes refresh automatically. Old links are rejected rather than silently redirected; bookmarks move only when source evidence supports the match, and unmatched bookmarks keep their notes.

@@ -160,6 +160,57 @@ mod tests {
     };
     use std::collections::HashSet;
 
+    #[test]
+    fn source_receiver_marker_reader_accepts_registry_and_manual_producers() {
+        use codestory_contracts::graph::callsite_has_source_receiver_marker;
+
+        let mut producer_markers = HashSet::new();
+        for extraction in EXTRACTIONS {
+            for &(syntax, marker) in extraction.callsite_marker_families {
+                if syntax == "php_new" {
+                    assert!(
+                        !callsite_has_source_receiver_marker(Some(marker)),
+                        "construction syntax is not a receiver/member marker"
+                    );
+                } else {
+                    producer_markers.insert(marker);
+                }
+            }
+        }
+        // Ruby's receiver collector emits this tag manually, outside the
+        // rule-syntax registry. TSX shares the TypeScript registry tag.
+        producer_markers.insert(ruby::MEMBER_CALLSITE_MARKER);
+        assert!(!producer_markers.is_empty());
+        for marker in producer_markers {
+            let identity = format!("1:2:3:4|{marker}|receiver-owner:Widget");
+            assert!(
+                callsite_has_source_receiver_marker(Some(&identity)),
+                "persisted producer marker {marker} is not recognized by the graph reader"
+            );
+            for near_match in [format!("{marker}-extra"), format!("prefix-{marker}")] {
+                let identity = format!("1:2:3:4|{near_match}");
+                assert!(
+                    !callsite_has_source_receiver_marker(Some(&identity)),
+                    "unknown token {near_match} borrowed a known marker's meaning"
+                );
+            }
+        }
+        for identity in [
+            None,
+            Some("1:2:3:4"),
+            Some("1:2:3:4|syntax:unknown-member-call"),
+            Some(php::NEW_CALLSITE_MARKER),
+            Some(javascript::PRIVATE_NAME_CALLSITE_MARKER),
+            Some(javascript::RUNTIME_IMPORT_CALLSITE_MARKER),
+            Some(go::PACKAGE_FUNCTION_CALLSITE_MARKER),
+        ] {
+            assert!(
+                !callsite_has_source_receiver_marker(identity),
+                "unqualified or non-member syntax was classified as a receiver: {identity:?}"
+            );
+        }
+    }
+
     /// Every registry row must agree with the public language registry.
     ///
     /// A row that claimed an extension the contracts registry routes elsewhere

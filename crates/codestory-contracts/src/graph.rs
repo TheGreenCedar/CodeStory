@@ -51,6 +51,33 @@ pub fn source_ordinal_canonical_id_parts(canonical_id: &str) -> (&str, &str) {
     ("", canonical_id)
 }
 
+/// Whether persisted source syntax identifies a receiver/member CALL.
+///
+/// These exact producer tags distinguish member syntax from an unqualified
+/// utility name. They provide no authority to select or resolve a target.
+pub fn callsite_has_source_receiver_marker(callsite_identity: Option<&str>) -> bool {
+    callsite_identity.is_some_and(|identity| {
+        identity.split('|').any(|part| {
+            matches!(
+                part,
+                "syntax:cpp-member-call"
+                    | "syntax:csharp-member-call"
+                    | "syntax:dart-member-call"
+                    | "syntax:go-selector-call"
+                    | "syntax:java-member-call"
+                    | "syntax:js-member-call"
+                    | "syntax:kotlin-member-call"
+                    | "syntax:php-member-call"
+                    | "syntax:python-attribute-call"
+                    | "syntax:ruby-member-call"
+                    | "syntax:rust-method-call"
+                    | "syntax:swift-member-call"
+                    | "syntax:ts-member-call"
+            )
+        })
+    })
+}
+
 pub mod access;
 pub mod definition;
 pub mod error;

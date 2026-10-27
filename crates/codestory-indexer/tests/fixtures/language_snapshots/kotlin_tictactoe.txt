@@ -67,11 +67,11 @@ file path=game.kt language=kotlin lines=73 complete=true role=Source
 occurrence element=CLASS:ArtificialPlayer@46 kind=DEFINITION span=46:1-58:2
 occurrence element=CLASS:Field@19 kind=DEFINITION span=19:1-34:2
 occurrence element=CLASS:GameObject@15 kind=DEFINITION span=15:1-17:2
-occurrence element=CLASS:GameObject@19 kind=DEFINITION span=19:15-19:25
-occurrence element=CLASS:GameObject@19 kind=DEFINITION span=60:19-60:29
+occurrence element=CLASS:GameObject@19 kind=REFERENCE span=19:15-19:25
+occurrence element=CLASS:GameObject@19 kind=REFERENCE span=60:19-60:29
 occurrence element=CLASS:HumanPlayer@40 kind=DEFINITION span=40:1-44:2
-occurrence element=CLASS:Player@40 kind=DEFINITION span=40:21-40:27
-occurrence element=CLASS:Player@40 kind=DEFINITION span=46:26-46:32
+occurrence element=CLASS:Player@40 kind=REFERENCE span=40:21-40:27
+occurrence element=CLASS:Player@40 kind=REFERENCE span=46:26-46:32
 occurrence element=CLASS:TicTacToe@60 kind=DEFINITION span=60:1-68:2
 occurrence element=FUNCTION:main@70 kind=DEFINITION span=70:1-73:2
 occurrence element=FUNCTION:numberIn@5 kind=DEFINITION span=5:1-5:24
@@ -86,30 +86,30 @@ occurrence element=METHOD:GameObject.announce@16 kind=DEFINITION span=16:5-16:22
 occurrence element=METHOD:HumanPlayer.turn@41 kind=DEFINITION span=41:5-43:6
 occurrence element=METHOD:Player.turn@37 kind=DEFINITION span=37:5-37:48
 occurrence element=METHOD:TicTacToe.run@63 kind=DEFINITION span=63:5-67:6
-occurrence element=MODULE:kotlin.random.Random@3 kind=DEFINITION span=3:8-3:28
+occurrence element=MODULE:kotlin.random.Random@3 kind=REFERENCE span=3:8-3:28
 occurrence element=MODULE:tictactoe@1 kind=DEFINITION span=1:1-1:18
-occurrence element=UNKNOWN:Field@61 kind=DEFINITION span=61:17-61:22
-occurrence element=UNKNOWN:TicTacToe@71 kind=DEFINITION span=71:16-71:25
-occurrence element=UNKNOWN:makeMove@42 kind=DEFINITION span=42:22-42:30
-occurrence element=UNKNOWN:minMax@51 kind=DEFINITION span=51:16-51:22
-occurrence element=UNKNOWN:minMax@55 kind=DEFINITION span=55:9-55:15
-occurrence element=UNKNOWN:nextInt@66 kind=DEFINITION span=66:16-66:23
-occurrence element=UNKNOWN:numberIn@64 kind=DEFINITION span=64:9-64:17
-occurrence element=UNKNOWN:println@12 kind=DEFINITION span=12:5-12:12
-occurrence element=UNKNOWN:println@8 kind=DEFINITION span=8:5-8:12
-occurrence element=UNKNOWN:run@72 kind=DEFINITION span=72:10-72:13
-occurrence element=UNKNOWN:sameInRow@31 kind=DEFINITION span=31:9-31:18
-occurrence element=UNKNOWN:stringOut@65 kind=DEFINITION span=65:9-65:18
-callable_state CallableProjectionState { file_id: -3740202488659960972, symbol_key: "13:main", node_id: NodeId(-3269461739909379704), signature_hash: -4671339478033693080, normalized_signature: Some("shape:-2692651601011948422"), body_hash: -8673273081720969995, start_line: 70, end_line: 73 }
+occurrence element=UNKNOWN:Field@61 kind=REFERENCE span=61:17-61:22
+occurrence element=UNKNOWN:TicTacToe@71 kind=REFERENCE span=71:16-71:25
+occurrence element=UNKNOWN:makeMove@42 kind=REFERENCE span=42:22-42:30
+occurrence element=UNKNOWN:minMax@51 kind=REFERENCE span=51:16-51:22
+occurrence element=UNKNOWN:minMax@55 kind=REFERENCE span=55:9-55:15
+occurrence element=UNKNOWN:nextInt@66 kind=REFERENCE span=66:16-66:23
+occurrence element=UNKNOWN:numberIn@64 kind=REFERENCE span=64:9-64:17
+occurrence element=UNKNOWN:println@12 kind=REFERENCE span=12:5-12:12
+occurrence element=UNKNOWN:println@8 kind=REFERENCE span=8:5-8:12
+occurrence element=UNKNOWN:run@72 kind=REFERENCE span=72:10-72:13
+occurrence element=UNKNOWN:sameInRow@31 kind=REFERENCE span=31:9-31:18
+occurrence element=UNKNOWN:stringOut@65 kind=REFERENCE span=65:9-65:18
+callable_state CallableProjectionState { file_id: -3740202488659960972, symbol_key: "13:main", node_id: NodeId(-3269461739909379704), signature_hash: -4671339478033693080, normalized_signature: Some("shape:2389624141537525614"), body_hash: 5203950131856271213, start_line: 70, end_line: 73 }
 callable_state CallableProjectionState { file_id: -3740202488659960972, symbol_key: "13:numberIn", node_id: NodeId(3089308516238638639), signature_hash: 2477812878330356949, normalized_signature: Some("outline:-1793518511152586733"), body_hash: 7459896940976823828, start_line: 5, end_line: 5 }
-callable_state CallableProjectionState { file_id: -3740202488659960972, symbol_key: "13:numberOut", node_id: NodeId(-3709840166360608430), signature_hash: -1579019679195996938, normalized_signature: Some("shape:-1605510924220694893"), body_hash: 2936401094215417944, start_line: 7, end_line: 9 }
-callable_state CallableProjectionState { file_id: -3740202488659960972, symbol_key: "13:stringOut", node_id: NodeId(-4149573940085942370), signature_hash: -5818630870471287222, normalized_signature: Some("shape:1309767868204554717"), body_hash: -4220344892772128265, start_line: 11, end_line: 13 }
-callable_state CallableProjectionState { file_id: -3740202488659960972, symbol_key: "14:tictactoe.ArtificialPlayer.minMax", node_id: NodeId(-5761633344270872004), signature_hash: 7923513529814909507, normalized_signature: Some("shape:1015635496070560885"), body_hash: 4242977279514388040, start_line: 47, end_line: 52 }
-callable_state CallableProjectionState { file_id: -3740202488659960972, symbol_key: "14:tictactoe.ArtificialPlayer.turn", node_id: NodeId(5137820935137696609), signature_hash: 7173012715314331748, normalized_signature: Some("shape:8113778084223192606"), body_hash: 3184914660125496680, start_line: 54, end_line: 57 }
-callable_state CallableProjectionState { file_id: -3740202488659960972, symbol_key: "14:tictactoe.Field.makeMove", node_id: NodeId(-7313089341527803310), signature_hash: 5427009982719951223, normalized_signature: Some("shape:5939635087886849543"), body_hash: 8577733092547693783, start_line: 26, end_line: 33 }
+callable_state CallableProjectionState { file_id: -3740202488659960972, symbol_key: "13:numberOut", node_id: NodeId(-3709840166360608430), signature_hash: -1579019679195996938, normalized_signature: Some("shape:4595568555581738972"), body_hash: 5713539031235124655, start_line: 7, end_line: 9 }
+callable_state CallableProjectionState { file_id: -3740202488659960972, symbol_key: "13:stringOut", node_id: NodeId(-4149573940085942370), signature_hash: -5818630870471287222, normalized_signature: Some("shape:8604911288559612062"), body_hash: -1569168865136013108, start_line: 11, end_line: 13 }
+callable_state CallableProjectionState { file_id: -3740202488659960972, symbol_key: "14:tictactoe.ArtificialPlayer.minMax", node_id: NodeId(-5761633344270872004), signature_hash: 7923513529814909507, normalized_signature: Some("shape:-7598077654587865900"), body_hash: -8792986475992598511, start_line: 47, end_line: 52 }
+callable_state CallableProjectionState { file_id: -3740202488659960972, symbol_key: "14:tictactoe.ArtificialPlayer.turn", node_id: NodeId(5137820935137696609), signature_hash: 7173012715314331748, normalized_signature: Some("shape:7058827279834543021"), body_hash: 2924041562295532635, start_line: 54, end_line: 57 }
+callable_state CallableProjectionState { file_id: -3740202488659960972, symbol_key: "14:tictactoe.Field.makeMove", node_id: NodeId(-7313089341527803310), signature_hash: 5427009982719951223, normalized_signature: Some("shape:3328439848300901868"), body_hash: 6656139009887152244, start_line: 26, end_line: 33 }
 callable_state CallableProjectionState { file_id: -3740202488659960972, symbol_key: "14:tictactoe.Field.sameInRow", node_id: NodeId(-3798522297738322762), signature_hash: 13991502958346549, normalized_signature: Some("outline:-5084961018881034800"), body_hash: -3596774140282798074, start_line: 22, end_line: 24 }
 callable_state CallableProjectionState { file_id: -3740202488659960972, symbol_key: "14:tictactoe.GameObject.announce", node_id: NodeId(6989368840253805161), signature_hash: -8484686843331876212, normalized_signature: Some("outline:-5083272169020481154"), body_hash: 5649390043764946485, start_line: 16, end_line: 16 }
-callable_state CallableProjectionState { file_id: -3740202488659960972, symbol_key: "14:tictactoe.HumanPlayer.turn", node_id: NodeId(6083351942803539678), signature_hash: 8396526627782628803, normalized_signature: Some("shape:8849405336717584789"), body_hash: 86375802672240801, start_line: 41, end_line: 43 }
+callable_state CallableProjectionState { file_id: -3740202488659960972, symbol_key: "14:tictactoe.HumanPlayer.turn", node_id: NodeId(6083351942803539678), signature_hash: 8396526627782628803, normalized_signature: Some("shape:-6825445992077977604"), body_hash: 7871245185677871532, start_line: 41, end_line: 43 }
 callable_state CallableProjectionState { file_id: -3740202488659960972, symbol_key: "14:tictactoe.Player.turn", node_id: NodeId(1806542613209924669), signature_hash: 3751145040262998084, normalized_signature: Some("outline:-5083272169020481154"), body_hash: -3888748658543768978, start_line: 37, end_line: 37 }
-callable_state CallableProjectionState { file_id: -3740202488659960972, symbol_key: "14:tictactoe.TicTacToe.run", node_id: NodeId(3180349830509067196), signature_hash: 7756538164283989331, normalized_signature: Some("shape:6107906801655771678"), body_hash: 2516058718679896838, start_line: 63, end_line: 67 }
-callable_state CallableProjectionState { file_id: -3740202488659960972, symbol_key: "__file_structural__", node_id: NodeId(-3740202488659960972), signature_hash: 8859361582818242897, normalized_signature: None, body_hash: 741816125663691004, start_line: 1, end_line: 73 }
+callable_state CallableProjectionState { file_id: -3740202488659960972, symbol_key: "14:tictactoe.TicTacToe.run", node_id: NodeId(3180349830509067196), signature_hash: 7756538164283989331, normalized_signature: Some("shape:8822990354250684421"), body_hash: -7445762730571606819, start_line: 63, end_line: 67 }
+callable_state CallableProjectionState { file_id: -3740202488659960972, symbol_key: "__file_structural__", node_id: NodeId(-3740202488659960972), signature_hash: 7883124735632861349, normalized_signature: None, body_hash: -4941549388779034900, start_line: 1, end_line: 73 }

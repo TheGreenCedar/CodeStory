@@ -13633,6 +13633,145 @@ fn test_trail_can_hide_utility_calls() -> Result<(), StorageError> {
 }
 
 #[test]
+fn trail_common_name_visibility_does_not_weaken_resolution_certainty() {
+    let mut failures = Vec::new();
+    for (label, certainty, default_visible) in [
+        (
+            "certain repository target",
+            ResolutionCertainty::Certain,
+            true,
+        ),
+        (
+            "probable bare common-name target",
+            ResolutionCertainty::Probable,
+            false,
+        ),
+    ] {
+        let outcome = std::panic::catch_unwind(|| -> Result<(), StorageError> {
+            let mut storage = Storage::new_in_memory()?;
+            storage.insert_nodes_batch(&[
+                Node {
+                    id: NodeId(1),
+                    kind: NodeKind::FILE,
+                    serialized_name: "src/workflow.js".into(),
+                    ..Default::default()
+                },
+                Node {
+                    id: NodeId(10),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "request".into(),
+                    file_node_id: Some(NodeId(1)),
+                    ..Default::default()
+                },
+                Node {
+                    id: NodeId(20),
+                    kind: NodeKind::UNKNOWN,
+                    serialized_name: "remove".into(),
+                    file_node_id: Some(NodeId(1)),
+                    ..Default::default()
+                },
+                Node {
+                    id: NodeId(30),
+                    kind: NodeKind::METHOD,
+                    serialized_name: "Repository.remove".into(),
+                    qualified_name: Some("Repository.remove".into()),
+                    canonical_id: Some(
+                        "script-ordinal-v1:src/workflow.js:Repository.remove#0".into(),
+                    ),
+                    file_node_id: Some(NodeId(1)),
+                    start_line: Some(1),
+                    start_col: Some(1),
+                    end_line: Some(1),
+                    end_col: Some(30),
+                    ..Default::default()
+                },
+            ])?;
+            storage.insert_edges_batch(&[Edge {
+                id: EdgeId(100),
+                source: NodeId(10),
+                target: NodeId(20),
+                kind: EdgeKind::CALL,
+                file_node_id: Some(NodeId(1)),
+                line: Some(3),
+                resolved_target: Some(NodeId(30)),
+                certainty: Some(certainty),
+                confidence: Some(if certainty == ResolutionCertainty::Certain {
+                    1.0
+                } else {
+                    0.8
+                }),
+                candidate_targets: vec![NodeId(30)],
+                ..Default::default()
+            }])?;
+            let raw = storage.get_raw_call_edges_by_effective_source(NodeId(10))?;
+            assert_eq!(raw.len(), 1);
+            assert_eq!(raw[0].resolved_target, Some(NodeId(30)));
+            assert_eq!(raw[0].certainty, Some(certainty));
+            let config = TrailConfig {
+                root_id: NodeId(10),
+                mode: TrailMode::Neighborhood,
+                target_id: None,
+                depth: 1,
+                direction: TrailDirection::Outgoing,
+                caller_scope: TrailCallerScope::IncludeTestsAndBenches,
+                edge_filter: vec![EdgeKind::CALL],
+                show_utility_calls: true,
+                node_filter: vec![],
+                max_nodes: 50,
+            };
+            let shown = storage.get_trail(&config)?;
+            assert_eq!(
+                shown.edges.len(),
+                1,
+                "{label}: explicit utility view retains the CALL"
+            );
+            let edge = &shown.edges[0];
+            assert_eq!(edge.id, EdgeId(100));
+            if certainty == ResolutionCertainty::Certain {
+                assert_eq!(edge.resolved_target, Some(NodeId(30)));
+                assert_eq!(edge.certainty, Some(ResolutionCertainty::Certain));
+                assert_eq!(edge.effective_target(), NodeId(30));
+            } else {
+                assert_eq!(
+                    edge.resolved_target, None,
+                    "common-name probable resolution must still be cleared"
+                );
+                assert_eq!(edge.certainty, None);
+                assert_eq!(edge.confidence, None);
+                assert_eq!(edge.effective_target(), NodeId(20));
+            }
+            let default = storage.get_trail(&TrailConfig {
+                show_utility_calls: false,
+                ..config
+            })?;
+            assert_eq!(
+                default.edges.iter().any(|edge| edge.id == EdgeId(100)),
+                default_visible,
+                "{label}: default visibility must respect repository authority without promoting probable resolution"
+            );
+            Ok(())
+        });
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => failures.push(format!("{label}: {error}")),
+            Err(payload) => {
+                let message = payload
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| payload.downcast_ref::<&str>().copied())
+                    .unwrap_or("non-string panic payload");
+                failures.push(format!("{label}: {message}"));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "common-name trail policy failures:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
 fn test_helper_calls_are_not_suppressed_as_ambiguous() {
     assert!(!should_ignore_call_resolution(
         "Self::flush_projection_batch",
