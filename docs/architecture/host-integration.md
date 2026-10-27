@@ -41,6 +41,36 @@ reported unavailable rather than clipped. Runtime
 receipts verify the CLI hash; explicit executable overrides retain their
 existing operator-controlled contract.
 
+## Experimental model usage feedback
+
+`CODESTORY_MODEL_USAGE_FEEDBACK=1`, captured at hook startup, optionally adds a
+notice of at most 384 UTF-8 bytes to an already accepted Codex Bash source-context
+rewrite. It reports the last observed response's input, output and total tokens.
+Cached input is already included; the notice describes the parent transcript,
+may lag, and leaves helper totals unknown. It supplies no prices, quotas or advice.
+The default is off, with no transcript reads. Missing or unsupported data omits
+the notice without changing the command, permission or existing rewrite.
+
+The adapter accepts only the observed Codex CLI `0.164.0` compact transcript
+metadata format and first root-owner metadata matching the hook session.
+Identity and usage records must roundtrip through native JSON serialization
+exactly; duplicate or escaped member spellings and other unsupported metadata
+formats omit the notice. Every parsed top-level discriminator must match its
+record prefix. Irrelevant event records need not roundtrip, since genuine host
+numeric formatting can differ. It reads only the supplied
+regular `.jsonl` below the captured Codex home's `sessions` directory, using a
+64 KiB header and at most 1 MiB tail, with 8 KiB usage records and 2048 rows.
+It checks native file and directory identities, rejects static descendant
+symlinks, and checks for mutation around descriptor reads. Unsupported platforms
+omit the signal; the current secure-open adapter covers macOS and Linux.
+
+This trusts the host-supplied path and native home. Platform aliases above that
+home may resolve to its canonical native location. Portable Node checks do not
+provide atomic confinement against malicious same-user ancestor replacement.
+Transcript format is unstable, and actual hook-time availability and delivery
+remain host-dependent. Repeated notices can repeat the same response; they are
+not cumulative charges. Token savings and better batching remain unmeasured.
+
 ## Installed lifecycle
 
 ```mermaid

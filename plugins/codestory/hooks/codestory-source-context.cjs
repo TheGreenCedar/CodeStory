@@ -4,6 +4,15 @@ const path = require('node:path');
 const runtime = require('./codestory-runtime.cjs');
 // The operator declares a fixed executor default, not a per-request override.
 const declaredZshLogin = process.env.CODESTORY_SOURCE_CONTEXT_ZSH_LOGIN === '1';
+const modelUsageFeedback = process.env.CODESTORY_MODEL_USAGE_FEEDBACK === '1';
+let modelUsageHome = null;
+if (modelUsageFeedback) {
+  try {
+    modelUsageHome = process.env.CODEX_HOME ?? path.join(require('node:os').homedir(), '.codex');
+  } catch {
+    // An unavailable host home also leaves the existing rewrite available.
+  }
+}
 
 function rewrite(event, resolved) {
   if (event?.hook_event_name !== 'PreToolUse' || event?.tool_name !== 'Bash' || !resolved?.cli) return null;
@@ -44,6 +53,14 @@ async function main() {
     const event = JSON.parse(Buffer.concat(chunks).toString('utf8'));
     const cli = runtime.resolveCli(process.argv.slice(2), runtime.pluginDataDir());
     const result = rewrite(event, { cli, shimDirectory: path.join(__dirname, 'source-context-bin') });
+    if (result && modelUsageFeedback) {
+      try {
+        const context = require('./codestory-model-usage.cjs').observe(event, modelUsageHome);
+        if (context) result.hookSpecificOutput.additionalContext = context;
+      } catch {
+        // Usage feedback must never suppress an otherwise valid capture rewrite.
+      }
+    }
     if (result) process.stdout.write(`${JSON.stringify(result)}\n`);
   } catch {
     // Optional observer fails open without changing the original tool input.
