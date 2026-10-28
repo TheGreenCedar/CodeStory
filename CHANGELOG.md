@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Function-body snippets can return long indexed functions without falling back to a single source line when the body fits the source limit.
+
 - Go symbol search finds package variables, including wrapped handlers. Existing Go indexes refresh automatically.
 
 - Call navigation keeps receiver calls such as `api.remove()` and resolved repository calls visible when their names match common utility functions.

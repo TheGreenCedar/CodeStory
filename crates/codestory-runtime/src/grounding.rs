@@ -1779,7 +1779,7 @@ impl AppController {
         let range = if path_supports_brace_balanced_function_fallback(&path) {
             // Indexed extents can stop at an inner block or include another
             // symbol. Qualify once against the already verified source buffer.
-            brace_balanced_function_body_end_line(&path, &source.content, line).map(|end_line| {
+            brace_balanced_function_body_end_line(&path, &source.content, line, indexed_end).map(|end_line| {
                 FunctionBodyRange {
                     end_line,
                     range_source: if indexed_end == Some(end_line) {
@@ -1849,6 +1849,7 @@ fn brace_balanced_function_body_end_line(
     path: &str,
     content: &str,
     start_line: u32,
+    indexed_end: Option<u32>,
 ) -> Option<u32> {
     if !path_supports_brace_balanced_function_fallback(path) {
         return None;
@@ -1856,11 +1857,40 @@ fn brace_balanced_function_body_end_line(
     let extension = Path::new(path)
         .extension()
         .and_then(|extension| extension.to_str());
+    let mut max_scan_lines = FUNCTION_BODY_FALLBACK_MAX_SCAN_LINES;
+    if let Some(candidate_lines) = indexed_end
+        .and_then(|end| end.checked_sub(start_line))
+        .and_then(|span| span.checked_add(1))
+        .map(|span| span as usize)
+        .filter(|span| *span > FUNCTION_BODY_FALLBACK_MAX_SCAN_LINES)
+    {
+        // A usable indexed candidate can justify more qualification work than
+        // inference alone. Bound that work by its actual bytes, without trusting
+        // its endpoint or changing the renderer's separate output allowance.
+        let start_index = start_line.checked_sub(1)? as usize;
+        let mut candidate_bytes = 0usize;
+        let mut present_lines = 0usize;
+        for line in content
+            .split_inclusive('\n')
+            .skip(start_index)
+            .take(candidate_lines)
+        {
+            candidate_bytes = candidate_bytes.checked_add(line.len())?;
+            if candidate_bytes > crate::DIRECT_SNIPPET_MAX_BYTES {
+                break;
+            }
+            present_lines += 1;
+        }
+        if present_lines == candidate_lines {
+            max_scan_lines = candidate_lines;
+        }
+    }
     brace_balanced_body_end_line_with_syntax(
         content,
         start_line,
         extension.is_some_and(|extension| extension.eq_ignore_ascii_case("rs")),
         extension.is_some_and(|extension| extension.eq_ignore_ascii_case("go")),
+        max_scan_lines,
     )
 }
 
@@ -1920,7 +1950,13 @@ fn brace_balanced_body_end_line(
     start_line: u32,
     rust_literal_syntax: bool,
 ) -> Option<u32> {
-    brace_balanced_body_end_line_with_syntax(source, start_line, rust_literal_syntax, false)
+    brace_balanced_body_end_line_with_syntax(
+        source,
+        start_line,
+        rust_literal_syntax,
+        false,
+        FUNCTION_BODY_FALLBACK_MAX_SCAN_LINES,
+    )
 }
 
 fn brace_balanced_body_end_line_with_syntax(
@@ -1928,6 +1964,7 @@ fn brace_balanced_body_end_line_with_syntax(
     start_line: u32,
     rust_literal_syntax: bool,
     go_literal_syntax: bool,
+    max_scan_lines: usize,
 ) -> Option<u32> {
     let start_index = start_line.checked_sub(1)? as usize;
     if go_literal_syntax {
@@ -1960,7 +1997,7 @@ fn brace_balanced_body_end_line_with_syntax(
         .lines()
         .enumerate()
         .skip(start_index)
-        .take(FUNCTION_BODY_FALLBACK_MAX_SCAN_LINES)
+        .take(max_scan_lines)
     {
         if !rust_literal_syntax
             && block_comment_depth == 0
@@ -4087,6 +4124,108 @@ mod tests {
     }
 
     #[test]
+    fn function_body_snippet_qualifies_long_indexed_body_without_trusting_its_end() {
+        let work = "    record_event(\"ordinary input was accepted\");\n";
+        let body = format!(
+            "fn route_handler() {{\n{}    let quoted = r###\"fake }} {{\"###;\n    /* fake }}\n       still inside the comment {{ */\n{}    if ready() {{\n        finish_late_body();\n    }}\n}}\n",
+            work.repeat(430),
+            work.repeat(443),
+        );
+        let start = 3;
+        let end = start + body.lines().count() as u32 - 1;
+        let content =
+            format!("fn before() {{}}\n\n{body}fn unrelated() {{\n    do_not_include();\n}}\n");
+        assert!(body.len() < crate::DIRECT_SNIPPET_MAX_BYTES);
+
+        for indexed_end in [end, end + 3] {
+            let (_temp, controller, _path) =
+                snippet_source_fixture(&content, start, Some(indexed_end));
+            let snippet = controller
+                .snippet_function_body_context(NodeId("101".into()), 0)
+                .unwrap();
+            assert_eq!(
+                snippet.scope,
+                codestory_contracts::api::SnippetScopeDto::FunctionBody,
+                "indexed end {indexed_end}"
+            );
+            assert_eq!(snippet.node.end_line, Some(indexed_end));
+            assert!(snippet.snippet.contains("finish_late_body();"));
+            assert!(snippet.snippet.contains(&format!("{end} | }}")));
+            assert!(!snippet.snippet.contains("fn before"));
+            assert!(!snippet.snippet.contains("unrelated"));
+            assert!(!snippet.snippet.contains("do_not_include"));
+            assert!(!snippet.snippet_truncated);
+            assert!(snippet.snippet.len() <= crate::DIRECT_SNIPPET_MAX_BYTES);
+            assert_eq!(
+                snippet.range_source.as_deref(),
+                Some(if indexed_end == end {
+                    "indexed_symbol_range"
+                } else {
+                    "brace_balanced_fallback"
+                })
+            );
+            assert_eq!(snippet.fallback_reason.is_some(), indexed_end != end);
+        }
+
+        // A bad inner extent must not turn a prefix into a complete body.
+        let (_temp, controller, _path) = snippet_source_fixture(&content, start, Some(end - 1));
+        let snippet = controller
+            .snippet_function_body_context(NodeId("101".into()), 0)
+            .unwrap();
+        if snippet.scope == codestory_contracts::api::SnippetScopeDto::FunctionBody {
+            assert!(snippet.snippet.contains(&format!("{end} | }}")));
+            assert!(snippet.snippet.contains("finish_late_body();"));
+            assert_eq!(
+                snippet.range_source.as_deref(),
+                Some("brace_balanced_fallback")
+            );
+        } else {
+            assert_eq!(snippet.range_source.as_deref(), Some("line_context"));
+            assert!(snippet.fallback_reason.is_some());
+        }
+        assert!(!snippet.snippet.contains("unrelated"));
+
+        for indexed_end in [None, Some(start - 1), Some(end + 1000)] {
+            let (_temp, controller, _path) = snippet_source_fixture(&content, start, indexed_end);
+            let snippet = controller
+                .snippet_function_body_context(NodeId("101".into()), 0)
+                .unwrap();
+            assert_eq!(
+                snippet.scope,
+                codestory_contracts::api::SnippetScopeDto::LineContext,
+                "unusable indexed end {indexed_end:?}"
+            );
+            assert_eq!(snippet.range_source.as_deref(), Some("line_context"));
+            assert!(snippet.fallback_reason.is_some());
+            assert!(!snippet.snippet.contains("finish_late_body"));
+        }
+    }
+
+    #[test]
+    fn function_body_snippet_rejects_unclosed_lexical_state_after_long_indexed_prefix() {
+        for tail in [
+            "    let text = r###\"unterminated raw string\n}\n",
+            "    /* unterminated comment with a fake close\n}\n",
+        ] {
+            let content = format!(
+                "fn route_handler() {{\n{}{tail}",
+                "    record_event();\n".repeat(430),
+            );
+            let indexed_end = content.lines().count() as u32;
+            let (_temp, controller, _path) = snippet_source_fixture(&content, 1, Some(indexed_end));
+            let snippet = controller
+                .snippet_function_body_context(NodeId("101".into()), 0)
+                .unwrap();
+            assert_eq!(
+                snippet.scope,
+                codestory_contracts::api::SnippetScopeDto::LineContext
+            );
+            assert_eq!(snippet.range_source.as_deref(), Some("line_context"));
+            assert!(snippet.fallback_reason.is_some());
+        }
+    }
+
+    #[test]
     fn function_body_snippet_rejects_unresolved_indexed_extents() {
         for content in [
             "fn route_handler();\nfn unrelated() {}\n",
@@ -4121,7 +4260,7 @@ mod tests {
             "func typed() interface /* comment with } */ { Read() int } {\n    return nil\n}\nfunc next() {}\n",
         ] {
             assert_eq!(
-                brace_balanced_function_body_end_line("anonymous.go", source, 1),
+                brace_balanced_function_body_end_line("anonymous.go", source, 1, None),
                 Some(3),
                 "{source}"
             );
@@ -4137,7 +4276,7 @@ mod tests {
             "func body(v interface{}) {\n    work()\n",
         ] {
             assert_eq!(
-                brace_balanced_function_body_end_line("anonymous.go", source, 1),
+                brace_balanced_function_body_end_line("anonymous.go", source, 1, None),
                 None
             );
         }
@@ -4158,14 +4297,22 @@ mod tests {
             "    work();\n".repeat(FUNCTION_BODY_FALLBACK_MAX_SCAN_LINES - 1)
         );
         assert_eq!(brace_balanced_body_end_line(&beyond, 1, true), None);
-        let (_temp, controller, _path) = snippet_source_fixture(&beyond, 1, Some(401));
-        assert_eq!(
-            controller
-                .snippet_function_body_context(NodeId("101".into()), 0)
-                .unwrap()
-                .scope,
-            codestory_contracts::api::SnippetScopeDto::LineContext
-        );
+        for (indexed_end, expected_scope) in [
+            (None, codestory_contracts::api::SnippetScopeDto::LineContext),
+            (
+                Some(401),
+                codestory_contracts::api::SnippetScopeDto::FunctionBody,
+            ),
+        ] {
+            let (_temp, controller, _path) = snippet_source_fixture(&beyond, 1, indexed_end);
+            assert_eq!(
+                controller
+                    .snippet_function_body_context(NodeId("101".into()), 0)
+                    .unwrap()
+                    .scope,
+                expected_scope
+            );
+        }
     }
 
     #[test]
