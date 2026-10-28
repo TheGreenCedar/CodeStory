@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Exact-symbol searches, source snippets and name-based relationship lookups return resume instructions during longer setup, so agents can receive other tool results while preparation continues.
+
 - Function-body snippets can return long indexed functions without falling back to a single source line when the body fits the source limit.
 
 - Go symbol search finds package variables, including wrapped handlers. Existing Go indexes refresh automatically.

@@ -30,7 +30,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, Mutex,
+    Arc,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread;
@@ -72,9 +72,9 @@ const STDIO_TEXT_ITEM_LIMIT: usize = 8;
 const STDIO_TEXT_MAX_BYTES: usize = 4 * 1024;
 const STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3: usize = 16 * 1024;
 const STDIO_STATUS_CACHE_TTL: Duration = Duration::from_secs(5);
-/// One MCP call may wait through several five-second activation slices. The
-/// deadline is fixed when that call begins and never renewed by a slice.
-const STDIO_PREPARATION_WAIT_BUDGET: Duration = Duration::from_secs(120);
+/// Activation and managed admission share one deadline, never renewed by a slice.
+const STDIO_OPERATION_BUDGET: Duration = Duration::from_secs(120);
+const STDIO_PREPARATION_FOREGROUND_BUDGET: Duration = Duration::from_millis(500);
 const STDIO_PREPARATION_PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 const STDIO_STATUS_PUBLICATION_ATTEMPTS: usize = 3;
 const STDIO_SOURCE_FINGERPRINT_FILE_CAP: usize = 25_000;
@@ -284,9 +284,9 @@ where
                 let line = message.line;
                 let cancelled = Arc::new(AtomicBool::new(false));
                 let worker_cancelled = Arc::clone(&cancelled);
-                let progress = Arc::new(Mutex::new(None));
+                let (progress_sender, progress) = tokio::sync::watch::channel(None);
                 let progress_token = stdio_progress_token(&line);
-                request_session.preparation_progress = Some(Arc::clone(&progress));
+                request_session.preparation_progress = Some(progress_sender);
                 active = Some(ActiveStdioRequest {
                     id: message.id,
                     cancelled,
@@ -356,14 +356,19 @@ where
                     write_stdio_response(&mut writer, &response).await?;
                 }
             }
-            _ = progress_tick.tick(), if active_request.progress_token.is_some() => {
-                let snapshot = {
-                    active_request
-                        .progress
-                        .lock()
-                        .expect("stdio preparation progress mutex")
-                        .clone()
-                };
+            _ = async {
+                // A watch retains only the latest request-local snapshot while
+                // a progress frame is blocked. A closed sender must not spin.
+                if active_request.progress.has_changed().is_err() {
+                    progress_tick.tick().await;
+                } else {
+                    tokio::select! {
+                        _ = progress_tick.tick() => {},
+                        _ = active_request.progress.changed() => {},
+                    }
+                }
+            }, if active_request.progress_token.is_some() => {
+                let snapshot = active_request.progress.borrow_and_update().clone();
                 if !active_request.client_cancelled.load(Ordering::Acquire)
                     && !active_request.task.is_finished()
                     && let Some(snapshot) = snapshot
@@ -492,7 +497,7 @@ struct ActiveStdioRequest {
     /// raises `cancelled` without raising this one, because the client is still
     /// waiting and has to be told the server is stopping.
     client_cancelled: Arc<AtomicBool>,
-    progress: Arc<Mutex<Option<codestory_runtime::ActivationSnapshot>>>,
+    progress: tokio::sync::watch::Receiver<Option<codestory_runtime::ActivationSnapshot>>,
     progress_token: Option<serde_json::Value>,
     progress_sequence: u64,
     task: tokio::task::JoinHandle<(StdioServerSession, StdioRequestOutcome)>,
@@ -1355,7 +1360,8 @@ struct StdioServerSession {
     tainted_project: Option<args::ProjectArgs>,
     protocol_v3: crate::stdio_v3::NativeSessionV3,
     diagnostics_v3: Arc<std::sync::Mutex<crate::stdio_v3::DiagnosticsRegistryV3>>,
-    preparation_progress: Option<Arc<Mutex<Option<codestory_runtime::ActivationSnapshot>>>>,
+    preparation_progress:
+        Option<tokio::sync::watch::Sender<Option<codestory_runtime::ActivationSnapshot>>>,
     #[cfg(test)]
     proof_fixture: bool,
     #[cfg(test)]
@@ -1998,7 +2004,7 @@ fn handle_stdio_request(
                     ));
                 }
             };
-            let (_packet_latency_scope, preparation_budget) = if name == "packet" {
+            let (_packet_latency_scope, operation_budget) = if name == "packet" {
                 let latency_budget_ms = match stdio_packet_latency_budget(&request) {
                     Ok(latency_budget_ms) => latency_budget_ms,
                     Err(error) => {
@@ -2019,7 +2025,20 @@ fn handle_stdio_request(
                     Duration::from_millis(u64::from(latency_budget_ms.unwrap_or(18_000))),
                 )
             } else {
-                (None, STDIO_PREPARATION_WAIT_BUDGET)
+                (None, STDIO_OPERATION_BUDGET)
+            };
+            // Yield fresh-source activation promptly without spending the separate
+            // admission/source-repair budget of a ready public operation.
+            let operation_deadline = request_started
+                .checked_add(operation_budget)
+                .unwrap_or(request_started);
+            let preparation_budget = if name != "packet"
+                && stdio_tool_read_class(name, &request)
+                    == codestory_runtime::OperationReadClass::SourceBacked
+            {
+                STDIO_PREPARATION_FOREGROUND_BUDGET
+            } else {
+                operation_budget
             };
             #[cfg(test)]
             let preparation_budget = session
@@ -2027,7 +2046,8 @@ fn handle_stdio_request(
                 .unwrap_or(preparation_budget);
             let preparation_deadline = request_started
                 .checked_add(preparation_budget)
-                .unwrap_or(request_started);
+                .unwrap_or(request_started)
+                .min(operation_deadline);
             codestory_runtime::observe_packet_entry_phase(
                 codestory_runtime::PacketEntryObservationPhase::ProjectSelectionStarted,
             );
@@ -2171,10 +2191,19 @@ fn handle_stdio_request(
                 // Read classes own preparation scope. Graph browsing and
                 // source reads require Core; only retrieval tools prepare
                 // sidecars. CoreOnly does not grant broad-search readiness.
-                let goal = stdio_tool_read_class(name, &request).activation_goal();
+                let read_class = stdio_tool_read_class(name, &request);
+                let goal = read_class.activation_goal();
+                // Observe short-lived source preparation before its foreground
+                // deadline, without extending that deadline or restarting work.
+                let preparation_slice =
+                    if read_class == codestory_runtime::OperationReadClass::SourceBacked {
+                        Duration::from_millis(100)
+                    } else {
+                        Duration::from_secs(5)
+                    };
                 let first_slice = preparation_deadline
                     .saturating_duration_since(Instant::now())
-                    .min(Duration::from_secs(5));
+                    .min(preparation_slice);
                 let mut activation = if let (Some(expected), Some(attempt)) =
                     (resumed_operation_id, resumed_attempt)
                 {
@@ -2242,8 +2271,17 @@ fn handle_stdio_request(
                     waiting_operation_id = Some(snapshot.operation_id.clone());
                     waiting_attempt = Some(snapshot.attempt);
                     if let Some(progress) = preparation_progress.as_ref() {
-                        *progress.lock().expect("stdio preparation progress mutex") =
-                            Some(snapshot.clone());
+                        progress.send_if_modified(|current| {
+                            let changed = current.as_ref().is_none_or(|previous| {
+                                previous.operation_id != snapshot.operation_id
+                                    || previous.attempt != snapshot.attempt
+                                    || previous.revision != snapshot.revision
+                            });
+                            if changed {
+                                *current = Some(snapshot.clone());
+                            }
+                            changed
+                        });
                     }
                     let now = Instant::now();
                     if now >= preparation_deadline {
@@ -2252,7 +2290,7 @@ fn handle_stdio_request(
                     }
                     let budget = preparation_deadline
                         .saturating_duration_since(now)
-                        .min(Duration::from_secs(5));
+                        .min(preparation_slice);
                     activation = runtime
                         .activation
                         .wait_for_existing_operation(
@@ -2522,7 +2560,7 @@ fn handle_stdio_request(
                     runtime.public_operation.run_managed_with_cancel(
                         public_operation,
                         Arc::clone(cancelled),
-                        preparation_deadline,
+                        operation_deadline,
                         || {
                             project_stdio_tool_execution_v3(
                                 runtime, state, &request, &prepared, name, revision,
@@ -8725,6 +8763,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::process::Command;
+    use std::sync::Mutex;
     use uuid::Uuid;
 
     /// Release owned gated workers even when a transport assertion panics.
@@ -8745,6 +8784,56 @@ mod tests {
             changed.notify_all();
             self.activation.cancel_and_wait();
         }
+    }
+
+    /// Follow only the exact retry instructions returned by a preparing response.
+    fn preparing_resume_test_request(
+        request: &serde_json::Value,
+        response: &serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        let preparing = &response["result"]["structuredContent"];
+        if preparing["kind"] != json!("preparing") {
+            return None;
+        }
+        assert_eq!(response["id"], request["id"], "{response}");
+        assert_eq!(response["result"]["isError"], json!(false), "{response}");
+        assert_eq!(preparing["deadline_exceeded"], json!(true), "{response}");
+        let operation_id = preparing["resume_operation_id"]
+            .as_str()
+            .expect("operation id");
+        let attempt = preparing["resume_operation_attempt"]
+            .as_u64()
+            .expect("attempt");
+        let mut expected = request["params"]["arguments"].clone();
+        if let Some(id) = expected.get("resume_operation_id") {
+            assert_eq!(
+                id,
+                &json!(operation_id),
+                "resume changed operation: {response}"
+            );
+            assert_eq!(
+                expected["resume_operation_attempt"],
+                json!(attempt),
+                "{response}"
+            );
+        }
+        expected["resume_operation_id"] = json!(operation_id);
+        expected["resume_operation_attempt"] = json!(attempt);
+        let next = &preparing["minimum_next"];
+        assert_eq!(next["kind"], json!("retry_same_request"), "{response}");
+        assert_eq!(next["arguments"], expected, "{response}");
+        assert_eq!(
+            next["request_meta"],
+            json!({
+                "codestory_operation_id":operation_id,
+                "codestory_operation_attempt":attempt,
+            }),
+            "{response}"
+        );
+        let mut resumed = request.clone();
+        resumed["params"]["arguments"] = next["arguments"].clone();
+        resumed["params"]["_meta"] = next["request_meta"].clone();
+        Some(resumed)
     }
 
     fn fixture_json_sha256(value: &serde_json::Value) -> String {
@@ -9147,8 +9236,8 @@ mod tests {
         runtime
             .activation
             .use_published_retrieval_fixture_for_test();
-        let mut canonical_id = None;
-        for mode in ["off"] {
+        {
+            let mode = "off";
             let request = json!({"params":{"name":"search","arguments":{"project":runtime.project_root,"query":"Painter","repo_text":mode,"limit":5}}});
             let execution = runtime
                 .public_operation
@@ -9197,11 +9286,6 @@ mod tests {
                     .unwrap()
                     .contains("entry.ts:2")
             );
-            if let Some(id) = canonical_id.as_ref() {
-                assert_eq!(&owner["symbol_id"], id);
-            } else {
-                canonical_id = Some(owner["symbol_id"].clone());
-            }
             assert!(!projection.evidence.as_slice().is_empty());
             let served = build_served_tool_result_v3(
                 crate::stdio_v3::McpRevisionV3::preferred(),
@@ -10752,7 +10836,7 @@ mod tests {
             id: Some(json!("request-1")),
             cancelled: Arc::clone(&cancelled),
             client_cancelled: Arc::clone(&client_cancelled),
-            progress: Arc::new(Mutex::new(None)),
+            progress: tokio::sync::watch::channel(None).1,
             progress_token: None,
             progress_sequence: 0,
             task: tokio::task::spawn_blocking(|| {
@@ -10939,7 +11023,7 @@ mod tests {
             id: Some(json!("long-running")),
             cancelled: Arc::new(AtomicBool::new(false)),
             client_cancelled: Arc::new(AtomicBool::new(false)),
-            progress: Arc::new(Mutex::new(None)),
+            progress: tokio::sync::watch::channel(None).1,
             progress_token: None,
             progress_sequence: 0,
             task: tokio::task::spawn_blocking(move || {
@@ -11776,6 +11860,158 @@ mod tests {
             StdioServeOutcome::StdinClosed
         );
         activation.cancel_and_wait();
+    }
+
+    #[test]
+    fn callers_default_preparation_yields_then_resumes_full_evidence() {
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("cache");
+        std::fs::write(
+            project.path().join("lib.rs"),
+            "pub fn target() {}\npub fn caller() { target(); }\n",
+        )
+        .expect("source file");
+        let mut session = StdioServerSession::new(None);
+        session.startup = stdio_multi_project_startup(cache.path());
+        // Exercise the public default, without the test-only budget override.
+        session
+            .select_project(project.path().to_str())
+            .expect("select project");
+        let activation = session
+            .active_project
+            .as_ref()
+            .expect("selected project")
+            .runtime
+            .activation
+            .clone();
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        activation.set_worker_start_gate_for_test(Some(Arc::clone(&gate)));
+        let _cleanup = PreparationTestCleanup {
+            activation: activation.clone(),
+            gate: Arc::clone(&gate),
+            restore_snapshot: None,
+        };
+        let request = json!({
+            "jsonrpc":"2.0", "id":"cold-callers", "method":"tools/call",
+            "params":{"name":"callers", "arguments":{
+                "project":project.path(), "query":"target", "depth":1,
+                "max_nodes":10, "caller_scope":"production_only"
+            }}
+        });
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let original = request.clone();
+        let (sent, received) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let response =
+                handle_stdio_message(&mut session, &original.to_string(), &worker_cancelled);
+            sent.send(response).expect("deliver cold response");
+            session
+        });
+        // A broken default must fail safely rather than leave a 120-second waiter.
+        let first = received.recv_timeout(Duration::from_secs(2));
+        if first.is_err() {
+            cancelled.store(true, Ordering::Release);
+            activation.set_worker_start_gate_for_test(None);
+            let (released, changed) = gate.as_ref();
+            *released.lock().expect("activation gate") = true;
+            changed.notify_all();
+        }
+        let mut session = worker.join().expect("join bounded request");
+        let first = first
+            .expect("default callers preparation must yield within two seconds")
+            .expect("cold response");
+        assert_eq!(first["id"], json!("cold-callers"), "{first}");
+        let preparing = &first["result"]["structuredContent"];
+        assert_eq!(preparing["kind"], json!("preparing"), "{first}");
+        assert_eq!(preparing["deadline_exceeded"], json!(true), "{first}");
+        assert_ne!(first.pointer("/result/isError"), Some(&json!(true)));
+        let snapshot = activation
+            .snapshot()
+            .expect("background operation survives yield");
+        assert_eq!(
+            snapshot.state,
+            codestory_runtime::ActivationState::Preparing,
+            "{snapshot:?}"
+        );
+        assert_eq!(
+            preparing["resume_operation_id"],
+            json!(snapshot.operation_id)
+        );
+        assert_eq!(
+            preparing["resume_operation_attempt"],
+            json!(snapshot.attempt)
+        );
+        let mut resume_arguments = request["params"]["arguments"].clone();
+        resume_arguments["resume_operation_id"] = json!(snapshot.operation_id);
+        resume_arguments["resume_operation_attempt"] = json!(snapshot.attempt);
+        assert_eq!(preparing["minimum_next"]["arguments"], resume_arguments);
+        assert_eq!(
+            preparing["minimum_next"]["request_meta"],
+            json!({
+                "codestory_operation_id":snapshot.operation_id,
+                "codestory_operation_attempt":snapshot.attempt
+            })
+        );
+
+        activation.set_worker_start_gate_for_test(None);
+        let (released, changed) = gate.as_ref();
+        *released.lock().expect("activation gate") = true;
+        changed.notify_all();
+        let ready_deadline = Instant::now() + Duration::from_secs(10);
+        while !activation.snapshot().is_some_and(|snapshot| {
+            snapshot.capabilities.local_navigation
+                == codestory_runtime::ActivationCapabilityState::Ready
+        }) {
+            assert!(
+                Instant::now() < ready_deadline,
+                "background activation must finish"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let ready = activation.snapshot().expect("ready operation");
+        assert_eq!(ready.operation_id, snapshot.operation_id);
+        assert_eq!(ready.attempt, snapshot.attempt);
+        let mut resumed = request.clone();
+        resumed["id"] = json!("resumed-callers");
+        resumed["params"]["arguments"] = resume_arguments;
+        let resume = handle_stdio_message(&mut session, &resumed.to_string(), &cancelled)
+            .expect("resumed evidence");
+        // Expiring only the foreground wait must not expire admission of the
+        // exact completed operation. A new request may legitimately refresh Core.
+        session.preparation_wait_budget_for_test = Some(Duration::ZERO);
+        let mut warm = resumed.clone();
+        warm["id"] = json!("ready-resumed-callers");
+        let warm = handle_stdio_message(&mut session, &warm.to_string(), &cancelled)
+            .expect("ready evidence");
+        let after_resume = activation.snapshot().expect("same completed operation");
+        assert_eq!(after_resume.operation_id, snapshot.operation_id);
+        assert_eq!(after_resume.attempt, snapshot.attempt);
+        for response in [&resume, &warm] {
+            assert_ne!(
+                response.pointer("/result/isError"),
+                Some(&json!(true)),
+                "{response}"
+            );
+            let graph = &response["result"]["structuredContent"]["graph"];
+            let edges = graph["edges"]
+                .as_array()
+                .unwrap_or_else(|| panic!("caller edges missing: {response}"));
+            assert_eq!(edges.len(), 1, "{response}");
+            assert_eq!(edges[0]["kind"], json!("CALL"), "{response}");
+            let nodes = graph["nodes"].as_array().expect("caller nodes");
+            for name in ["target", "caller"] {
+                assert!(
+                    nodes.iter().any(|node| node["label"] == json!(name)),
+                    "missing {name}: {response}"
+                );
+            }
+            assert_eq!(graph["truncated"], json!(false), "{response}");
+        }
+        assert_eq!(
+            resume["result"]["structuredContent"]["graph"],
+            warm["result"]["structuredContent"]["graph"]
+        );
     }
 
     #[tokio::test]
@@ -17739,6 +17975,66 @@ version = "0.11.20"
             .unwrap_or_else(|_| panic!("response for {id} never arrived"))
         }
 
+        async fn complete_call(
+            &mut self,
+            mut request: serde_json::Value,
+            timeout: Duration,
+        ) -> serde_json::Value {
+            let deadline = Instant::now() + timeout;
+            loop {
+                self.input
+                    .write_all(format!("{}\n", request).as_bytes())
+                    .await
+                    .expect("send complete-request frame");
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let response = tokio::time::timeout(remaining, async {
+                    loop {
+                        let mut line = String::new();
+                        self.output
+                            .read_line(&mut line)
+                            .await
+                            .expect("read complete response");
+                        let frame: serde_json::Value =
+                            serde_json::from_str(&line).expect("complete response JSON-RPC");
+                        if frame["id"] == request["id"] {
+                            break frame;
+                        }
+                    }
+                })
+                .await;
+                let response = match response {
+                    Ok(response) => response,
+                    Err(_) => {
+                        self.activation.cancel_and_wait();
+                        self.input
+                            .shutdown()
+                            .await
+                            .expect("close timed-out fixture");
+                        let outcome =
+                            tokio::time::timeout(Duration::from_secs(3), &mut self.serving)
+                                .await
+                                .expect("timed-out fixture must join")
+                                .expect("timed-out fixture serve task")
+                                .expect("timed-out fixture serve outcome");
+                        assert_eq!(outcome, StdioServeOutcome::StdinClosed);
+                        panic!("complete request exceeded overall deadline: {request}");
+                    }
+                };
+                let Some(resumed) = preparing_resume_test_request(&request, &response) else {
+                    return response;
+                };
+                request = resumed;
+                let delay = response["result"]["structuredContent"]["minimum_next"]["after_ms"]
+                    .as_u64()
+                    .expect("resume delay");
+                tokio::time::sleep(
+                    Duration::from_millis(delay)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                )
+                .await;
+            }
+        }
+
         /// Drain any frames for `id` that arrive inside `window`; the caller
         /// asserts none arrived, proving the call stayed pending.
         async fn collect_frames_for(
@@ -17938,26 +18234,29 @@ version = "0.11.20"
         .expect("mutate indexed source");
         let _hold = MidIndexingHold::arm(&fixture.storage_path);
 
+        let request = json!({
+            "jsonrpc":"2.0", "id":"held-snippet", "method":"tools/call",
+            "params":{"name":"snippet", "arguments":{
+                "project":fixture.project_root, "id":node_id
+            }}
+        });
         fixture
-            .send_call(
-                "held-snippet",
-                "snippet",
-                json!({"project": fixture.project_root, "id": node_id}),
-            )
-            .await;
+            .input
+            .write_all(format!("{}\n", request).as_bytes())
+            .await
+            .expect("send held snippet");
         _hold.wait_until_entered().await;
-        let pending = fixture
-            .collect_frames_for("held-snippet", Duration::from_secs(6))
+        let early = fixture
+            .read_response("held-snippet", Duration::from_secs(3))
             .await;
+        let resume = preparing_resume_test_request(&request, &early)
+            .unwrap_or_else(|| panic!("held source must yield preparing: {early}"));
         assert!(
-            pending.is_empty(),
-            "a source-backed read must wait for the fresh core, not answer from retained: {pending:?}"
+            early.pointer("/result/structuredContent/snippet").is_none(),
+            "{early}"
         );
-
         drop(_hold);
-        let response = fixture
-            .read_response("held-snippet", Duration::from_secs(60))
-            .await;
+        let response = fixture.complete_call(resume, Duration::from_secs(60)).await;
         let snippet = &response["result"]["structuredContent"];
         let source = snippet["snippet"].as_str().unwrap_or_else(|| {
             panic!("snippet must serve after the refresh completes: {response}")
@@ -18094,29 +18393,31 @@ version = "0.11.20"
         .expect("mutate indexed source");
         let _hold = MidIndexingHold::arm(&fixture.storage_path);
 
+        let request = json!({
+            "jsonrpc":"2.0", "id":"held-exact", "method":"tools/call",
+            "params":{"name":"search", "arguments":{
+                "project":fixture.project_root, "query":"second_marker", "repo_text":"off"
+            }}
+        });
         fixture
-            .send_call(
-                "held-exact",
-                "search",
-                json!({
-                    "project": fixture.project_root,
-                    "query": "second_marker",
-                    "repo_text": "off"
-                }),
-            )
-            .await;
+            .input
+            .write_all(format!("{}\n", request).as_bytes())
+            .await
+            .expect("send held exact search");
         _hold.wait_until_entered().await;
-        let pending = fixture
-            .collect_frames_for("held-exact", Duration::from_secs(6))
+        let early = fixture
+            .read_response("held-exact", Duration::from_secs(3))
             .await;
+        let resume = preparing_resume_test_request(&request, &early)
+            .unwrap_or_else(|| panic!("held exact search must yield preparing: {early}"));
         assert!(
-            pending.is_empty(),
-            "exact search must wait for the fresh core: {pending:?}"
+            early
+                .pointer("/result/structuredContent/evidence")
+                .is_none(),
+            "{early}"
         );
         drop(_hold);
-        let response = fixture
-            .read_response("held-exact", Duration::from_secs(60))
-            .await;
+        let response = fixture.complete_call(resume, Duration::from_secs(60)).await;
         let wire = serde_json::to_string(&response).expect("serialize exact response");
         assert!(
             wire.contains("second_marker"),
