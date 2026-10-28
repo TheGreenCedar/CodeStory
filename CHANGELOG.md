@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Go symbol search finds package variables, including wrapped handlers, and shows their complete initializers. Existing Go indexes refresh automatically.
+
 - Call navigation keeps receiver calls such as `api.remove()` and resolved repository calls visible when their names match common utility functions.
 
 - JavaScript and TypeScript navigation recognizes functions stored in named object properties and keeps calls attached to the right source body, including scripts embedded in templates.

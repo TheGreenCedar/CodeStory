@@ -3,13 +3,17 @@ use super::*;
 use codestory_contracts::graph::{NodeId, OccurrenceKind};
 use std::path::Path;
 
-fn refresh(root: &Path, store: &mut Storage, names: &[&str]) -> anyhow::Result<()> {
+fn refresh(
+    root: &Path,
+    store: &mut Storage,
+    names: &[&str],
+) -> anyhow::Result<codestory_indexer::IncrementalIndexingStats> {
     let existing_file_ids = store
         .get_files()?
         .into_iter()
         .map(|file| (file.path, file.id))
         .collect();
-    WorkspaceIndexer::new(root.to_path_buf()).run_incremental(
+    let stats = WorkspaceIndexer::new(root.to_path_buf()).run_incremental(
         store,
         &codestory_workspace::RefreshInfo {
             mode: codestory_workspace::BuildMode::Incremental,
@@ -24,7 +28,7 @@ fn refresh(root: &Path, store: &mut Storage, names: &[&str]) -> anyhow::Result<(
         store.get_errors(None)?.is_empty(),
         "fixture must index without errors"
     );
-    Ok(())
+    Ok(stats)
 }
 
 fn line(source: &str, anchor: &str) -> u32 {
@@ -136,6 +140,216 @@ fn value_reference_at(
             && edge.effective_target() == target),
         "a function value does not call its target at row {row}"
     );
+}
+
+#[test]
+fn go_package_variables_keep_identifier_definitions_and_full_initializers() -> anyhow::Result<()> {
+    let source = r#"package values
+type action func()
+func wrap(fn action) action { return fn }
+func deferred() {}
+func pair() (int, int) { return 1, 2 }
+func before() { Late() }
+var Late = wrap(func() { deferred() })
+var Plain int
+var Wrapped = wrap(func() {
+    deferred()
+})
+var Left, Right = pair()
+var (
+    Grouped = wrap(func() { deferred() })
+    GroupedLeft, GroupedRight = pair()
+    Declared action
+)
+// public is ordinary comment text, not Go visibility.
+var privateBinding = "public"
+// private is ordinary comment text, not Go visibility.
+var Exported = "private"
+var _ = wrap(deferred)
+var _, Visible = pair()
+const Constant = 1
+func consume() {
+    Wrapped := func() {}
+    Wrapped()
+    var Local = wrap(deferred)
+    _ = Local
+}
+func invoke() { Wrapped() }
+"#;
+    let dir = tempdir()?;
+    fs::write(dir.path().join("variables.go"), source)?;
+    let mut store = Storage::new_in_memory()?;
+    refresh(dir.path(), &mut store, &["variables.go"])?;
+    let nodes = store.get_nodes()?;
+    let globals: Vec<_> = nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::GLOBAL_VARIABLE)
+        .collect();
+    let expected = [
+        ("Late", "var Late = wrap(func() { deferred() })"),
+        ("Plain", "var Plain int"),
+        ("Wrapped", "var Wrapped = wrap(func() {\n    deferred()\n})"),
+        ("Left", "var Left, Right = pair()"),
+        ("Right", "var Left, Right = pair()"),
+        ("Grouped", "Grouped = wrap(func() { deferred() })"),
+        ("GroupedLeft", "GroupedLeft, GroupedRight = pair()"),
+        ("GroupedRight", "GroupedLeft, GroupedRight = pair()"),
+        ("Declared", "Declared action"),
+        ("privateBinding", "var privateBinding = \"public\""),
+        ("Exported", "var Exported = \"private\""),
+        ("Visible", "var _, Visible = pair()"),
+    ];
+    let mut actual_names: Vec<_> = globals
+        .iter()
+        .map(|node| node.serialized_name.as_str())
+        .collect();
+    actual_names.sort();
+    let mut expected_names: Vec<_> = expected.iter().map(|(name, _)| *name).collect();
+    expected_names.sort();
+    assert_eq!(
+        actual_names, expected_names,
+        "only package variables are declarations"
+    );
+    let projections = store.get_canonical_search_symbol_detail_batch_after(None, 128)?;
+    for (name, declaration) in expected {
+        let variable = globals
+            .iter()
+            .find(|node| node.serialized_name == name)
+            .unwrap();
+        let start = source.find(declaration).unwrap();
+        let name_start = start + declaration.find(name).unwrap();
+        let name_line = source[..name_start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count() as u32
+            + 1;
+        let name_col = source[..name_start].rsplit('\n').next().unwrap().len() as u32 + 1;
+        let definitions: Vec<_> = store
+            .get_occurrences_for_element(variable.id.0)?
+            .into_iter()
+            .filter(|occurrence| occurrence.kind == OccurrenceKind::DEFINITION)
+            .collect();
+        assert_eq!(definitions.len(), 1, "one identifier definition for {name}");
+        let location = &definitions[0].location;
+        assert_eq!(
+            (
+                location.start_line,
+                location.start_col,
+                location.end_line,
+                location.end_col
+            ),
+            (name_line, name_col, name_line, name_col + name.len() as u32),
+            "{name} occurrence must remain the identifier, not its initializer"
+        );
+        let line_offsets: Vec<_> = std::iter::once(0)
+            .chain(source.match_indices('\n').map(|(index, _)| index + 1))
+            .collect();
+        let display_start = line_offsets[variable.start_line.unwrap() as usize - 1]
+            + variable.start_col.unwrap() as usize
+            - 1;
+        let display_end = line_offsets[variable.end_line.unwrap() as usize - 1]
+            + variable.end_col.unwrap() as usize
+            - 1;
+        assert_eq!(
+            &source[display_start..display_end],
+            declaration,
+            "complete declaration for {name}"
+        );
+        assert!(
+            projections.iter().any(|row| row.node_id == variable.id
+                && row.display_name == name
+                && row.start_line == variable.start_line
+                && row.end_line == variable.end_line),
+            "{name} must reach canonical source search with its full span"
+        );
+        assert_eq!(
+            store.get_component_access(variable.id)?,
+            Some(if name == "privateBinding" {
+                codestory_contracts::graph::AccessKind::Private
+            } else {
+                codestory_contracts::graph::AccessKind::Public
+            }),
+            "Go visibility follows the variable name, not nearby text"
+        );
+    }
+    let file = nodes
+        .iter()
+        .find(|node| node.kind == NodeKind::FILE)
+        .unwrap();
+    let edges = store.get_edges()?;
+    let eager: Vec<_> = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL && edge.effective_source() == file.id)
+        .collect();
+    assert_eq!(
+        eager.len(),
+        7,
+        "all seven package initializer calls, including discarded blank values, execute eagerly"
+    );
+    assert!(
+        !edges.iter().any(|edge| edge.kind == EdgeKind::CALL
+            && globals.iter().any(
+                |node| node.id == edge.effective_source() || node.id == edge.effective_target()
+            )),
+        "variable discovery cannot assert callable identity or ownership"
+    );
+    for anchor in [
+        "    deferred()",
+        "    Grouped = wrap(func() { deferred() })",
+    ] {
+        assert!(
+            !edges.iter().any(|edge| edge.kind == EdgeKind::CALL
+                && edge.line == Some(line(source, anchor))
+                && nodes
+                    .iter()
+                    .any(|node| node.id == edge.effective_target()
+                        && node.serialized_name == "deferred")),
+            "deferred literal body cannot acquire a CALL"
+        );
+    }
+    let revision = codestory_indexer::current_file_extraction_revision("go").unwrap();
+    assert!(store.file_extraction_identity_matches(file.id.0, "go", revision)?);
+    assert!(
+        !store.file_extraction_identity_matches(
+            file.id.0,
+            "go",
+            "canonical-reference-occurrences-v1;go-callable-value-references-v4"
+        )?,
+        "the old producer revision must not admit a newly indexed variable publication"
+    );
+    let identities = |store: &Storage| -> anyhow::Result<_> {
+        let mut nodes = store.get_nodes()?;
+        nodes.sort_by_key(|node| node.id);
+        let mut occurrences = store.get_occurrences()?;
+        occurrences.sort_by_key(|occurrence| {
+            let location = &occurrence.location;
+            (
+                occurrence.element_id,
+                occurrence.kind as i32,
+                location.file_node_id,
+                location.start_line,
+                location.start_col,
+                location.end_line,
+                location.end_col,
+            )
+        });
+        Ok((
+            serde_json::to_value(nodes)?,
+            serde_json::to_value(occurrences)?,
+        ))
+    };
+    let fresh = identities(&store)?;
+    let warm = refresh(dir.path(), &mut store, &["variables.go"])?;
+    assert_eq!(
+        warm.artifact_cache_hits, 1,
+        "identity comparison requires an actual cached artifact replay"
+    );
+    assert_eq!(
+        identities(&store)?,
+        fresh,
+        "a call before its package binding cannot reorder cached declaration/reference identities"
+    );
+    Ok(())
 }
 
 #[test]

@@ -35,6 +35,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::OnceLock;
 
+use codestory_contracts::graph::{Node, NodeKind};
 use tree_sitter::{Node as TsNode, Tree};
 
 #[cfg(test)]
@@ -84,7 +85,65 @@ pub(crate) const PACKAGE_FUNCTION_IMPORT_SET_PREFIX: &str = "syntax:go-package-f
 pub(crate) const RETURN_PATH_OWNER_PREFIX: &str = "go-return-path:";
 
 pub(crate) const INITIALIZER_CALL_REVISION: &str =
-    extraction_revision!("go-callable-value-references-v4");
+    extraction_revision!("go-callable-value-references-v5");
+
+/// Expand display spans after identifier occurrences, call ownership and IDs are fixed.
+pub(crate) fn apply_package_variable_envelopes(tree: &Tree, nodes: &mut [Node]) {
+    if tree.root_node().has_error() {
+        return;
+    }
+    let mut envelopes = HashMap::<GraphNodeSpan, GraphNodeSpan>::new();
+    let mut cursor = tree.root_node().walk();
+    for declaration in tree.root_node().named_children(&mut cursor) {
+        if declaration.kind() != "var_declaration" {
+            continue;
+        }
+        walk_tree_nodes(declaration, &mut |spec| {
+            if spec.kind() != "var_spec" {
+                return;
+            }
+            let Some(parent) = spec.parent() else {
+                return;
+            };
+            let envelope = if parent.id() == declaration.id() {
+                declaration
+            } else if parent.kind() == "var_spec_list"
+                && parent
+                    .parent()
+                    .is_some_and(|owner| owner.id() == declaration.id())
+            {
+                spec
+            } else {
+                return;
+            };
+            let mut cursor = spec.walk();
+            for name in spec.children_by_field_name("name", &mut cursor) {
+                envelopes.insert(ts_node_graph_span(name), ts_node_graph_span(envelope));
+            }
+        });
+    }
+    for node in nodes {
+        if node.kind != NodeKind::GLOBAL_VARIABLE {
+            continue;
+        }
+        let (Some(start_line), Some(start_col), Some(end_line), Some(end_col)) =
+            (node.start_line, node.start_col, node.end_line, node.end_col)
+        else {
+            continue;
+        };
+        if let Some(envelope) = envelopes.get(&GraphNodeSpan {
+            start_line,
+            start_col,
+            end_line,
+            end_col,
+        }) {
+            node.start_line = Some(envelope.start_line);
+            node.start_col = Some(envelope.start_col);
+            node.end_line = Some(envelope.end_line);
+            node.end_col = Some(envelope.end_col);
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PackageInitializerCall {

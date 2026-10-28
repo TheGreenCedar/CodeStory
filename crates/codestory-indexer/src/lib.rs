@@ -16993,9 +16993,10 @@ fn index_file_with_resolution_inputs(
                         AccessKind::Default
                     },
                 )
-            } else if language_config.language_name == "go" && kind == NodeKind::METHOD {
-                // Go exports a method by its own initial, independently of its
-                // receiver's name and any modifier-like text in nearby source.
+            } else if language_config.language_name == "go"
+                && matches!(kind, NodeKind::METHOD | NodeKind::GLOBAL_VARIABLE)
+            {
+                // Go exports by the symbol's initial, independently of nearby text.
                 Some(go_symbol_access(&name_str))
             } else {
                 access_kind.or_else(|| {
@@ -17546,6 +17547,8 @@ fn index_file_with_resolution_inputs(
         languages::python::apply_callable_declaration_envelopes(&tree, &mut final_nodes);
     } else if language_config.language_name == "rust" {
         languages::rust::apply_declaration_envelopes(&tree, &mut final_nodes);
+    } else if language_config.language_name == "go" {
+        languages::go::apply_package_variable_envelopes(&tree, &mut final_nodes);
     }
     let callable_projection_states =
         build_callable_projection_states(&final_nodes, &result_edges, &result_occurrences);

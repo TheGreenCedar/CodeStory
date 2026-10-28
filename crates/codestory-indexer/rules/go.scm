@@ -63,6 +63,39 @@
   attr (@name.node) end_col = (end-column @def)
 }
 
+((source_file
+  (var_declaration
+    (var_spec
+      name: (identifier) @name)))
+ (#not-eq? @name "_"))
+{
+  node @name.node
+  attr (@name.node) kind = "GLOBAL_VARIABLE"
+  attr (@name.node) canonical_role = "definition"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @name)
+  attr (@name.node) start_col = (start-column @name)
+  attr (@name.node) end_row = (end-row @name)
+  attr (@name.node) end_col = (end-column @name)
+}
+
+((source_file
+  (var_declaration
+    (var_spec_list
+      (var_spec
+        name: (identifier) @name))))
+ (#not-eq? @name "_"))
+{
+  node @name.node
+  attr (@name.node) kind = "GLOBAL_VARIABLE"
+  attr (@name.node) canonical_role = "definition"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @name)
+  attr (@name.node) start_col = (start-column @name)
+  attr (@name.node) end_row = (end-row @name)
+  attr (@name.node) end_col = (end-column @name)
+}
+
 ;; Calls (global fallback identifier)
 (call_expression
   function: (identifier) @callee_any) @call_any

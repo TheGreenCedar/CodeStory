@@ -65,6 +65,15 @@ Decorator callee references remain graph nodes but cannot act as lexical
 callers for argument expressions; canonical declarations, including one-line
 functions, remain eligible owners.
 
+Go package variables retain identifier-only definition occurrences and a
+non-callable graph kind. After identities, occurrences and call proof inputs
+are collected, display ranges expand to the full standalone declaration or
+the variable's own specification within a declaration group. Eager initializer
+calls remain file-owned, while deferred literal bodies do not gain call edges.
+Visibility follows the identifier's initial. The Go extraction revision
+refreshes existing files through normal indexing, and artifact reuse preserves
+the tested declaration and occurrence identities.
+
 JavaScript and TypeScript functions assigned to static identifier-keyed object
 properties own their source bodies without introducing lexical function
 bindings. Their identities use a separate property-callable namespace; ordinary
