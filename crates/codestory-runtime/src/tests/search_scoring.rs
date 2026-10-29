@@ -1468,13 +1468,17 @@ fn core_exact_search_is_invariant_to_absolute_project_root() {
             .expect("create source directory");
         fs::write(
             &source_path,
-            "export function renderFailurePanel() {}\nexport function resume() {}\n",
+            "export function renderFailurePanel() {}\nexport function resume() {}\nfunction collectMetrics() {}\napp.get('/health', collectMetrics);\n",
         )
         .expect("write source fixture");
-        let external_source = root
-            .parent()
-            .expect("workspace root")
-            .join("external-render-failure-panel.ts");
+        let external_root = root.with_file_name(format!(
+            "{}-external",
+            root.file_name()
+                .expect("project directory name")
+                .to_string_lossy()
+        ));
+        fs::create_dir_all(&external_root).expect("create outside prefix-neighbour directory");
+        let external_source = external_root.join("external-render-failure-panel.ts");
         fs::write(&external_source, "export const external = true\n")
             .expect("write external source fixture");
 
@@ -1504,7 +1508,7 @@ fn core_exact_search_is_invariant_to_absolute_project_root() {
                     id: CoreNodeId(10),
                     kind: NodeKind::FILE,
                     serialized_name: absolute_source.clone(),
-                    qualified_name: Some(absolute_source),
+                    qualified_name: Some(absolute_source.clone()),
                     file_node_id: Some(CoreNodeId(10)),
                     start_line: Some(1),
                     ..Default::default()
@@ -1531,9 +1535,50 @@ fn core_exact_search_is_invariant_to_absolute_project_root() {
                     id: CoreNodeId(13),
                     kind: NodeKind::FILE,
                     serialized_name: external_source.clone(),
-                    qualified_name: Some(external_source),
+                    qualified_name: Some(external_source.clone()),
                     file_node_id: Some(CoreNodeId(13)),
                     start_line: Some(1),
+                    ..Default::default()
+                },
+                // Match the indexer's file-MEMBER qualification shape: the
+                // absolute FILE name prefixes both ordinary and route labels.
+                Node {
+                    id: CoreNodeId(15),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "collectMetrics".to_string(),
+                    qualified_name: Some(format!("{absolute_source}.collectMetrics")),
+                    file_node_id: Some(CoreNodeId(10)),
+                    start_line: Some(3),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(16),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "GET /health (express route; confidence=heuristic)"
+                        .to_string(),
+                    qualified_name: Some(format!(
+                        "{absolute_source}.GET /health (express route; confidence=heuristic)"
+                    )),
+                    file_node_id: Some(CoreNodeId(10)),
+                    start_line: Some(4),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(17),
+                    kind: NodeKind::VARIABLE,
+                    serialized_name: "external".to_string(),
+                    qualified_name: Some(format!("{external_source}.external")),
+                    file_node_id: Some(CoreNodeId(13)),
+                    start_line: Some(1),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(19),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "collectMetrics".to_string(),
+                    qualified_name: Some("src/module-entry.ts.collectMetrics".to_string()),
+                    file_node_id: Some(CoreNodeId(10)),
+                    start_line: Some(3),
                     ..Default::default()
                 },
             ];
@@ -1543,9 +1588,18 @@ fn core_exact_search_is_invariant_to_absolute_project_root() {
                     id: CoreNodeId(14),
                     kind: NodeKind::FILE,
                     serialized_name: alias_source.clone(),
-                    qualified_name: Some(alias_source),
+                    qualified_name: Some(alias_source.clone()),
                     file_node_id: Some(CoreNodeId(14)),
                     start_line: Some(1),
+                    ..Default::default()
+                });
+                nodes.push(Node {
+                    id: CoreNodeId(18),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "collectMetrics".to_string(),
+                    qualified_name: Some(format!("{alias_source}.collectMetrics")),
+                    file_node_id: Some(CoreNodeId(14)),
+                    start_line: Some(3),
                     ..Default::default()
                 });
             }
@@ -1562,7 +1616,7 @@ fn core_exact_search_is_invariant_to_absolute_project_root() {
                     modification_time: 0,
                     indexed: true,
                     complete: true,
-                    line_count: 2,
+                    line_count: 4,
                     file_role: codestory_store::FileRole::Source,
                 })
                 .collect();
@@ -1636,8 +1690,8 @@ fn core_exact_search_is_invariant_to_absolute_project_root() {
         assert!(
             external_hits
                 .iter()
-                .all(|hit| hit.node_id != NodeId("13".to_string())),
-            "external absolute FILE identities must not participate in project search: {external_hits:#?}"
+                .all(|hit| !["13", "17"].contains(&hit.node_id.0.as_str())),
+            "outside identities must not match through a lexical project-root prefix: {external_hits:#?}"
         );
 
         let qualified_hits = search(&fixture.controller, "service::Session::resume");
@@ -1651,6 +1705,62 @@ fn core_exact_search_is_invariant_to_absolute_project_root() {
             Some("service::Session::resume"),
             "non-FILE qualified labels must remain untouched"
         );
+
+        for (query, id, label) in [
+            ("collectMetrics", "15", "collectMetrics"),
+            (
+                "health",
+                "16",
+                "GET /health (express route; confidence=heuristic)",
+            ),
+        ] {
+            let hits = search(&fixture.controller, query);
+            let hit = hits
+                .iter()
+                .find(|hit| hit.node_id == NodeId(id.to_string()))
+                .expect("a file-owned declaration must remain searchable by its own label");
+            assert_eq!(
+                hit.display_name,
+                format!("{}.{label}", fixture.source_path.to_string_lossy()),
+                "search admission must preserve the returned canonical display name"
+            );
+            let canonical_hits = search(&fixture.controller, &hit.display_name);
+            assert!(
+                canonical_hits.iter().any(|canonical| {
+                    canonical.node_id == hit.node_id && canonical.display_name == hit.display_name
+                }),
+                "returned absolute canonical labels must remain valid resolver queries: {canonical_hits:#?}"
+            );
+            let stored = Storage::open_read_only(&fixture.storage_path)
+                .expect("open stored core")
+                .get_node(CoreNodeId(id.parse().expect("fixture node ID")))
+                .expect("read stored file-owned node")
+                .expect("stored file-owned node");
+            assert_eq!(stored.serialized_name, label);
+            assert_eq!(
+                stored.qualified_name.as_deref(),
+                Some(hit.display_name.as_str())
+            );
+        }
+        let callable_hits = search(&fixture.controller, "collectMetrics");
+        for id in ["18", "19"] {
+            if id == "18" && !cfg!(unix) {
+                continue;
+            }
+            let hit = callable_hits
+                .iter()
+                .find(|hit| hit.node_id == NodeId(id.to_string()))
+                .expect("native aliases and relative qualified names must remain searchable");
+            let stored = Storage::open_read_only(&fixture.storage_path)
+                .expect("open stored core")
+                .get_node(CoreNodeId(id.parse().expect("fixture node ID")))
+                .expect("read stored callable")
+                .expect("stored callable");
+            assert_eq!(
+                stored.qualified_name.as_deref(),
+                Some(hit.display_name.as_str())
+            );
+        }
 
         let stored = Storage::open_read_only(&fixture.storage_path)
             .expect("open stored core")
@@ -1702,8 +1812,15 @@ fn core_exact_search_is_invariant_to_absolute_project_root() {
             .iter()
             .map(|hit| hit.node_id.clone())
             .collect::<Vec<_>>(),
-        "absolute checkout spelling must not add fuzzy FILE results to an exact-symbol query"
+        "absolute checkout spelling must not change admitted identities or their ranking for an exact-symbol query"
     );
+    for hits in [&matching_hits, &neutral_hits] {
+        assert!(
+            hits.iter()
+                .all(|hit| !["15", "16", "18", "19"].contains(&hit.node_id.0.as_str())),
+            "a checkout-prefix match must not admit unrelated file-owned callable or route labels: {hits:#?}"
+        );
+    }
 }
 
 #[test]

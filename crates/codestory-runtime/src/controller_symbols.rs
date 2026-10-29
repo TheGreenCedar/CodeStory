@@ -336,7 +336,7 @@ impl AppController {
     ) -> Result<Vec<SearchHit>, ApiError> {
         let storage = self.open_storage_read_only()?;
         let project_root = self.require_project_root()?;
-        let absolute_file_query = Path::new(query.trim()).is_absolute();
+        let absolute_query = Path::new(query.trim()).is_absolute();
         let expected_rows = storage
             .get_canonical_search_symbol_count()
             .map_err(|error| {
@@ -366,22 +366,29 @@ impl AppController {
                 if !crate::search::engine::symbol_kind_is_searchable(entry.node_kind) {
                     continue;
                 }
-                let display_name =
-                    if entry.node_kind == Some(codestory_contracts::graph::NodeKind::FILE as i64) {
-                        let path = Path::new(&entry.display_name);
-                        match codestory_workspace::workspace_relative_path(&project_root, path) {
-                            // Preserve an explicit absolute FILE lookup, but keep
-                            // checkout-root spelling out of ordinary fuzzy search.
-                            Some(_) if absolute_file_query => entry.display_name.clone(),
-                            Some(relative) => relative.to_string_lossy().replace('\\', "/"),
-                            None if path.is_absolute() => continue,
-                            None => entry.display_name.clone(),
-                        }
-                    } else {
-                        entry.display_name
-                    };
-                node_names.insert(entry.node_id, display_name.clone());
-                symbols.push((entry.node_id, display_name));
+                let is_file =
+                    entry.node_kind == Some(codestory_contracts::graph::NodeKind::FILE as i64);
+                let path = Path::new(&entry.display_name);
+                let scoring_name = if is_file || path.is_absolute() {
+                    match codestory_workspace::workspace_relative_path(&project_root, path) {
+                        Some(_) if absolute_query => entry.display_name.clone(),
+                        Some(relative) => relative.to_string_lossy().replace('\\', "/"),
+                        None if path.is_absolute() => continue,
+                        None => entry.display_name.clone(),
+                    }
+                } else {
+                    entry.display_name.clone()
+                };
+                // File-owned qualified names can start with the absolute FILE
+                // identity too. Match and rank without that checkout prefix,
+                // while keeping non-FILE canonical labels unchanged in results.
+                let display_name = if is_file {
+                    scoring_name.clone()
+                } else {
+                    entry.display_name
+                };
+                node_names.insert(entry.node_id, display_name);
+                symbols.push((entry.node_id, scoring_name));
             }
         }
         if stream_rows != expected_rows as usize {
@@ -390,17 +397,17 @@ impl AppController {
             )));
         }
         let matches = search_core_symbol_names_with_scores(&symbols, query);
-        let names = node_names_for_ids(&node_names, matches.iter().map(|(id, _)| *id));
+        let matched_ids: HashSet<_> = matches.iter().map(|(id, _)| *id).collect();
+        let names = symbols
+            .into_iter()
+            .filter(|(id, _)| matched_ids.contains(id))
+            .collect();
         let mut hits = matches
             .into_iter()
             .map(|(id, score)| Self::build_search_hit(&storage, &names, id, score))
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
             .flatten()
-            .map(|mut hit| {
-                decorate_lexical_search_hit_evidence(&mut hit);
-                hit
-            })
             .collect::<Vec<_>>();
         hits.sort_by(|left, right| {
             compare_search_hits_with_project_root(
@@ -412,6 +419,18 @@ impl AppController {
             )
         });
         hits.truncate(max_results.clamp(1, 50));
+        for hit in &mut hits {
+            if let Some(display_name) = hit
+                .node_id
+                .0
+                .parse::<i64>()
+                .ok()
+                .and_then(|id| node_names.get(&codestory_contracts::graph::NodeId(id)))
+            {
+                hit.display_name.clone_from(display_name);
+            }
+            decorate_lexical_search_hit_evidence(hit);
+        }
         Ok(hits)
     }
 
