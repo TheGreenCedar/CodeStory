@@ -5105,6 +5105,9 @@ fn stdio_affected_request(
             "affected accepts at most {STDIO_AFFECTED_INPUT_PATH_LIMIT} changed path records per call"
         )));
     }
+    if let AffectedAnalysisInput::ChangeRecords(records) = &input {
+        codestory_contracts::api::validate_affected_scopes(records)?;
+    }
     Ok(AffectedAnalysisRequest {
         input,
         depth: stdio_affected_depth(request)
@@ -5223,6 +5226,7 @@ fn compact_stdio_affected_result(mut value: serde_json::Value) -> serde_json::Va
         ("unmatched_paths", STDIO_AFFECTED_PATH_OUTPUT_LIMIT),
         ("uncovered_inputs", STDIO_AFFECTED_PATH_OUTPUT_LIMIT),
         ("impacted_symbols", STDIO_AFFECTED_SYMBOL_OUTPUT_LIMIT),
+        ("scope_resolutions", STDIO_AFFECTED_SYMBOL_OUTPUT_LIMIT),
         ("impacted_routes", STDIO_AFFECTED_ROUTE_OUTPUT_LIMIT),
         ("impacted_tests", STDIO_AFFECTED_TEST_OUTPUT_LIMIT),
         ("follow_ups", STDIO_AFFECTED_PATH_OUTPUT_LIMIT),
@@ -5277,6 +5281,16 @@ fn compact_stdio_affected_result(mut value: serde_json::Value) -> serde_json::Va
                 "tests": STDIO_AFFECTED_TEST_OUTPUT_LIMIT
             }),
         );
+        if object.contains_key("scope_resolutions") {
+            object
+                .get_mut("limits")
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("affected limits are an object")
+                .insert(
+                    "scope_resolutions".to_string(),
+                    serde_json::json!(STDIO_AFFECTED_SYMBOL_OUTPUT_LIMIT),
+                );
+        }
     }
     value
 }
@@ -5384,6 +5398,8 @@ fn stdio_affected_change_record(value: &serde_json::Value) -> Result<AffectedCha
         kind,
         status,
         previous_path,
+        scope: object.get("scope").map(|value| serde_json::from_value::<codestory_contracts::api::AffectedChangedScopeDto>(value.clone())
+            .context("affected.change_records[].scope must contain typed current or previous source ranges")).transpose()?,
     })
 }
 
@@ -10611,6 +10627,55 @@ mod tests {
     }
 
     #[test]
+    fn affected_transport_scope_resolutions_are_bounded_and_layout_independent() {
+        let mut input = json!({
+            "project_root":"/project", "changed_paths":["owner.rs"], "change_records":[],
+            "matched_files":[], "uncovered_inputs":[], "matched_file_count":0, "depth":2,
+            "impacted_symbols":[], "impacted_tests":[],
+            "bounds":{"requested_depth":2,"maximum_depth":8,"visited_node_count":0,
+                "visited_edge_count":0,"impacted_symbol_limit":200,"impacted_route_limit":100},
+            "completeness":{"complete":true,"confidence":"complete","direct_impact_count":0,
+                "propagated_impact_count":0,"candidate_test_count":0,"uncovered_input_count":0,
+                "unavailable_evidence_count":0,"truncated":false,"truncation_reasons":[]}
+        });
+        let legacy =
+            render_stdio_affected_result(input.clone(), AffectedSymbolLayout::Records).unwrap();
+        assert!(legacy.get("scope_resolutions").is_none());
+        assert!(legacy["counts"].get("scope_resolutions").is_none());
+        assert!(legacy["limits"].get("scope_resolutions").is_none());
+        input["scope_resolutions"] = json!(
+            (0..51)
+                .map(|index| json!({
+                    "record_index":index,"range_index":0,"path":"owner.rs","side":"previous",
+                    "range":{"start_line":1,"end_line":1},"source_sha256":"a".repeat(64),
+                    "status":"previous_unavailable","owner_ids":[]
+                }))
+                .collect::<Vec<_>>()
+        );
+        for layout in [
+            AffectedSymbolLayout::Records,
+            AffectedSymbolLayout::SharedFieldsV1,
+        ] {
+            let served = render_stdio_affected_result(input.clone(), layout).unwrap();
+            assert_eq!(served["scope_resolutions"].as_array().unwrap().len(), 50);
+            assert_eq!(served["counts"]["scope_resolutions"], 51);
+            assert_eq!(served["limits"]["scope_resolutions"], 50);
+            assert_eq!(served["completeness"]["complete"], false);
+            assert!(
+                served["completeness"]["truncation_reasons"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|reason| reason
+                        .as_str()
+                        .unwrap()
+                        .contains("scope_resolutions response total 51"))
+            );
+            assert_eq!(served["scope_resolutions"][49]["record_index"], 49);
+        }
+    }
+
+    #[test]
     fn storage_freshness_uses_durable_db_and_wal_but_ignores_shm() {
         let temp = tempfile::tempdir().expect("storage tempdir");
         let storage = temp.path().join("codestory.db");
@@ -15634,6 +15699,70 @@ version = "0.11.20"
             assert!(session.retained_projects.is_empty());
         }
         assert_eq!(fs::read_dir(cache.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn affected_invalid_scope_refuses_before_activation_and_keeps_duplicate_records() {
+        let cache = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut session = StdioServerSession::new(None);
+        session.startup.stdio_cache_root = Some(cache.path().to_path_buf());
+        let hash = "a".repeat(64);
+        let valid = json!({"source_sha256":hash,"ranges":[{"start_line":1,"end_line":1}]});
+        let mut cases = vec![
+            json!(null),
+            json!({}),
+            json!({"current":null}),
+            json!({"current":{"source_sha256":"x".repeat(64),"ranges":[{"start_line":1,"end_line":1}]}}),
+            json!({"current":{"source_sha256":hash,"ranges":[]}}),
+            json!({"current":{"source_sha256":hash,"ranges":[{"start_line":0,"end_line":1}]}}),
+            json!({"current":{"source_sha256":hash,"ranges":[{"start_line":2,"end_line":1}]}}),
+            json!({"current":{"source_sha256":hash,"ranges":[{"start_line":1,"end_line":4097}]}}),
+            json!({"current":valid,"unknown":true}),
+        ];
+        cases.push(json!({"current":{"source_sha256":hash,"ranges":vec![json!({"start_line":1,"end_line":1});128]},
+            "previous":valid}));
+        for scope in cases {
+            let request = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"affected","arguments":{
+                "project":project.path(),"change_records":[{"path":"owner.rs","kind":"modified","scope":scope}]}}});
+            let response = handle_stdio_message(
+                &mut session,
+                &request.to_string(),
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap();
+            if response.get("error").is_some() {
+                assert_eq!(response["error"]["code"], -32602, "{response}");
+            } else {
+                assert_eq!(response["result"]["isError"], true, "{response}");
+                let failure: serde_json::Value = serde_json::from_str(
+                    response["result"]["content"][0]["text"].as_str().unwrap(),
+                )
+                .unwrap();
+                assert_eq!(failure["code"], "invalid_argument", "{response}");
+                assert!(
+                    failure["message"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("affected scope"),
+                    "{response}"
+                );
+            }
+            assert!(session.active_project.is_none());
+            assert!(session.retained_projects.is_empty());
+        }
+        assert_eq!(fs::read_dir(cache.path()).unwrap().count(), 0);
+        let parsed = stdio_affected_request(&json!({"params":{"arguments":{"change_records":[
+            {"path":"owner.rs","kind":"modified","scope":{"current":valid}},
+            {"path":"owner.rs","kind":"modified","scope":{"previous":valid}}
+        ]}}}))
+        .unwrap();
+        let AffectedAnalysisInput::ChangeRecords(records) = parsed.input else {
+            panic!("records");
+        };
+        assert_eq!(records.len(), 2);
+        assert!(records[0].scope.as_ref().unwrap().current.is_some());
+        assert!(records[1].scope.as_ref().unwrap().previous.is_some());
     }
 
     #[test]

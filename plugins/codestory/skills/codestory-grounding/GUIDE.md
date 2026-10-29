@@ -170,7 +170,7 @@ retrieval readiness and may trigger managed preparation.
 | Inspect source | `snippet` for windows, or host reads for relevant files and artifacts. Batch known windows with `snippet.paths`. |
 | Follow relationships | `callers`, `callees`, `references`, `trace` or `trail`; `neighbors`, `shortest_path` and `query_subgraph` require returned node IDs. |
 | Inspect identities | `symbol`, `symbols`, `definition` or `get_node`. Copy opaque IDs unchanged; resolve ambiguity through paths, scope and source. |
-| Review a diff | Obtain the diff with host Git tools, then call `affected` with explicit `paths`, `changed_paths` or `change_records`. |
+| Review a diff | Obtain the diff with host Git tools. `affected` accepts broad `paths`/`changed_paths` or `change_records`; use optional [changed scopes](references/affected.md#explicit-changed-ranges) for known physical ranges and source hashes. |
 | Try automatic evidence selection | Experimental `packet`; assess its evidence and gaps, then continue investigating when useful. |
 
 ### Read around returned anchors

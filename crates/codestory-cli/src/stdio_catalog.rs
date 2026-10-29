@@ -1298,6 +1298,69 @@ static INDEXED_FILES_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
     &["code", "message"],
 ]);
 
+static AFFECTED_CHANGED_RANGE_SCHEMA: SchemaObject = SchemaObject::object(
+    "Inclusive physical line range in the explicitly hashed source side.",
+    &[
+        SchemaProperty::integer("start_line", "First changed line (1-based).")
+            .with_bounds(1, 1_000_000),
+        SchemaProperty::integer(
+            "end_line",
+            "Last changed line (inclusive, at or after start_line).",
+        )
+        .with_bounds(1, 1_000_000),
+    ],
+    &["start_line", "end_line"],
+);
+static AFFECTED_CHANGED_SOURCE_SCHEMA: SchemaObject = SchemaObject::object(
+    "One source side; all scopes together allow at most 128 ranges and 4096 physical lines.",
+    &[
+        SchemaProperty::string(
+            "source_sha256",
+            "SHA-256 of the exact source bytes, 64 lowercase hexadecimal characters.",
+        )
+        .with_min_length(64)
+        .with_max_length(64),
+        SchemaProperty::array(
+            "ranges",
+            "Changed ranges in this source side.",
+            &AFFECTED_CHANGED_RANGE_SCHEMA,
+        )
+        .with_item_bounds(1, 128),
+    ],
+    &["source_sha256", "ranges"],
+);
+static AFFECTED_CHANGED_SCOPE_SCHEMA: SchemaObject = SchemaObject::object(
+    "Opt-in changed-range admission. Omit scope to retain broad file expansion. Previous bytes are unresolved unless authenticated historical source is available; no history is read.",
+    &[
+        SchemaProperty::object("current", "Current source coordinates.").with_object_schema(&AFFECTED_CHANGED_SOURCE_SCHEMA),
+        SchemaProperty::object("previous", "Removed or previous source coordinates; never reinterpret against current bytes.").with_object_schema(&AFFECTED_CHANGED_SOURCE_SCHEMA),
+    ], &[],
+).with_any_of_required(&[&["current"], &["previous"]]);
+static AFFECTED_SCOPE_PUBLICATION_SCHEMA: SchemaObject = SchemaObject::object(
+    "Complete core publication authenticating the current source and owner IDs.",
+    &[
+        SchemaProperty::string("project_id", "Logical project identity."),
+        SchemaProperty::string("generation_id", "Pinned core generation identity."),
+        SchemaProperty::string("run_id", "Pinned core run identity."),
+    ],
+    &["project_id", "generation_id", "run_id"],
+);
+static AFFECTED_SCOPE_RESOLUTION_SCHEMA: SchemaObject = SchemaObject::object(
+    "One outcome per original record, side and range. Only independently verified owners are admitted; ambiguous portions admit none.",
+    &[
+        SchemaProperty::integer("record_index", "Zero-based index in the original record array."),
+        SchemaProperty::integer("range_index", "Zero-based range index within the named side."),
+        SchemaProperty::string("path", "Submitted path for this source side."),
+        SchemaProperty::string("side", "Coordinate side.").with_enum(&["current", "previous"]),
+        SchemaProperty::object("range", "Submitted physical range.").with_object_schema(&AFFECTED_CHANGED_RANGE_SCHEMA),
+        SchemaProperty::string("source_sha256", "Submitted source hash.").with_min_length(64).with_max_length(64),
+        SchemaProperty::string("status", "Scope admission outcome; only resolved establishes full unique ownership of this range.").with_enum(&["resolved", "partial", "ambiguous", "unowned", "cross_owner", "caller_hash_mismatch", "source_unavailable", "previous_unavailable", "budget_exceeded", "out_of_bounds"]),
+        SchemaProperty::string_array("owner_ids", "Admitted owner IDs, at most 16 per range.").with_item_bounds(0, 16),
+        SchemaProperty::object("publication", "Publication of verified current source.").with_object_schema(&AFFECTED_SCOPE_PUBLICATION_SCHEMA),
+        SchemaProperty::string("verified_source_sha256", "Hash actually verified against indexed and workspace bytes.").with_min_length(64).with_max_length(64),
+    ], &["record_index", "range_index", "path", "side", "range", "source_sha256", "status", "owner_ids"],
+);
+
 static AFFECTED_CHANGE_RECORD_SCHEMA: SchemaObject = SchemaObject::object(
     "Changed file record.",
     &[
@@ -1312,6 +1375,7 @@ static AFFECTED_CHANGE_RECORD_SCHEMA: SchemaObject = SchemaObject::object(
             "Optional previous path accepted only for renamed or copied records; it can seed bounded proxy graph evidence when the current path is not indexed.",
         )
         .nullable(),
+        SchemaProperty::object("scope", "Optional typed changed ranges; omission retains legacy broad file semantics.").with_object_schema(&AFFECTED_CHANGED_SCOPE_SCHEMA),
     ],
     &["path", "kind"],
 );
@@ -1530,6 +1594,7 @@ static AFFECTED_ANALYSIS_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
             &AFFECTED_FOLLOW_UP_SCHEMA,
         ),
         SchemaProperty::string_array("notes", "Additional analysis notes."),
+        SchemaProperty::array("scope_resolutions", "Present only for scoped requests. Original range outcomes before transport caps are bounded to 128.", &AFFECTED_SCOPE_RESOLUTION_SCHEMA).with_item_bounds(1, 128),
         SchemaProperty::object("counts", "Original result counts before response caps."),
         SchemaProperty::object("limits", "Applied response caps."),
         SchemaProperty::boolean("truncated", "Whether any result collection was capped."),

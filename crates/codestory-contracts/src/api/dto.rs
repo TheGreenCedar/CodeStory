@@ -1,3 +1,4 @@
+use super::errors::ApiError;
 use super::ids::{EdgeId, NodeId};
 use super::types::{
     EdgeKind, IndexMode, LayoutDirection, MemberAccess, NodeKind, TrailCallerScope, TrailDirection,
@@ -1386,6 +1387,154 @@ pub struct AffectedChangeRecordDto {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_path: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "affected_present_scope"
+    )]
+    pub scope: Option<AffectedChangedScopeDto>,
+}
+
+fn affected_present_scope<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+pub const AFFECTED_SCOPE_MAX_RANGES: usize = 128;
+pub const AFFECTED_SCOPE_MAX_LINES: usize = 4096;
+pub const AFFECTED_SCOPE_MAX_OWNERS: usize = 16;
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AffectedChangedRangeDto {
+    pub start_line: u32,
+    pub end_line: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AffectedChangedSourceDto {
+    pub source_sha256: String,
+    pub ranges: Vec<AffectedChangedRangeDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AffectedChangedScopeDto {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "affected_present_scope"
+    )]
+    pub current: Option<AffectedChangedSourceDto>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "affected_present_scope"
+    )]
+    pub previous: Option<AffectedChangedSourceDto>,
+}
+
+/// Shared boundary validation; adapters validate before activating a project.
+pub fn validate_affected_scopes(records: &[AffectedChangeRecordDto]) -> Result<(), ApiError> {
+    let mut ranges = 0usize;
+    let mut lines = 0usize;
+    for record in records {
+        let Some(scope) = &record.scope else { continue };
+        if scope.current.is_none() && scope.previous.is_none() {
+            return Err(ApiError::invalid_argument(
+                "affected scope requires current or previous ranges",
+            ));
+        }
+        if scope.current.is_some() && record.kind == AffectedChangeKindDto::Deleted {
+            return Err(ApiError::invalid_argument(
+                "deleted affected records accept only previous scope",
+            ));
+        }
+        for source in [&scope.current, &scope.previous].into_iter().flatten() {
+            if source.source_sha256.len() != 64
+                || !source
+                    .source_sha256
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                return Err(ApiError::invalid_argument(
+                    "affected scope source_sha256 must be 64 lowercase hexadecimal characters",
+                ));
+            }
+            if source.ranges.is_empty() {
+                return Err(ApiError::invalid_argument(
+                    "affected scope ranges must not be empty",
+                ));
+            }
+            for range in &source.ranges {
+                if range.start_line == 0
+                    || range.end_line < range.start_line
+                    || range.end_line > 1_000_000
+                {
+                    return Err(ApiError::invalid_argument(
+                        "affected scope needs ordered 1-based ranges ending at most at line 1000000",
+                    ));
+                }
+                ranges = ranges.saturating_add(1);
+                lines = lines.saturating_add((range.end_line - range.start_line + 1) as usize);
+                if ranges > AFFECTED_SCOPE_MAX_RANGES || lines > AFFECTED_SCOPE_MAX_LINES {
+                    return Err(ApiError::invalid_argument(
+                        "affected scopes exceed the combined 128-range or 4096-line bound",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AffectedScopeSideDto {
+    Current,
+    Previous,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AffectedScopeStatusDto {
+    Resolved,
+    Partial,
+    Ambiguous,
+    Unowned,
+    CrossOwner,
+    CallerHashMismatch,
+    SourceUnavailable,
+    PreviousUnavailable,
+    BudgetExceeded,
+    OutOfBounds,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct AffectedScopePublicationDto {
+    pub project_id: String,
+    pub generation_id: String,
+    pub run_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct AffectedScopeResolutionDto {
+    pub record_index: u32,
+    pub range_index: u32,
+    pub path: String,
+    pub side: AffectedScopeSideDto,
+    pub range: AffectedChangedRangeDto,
+    pub source_sha256: String,
+    pub status: AffectedScopeStatusDto,
+    pub owner_ids: Vec<NodeId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication: Option<AffectedScopePublicationDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_source_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -1565,6 +1714,8 @@ pub struct AffectedAnalysisDto {
     pub follow_ups: Vec<AffectedFollowUpDto>,
     #[serde(default)]
     pub notes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scope_resolutions: Vec<AffectedScopeResolutionDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -4536,4 +4687,79 @@ pub struct WriteFileDataUrlRequest {
 pub struct WriteFileResponse {
     // Use u32 so TS can safely represent this as `number` without BigInt.
     pub bytes_written: u32,
+}
+
+#[cfg(test)]
+mod affected_scope_contract_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn records(scope: Value) -> Result<Vec<AffectedChangeRecordDto>, serde_json::Error> {
+        serde_json::from_value(
+            json!([{"path":"owner.rs","kind":"modified","status":"M","scope":scope}]),
+        )
+    }
+
+    #[test]
+    fn affected_scope_contract_rejects_malformed_and_combined_over_budget_ranges() {
+        let source = |ranges| json!({"source_sha256":"a".repeat(64),"ranges":ranges});
+        let line = json!({"start_line":1,"end_line":1});
+        let valid = records(json!({"current":source(json!([line]))})).unwrap();
+        validate_affected_scopes(&valid).unwrap();
+        for scope in [
+            json!(null),
+            json!({"current":null}),
+            json!({"current":false}),
+            json!({"current":{"source_sha256":"a".repeat(64),"ranges":[],"unknown":true}}),
+        ] {
+            assert!(
+                records(scope.clone()).is_err(),
+                "must reject malformed scope {scope}"
+            );
+        }
+        for scope in [
+            json!({}),
+            json!({"current":source(json!([]))}),
+            json!({"current":source(json!([{"start_line":0,"end_line":1}]))}),
+            json!({"current":source(json!([{"start_line":2,"end_line":1}]))}),
+            json!({"current":source(json!([{"start_line":1,"end_line":4097}]))}),
+            json!({"current":{"source_sha256":"A".repeat(64),"ranges":[line]}}),
+            json!({"current":source(json!(vec![line.clone();129]))}),
+            json!({"current":source(json!(vec![line.clone();128])),"previous":source(json!([line]))}),
+        ] {
+            assert!(
+                validate_affected_scopes(&records(scope.clone()).unwrap()).is_err(),
+                "must reject invalid scope {scope}"
+            );
+        }
+        validate_affected_scopes(
+            &records(json!({"current":source(json!(vec![line.clone();128]))})).unwrap(),
+        )
+        .unwrap();
+        validate_affected_scopes(
+            &records(json!({"current":source(json!([{"start_line":1,"end_line":4096}]))})).unwrap(),
+        )
+        .unwrap();
+        let mut combined = valid.clone();
+        combined.extend(records(json!({"current":source(json!(vec![line;128]))})).unwrap());
+        assert!(
+            validate_affected_scopes(&combined).is_err(),
+            "bound is shared across records"
+        );
+    }
+
+    #[test]
+    fn affected_legacy_record_omits_scope_and_explicit_null_cannot_widen_it() {
+        let original = json!({"path":"owner.rs","kind":"modified","status":"M"});
+        let record: AffectedChangeRecordDto = serde_json::from_value(original.clone()).unwrap();
+        assert_eq!(serde_json::to_value(record).unwrap(), original);
+        assert!(records(json!(null)).is_err());
+        let deleted: Vec<AffectedChangeRecordDto> = serde_json::from_value(json!([{
+            "path":"gone.rs","kind":"deleted","status":"D", "scope":{"current":{
+                "source_sha256":"a".repeat(64),"ranges":[{"start_line":1,"end_line":1}]
+            }}
+        }]))
+        .unwrap();
+        assert!(validate_affected_scopes(&deleted).is_err());
+    }
 }

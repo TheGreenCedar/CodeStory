@@ -30,3 +30,33 @@ CLI flags. Every call requires `project` (absolute repository root).
 - Route suggestions come from typed route/endpoint metadata when it is present. Empty route suggestions mean no route evidence was found in the matched graph slice, not that routes are unaffected.
 - `completeness.complete=false` or `completeness.truncated=true` blocks a complete no-impact claim. Runtime and MCP transport caps both degrade these nested fields and append field-specific reasons with original totals; read them before narrowing verification.
 - Follow-ups are conditional. Complete fresh analysis emits none; valid uncovered assets explain the graph boundary without recommending reindex; only exact stale evidence for a requested path recommends incremental refresh; unrelated workspace staleness remains a blind spot instead of becoming a repair command; missing or ambiguous paths recommend a focused `files --path` lookup.
+
+## Explicit changed ranges
+
+When the caller already has exact changed coordinates and source hashes, a
+`change_records` entry can include `scope.current` and/or `scope.previous`.
+Each side contains `source_sha256` (64 lowercase hexadecimal characters) and
+`ranges` of inclusive 1-based `start_line`/`end_line` pairs. Omit `scope` for the
+existing broad file analysis. CodeStory does not discover or parse Git patches.
+
+Current ranges admit declarations only after the indexed publication and actual
+project-contained source bytes agree with the supplied hash. A mismatched caller
+hash produces `caller_hash_mismatch`; actual publication/source drift fails
+closed. Source reads use at most 32 files, 2 MiB per file and 8 MiB in aggregate;
+source parsing and owner lookup also share a fixed work bound. Inputs share a
+128-range/4096-line allowance. One range can admit at most 16 owners.
+
+`scope_resolutions` retains each original record index, side and range, its
+outcome, admitted owner IDs and any verified source/publication binding. Tied
+ownership admits no arbitrary winner. Cross-owner or partly unowned ranges stay
+incomplete while independently verified portions can supply leads. Imports,
+non-symbol changes and unsupported ownership remain explicit gaps; they never
+silently expand an entire file. Previous ranges currently report
+`previous_unavailable`: CodeStory does not read historical source. A previous
+range is never interpreted against current line numbers.
+
+Repeated scoped records are combined after resolving their individual ranges.
+An unscoped record for the same file retains its broad meaning. Runtime results
+contain at most 128 scope outcomes; MCP retains the first 50 in input order and
+reports any transport truncation in counts and completeness. The default symbol
+layout and optional lossless shared-field layout retain the same selection.
