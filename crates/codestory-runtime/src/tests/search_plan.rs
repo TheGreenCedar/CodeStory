@@ -584,6 +584,8 @@ fn bridge_evidence_uses_collector_canonical_ids_not_display_labels() {
         GraphResponse {
             center_id: NodeId("n1".to_string()),
             nodes: vec![GraphNodeDto {
+                start_line: None,
+                end_line: None,
                 id: NodeId("n1".to_string()),
                 label: label.to_string(),
                 kind: NodeKind::FUNCTION,
@@ -597,6 +599,8 @@ fn bridge_evidence_uses_collector_canonical_ids_not_display_labels() {
                 member_access: None,
             }],
             edges: vec![GraphEdgeDto {
+                file_path: None,
+                line: None,
                 id: EdgeId("e1".to_string()),
                 source: NodeId("n1".to_string()),
                 target: NodeId("n1".to_string()),

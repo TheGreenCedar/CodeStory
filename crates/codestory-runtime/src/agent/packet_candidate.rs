@@ -2033,6 +2033,8 @@ mod tests {
                 nodes: [("1", "Session.request"), ("2", "Session.send")]
                     .into_iter()
                     .map(|(id, label)| GraphNodeDto {
+                        start_line: None,
+                        end_line: None,
                         id: NodeId(id.into()),
                         label: label.into(),
                         kind: NodeKind::METHOD,
@@ -2047,6 +2049,8 @@ mod tests {
                     })
                     .collect(),
                 edges: vec![GraphEdgeDto {
+                    file_path: None,
+                    line: None,
                     id: EdgeId(edge_id.into()),
                     source: NodeId("1".into()),
                     target: node_id,
@@ -2078,6 +2082,8 @@ mod tests {
         let edges = edge_specs
             .iter()
             .map(|(id, source, target)| GraphEdgeDto {
+                file_path: None,
+                line: None,
                 id: EdgeId((*id).into()),
                 source: NodeId((*source).into()),
                 target: NodeId((*target).into()),
@@ -2128,6 +2134,8 @@ mod tests {
                 nodes: node_ids
                     .into_iter()
                     .map(|id| GraphNodeDto {
+                        start_line: None,
+                        end_line: None,
                         id: NodeId(id.into()),
                         label: id.into(),
                         kind: NodeKind::METHOD,

@@ -86,14 +86,29 @@ fn env_flag(name: &str, default: bool) -> bool {
 }
 
 pub(crate) fn graph_edge_dto(
+    storage: &codestory_store::Store,
     edge: codestory_contracts::graph::Edge,
     flags: AppGraphFeatureFlags,
-) -> GraphEdgeDto {
-    GraphEdgeDto {
+) -> Result<GraphEdgeDto, codestory_contracts::api::ApiError> {
+    let file_path = match edge.file_node_id {
+        Some(file_id) => storage
+            .get_node(file_id)
+            .map_err(|error| {
+                codestory_contracts::api::ApiError::internal(format!(
+                    "Failed to resolve graph edge occurrence file: {error}"
+                ))
+            })?
+            .filter(|file| file.kind == codestory_contracts::graph::NodeKind::FILE)
+            .map(|file| file.serialized_name),
+        None => None,
+    };
+    Ok(GraphEdgeDto {
         id: EdgeId::from(edge.id),
         source: NodeId::from(edge.source),
         target: NodeId::from(edge.target),
         kind: EdgeKind::from(edge.kind),
+        file_path,
+        line: edge.line,
         confidence: edge.confidence,
         certainty: if flags.include_edge_certainty {
             edge_certainty_label(edge.kind, edge.certainty, edge.confidence)
@@ -114,5 +129,5 @@ pub(crate) fn graph_edge_dto(
         } else {
             Vec::new()
         },
-    }
+    })
 }

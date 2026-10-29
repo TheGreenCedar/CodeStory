@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Relationship graphs include available symbol line ranges and callsite file and line locations, keeping repeated calls distinct for source navigation.
+
 - Symbol-name lookup returns the same matches when a repository moves, without matching unrelated declarations through its checkout path.
 
 - Change-impact analysis accepts exact changed source ranges and reports verified owners and unresolved ranges, helping callers avoid treating every declaration in a changed file as edited.

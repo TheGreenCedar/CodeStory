@@ -350,6 +350,8 @@ fn hybrid_test_env() -> HybridTestEnv {
 
 #[test]
 fn graph_edge_dto_defaults_structural_member_certainty() {
+    let temp = tempdir().expect("create temp dir");
+    let storage = Storage::open(temp.path().join("codestory.db")).expect("open storage");
     let flags = AppGraphFeatureFlags {
         include_edge_certainty: true,
         include_callsite_identity: true,
@@ -357,6 +359,7 @@ fn graph_edge_dto_defaults_structural_member_certainty() {
     };
 
     let member = graph_edge_dto(
+        &storage,
         Edge {
             id: EdgeId(1),
             source: CoreNodeId(10),
@@ -365,8 +368,10 @@ fn graph_edge_dto_defaults_structural_member_certainty() {
             ..Default::default()
         },
         flags,
-    );
+    )
+    .expect("project edge");
     let unresolved_call = graph_edge_dto(
+        &storage,
         Edge {
             id: EdgeId(2),
             source: CoreNodeId(10),
@@ -375,8 +380,10 @@ fn graph_edge_dto_defaults_structural_member_certainty() {
             ..Default::default()
         },
         flags,
-    );
+    )
+    .expect("project edge");
     let explicit_probable = graph_edge_dto(
+        &storage,
         Edge {
             id: EdgeId(3),
             source: CoreNodeId(10),
@@ -386,7 +393,8 @@ fn graph_edge_dto_defaults_structural_member_certainty() {
             ..Default::default()
         },
         flags,
-    );
+    )
+    .expect("project edge");
 
     assert_eq!(member.certainty.as_deref(), Some("certain"));
     assert_eq!(unresolved_call.certainty, None);
@@ -13000,6 +13008,287 @@ fn list_root_symbols_deduplicates_repeated_entries() {
 
     assert_eq!(react_count, 1);
     assert!(roots.iter().any(|symbol| symbol.label == "\"./app/types\""));
+}
+
+#[test]
+fn graph_projection_preserves_typed_source_anchors() {
+    let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+    let temp = tempdir().expect("create temp dir");
+    let db_path = temp.path().join("codestory.db");
+    let callers_path = temp.path().join("callers.rs").to_string_lossy().to_string();
+    let target_path = temp.path().join("target.rs").to_string_lossy().to_string();
+    let occurrence_path = temp
+        .path()
+        .join("occurrence.rs")
+        .to_string_lossy()
+        .to_string();
+
+    {
+        let mut storage = Storage::open(&db_path).expect("open storage");
+        let mut nodes = Vec::new();
+        for (id, path) in [
+            (10, &callers_path),
+            (11, &target_path),
+            (12, &occurrence_path),
+        ] {
+            nodes.push(Node {
+                id: CoreNodeId(id),
+                kind: NodeKind::FILE,
+                serialized_name: path.clone(),
+                ..Default::default()
+            });
+        }
+        for (id, name, file_id, start_line, end_line) in [
+            (1, "target", 11, Some(100), Some(120)),
+            (2, "caller_a", 10, Some(10), Some(25)),
+            (3, "caller_b", 10, Some(40), Some(55)),
+            (4, "raw_caller", 12, Some(70), Some(80)),
+            (5, "raw_target", 12, Some(77), Some(77)),
+            (6, "caller_without_coordinates", 10, None, None),
+        ] {
+            nodes.push(Node {
+                id: CoreNodeId(id),
+                kind: NodeKind::FUNCTION,
+                serialized_name: name.to_string(),
+                file_node_id: Some(CoreNodeId(file_id)),
+                start_line,
+                end_line,
+                ..Default::default()
+            });
+        }
+        storage
+            .insert_nodes_batch(&nodes)
+            .expect("insert typed nodes");
+        storage
+            .insert_edges_batch(&[
+                Edge {
+                    id: EdgeId(201),
+                    source: CoreNodeId(2),
+                    target: CoreNodeId(1),
+                    kind: EdgeKind::CALL,
+                    file_node_id: Some(CoreNodeId(10)),
+                    line: Some(12),
+                    callsite_identity: Some("opaque-call-a".to_string()),
+                    ..Default::default()
+                },
+                Edge {
+                    id: EdgeId(202),
+                    source: CoreNodeId(2),
+                    target: CoreNodeId(1),
+                    kind: EdgeKind::CALL,
+                    file_node_id: Some(CoreNodeId(10)),
+                    line: Some(19),
+                    callsite_identity: Some("opaque-call-b".to_string()),
+                    ..Default::default()
+                },
+                Edge {
+                    id: EdgeId(203),
+                    source: CoreNodeId(4),
+                    target: CoreNodeId(5),
+                    resolved_source: Some(CoreNodeId(3)),
+                    resolved_target: Some(CoreNodeId(1)),
+                    kind: EdgeKind::CALL,
+                    file_node_id: Some(CoreNodeId(12)),
+                    line: Some(77),
+                    callsite_identity: Some("opaque-call-c".to_string()),
+                    ..Default::default()
+                },
+                Edge {
+                    id: EdgeId(204),
+                    source: CoreNodeId(6),
+                    target: CoreNodeId(1),
+                    kind: EdgeKind::CALL,
+                    // Missing typed coordinates must not be reconstructed from this opaque ID.
+                    callsite_identity: Some("12:900:1:5|opaque-call-d".to_string()),
+                    ..Default::default()
+                },
+            ])
+            .expect("insert typed callsites");
+    }
+
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
+    controller
+        .open_project(OpenProjectRequest {
+            path: temp.path().to_string_lossy().to_string(),
+        })
+        .expect("open project");
+    let incoming = || TrailConfigDto {
+        root_id: NodeId("1".to_string()),
+        mode: codestory_contracts::api::TrailMode::AllReferencing,
+        target_id: None,
+        depth: 1,
+        direction: codestory_contracts::api::TrailDirection::Incoming,
+        caller_scope: codestory_contracts::api::TrailCallerScope::IncludeTestsAndBenches,
+        edge_filter: vec![codestory_contracts::api::EdgeKind::CALL],
+        show_utility_calls: true,
+        hide_speculative: false,
+        story: false,
+        node_filter: vec![],
+        max_nodes: 128,
+        layout_direction: codestory_contracts::api::LayoutDirection::Horizontal,
+    };
+    let graphs = [
+        (
+            "neighborhood",
+            controller.graph_neighborhood(GraphRequest {
+                center_id: NodeId("1".to_string()),
+                max_edges: None,
+            }),
+        ),
+        ("trail", controller.graph_trail(incoming())),
+        (
+            "direct references",
+            controller.graph_direct_references(incoming()),
+        ),
+    ];
+    for (surface, graph) in graphs {
+        let graph = graph.expect(surface);
+        assert!(!graph.truncated, "{surface}");
+        assert_eq!(graph.omitted_edge_count, 0, "{surface}");
+        let value = serde_json::to_value(graph).expect("serialize graph");
+        let nodes = value["nodes"].as_array().expect("graph nodes");
+        let edges = value["edges"].as_array().expect("graph edges");
+        assert_eq!(nodes.len(), 4, "{surface}: only effective endpoints");
+        assert_eq!(edges.len(), 4, "{surface}: preserve distinct callsites");
+        for (id, path, start, end) in [
+            ("1", &target_path, Some(100), Some(120)),
+            ("2", &callers_path, Some(10), Some(25)),
+            ("3", &callers_path, Some(40), Some(55)),
+            ("6", &callers_path, None, None),
+        ] {
+            let node = nodes
+                .iter()
+                .find(|node| node["id"] == id)
+                .expect("effective node");
+            assert_eq!(
+                node["file_path"],
+                serde_json::json!(path),
+                "{surface}: node {id}"
+            );
+            assert_eq!(
+                node["start_line"],
+                serde_json::json!(start),
+                "{surface}: node {id} start"
+            );
+            assert_eq!(
+                node["end_line"],
+                serde_json::json!(end),
+                "{surface}: node {id} end"
+            );
+        }
+        for (id, source, path, line) in [
+            ("201", "2", Some(&callers_path), Some(12)),
+            ("202", "2", Some(&callers_path), Some(19)),
+            ("203", "3", Some(&occurrence_path), Some(77)),
+            ("204", "6", None, None),
+        ] {
+            let edge = edges
+                .iter()
+                .find(|edge| edge["id"] == id)
+                .expect("retained callsite");
+            assert_eq!(
+                edge["source"], source,
+                "{surface}: edge {id} effective caller"
+            );
+            assert_eq!(edge["target"], "1", "{surface}: edge {id} effective target");
+            assert_eq!(
+                edge["file_path"],
+                serde_json::json!(path),
+                "{surface}: edge {id} occurrence file"
+            );
+            assert_eq!(
+                edge["line"],
+                serde_json::json!(line),
+                "{surface}: edge {id} occurrence line"
+            );
+        }
+    }
+}
+
+#[test]
+fn graph_projection_preserves_partial_and_invalid_indexed_coordinates() {
+    let process_cache = tempdir().expect("owned runtime cache root");
+    let temp = tempdir().expect("create temp dir");
+    let path = temp.path().join("source.rs").to_string_lossy().to_string();
+    let bounds = [
+        (Some(10), None),
+        (None, Some(25)),
+        (Some(0), Some(25)),
+        (Some(10), Some(0)),
+        (Some(25), Some(10)),
+        (Some(10), Some(10)),
+        (Some(1_000_001), Some(u32::MAX)),
+    ];
+    {
+        let mut storage = Storage::open(temp.path().join("codestory.db")).expect("open storage");
+        let mut nodes = vec![Node {
+            id: CoreNodeId(100),
+            kind: NodeKind::FILE,
+            serialized_name: path.clone(),
+            ..Default::default()
+        }];
+        nodes.extend(
+            bounds
+                .iter()
+                .enumerate()
+                .map(|(index, &(start_line, end_line))| Node {
+                    id: CoreNodeId(index as i64 + 1),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: format!("caller_{index}"),
+                    file_node_id: Some(CoreNodeId(100)),
+                    start_line,
+                    end_line,
+                    ..Default::default()
+                }),
+        );
+        storage
+            .insert_nodes_batch(&nodes)
+            .expect("insert indexed bounds");
+        let flags = AppGraphFeatureFlags {
+            include_edge_certainty: true,
+            include_callsite_identity: true,
+            include_candidate_targets: true,
+        };
+        for (file_node_id, line, expected_path) in [
+            (Some(CoreNodeId(100)), None, Some(&path)),
+            (None, Some(12), None),
+            (Some(CoreNodeId(999)), Some(12), None),
+            (Some(CoreNodeId(1)), Some(12), None),
+            (Some(CoreNodeId(100)), Some(0), Some(&path)),
+            (Some(CoreNodeId(100)), Some(u32::MAX), Some(&path)),
+        ] {
+            let edge = graph_edge_dto(
+                &storage,
+                Edge {
+                    file_node_id,
+                    line,
+                    callsite_identity: Some("100:99:1:2|opaque".to_string()),
+                    ..Default::default()
+                },
+                flags,
+            )
+            .expect("project occurrence metadata");
+            assert_eq!(edge.file_path.as_ref(), expected_path);
+            assert_eq!(edge.line, line);
+        }
+    }
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
+    controller
+        .open_project(OpenProjectRequest {
+            path: temp.path().to_string_lossy().to_string(),
+        })
+        .expect("open project");
+    for (index, (start, end)) in bounds.into_iter().enumerate() {
+        let graph = controller
+            .graph_neighborhood(GraphRequest {
+                center_id: NodeId((index + 1).to_string()),
+                max_edges: None,
+            })
+            .expect("project indexed bounds");
+        assert_eq!(graph.nodes.len(), 1);
+        assert_eq!(graph.nodes[0].start_line, start);
+        assert_eq!(graph.nodes[0].end_line, end);
+    }
 }
 
 #[test]

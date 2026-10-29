@@ -822,6 +822,8 @@ mod tests {
 
     fn node(id: &str, label: &str, kind: NodeKind, depth: u32) -> GraphNodeDto {
         GraphNodeDto {
+            start_line: None,
+            end_line: None,
             id: NodeId(id.to_string()),
             label: label.to_string(),
             kind,
@@ -838,6 +840,8 @@ mod tests {
 
     fn edge(id: &str, source: &str, target: &str, kind: EdgeKind) -> GraphEdgeDto {
         GraphEdgeDto {
+            file_path: None,
+            line: None,
             id: codestory_contracts::api::EdgeId(id.to_string()),
             source: NodeId(source.to_string()),
             target: NodeId(target.to_string()),

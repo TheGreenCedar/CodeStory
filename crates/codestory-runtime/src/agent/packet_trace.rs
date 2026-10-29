@@ -348,6 +348,8 @@ mod golden_tests {
                 center_id: center_id.clone(),
                 nodes: vec![
                     GraphNodeDto {
+                        start_line: None,
+                        end_line: None,
                         id: center_id.clone(),
                         label: display_name.into(),
                         kind: NodeKind::METHOD,
@@ -361,6 +363,8 @@ mod golden_tests {
                         member_access: None,
                     },
                     GraphNodeDto {
+                        start_line: None,
+                        end_line: None,
                         id: target_id.clone(),
                         label: target_label.into(),
                         kind: NodeKind::UNKNOWN,
@@ -375,6 +379,8 @@ mod golden_tests {
                     },
                 ],
                 edges: vec![GraphEdgeDto {
+                    file_path: None,
+                    line: None,
                     id: EdgeId(edge_id.into()),
                     source: center_id,
                     target: target_id,

@@ -522,6 +522,8 @@ mod tests {
 
     fn node(id: &str, label: &str, depth: u32) -> GraphNodeDto {
         GraphNodeDto {
+            start_line: None,
+            end_line: None,
             id: NodeId(id.to_string()),
             label: label.to_string(),
             kind: NodeKind::FUNCTION,
@@ -569,6 +571,8 @@ mod tests {
                 ],
                 edges: vec![
                     GraphEdgeDto {
+                        file_path: None,
+                        line: None,
                         id: EdgeId("direct-b-focus".to_string()),
                         source: NodeId("direct-b".to_string()),
                         target: NodeId("focus".to_string()),
@@ -579,6 +583,8 @@ mod tests {
                         candidate_targets: Vec::new(),
                     },
                     GraphEdgeDto {
+                        file_path: None,
+                        line: None,
                         id: EdgeId("direct-a-focus".to_string()),
                         source: NodeId("direct-a".to_string()),
                         target: NodeId("focus".to_string()),
@@ -589,6 +595,8 @@ mod tests {
                         candidate_targets: Vec::new(),
                     },
                     GraphEdgeDto {
+                        file_path: None,
+                        line: None,
                         id: EdgeId("transitive-b-direct".to_string()),
                         source: NodeId("transitive-b".to_string()),
                         target: NodeId("direct-b".to_string()),
@@ -599,6 +607,8 @@ mod tests {
                         candidate_targets: Vec::new(),
                     },
                     GraphEdgeDto {
+                        file_path: None,
+                        line: None,
                         id: EdgeId("transitive-a-direct".to_string()),
                         source: NodeId("transitive-a".to_string()),
                         target: NodeId("direct-a".to_string()),
@@ -609,6 +619,8 @@ mod tests {
                         candidate_targets: Vec::new(),
                     },
                     GraphEdgeDto {
+                        file_path: None,
+                        line: None,
                         id: EdgeId("reference-direct".to_string()),
                         source: NodeId("reference".to_string()),
                         target: NodeId("direct-b".to_string()),
