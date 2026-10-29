@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Packets can return complete matching source lines from large indexed files without treating the short range as a complete file.
+
 - Symbol-name lookup returns the same matches when a repository moves, without matching unrelated declarations through its checkout path.
 
 - Change-impact analysis accepts exact changed source ranges and reports verified owners and unresolved ranges, helping callers avoid treating every declaration in a changed file as edited.

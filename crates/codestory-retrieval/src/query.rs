@@ -745,6 +745,13 @@ impl PinnedQuerySession {
             #[cfg(not(feature = "benchmark-support"))]
             unreachable!("dense semantic packet control requires benchmark-support")
         };
+        for candidate in &mut result.hits {
+            candidate.bind_lexical_file_focus_project(
+                &self.project_id,
+                &self.publication_identity.sidecar_generation,
+                &self.publication_identity.sidecar_input_hash,
+            );
+        }
         sanitize_packet_candidate_descriptors(&mut result.hits);
         Ok(result.with_publication_identity(&self.publication_identity))
     }
@@ -896,6 +903,13 @@ impl PinnedQuerySession {
             max_descriptor_stage_elapsed_ms(&results, RetrievalStageKind::Stage1bSemantic)
         });
         for result in &mut results {
+            for candidate in &mut result.hits {
+                candidate.bind_lexical_file_focus_project(
+                    &self.project_id,
+                    &self.publication_identity.sidecar_generation,
+                    &self.publication_identity.sidecar_input_hash,
+                );
+            }
             sanitize_packet_candidate_descriptors(&mut result.hits);
             result.publication_identity = Some(self.publication_identity.clone());
         }
