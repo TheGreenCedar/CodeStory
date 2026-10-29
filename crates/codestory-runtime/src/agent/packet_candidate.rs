@@ -66,9 +66,6 @@ pub(crate) struct PacketProofSession {
         >,
     >,
     early_whole_file_refusals: RefCell<BTreeMap<String, (String, usize)>>,
-    /// Frozen only when retrieval actually issues a new receipt. Later query
-    /// results, exact selectors and served history cannot replace this focus.
-    admitted_file_focus: RefCell<HashMap<String, AdmittedFileFocus>>,
     admitted_call_annotations:
         RefCell<HashMap<String, codestory_contracts::compilation::PacketPublishedCallsV1>>,
     include_dense_semantic: bool,
@@ -125,13 +122,6 @@ struct RetainedPacketDescriptorResult {
     include_dense_semantic: bool,
     publication: RetrievalPublicationIdentity,
     result: QueryResult,
-}
-
-#[derive(Debug)]
-struct AdmittedFileFocus {
-    receipt: PacketAdmissionReceiptV1,
-    publication: RetrievalPublicationIdentity,
-    candidate: codestory_retrieval::CandidateHit,
 }
 
 impl Default for PacketProofSession {
@@ -256,7 +246,6 @@ impl PacketProofSession {
             descriptor_results: RefCell::new(Vec::new()),
             whole_file_length_candidates: RefCell::new(HashMap::new()),
             early_whole_file_refusals: RefCell::new(BTreeMap::new()),
-            admitted_file_focus: RefCell::new(HashMap::new()),
             admitted_call_annotations: RefCell::new(HashMap::new()),
             include_dense_semantic: true,
             replay_ranked_descriptors: RefCell::new(None),
@@ -597,35 +586,7 @@ impl PacketProofSession {
             );
             return PacketAdmissionDecision::SourceBudgetExceeded;
         };
-        let focused = self
-            .whole_file_length_candidates
-            .borrow()
-            .get(&descriptor.stable_identity)
-            .filter(|(_, candidate)| {
-                descriptor.exact_selector_ordinal.is_none()
-                    && descriptor.retrieval_lane
-                        == codestory_contracts::compilation::PacketRetrievalLaneV1::Lexical
-                    && descriptor.symbol.is_none()
-                    && candidate.source == codestory_retrieval::CandidateSource::Lexical
-                    && candidate.file_path == descriptor.path
-                    && candidate.source_bytes_upper_bound == descriptor.source_bytes_upper_bound
-                    && candidate.packet_stable_identity().as_deref()
-                        == Some(descriptor.stable_identity.as_str())
-            })
-            .and_then(|(publication, candidate)| {
-                candidate
-                    .lexical_file_focus(
-                        &publication.sidecar_generation,
-                        &publication.sidecar_input_hash,
-                    )
-                    .filter(|focus| {
-                        focus.rendered_bytes()
-                            <= (source_bytes as usize).min(INTERIM_SOURCE_ROW_UPPER_BOUND)
-                    })
-                    .map(|_| (publication.clone(), candidate.clone()))
-            });
         if descriptor.exact_selector_ordinal.is_none()
-            && focused.is_none()
             && let Some((publication, candidate)) = self
                 .whole_file_length_candidates
                 .borrow()
@@ -652,64 +613,13 @@ impl PacketProofSession {
             );
             return PacketAdmissionDecision::SourceBudgetExceeded;
         }
-        let decision = self.admit_with_receipt(
+        self.admit_with_receipt(
             &descriptor.stable_identity,
             source_bytes as usize,
             origin,
             &descriptor.retrieval_score.version,
             descriptor.exact_selector_ordinal,
-        );
-        if decision == PacketAdmissionDecision::Admitted
-            && let Some((publication, candidate)) = focused
-            && let Some(receipt) = self.receipts.borrow().last().cloned()
-        {
-            self.admitted_file_focus.borrow_mut().insert(
-                descriptor.stable_identity.clone(),
-                AdmittedFileFocus {
-                    receipt,
-                    publication,
-                    candidate,
-                },
-            );
-        }
-        decision
-    }
-
-    pub(crate) fn file_focus(
-        &self,
-        receipt: &PacketAdmissionReceiptV1,
-        publication: &RetrievalPublicationIdentity,
-        project_id: &str,
-    ) -> Option<codestory_retrieval::LexicalFileFocus> {
-        if !self.retrieval_admission_is_sealed()
-            || receipt.origin != PacketAdmissionOriginV1::Retrieval
-            || !self
-                .receipts
-                .borrow()
-                .iter()
-                .any(|issued| issued == receipt)
-        {
-            return None;
-        }
-        let frozen = self.admitted_file_focus.borrow();
-        let frozen = frozen.get(&receipt.stable_identity)?;
-        if &frozen.receipt != receipt || &frozen.publication != publication {
-            return None;
-        }
-        frozen
-            .candidate
-            .lexical_file_focus(
-                &publication.sidecar_generation,
-                &publication.sidecar_input_hash,
-            )
-            .filter(|focus| {
-                focus.project_id() == Some(project_id)
-                    && focus.rendered_bytes() <= receipt.reserved_source_bytes as usize
-            })
-    }
-
-    pub(crate) fn is_focused_file(&self, identity: &str) -> bool {
-        self.admitted_file_focus.borrow().contains_key(identity)
+        )
     }
 
     pub(crate) fn is_metadata_excluded_candidate(

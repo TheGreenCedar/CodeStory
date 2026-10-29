@@ -30,11 +30,6 @@ use tracing::warn;
 pub const LEXICAL_INDEX_VERSION: &str = "sqlite-fts5-v3-callable-source-v1";
 const LEGACY_CALLABLE_INDEX_VERSION: &str = "sqlite-fts5-v3-callable-source-v1";
 const LEXICAL_CALLABLE_SOURCE_BYTES: usize = 4_096;
-const LEXICAL_FOCUS_FILE_BYTES: usize = 256 * 1024;
-const LEXICAL_FOCUS_TOTAL_BYTES: usize = 1024 * 1024;
-const LEXICAL_FOCUS_MAX_CANDIDATES: usize = 16;
-const LEXICAL_FOCUS_MAX_TOKENS: usize = 64;
-const LEXICAL_FOCUS_QUERY_BYTES: usize = 4096;
 pub const LEXICAL_INDEX_FILE: &str = "lexical-index.sqlite3";
 const LEXICAL_COMPONENT_ENVELOPE_FILE: &str = "lexical-component-envelope.json";
 const LEXICAL_COMPONENT_ENVELOPE_SCHEMA_VERSION: u32 = 1;
@@ -2300,13 +2295,7 @@ fn search_lexical_component_set(
             .is_some();
     if unchanged && payload == LexicalHitPayload::DescriptorOnly {
         let seals = Arc::new(before.expect("sealed observations"));
-        let tokens = lexical_query_tokens(query);
-        let mut focus_bytes = LEXICAL_FOCUS_TOTAL_BYTES;
-        let mut focus_attempts = 0_usize;
         for hit in &mut hits {
-            if cancelled() {
-                bail!("lexical search cancelled");
-            }
             if hit.source != LexicalDocumentSource::LexicalSource
                 || hit.node_id.is_some()
                 || hit.symbol_name.is_some()
@@ -2320,12 +2309,11 @@ fn search_lexical_component_set(
                 continue;
             };
             let key = lexical_hit_document_key(hit)?;
-            let component = match latest.get(&key) {
-                None => &component_set.base,
-                Some(Some(index)) => &component_set.deltas[*index].component,
+            let owner = match latest.get(&key) {
+                None => &component_set.base.file_name,
+                Some(Some(index)) => &component_set.deltas[*index].component.file_name,
                 Some(None) => continue,
             };
-            let owner = &component.file_name;
             hit.whole_file_length_evidence =
                 Some(crate::candidate::WholeFileLengthEvidence::sealed(
                     hit.path.clone(),
@@ -2335,113 +2323,9 @@ fn search_lexical_component_set(
                     decoded_bytes,
                     Arc::clone(&seals),
                 ));
-            // Small files retain their existing whole-file semantics. Larger
-            // files may carry one complete matching line, independently from
-            // Full hit coordinates and without opening Core or current source.
-            if decoded_bytes
-                > codestory_contracts::compilation::INTERIM_SOURCE_ROW_UPPER_BOUND as u64
-                && focus_attempts < LEXICAL_FOCUS_MAX_CANDIDATES
-                && codestory_contracts::language_support::language_name_for_path(Some(&hit.path))
-                    .is_some()
-            {
-                focus_attempts += 1;
-                let focus = read_sealed_lexical_focus(
-                    &shard_dir.join(owner),
-                    &component.metadata.project_id,
-                    hit,
-                    &tokens,
-                    &mut focus_bytes,
-                    Arc::clone(&cancelled),
-                )?;
-                hit.whole_file_length_evidence
-                    .as_mut()
-                    .expect("sealed length")
-                    .attach_focus(focus);
-            }
-        }
-        if cancelled() {
-            bail!("lexical search cancelled");
-        }
-        if ArtifactSeal::observe_all(&artifacts).ok().as_ref() != Some(seals.as_ref()) {
-            bail!("lexical publication changed while locating source focus");
         }
     }
     Ok(hits)
-}
-
-fn read_sealed_lexical_focus(
-    database: &Path,
-    physical_generation: &str,
-    hit: &LexicalHit,
-    tokens: &[String],
-    remaining: &mut usize,
-    cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
-) -> Result<Option<crate::candidate::LexicalFileFocus>> {
-    if cancelled() {
-        bail!("lexical search cancelled");
-    }
-    if tokens.len() > LEXICAL_FOCUS_MAX_TOKENS
-        || tokens.iter().map(String::len).sum::<usize>() > LEXICAL_FOCUS_QUERY_BYTES
-    {
-        return Ok(None);
-    }
-    let connection = open_read_only(database)?;
-    let progress = Arc::clone(&cancelled);
-    connection.progress_handler(1_000, Some(move || progress()))?;
-    let representation = lexical_database_representation(&connection)?;
-    // Older publications have no original-encoding identity column. Preserve
-    // their existing navigation/whole-file behavior without inventing focus.
-    if representation.schema_version < LEXICAL_DATABASE_SCHEMA_V5 {
-        return Ok(None);
-    }
-    let row: Option<(i64, i64, i64, String, Option<String>)> = connection.query_row(
-        "SELECT id, content_decoded_bytes, length(CAST(content AS BLOB)), document_hash, encoded_source_sha256
-         FROM lexical_documents WHERE document_key=?1 AND path=?2 AND source='lexical_source'
-         AND node_id IS NULL AND symbol_name IS NULL AND start_line IS NULL",
-        rusqlite::params![format!("source\0{}", hit.path), hit.path],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-    ).optional()?;
-    let Some((id, decoded, encoded, document_hash, original_hash)) = row else {
-        return Ok(None);
-    };
-    let Ok(decoded) = usize::try_from(decoded) else {
-        return Ok(None);
-    };
-    if decoded == 0
-        || decoded > LEXICAL_FOCUS_FILE_BYTES
-        || decoded > *remaining
-        || encoded < 0
-        || encoded as u64 > (LEXICAL_FOCUS_FILE_BYTES + 1024) as u64
-        || hit.raw_decoded_bytes != Some(decoded as u64)
-    {
-        return Ok(None);
-    }
-    *remaining -= decoded;
-    let content = read_admitted_source_content(
-        &connection,
-        id,
-        LexicalDatabaseRepresentation {
-            schema_version: representation.schema_version,
-            decoded_byte_limit: representation
-                .decoded_byte_limit
-                .min(LEXICAL_FOCUS_FILE_BYTES as u64),
-        },
-        cancelled.as_ref(),
-    )?;
-    let matched = lexical_source_match(&content, tokens);
-    if cancelled() {
-        bail!("lexical search cancelled");
-    }
-    Ok(matched.and_then(|matched| {
-        crate::candidate::LexicalFileFocus::from_source(
-            physical_generation,
-            document_hash,
-            original_hash.unwrap_or_else(|| format!("{:x}", Sha256::digest(content.as_bytes()))),
-            &content,
-            matched.start_byte,
-            matched.end_byte,
-        )
-    }))
 }
 
 fn search_lexical_component(
@@ -7654,8 +7538,7 @@ mod tests {
         for schema_version in [LEXICAL_DATABASE_SCHEMA_V3, LEXICAL_DATABASE_SCHEMA_V4] {
             let temp = TempDir::new().unwrap();
             let file = temp.path().join("legacy.sqlite3");
-            let content = format!("{}// legacyneedle\n", "// regular context\n".repeat(64));
-            let document = source_document("src/worker.rs", &content);
+            let document = source_document("src/worker.rs", "legacyneedle");
             let prepared = prepared_documents(vec![document]);
             write_lexical_database(&file, "legacy", "input", &prepared.fingerprint, |visit| {
                 for doc in &prepared.documents {
@@ -7726,22 +7609,6 @@ mod tests {
                 .unwrap();
                 assert_eq!(hits.len(), 1);
                 assert!(hits[0].call_neighborhood.is_none());
-                if payload == LexicalHitPayload::DescriptorOnly {
-                    let mut remaining = LEXICAL_FOCUS_TOTAL_BYTES;
-                    assert!(
-                        read_sealed_lexical_focus(
-                            &file,
-                            "legacy",
-                            &hits[0],
-                            &["legacyneedle".into()],
-                            &mut remaining,
-                            Arc::new(|| false)
-                        )
-                        .unwrap()
-                        .is_none(),
-                        "legacy large rows remain readable without the optional encoding-identity column"
-                    );
-                }
             }
             assert_eq!(
                 LEXICAL_INDEX_VERSION, LEGACY_CALLABLE_INDEX_VERSION,
@@ -8307,134 +8174,6 @@ mod tests {
         assert_eq!(
             conflicted[0].whole_file_decoded_bytes("second", "input"),
             None
-        );
-    }
-
-    #[test]
-    fn lexical_focus_is_sealed_bounded_and_independent_of_whole_file_length() {
-        let temp = TempDir::new().unwrap();
-        let data = temp.path().join("shards");
-        let content = format!(
-            "{}// firstfocusneedle\r\n// secondfocusneedle\n",
-            "// ordinary context\n".repeat(64)
-        );
-        let prepared = prepared_documents(vec![source_document("settings.rs", &content)]);
-        build_prepared_lexical_shard(&data, "focus", &prepared, "input", None, || Ok(())).unwrap();
-        let shard = shard_dir_for(&data, "focus");
-        let mut candidates = Vec::new();
-        for (query, line) in [
-            ("firstfocusneedle", Some(65)),
-            ("secondfocusneedle", Some(66)),
-            ("\"settings.rs\"", None),
-        ] {
-            let mut hits =
-                search_lexical_index_descriptors_with_cancel(&shard, "input", query, 4, || false)
-                    .unwrap();
-            assert_eq!(hits.len(), 1);
-            let hit = hits.remove(0);
-            assert!(
-                hit.start_line.is_none() && hit.target.is_none() && hit.source_excerpt.is_none(),
-                "focus must not change ordinary hit coordinates or fusion identity"
-            );
-            let candidate =
-                crate::lexical_client::lexical_hit_to_candidate_bound(hit, "input").unwrap();
-            let focus = candidate.lexical_file_focus("focus", "input");
-            assert_eq!(focus.as_ref().map(|f| f.line()), line);
-            assert_eq!(
-                candidate.whole_file_decoded_bytes("focus", "input"),
-                Some(content.len() as u64)
-            );
-            if let Some(focus) = focus {
-                assert_eq!(
-                    focus.project_id(),
-                    None,
-                    "a physical lexical shard cannot invent a logical project binding"
-                );
-                assert!(
-                    focus.rendered_bytes()
-                        <= codestory_contracts::compilation::INTERIM_SOURCE_ROW_UPPER_BOUND
-                );
-                assert!(focus.matches_source(
-                    &content,
-                    &format!("{:x}", Sha256::digest(content.as_bytes()))
-                ));
-                assert!(!focus.matches_source(
-                    &content.replace("first", "other"),
-                    &format!("{:x}", Sha256::digest(content.as_bytes()))
-                ));
-                assert!(candidate.lexical_file_focus("wrong", "input").is_none());
-                assert!(candidate.lexical_file_focus("focus", "wrong").is_none());
-                candidates.push(candidate);
-            }
-        }
-        let merged = crate::executor::replay_fuse_published_calls(vec![
-            candidates[0].clone(),
-            candidates[1].clone(),
-            candidates[0].clone(),
-        ]);
-        assert_eq!(merged.len(), 1);
-        assert!(
-            merged[0].lexical_file_focus("focus", "input").is_none(),
-            "conflicting foci cannot splice or resurrect"
-        );
-        assert_eq!(
-            merged[0].whole_file_decoded_bytes("focus", "input"),
-            Some(content.len() as u64),
-            "focus conflicts must not discard independent valid length authority"
-        );
-        let full = search_lexical_index(&shard, "input", "firstfocusneedle", 4).unwrap();
-        assert_eq!(full[0].start_line, Some(65));
-        assert!(matches!(
-            full[0].target.as_ref(),
-            Some(SearchTargetDto::FileRange { .. })
-        ));
-        assert!(
-            full[0].whole_file_length_evidence.is_none(),
-            "ordinary Full output is unchanged"
-        );
-        assert!(
-            search_lexical_index_descriptors_with_cancel(
-                &shard,
-                "input",
-                "firstfocusneedle",
-                4,
-                || true
-            )
-            .is_err()
-        );
-        let components = read_lexical_component_set(&shard, Some("focus"), Some("input"))
-            .unwrap()
-            .unwrap();
-        let database = shard.join(&components.base.file_name);
-        let hit = search_lexical_index_descriptors_with_cancel(
-            &shard,
-            "input",
-            "firstfocusneedle",
-            4,
-            || false,
-        )
-        .unwrap()
-        .remove(0);
-        let mut remaining = 0;
-        assert!(
-            read_sealed_lexical_focus(
-                &database,
-                &components.base.metadata.project_id,
-                &hit,
-                &["firstfocusneedle".into()],
-                &mut remaining,
-                Arc::new(|| false)
-            )
-            .unwrap()
-            .is_none(),
-            "decode allowance must be charged before reading"
-        );
-        make_test_file_writable(&database);
-        let writer = Connection::open(&database).unwrap();
-        writer.execute_batch("DROP TRIGGER lexical_documents_no_update; UPDATE lexical_documents SET content_decoded_bytes=content_decoded_bytes+1;").unwrap();
-        assert!(
-            candidates[0].lexical_file_focus("focus", "input").is_none(),
-            "component mutation invalidates the retained focus"
         );
     }
 

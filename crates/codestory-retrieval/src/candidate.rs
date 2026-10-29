@@ -86,112 +86,10 @@ pub enum CandidateLane {
     Graph,
 }
 
-/// In-memory length authority and an independent optional match focus from a
-/// sealed lexical publication. JSON cannot mint either fact.
+/// In-memory authority from a sealed whole-file lexical publication. JSON cannot mint it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WholeFileLengthEvidence {
     fact: Option<WholeFileLengthFact>,
-    focus: Option<LexicalFileFocus>,
-    focus_conflicted: bool,
-}
-
-/// A physical match from immutable lexical bytes. Only retrieval can mint it;
-/// ordinary hit coordinates and deserialized candidates carry no authority.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LexicalFileFocus {
-    physical_generation: String,
-    project_id: Option<String>,
-    document_hash: String,
-    source_sha256: String,
-    decoded_sha256: String,
-    match_start: usize,
-    match_end: usize,
-    line: u32,
-    rendered_bytes: usize,
-}
-
-impl LexicalFileFocus {
-    pub(crate) fn from_source(
-        physical_generation: &str,
-        document_hash: String,
-        source_sha256: String,
-        content: &str,
-        match_start: usize,
-        match_end: usize,
-    ) -> Option<Self> {
-        use sha2::{Digest, Sha256};
-        let digest = |value: &str| {
-            value.len() == 64
-                && value
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        };
-        if physical_generation.is_empty()
-            || !digest(&document_hash)
-            || !digest(&source_sha256)
-            || match_start >= match_end
-            || content.get(match_start..match_end).is_none()
-        {
-            return None;
-        }
-        let line_start = content[..match_start].rfind('\n').map_or(0, |i| i + 1);
-        let line_end = content[match_end..]
-            .find('\n')
-            .map_or(content.len(), |i| match_end + i);
-        let line = u32::try_from(
-            content[..line_start]
-                .bytes()
-                .filter(|b| *b == b'\n')
-                .count(),
-        )
-        .ok()?
-        .checked_add(1)?;
-        let text = &content[line_start..line_end];
-        let text = if line_end < content.len() {
-            text.strip_suffix('\r').unwrap_or(text)
-        } else {
-            text
-        };
-        let rendered_bytes = format!("```text\n>{line:>5} | {text}\n```").len();
-        if rendered_bytes > codestory_contracts::compilation::INTERIM_SOURCE_ROW_UPPER_BOUND {
-            return None;
-        }
-        Some(Self {
-            physical_generation: physical_generation.into(),
-            project_id: None,
-            document_hash,
-            source_sha256,
-            decoded_sha256: format!("{:x}", Sha256::digest(content.as_bytes())),
-            match_start,
-            match_end,
-            line,
-            rendered_bytes,
-        })
-    }
-
-    pub fn line(&self) -> u32 {
-        self.line
-    }
-    pub fn rendered_bytes(&self) -> usize {
-        self.rendered_bytes
-    }
-    pub fn project_id(&self) -> Option<&str> {
-        self.project_id.as_deref()
-    }
-
-    pub fn matches_source(&self, source: &str, source_sha256: &str) -> bool {
-        use sha2::{Digest, Sha256};
-        source_sha256 == self.source_sha256
-            && format!("{:x}", Sha256::digest(source.as_bytes())) == self.decoded_sha256
-            && source.get(self.match_start..self.match_end).is_some()
-            && self.match_start < self.match_end
-            && source[..self.match_start]
-                .bytes()
-                .filter(|b| *b == b'\n')
-                .count()
-                + 1
-                == self.line as usize
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,8 +113,6 @@ impl WholeFileLengthEvidence {
         seals: std::sync::Arc<Vec<codestory_contracts::validation_receipts::ArtifactSeal>>,
     ) -> Self {
         Self {
-            focus: None,
-            focus_conflicted: false,
             fact: Some(WholeFileLengthFact {
                 document_key: format!("source\0{path}"),
                 path,
@@ -227,10 +123,6 @@ impl WholeFileLengthEvidence {
                 seals,
             }),
         }
-    }
-
-    pub(crate) fn attach_focus(&mut self, focus: Option<LexicalFileFocus>) {
-        self.focus = focus;
     }
 }
 
@@ -337,97 +229,20 @@ impl CandidateHit {
         let compatible = self.is_whole_file_length_candidate()
             && incoming.is_whole_file_length_candidate()
             && self.file_path == incoming.file_path;
-        let conflicting_focus = self
-            .whole_file_length_evidence
-            .as_ref()
-            .zip(incoming.whole_file_length_evidence.as_ref())
-            .is_some_and(|(left, right)| {
-                left.focus_conflicted
-                    || right.focus_conflicted
-                    || left
-                        .focus
-                        .as_ref()
-                        .zip(right.focus.as_ref())
-                        .is_some_and(|(a, b)| a != b)
-            });
-        let incoming_focus = incoming
-            .whole_file_length_evidence
-            .as_ref()
-            .and_then(|e| e.focus.clone());
         match (
             &self.whole_file_length_evidence,
             &incoming.whole_file_length_evidence,
         ) {
             (None, None) => {}
             _ if !compatible => {
-                self.whole_file_length_evidence = Some(WholeFileLengthEvidence {
-                    fact: None,
-                    focus: None,
-                    focus_conflicted: true,
-                })
+                self.whole_file_length_evidence = Some(WholeFileLengthEvidence { fact: None })
             }
             (None, Some(evidence)) => self.whole_file_length_evidence = Some(evidence.clone()),
-            (Some(left), Some(right)) if left.fact != right.fact => {
-                self.whole_file_length_evidence = Some(WholeFileLengthEvidence {
-                    fact: None,
-                    focus: None,
-                    focus_conflicted: true,
-                });
+            (Some(left), Some(right)) if left != right => {
+                self.whole_file_length_evidence = Some(WholeFileLengthEvidence { fact: None });
             }
             _ => {}
         }
-        if let Some(evidence) = self.whole_file_length_evidence.as_mut() {
-            if conflicting_focus {
-                evidence.focus = None;
-                evidence.focus_conflicted = true;
-            } else if evidence.focus.is_none() && !evidence.focus_conflicted {
-                evidence.focus = incoming_focus;
-            }
-        }
-    }
-
-    /// Only a pinned query session knows the logical project. Lexical component
-    /// metadata names its physical generation, which may be a reused predecessor.
-    pub(crate) fn bind_lexical_file_focus_project(
-        &mut self,
-        project_id: &str,
-        generation: &str,
-        input_hash: &str,
-    ) {
-        if project_id.is_empty()
-            || self
-                .whole_file_decoded_bytes(generation, input_hash)
-                .is_none()
-        {
-            return;
-        }
-        let Some(evidence) = self.whole_file_length_evidence.as_mut() else {
-            return;
-        };
-        let Some(focus) = evidence.focus.as_mut() else {
-            return;
-        };
-        if focus
-            .project_id
-            .as_deref()
-            .is_some_and(|bound| bound != project_id)
-        {
-            evidence.focus = None;
-            evidence.focus_conflicted = true;
-        } else {
-            focus.project_id = Some(project_id.into());
-        }
-    }
-
-    pub fn lexical_file_focus(
-        &self,
-        generation: &str,
-        input_hash: &str,
-    ) -> Option<LexicalFileFocus> {
-        self.whole_file_decoded_bytes(generation, input_hash)?;
-        let evidence = self.whole_file_length_evidence.as_ref()?;
-        let focus = evidence.focus.as_ref()?;
-        (!evidence.focus_conflicted).then(|| focus.clone())
     }
 
     /// Exact published UTF-8 bytes, only while the native artifact observations still match.

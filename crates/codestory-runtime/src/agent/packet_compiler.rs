@@ -61,10 +61,6 @@ pub(crate) struct PreparedPacketCompilationV1 {
     // Replay source DTOs cannot certify deliberate absence from Core.
     #[serde(skip)]
     published_file_sources: Vec<PacketHydratedSourceRangeV1>,
-    // Positive live whole-file proof: a complete focused line at line one
-    // must not acquire whole-file history authority, including after replay.
-    #[serde(skip)]
-    whole_file_source_identities: BTreeSet<String>,
     file_navigation_paths: HashMap<String, String>,
     #[serde(skip)]
     metadata_excluded_identities: BTreeSet<String>,
@@ -96,7 +92,6 @@ impl PreparedPacketCompilationV1 {
             source_coverage: Vec::new(),
             source_refusals: Vec::new(),
             published_file_sources: Vec::new(),
-            whole_file_source_identities: BTreeSet::new(),
             file_navigation_paths: HashMap::new(),
             metadata_excluded_identities: BTreeSet::new(),
             source_page_alternatives: BTreeMap::new(),
@@ -115,9 +110,6 @@ impl PreparedPacketCompilationV1 {
                         .strip_prefix("node:")
                         .is_some_and(|id| id.parse::<i64>().is_ok())
                         || (s.stable_identity == format!("path:{}", s.path)
-                            && self
-                                .whole_file_source_identities
-                                .contains(&s.stable_identity)
                             && s.symbol.is_none()
                             && s.start_line == 1
                             && d.requested_range.end_line == s.end_line
@@ -981,11 +973,7 @@ pub(crate) fn prepare_packet_compilation(
         .collect::<Vec<_>>();
     let source_coverage = observe_admitted_source_coverage(controller, &storage, &source_paths);
     for source in &mut sources {
-        source.parser_completeness = if session.is_focused_file(&source.stable_identity) {
-            PacketParserCompletenessV1::Unknown
-        } else {
-            parser_completeness_for_path(&source.path, &source_coverage)
-        };
+        source.parser_completeness = parser_completeness_for_path(&source.path, &source_coverage);
     }
     for pages in source_page_alternatives.values_mut() {
         for page in pages {
@@ -1048,15 +1036,6 @@ pub(crate) fn prepare_packet_compilation(
         ambiguities: probe_ambiguities(probe_resolutions),
         admission_gaps,
     };
-    let whole_file_source_identities = input
-        .sources
-        .iter()
-        .filter(|source| {
-            source.stable_identity.starts_with("path:")
-                && !session.is_focused_file(&source.stable_identity)
-        })
-        .map(|source| source.stable_identity.clone())
-        .collect();
     Ok(PreparedPacketCompilationV1 {
         input,
         call_navigation: session.admitted_call_navigation(),
@@ -1064,7 +1043,6 @@ pub(crate) fn prepare_packet_compilation(
         publication,
         source_refusals,
         published_file_sources,
-        whole_file_source_identities,
         file_navigation_paths,
         metadata_excluded_identities,
         source_page_alternatives,
@@ -1128,7 +1106,6 @@ pub(crate) fn replay_prepare_from_sealed_admissions(
         source_coverage: coverage,
         source_refusals: refusals,
         published_file_sources: Vec::new(),
-        whole_file_source_identities: BTreeSet::new(),
         file_navigation_paths: navigation,
         metadata_excluded_identities: BTreeSet::new(),
         source_page_alternatives: alternatives,
@@ -1482,19 +1459,7 @@ fn hydrate_admitted_sources_with_ranges(
                     (
                         AuthenticatedPacketOriginV1::CoreNode(CoreNodeId(file.id)),
                         true,
-                        if let Some(focus) = super::retrieval_primary::admitted_lexical_file_focus(
-                            controller, admission,
-                        ) {
-                            if ranges.contains_key(&admission.stable_identity) {
-                                Err(PacketAdmissionGapKindV1::SourceBoundMissing)
-                            } else {
-                                hydrate_admitted_file_focus(
-                                    controller, storage, admission, &file, &focus,
-                                )
-                            }
-                        } else {
-                            hydrate_admitted_file_source(controller, storage, admission, &file)
-                        },
+                        hydrate_admitted_file_source(controller, storage, admission, &file),
                     )
                 } else {
                     let witness = match super::retrieval_primary::read_admitted_published_file(
@@ -1964,56 +1929,6 @@ fn hydrate_admitted_file_source(
         .to_string_lossy()
         .replace('\\', "/");
     hydrated_source(admission, &canonical_path, None, &markdown)
-}
-
-fn hydrate_admitted_file_focus(
-    controller: &AppController,
-    storage: &Store,
-    admission: &PacketAdmissionReceiptV1,
-    file: &FileInfo,
-    focus: &codestory_retrieval::LexicalFileFocus,
-) -> Result<PacketHydratedSourceRangeV1, PacketAdmissionGapKindV1> {
-    if !file.indexed || !file.complete {
-        return Err(PacketAdmissionGapKindV1::SourceUnavailable);
-    }
-    let root = controller
-        .require_project_root()
-        .map_err(|_| PacketAdmissionGapKindV1::SourceUnavailable)?;
-    let source = crate::search_evidence::verified_file_bounded(
-        storage,
-        &root,
-        file,
-        FILE_NAVIGATION_VERIFICATION_MAX_BYTES as u64,
-    )
-    .map_err(|_| PacketAdmissionGapKindV1::SourceUnavailable)?;
-    if !focus.matches_source(&source.content, &source.content_sha256) {
-        return Err(PacketAdmissionGapKindV1::SourceUnavailable);
-    }
-    let requested = PacketSourceRangeV1 {
-        start_line: focus.line(),
-        end_line: focus.line(),
-    };
-    let (markdown, end, delivery) = complete_node_page(
-        &source.content,
-        requested,
-        source_byte_cap(admission),
-        &source.content_sha256,
-    )?;
-    if markdown.len() != focus.rendered_bytes() || end != focus.line() {
-        return Err(PacketAdmissionGapKindV1::SourceBoundMissing);
-    }
-    Ok(PacketHydratedSourceRangeV1 {
-        stable_identity: admission.stable_identity.clone(),
-        path: authenticated_file_navigation_path(controller, file)
-            .ok_or(PacketAdmissionGapKindV1::SourceUnavailable)?,
-        symbol: None,
-        start_line: requested.start_line,
-        end_line: end,
-        source: markdown,
-        parser_completeness: PacketParserCompletenessV1::Unknown,
-        callable_body: None,
-        delivery: Some(delivery),
-    })
 }
 
 fn hydrate_published_file_source(
@@ -7094,7 +7009,6 @@ mod tests {
             source_coverage: packet.answer.source_coverage.clone(),
             source_refusals: Vec::new(),
             published_file_sources: Vec::new(),
-            whole_file_source_identities: BTreeSet::new(),
             file_navigation_paths: HashMap::new(),
             metadata_excluded_identities: BTreeSet::new(),
             source_page_alternatives: BTreeMap::new(),

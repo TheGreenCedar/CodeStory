@@ -258,7 +258,7 @@ pub use cache_inventory::{
 };
 pub use candidate::{
     CandidateGraphDirection, CandidateGraphEvidence, CandidateHit, CandidateLane,
-    CandidateLaneEvidence, CandidateLaneScores, CandidateSource, LexicalFileFocus, RankFeatures,
+    CandidateLaneEvidence, CandidateLaneScores, CandidateSource, RankFeatures,
 };
 pub use candidate::{is_phantom_sidecar_hit, phantom_sidecar_candidates_only};
 pub use capabilities::SidecarCapabilities;
