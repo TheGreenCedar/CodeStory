@@ -1806,13 +1806,41 @@ impl AppController {
         let intent_query = parse_search_intent_query(&original_query);
         let query = intent_query.effective_query.clone();
         let limit_per_source = req.limit_per_source.clamp(1, 50) as usize;
-        let mut hits = self.resolve_core_symbol_candidates(&query, 50)?;
         let project_root = self.require_project_root()?;
         let storage = self.open_storage_read_only()?;
+        let candidates = Self::resolve_core_symbol_candidates_with_ids(
+            &storage,
+            project_root.as_path(),
+            &query,
+            50,
+        )?;
+        let typed_ids = candidates
+            .iter()
+            .map(|(id, hit)| (hit.node_id.clone(), *id))
+            .collect::<HashMap<_, _>>();
+        let mut hits = candidates
+            .into_iter()
+            .map(|(_, hit)| hit)
+            .collect::<Vec<_>>();
         let public_exports =
             self.admit_public_exports(&storage, project_root.as_path(), &query, &mut hits)?;
         apply_search_intent_filters(&mut hits, &intent_query.filters);
         dedupe_inexact_search_hits_by_display_key(&query, &mut hits);
+        let exact_callables = hits
+            .iter()
+            .filter(|hit| {
+                hit.resolvable
+                    && matches!(
+                        hit.kind,
+                        NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO
+                    )
+                    && matches!(
+                        search_hit_match_quality(&query, hit),
+                        SearchMatchQualityDto::Exact | SearchMatchQualityDto::NormalizedExact
+                    )
+            })
+            .map(|hit| hit.node_id.clone())
+            .collect::<HashSet<_>>();
         hits.truncate(limit_per_source);
         annotate_search_hit_match_quality(&query, &mut hits);
         Self::annotate_public_exports(&query, &mut hits, &public_exports);
@@ -1827,6 +1855,23 @@ impl AppController {
             Some(project_root.as_path()),
             &mut hits,
         );
+        let incoming_sources = if exact_callables.len() == 1 {
+            hits.iter()
+                .find(|hit| exact_callables.contains(&hit.node_id))
+                .and_then(|hit| typed_ids.get(&hit.node_id))
+                .map(|id| {
+                    crate::search_evidence::collect_pinned_incoming_search_sources(
+                        &storage,
+                        project_root.as_path(),
+                        *id,
+                        &self.source_index_policy,
+                        limit_per_source.saturating_sub(hits.len()),
+                    )
+                })
+                .unwrap_or_default()
+        } else {
+            Default::default()
+        };
         let freshness = self.index_freshness().ok();
         let query_assessment = search_query_assessment(
             &query,
@@ -1856,6 +1901,7 @@ impl AppController {
         Self::note_public_export_coverage(&mut retrieval, &public_exports);
         Ok(SearchResultsDto {
             public_exports,
+            incoming_sources,
             query: original_query,
             retrieval_publication: None,
             retrieval,
@@ -2126,6 +2172,7 @@ impl AppController {
         Self::note_public_export_coverage(&mut retrieval, &public_exports);
         Ok(SearchResultsDto {
             public_exports,
+            incoming_sources: Default::default(),
             query: original_query,
             retrieval_publication: None,
             retrieval,

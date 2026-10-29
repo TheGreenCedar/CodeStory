@@ -14956,6 +14956,82 @@ impl Storage {
         trail::get_trail(self, config)
     }
 
+    /// Read a bounded window of incoming production CALL candidates.
+    ///
+    /// Each indexed raw/resolved window is capped before hydration or eligibility
+    /// filtering. Rejected candidates consume the window; no refill is attempted.
+    /// The boolean discloses an omitted candidate/sentinel, not caller completeness.
+    /// This does not change the broader trail API's ordering or traversal contract.
+    pub fn get_bounded_incoming_call_edges(
+        &self,
+        target: NodeId,
+        max_candidates: usize,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(Vec<Edge>, bool), StorageError> {
+        let limit = max_candidates.min(153);
+        if cancelled() {
+            return Err(StorageError::Other("Incoming CALL lookup cancelled".into()));
+        }
+        if limit == 0 {
+            return Ok((Vec::new(), true));
+        }
+        let mut ids = BTreeSet::new();
+        let mut bounded = max_candidates > limit;
+        for sql in [
+            "SELECT id FROM edge INDEXED BY idx_edge_kind_target
+             WHERE kind = ?1 AND target_node_id = ?2 ORDER BY id LIMIT ?3",
+            "SELECT id FROM edge INDEXED BY idx_edge_kind_resolved_target
+             WHERE kind = ?1 AND resolved_target_node_id = ?2 ORDER BY id LIMIT ?3",
+        ] {
+            if cancelled() {
+                return Err(StorageError::Other("Incoming CALL lookup cancelled".into()));
+            }
+            let mut statement = self.conn.prepare(sql)?;
+            let mut window = statement
+                .query_map(
+                    params![EdgeKind::CALL as i32, target.0, (limit + 1) as i64],
+                    |row| Ok(EdgeId(row.get(0)?)),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if window.len() > limit {
+                bounded = true;
+                window.truncate(limit);
+            }
+            ids.extend(window);
+        }
+        bounded |= ids.len() > limit;
+        let mut statement = self
+            .conn
+            .prepare(&format!("{EDGE_SELECT_BASE} WHERE e.id = ?1"))?;
+        let mut edges = Vec::new();
+        for id in ids.into_iter().take(limit) {
+            if cancelled() {
+                return Err(StorageError::Other("Incoming CALL lookup cancelled".into()));
+            }
+            let mut rows = statement.query(params![id.0])?;
+            let Some(row) = rows.next()? else {
+                bounded = true;
+                continue;
+            };
+            let mut edge = Self::edge_from_row(row)?;
+            let target_symbol: String = row.get(12)?;
+            if edge.resolved_target.is_some()
+                && should_ignore_call_resolution(&target_symbol, edge.certainty, edge.confidence)
+            {
+                edge.resolved_target = None;
+                edge.certainty = None;
+                edge.confidence = None;
+            }
+            let caller_path: Option<String> = row.get(13)?;
+            if edge.effective_target() == target
+                && is_caller_scope_allowed(TrailCallerScope::ProductionOnly, caller_path.as_deref())
+            {
+                edges.push(edge);
+            }
+        }
+        Ok((edges, bounded))
+    }
+
     /// Helper: Get edges for a node in a specific direction
     fn get_edges_for_node(
         &self,

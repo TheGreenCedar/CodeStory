@@ -861,6 +861,18 @@ pub fn project_search_v3(
         was_bounded,
     } = search_evidence_selection(results);
     let mut gaps = Vec::new();
+    if results.incoming_sources.inspected {
+        gaps.push(gap_row("search-incoming-source-limits", GapKindV3Dto::EvidenceMissing,
+            Some("Related indexed source was selected through bounded incoming CALL navigation. Store-admitted relation values may be uncertain or unknown; source rows do not prove binding, execution, or an exhaustive consumer inventory."))?);
+    }
+    if results.incoming_sources.unavailable {
+        gaps.push(gap_row("search-incoming-source-unavailable", GapKindV3Dto::SourceUnavailable,
+            Some("Some incoming source could not be captured with a verified own file and complete indexed extent."))?);
+    }
+    if results.incoming_sources.bounded {
+        gaps.push(gap_row("search-incoming-source-bounded", GapKindV3Dto::OutputBudgetExceeded,
+            Some("Additional incoming source exceeded graph, file-read, or complete-source output bounds."))?);
+    }
     if results.public_exports.incomplete {
         gaps.push(gap_row("search-public-export-incomplete", GapKindV3Dto::EvidenceMissing,
             Some("Public export navigation is incomplete, unavailable or ambiguous; additional bindings may exist."))?);
@@ -977,7 +989,7 @@ fn search_evidence_selection(results: &SearchResultsDto) -> SearchEvidenceSelect
         };
         // The same location may be present in the merged and source-specific
         // result lists. Different lines in one file are separate evidence.
-        if !seen.insert((hit.node_id.0.as_str(), path, hit.line)) {
+        if !seen.insert((hit.node_id.0.clone(), path.to_owned(), hit.line)) {
             continue;
         }
         if rows.len() == row_limit {
@@ -994,6 +1006,31 @@ fn search_evidence_selection(results: &SearchResultsDto) -> SearchEvidenceSelect
             row.display_name = Some(symbol_id_text(&binding.presentation));
         }
         rows.push(row);
+    }
+    for source in &results.incoming_sources.sources {
+        let id = source.node_id.0.to_string();
+        if !seen.insert((id.clone(), source.path.clone(), Some(source.start_line))) {
+            continue;
+        }
+        if rows.len() == row_limit {
+            was_bounded = true;
+            continue;
+        }
+        let Ok(excerpt) =
+            codestory_contracts::packet_projection_v3::ExcerptTextV3::new(source.excerpt.clone())
+        else {
+            was_bounded = true;
+            continue;
+        };
+        rows.push(SearchEvidenceRowV3Dto {
+            identity: evidence_identity(&format!("search-related-{}-{id}", rows.len())),
+            path: path_text(&source.path),
+            symbol_id: Some(symbol_id_text(&id)),
+            display_name: Some(symbol_id_text(&source.display_name)),
+            start_line: Some(source.start_line),
+            end_line: Some(source.end_line),
+            excerpt: Some(excerpt),
+        });
     }
     SearchEvidenceSelectionV3 {
         rows,
@@ -2537,6 +2574,247 @@ mod tests {
             hybrid_weights: None,
             hybrid_limits: None,
         }
+    }
+
+    #[test]
+    fn core_exact_search_appends_verified_incoming_usage_at_public_boundary() {
+        use codestory_contracts::graph::{
+            Edge, EdgeId, EdgeKind, Node, NodeId as CoreNodeId, NodeKind, Occurrence,
+            OccurrenceKind, ResolutionCertainty, SourceLocation,
+        };
+        use codestory_store::{
+            FileInfo, FileRole, IndexPublicationMode, IndexPublicationRecord, Store,
+        };
+
+        const TARGET: &str = "def fixture_target(value):\n    return value\n";
+        const CALLER_BODY: &str = "def fixture_consumer(value):\n    if value is None:\n        return 'CALLER_ONLY_BRANCH'\n    fixture_target(value)\n    fixture_target(value)\n    return 'CALLER_ONLY_END'\n";
+        let project = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let process_cache = tempfile::tempdir().unwrap();
+        let target_path = project.path().join("target.py");
+        let caller_path = project.path().join("consumer.py");
+        let caller_source = format!("# outside the caller extent\n{CALLER_BODY}");
+        let storage_path = state.path().join("core.db");
+        let mut store = Store::open(&storage_path).unwrap();
+        for (id, path, source) in [
+            (10, &target_path, TARGET),
+            (30, &caller_path, caller_source.as_str()),
+        ] {
+            fs::write(path, source).unwrap();
+            let file = FileInfo {
+                id,
+                path: path.clone(),
+                language: "python".into(),
+                modification_time: codestory_workspace::clamp_system_time_to_epoch_millis(
+                    fs::metadata(path).unwrap().modified().unwrap(),
+                ),
+                indexed: true,
+                complete: true,
+                line_count: source.lines().count() as u32,
+                file_role: FileRole::Source,
+            };
+            store.insert_file(&file).unwrap();
+            store
+                .update_file_metadata(
+                    &file,
+                    Some(&format!("{:x}", Sha256::digest(source.as_bytes()))),
+                )
+                .unwrap();
+        }
+        store
+            .insert_nodes_batch(&[
+                Node {
+                    id: CoreNodeId(10),
+                    kind: NodeKind::FILE,
+                    serialized_name: target_path.to_string_lossy().into_owned(),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(30),
+                    kind: NodeKind::FILE,
+                    serialized_name: caller_path.to_string_lossy().into_owned(),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(20),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "fixture_target".into(),
+                    file_node_id: Some(CoreNodeId(10)),
+                    start_line: Some(1),
+                    end_line: Some(2),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(40),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "fixture_consumer".into(),
+                    file_node_id: Some(CoreNodeId(30)),
+                    start_line: Some(2),
+                    end_line: Some(7),
+                    ..Default::default()
+                },
+            ])
+            .unwrap();
+        // A reference in the target file must never become the caller's own source.
+        store
+            .insert_occurrences_batch(&[
+                Occurrence {
+                    element_id: 40,
+                    kind: OccurrenceKind::REFERENCE,
+                    location: SourceLocation {
+                        file_node_id: CoreNodeId(10),
+                        start_line: 1,
+                        start_col: 1,
+                        end_line: 1,
+                        end_col: 1,
+                    },
+                },
+                Occurrence {
+                    element_id: 40,
+                    kind: OccurrenceKind::DEFINITION,
+                    location: SourceLocation {
+                        file_node_id: CoreNodeId(30),
+                        start_line: 2,
+                        start_col: 1,
+                        end_line: 7,
+                        end_col: 29,
+                    },
+                },
+            ])
+            .unwrap();
+        let call = Edge {
+            id: EdgeId(50),
+            source: CoreNodeId(40),
+            target: CoreNodeId(20),
+            kind: EdgeKind::CALL,
+            file_node_id: Some(CoreNodeId(30)),
+            line: Some(5),
+            certainty: Some(ResolutionCertainty::Certain),
+            confidence: Some(1.0),
+            callsite_identity: Some("opaque-callsite-do-not-parse".into()),
+            ..Default::default()
+        };
+        let mut second_call = call.clone();
+        second_call.id = EdgeId(51);
+        second_call.line = Some(6);
+        second_call.certainty = Some(ResolutionCertainty::Probable);
+        second_call.confidence = Some(0.8);
+        second_call.callsite_identity = Some("another-opaque-callsite".into());
+        store.insert_edges_batch(&[call, second_call]).unwrap();
+        let publication = IndexPublicationRecord {
+            generation: 1,
+            generation_id: "11111111-1111-4111-8111-111111111111".into(),
+            run_id: "incoming-source-fixture".into(),
+            mode: IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        store
+            .publish_structural_text_unit_generation(&publication)
+            .unwrap();
+        codestory_retrieval::test_support::publish_complete_core_fixture(
+            &mut store,
+            project.path(),
+            &publication,
+        )
+        .unwrap();
+        drop(store);
+        let controller = crate::AppController::new_with_owned_cache_root(process_cache.path());
+        {
+            let mut controller_state = controller.state.lock();
+            controller_state.project_root = Some(project.path().to_path_buf());
+            controller_state.storage_path = Some(storage_path);
+        }
+        let service = PublicOperationService::new(controller.clone());
+        service
+            .run_observational_with_cancel(
+                crate::services::search_operation_name(SearchRepoTextMode::Off),
+                Arc::new(AtomicBool::new(false)),
+                || {
+                    let results =
+                        controller.search_results(core_search_request("fixture_target"))?;
+                    assert_eq!(results.hits.len(), 1, "primary hits must remain unchanged");
+                    assert_eq!(results.hits[0].node_id.0, "20");
+                    let legacy = serde_json::to_value(&results).unwrap();
+                    assert!(
+                        !legacy.to_string().contains("CALLER_ONLY_"),
+                        "incoming source must stay off the legacy JSON wire"
+                    );
+                    let mut without_incoming = results.clone();
+                    without_incoming.incoming_sources = Default::default();
+                    assert_eq!(serde_json::to_value(&without_incoming).unwrap(), legacy);
+                    let captured_reads = crate::search_evidence::verified_source_read_count();
+                    let projected = project_search_v3(&service, "test", &results)?;
+                    assert_eq!(
+                        crate::search_evidence::verified_source_read_count(),
+                        captured_reads,
+                        "projection serializes captured source without rereading the workspace"
+                    );
+                    let rows = projected.evidence.as_slice();
+                    assert_eq!(rows[0].symbol_id.as_ref().unwrap().as_str(), "20");
+                    assert_eq!(rows[0].path.as_str(), "target.py");
+                    let caller = rows
+                        .iter()
+                        .find(|row| row.symbol_id.as_ref().is_some_and(|id| id.as_str() == "40"))
+                        .expect("verified incoming caller source is missing");
+                    assert_eq!(rows.len(), 2, "repeated CALL edges share one source row");
+                    assert_eq!(caller.path.as_str(), "consumer.py");
+                    assert_eq!((caller.start_line, caller.end_line), (Some(2), Some(7)));
+                    assert_eq!(
+                        caller.display_name.as_ref().unwrap().as_str(),
+                        "fixture_consumer"
+                    );
+                    assert_eq!(
+                        caller
+                            .excerpt
+                            .as_ref()
+                            .unwrap()
+                            .as_str()
+                            .trim_end_matches('\n'),
+                        CALLER_BODY.trim_end_matches('\n'),
+                        "serve the complete own extent, including branches and final statement"
+                    );
+                    assert!(
+                        projected
+                            .gaps
+                            .as_slice()
+                            .iter()
+                            .any(|gap| { gap.kind == GapKindV3Dto::EvidenceMissing }),
+                        "source rows must not imply binding or exhaustive consumers"
+                    );
+
+                    let round_trip: SearchResultsDto = serde_json::from_value(legacy).unwrap();
+                    assert_eq!(
+                        project_search_v3(&service, "test", &round_trip)?
+                            .evidence
+                            .as_slice()
+                            .len(),
+                        1
+                    );
+                    let mut request = core_search_request("fixture_target");
+                    request.limit_per_source = 1;
+                    let limited = controller.search_results(request)?;
+                    let limited = project_search_v3(&service, "test", &limited)?;
+                    assert_eq!(limited.evidence.as_slice().len(), 1);
+                    assert_eq!(
+                        limited.evidence.as_slice()[0]
+                            .symbol_id
+                            .as_ref()
+                            .unwrap()
+                            .as_str(),
+                        "20"
+                    );
+                    assert!(
+                        limited
+                            .gaps
+                            .as_slice()
+                            .iter()
+                            .any(|gap| { gap.kind == GapKindV3Dto::OutputBudgetExceeded }),
+                        "the target consumes the same combined limit as related source"
+                    );
+                    Ok(())
+                },
+            )
+            .expect("real Core search and public source projection");
     }
 
     #[test]
@@ -4667,7 +4945,8 @@ mod tests {
         use codestory_contracts::graph::{Node, NodeId as CoreNodeId, NodeKind};
         use codestory_retrieval::{SidecarProfile, SidecarRuntimeConfig, test_support};
         use codestory_store::{
-            FileInfo, FileRole, IndexPublicationMode, IndexPublicationRecord, Store,
+            FileContentHash, FileExtractionIdentity, FileInfo, FileRole, IndexPublicationMode,
+            IndexPublicationRecord, ProjectionBatch, Store,
         };
         use sha2::{Digest, Sha256};
 
@@ -4700,34 +4979,54 @@ mod tests {
                 line_count: 3,
                 file_role: FileRole::Source,
             };
-            store.insert_file(&file).expect("file");
+            let content_hash = format!("{:x}", Sha256::digest(source.as_bytes()));
             store
-                .update_file_metadata(
-                    &file,
-                    Some(&format!("{:x}", Sha256::digest(source.as_bytes()))),
-                )
-                .expect("source hash");
-            store
-                .insert_nodes_batch(&[
-                    Node {
-                        id: CoreNodeId(10),
-                        kind: NodeKind::FILE,
-                        serialized_name: source_path.to_string_lossy().into_owned(),
-                        file_node_id: Some(CoreNodeId(10)),
-                        start_line: Some(1),
-                        ..Default::default()
-                    },
-                    Node {
-                        id: CoreNodeId(20),
-                        kind: NodeKind::FUNCTION,
-                        serialized_name: "focused_source_anchor".into(),
-                        file_node_id: Some(CoreNodeId(10)),
-                        start_line: Some(1),
-                        end_line: Some(3),
-                        ..Default::default()
-                    },
-                ])
-                .expect("nodes");
+                .projections()
+                .flush_projection_batch(ProjectionBatch {
+                    files: std::slice::from_ref(&file),
+                    file_content_hashes: &[FileContentHash {
+                        file_id: file.id,
+                        content_hash: content_hash.clone(),
+                    }],
+                    file_extraction_identities: &[FileExtractionIdentity {
+                        file_id: file.id,
+                        language: file.language.clone(),
+                        source_content_hash: content_hash,
+                        extraction_revision: codestory_indexer::current_file_extraction_revision(
+                            &file.language,
+                        )
+                        .expect("current JavaScript extraction revision")
+                        .into(),
+                    }],
+                    nodes: &[
+                        Node {
+                            id: CoreNodeId(10),
+                            kind: NodeKind::FILE,
+                            serialized_name: source_path.to_string_lossy().into_owned(),
+                            file_node_id: Some(CoreNodeId(10)),
+                            start_line: Some(1),
+                            ..Default::default()
+                        },
+                        Node {
+                            id: CoreNodeId(20),
+                            kind: NodeKind::FUNCTION,
+                            serialized_name: "focused_source_anchor".into(),
+                            file_node_id: Some(CoreNodeId(10)),
+                            start_line: Some(1),
+                            end_line: Some(3),
+                            ..Default::default()
+                        },
+                    ],
+                    structural_text_units: &[],
+                    structural_text_projections: &[],
+                    structural_text_cache_writes: &[],
+                    edges: &[],
+                    occurrences: &[],
+                    component_access: &[],
+                    callable_projection_states: &[],
+                    file_errors: &[],
+                })
+                .expect("current source projection");
             let publication = IndexPublicationRecord {
                 generation: 1,
                 generation_id: "11111111-1111-4111-8111-111111111111".into(),

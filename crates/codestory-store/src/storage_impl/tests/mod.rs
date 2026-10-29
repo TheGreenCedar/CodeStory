@@ -12992,6 +12992,249 @@ fn test_get_errors() -> Result<(), StorageError> {
 }
 
 #[test]
+fn bounded_incoming_calls_cap_indexed_work_before_normalization() -> Result<(), StorageError> {
+    const NOISE_EDGES: i64 = 16_000;
+    const LIMIT: usize = 51;
+    const VM_BUDGET: usize = 50_000;
+    for case in [
+        "non_call_noise",
+        "rejected_call_noise",
+        "resolved_rejected_noise",
+        "raw_reverts",
+        "resolved_reverts",
+        "raw_accepted",
+        "resolved_accepted",
+        "common_raw_reverts",
+        "common_resolved_kept",
+        "overlap",
+        "probable",
+        "unknown",
+        "full_raw",
+        "full_resolved",
+        "full_mixed",
+        "sentinel",
+        "union_bound",
+        "hard_cap",
+        "test_caller",
+        "zero_limit",
+        "cancel_before_query",
+        "cancel_second_branch",
+        "cancel_hydration",
+    ] {
+        let mut storage = Storage::new_in_memory()?;
+        storage.insert_nodes_batch(&[
+            Node {
+                id: NodeId(1),
+                kind: NodeKind::FUNCTION,
+                serialized_name: if case.starts_with("common_") {
+                    "remove"
+                } else {
+                    "interesting_target"
+                }
+                .into(),
+                ..Default::default()
+            },
+            Node {
+                id: NodeId(2),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "consumer".into(),
+                ..Default::default()
+            },
+            Node {
+                id: NodeId(3),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "other_target".into(),
+                ..Default::default()
+            },
+            Node {
+                id: NodeId(4),
+                kind: NodeKind::FILE,
+                serialized_name: "tests/test_consumer.py".into(),
+                ..Default::default()
+            },
+        ])?;
+        if case.ends_with("noise") {
+            let (kind, raw, resolved, certainty) = match case {
+                "non_call_noise" => (EdgeKind::USAGE, 1, None, None),
+                "rejected_call_noise" => (EdgeKind::CALL, 1, Some(3), Some("certain")),
+                _ => (EdgeKind::CALL, 3, Some(1), Some("uncertain")),
+            };
+            storage.conn.execute(
+                "WITH RECURSIVE sequence(value) AS (
+                     SELECT 1 UNION ALL SELECT value + 1 FROM sequence WHERE value < ?1
+                 )
+                 INSERT INTO edge(id, source_node_id, target_node_id, kind, resolved_target_node_id, certainty)
+                 SELECT value, 2, ?2, ?3, ?4, ?5 FROM sequence",
+                rusqlite::params![NOISE_EDGES, raw, kind as i32, resolved, certainty],
+            )?;
+        }
+        let mut edge = Edge {
+            id: EdgeId(if case.ends_with("noise") {
+                NOISE_EDGES + 1
+            } else {
+                1
+            }),
+            source: NodeId(2),
+            target: NodeId(1),
+            kind: EdgeKind::CALL,
+            certainty: Some(ResolutionCertainty::Certain),
+            confidence: Some(1.0),
+            ..Default::default()
+        };
+        match case {
+            "raw_reverts" | "raw_accepted" | "common_raw_reverts" => {
+                edge.resolved_target = Some(NodeId(3))
+            }
+            "resolved_reverts" | "resolved_accepted" | "common_resolved_kept" => {
+                edge.target = NodeId(3);
+                edge.resolved_target = Some(NodeId(1));
+            }
+            "overlap" | "probable" | "unknown" => edge.resolved_target = Some(NodeId(1)),
+            "test_caller" => edge.file_node_id = Some(NodeId(4)),
+            _ => {}
+        }
+        if matches!(case, "raw_reverts" | "resolved_reverts") {
+            edge.certainty = Some(ResolutionCertainty::Uncertain);
+            edge.confidence = Some(0.4);
+        } else if matches!(
+            case,
+            "probable" | "common_raw_reverts" | "common_resolved_kept"
+        ) {
+            edge.certainty = Some(ResolutionCertainty::Probable);
+            edge.confidence = Some(0.8);
+        } else if case == "unknown" {
+            edge.certainty = None;
+            edge.confidence = None;
+        }
+        let count = match case {
+            "full_raw" | "full_resolved" | "full_mixed" => LIMIT,
+            "sentinel" => LIMIT + 1,
+            "union_bound" => LIMIT * 2,
+            "hard_cap" => 154,
+            _ => 1,
+        };
+        let edges = (0..count)
+            .map(|index| {
+                let mut next = edge.clone();
+                next.id.0 += index as i64;
+                if case == "full_resolved"
+                    || case == "full_mixed" && index % 2 == 0
+                    || case == "union_bound" && index >= LIMIT
+                {
+                    next.target = NodeId(3);
+                    next.resolved_target = Some(NodeId(1));
+                }
+                next
+            })
+            .collect::<Vec<_>>();
+        storage.insert_edges_batch(&edges)?;
+        let steps = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&steps);
+        storage.conn.progress_handler(
+            100,
+            Some(move || counter.fetch_add(100, AtomicOrdering::Relaxed) + 100 >= VM_BUDGET),
+        )?;
+        let checks = AtomicUsize::new(0);
+        let cancelled = || {
+            let check = checks.fetch_add(1, AtomicOrdering::Relaxed);
+            match case {
+                "cancel_before_query" => true,
+                "cancel_second_branch" => check >= 2,
+                "cancel_hydration" => check >= 3,
+                _ => false,
+            }
+        };
+        let result = storage.get_bounded_incoming_call_edges(
+            NodeId(1),
+            match case {
+                "zero_limit" => 0,
+                "hard_cap" => usize::MAX,
+                _ => LIMIT,
+            },
+            &cancelled,
+        );
+        storage.conn.progress_handler(0, None::<fn() -> bool>)?;
+        let observed = steps.load(AtomicOrdering::Relaxed);
+        assert!(
+            observed < VM_BUDGET,
+            "{case}: exhausted {VM_BUDGET} VM steps"
+        );
+        if case.starts_with("cancel_") {
+            assert!(
+                result.unwrap_err().to_string().contains("cancelled"),
+                "{case}"
+            );
+            if case == "cancel_before_query" {
+                assert_eq!(observed, 0);
+            }
+            continue;
+        }
+        let (found, bounded) = result.unwrap_or_else(|error| {
+            panic!("{case}: bounded read failed after {observed} VM steps: {error}")
+        });
+        let expected = match case {
+            "rejected_call_noise"
+            | "resolved_rejected_noise"
+            | "resolved_reverts"
+            | "raw_accepted"
+            | "test_caller"
+            | "zero_limit" => 0,
+            "full_raw" | "full_resolved" | "full_mixed" | "sentinel" | "union_bound" => LIMIT,
+            "hard_cap" => 153,
+            _ => 1,
+        };
+        assert_eq!(found.len(), expected, "{case}: admitted CALL count");
+        assert_eq!(
+            bounded,
+            matches!(
+                case,
+                "rejected_call_noise"
+                    | "resolved_rejected_noise"
+                    | "sentinel"
+                    | "union_bound"
+                    | "hard_cap"
+                    | "zero_limit"
+            ),
+            "{case}: sentinel/merge disclosure"
+        );
+        assert!(
+            found.windows(2).all(|pair| pair[0].id < pair[1].id),
+            "{case}: deterministic typed-ID order/deduplication"
+        );
+        assert!(
+            found
+                .iter()
+                .all(|edge| edge.kind == EdgeKind::CALL && edge.effective_target() == NodeId(1)),
+            "{case}"
+        );
+        if case == "non_call_noise" {
+            assert_eq!(found[0].id, EdgeId(NOISE_EDGES + 1));
+        }
+        if matches!(case, "raw_reverts" | "common_raw_reverts") {
+            assert_eq!(found[0].resolved_target, None, "{case}");
+            assert_eq!(found[0].certainty, None, "{case}");
+            assert_eq!(found[0].confidence, None, "{case}");
+        }
+        if matches!(case, "probable" | "common_resolved_kept") {
+            assert_eq!(
+                found[0].certainty,
+                Some(ResolutionCertainty::Probable),
+                "{case}"
+            );
+            assert_eq!(found[0].confidence, Some(0.8), "{case}");
+        }
+        if case == "unknown" {
+            assert_eq!(found[0].certainty, None);
+            assert_eq!(found[0].confidence, None);
+        }
+        if case == "zero_limit" {
+            assert_eq!(observed, 0);
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn test_trail_query() -> Result<(), StorageError> {
     let mut storage = Storage::new_in_memory()?;
 
