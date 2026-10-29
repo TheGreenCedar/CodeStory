@@ -1,6 +1,6 @@
 ---
 name: codestory-grounding
-description: Use CodeStory MCP to locate repository code, inspect evidence, trace relationships or assess change impact; also for retrieval/plugin validation. Skip bounded named-file work needing none of these. If a CodeStory inventory is needed in Codex `ALL_TOOLS`, filter `tool.name` by the `mcp__codestory__` prefix, not generic `search` in descriptions. Emit matching names only, not full tool objects. Keep needed selected declarations complete.
+description: Select the next useful evidence operation before CodeStory setup or tool discovery. Ordinary source reads need no CodeStory discovery. Use CodeStory MCP to locate repository code, inspect evidence, trace relationships or assess change impact; also for retrieval/plugin validation. Skip bounded named-file work needing none of these. If a CodeStory inventory is needed in Codex `ALL_TOOLS`, filter `tool.name` by the `mcp__codestory__` prefix, not generic `search` in descriptions. Emit matching names only, not full tool objects. Keep needed selected declarations complete.
 ---
 
 # CodeStory
