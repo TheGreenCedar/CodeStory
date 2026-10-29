@@ -19,6 +19,7 @@ use crate::search_state::reload_llm_docs_from_storage;
 use codestory_store::Store;
 use rayon::prelude::*;
 use serde::Serialize;
+use std::borrow::Cow;
 use std::fmt::Write as _;
 
 /// Result of explicitly republishing semantic projections from one pinned core.
@@ -2549,12 +2550,12 @@ pub(super) fn semantic_doc_is_documented_nontrivial(doc_text: &str) -> bool {
         .is_some_and(|body| body.split_whitespace().count() >= 8)
 }
 
-fn base_dense_anchor_reason_for_node(
+fn base_dense_anchor_reason_for_node<'a>(
     graph_context: &SemanticDocGraphContext,
     node: &GraphNode,
     display_name: &str,
     file_path: Option<&str>,
-    doc_text: &str,
+    doc_text: impl FnOnce() -> Cow<'a, str>,
     access: Option<AccessKind>,
 ) -> Option<DenseAnchorReason> {
     let file_role = file_path
@@ -2597,10 +2598,162 @@ fn base_dense_anchor_reason_for_node(
     {
         return Some(DenseAnchorReason::PublicApi);
     }
-    if semantic_doc_is_documented_nontrivial(doc_text) {
+    if semantic_doc_is_documented_nontrivial(&doc_text()) {
         return Some(DenseAnchorReason::DocumentedNontrivial);
     }
     None
+}
+
+#[cfg(test)]
+mod dense_selection_tests {
+    use super::*;
+    use AccessKind::{Private, Public};
+    use DenseAnchorReason::{
+        CentralGraphNode, DocumentedNontrivial, Entrypoint, PublicApi, UnstructuredDoc,
+    };
+    use codestory_contracts::graph::NodeKind::{ANNOTATION, CLASS, FUNCTION};
+
+    #[test]
+    fn dense_selection_materializes_documents_only_for_documented_fallback() {
+        let documented = "comments: Explains the implementation\nbody_summary: one two three four five six seven eight\n";
+        let trivial = "body_summary: returns a value\n";
+        let cases = [
+            (
+                CLASS,
+                "docs/guide.md",
+                Public,
+                true,
+                documented,
+                Some(UnstructuredDoc),
+                0,
+            ),
+            (CLASS, "tests/helper.rs", Public, true, documented, None, 0),
+            (CLASS, "vendor/helper.rs", Public, true, documented, None, 0),
+            (
+                CLASS,
+                "target/generated/helper.rs",
+                Public,
+                true,
+                documented,
+                None,
+                0,
+            ),
+            (
+                FUNCTION,
+                "src/main.rs",
+                Private,
+                false,
+                documented,
+                Some(Entrypoint),
+                0,
+            ),
+            (
+                CLASS,
+                "src/internal/helper.rs",
+                Public,
+                true,
+                documented,
+                Some(CentralGraphNode),
+                0,
+            ),
+            (
+                CLASS,
+                "src/internal/helper.rs",
+                Public,
+                false,
+                documented,
+                Some(PublicApi),
+                0,
+            ),
+            (
+                CLASS,
+                "api/helper.rs",
+                Private,
+                false,
+                documented,
+                Some(PublicApi),
+                0,
+            ),
+            (
+                ANNOTATION,
+                "src/internal/Helper.java",
+                Public,
+                false,
+                documented,
+                Some(PublicApi),
+                0,
+            ),
+            (
+                FUNCTION,
+                "lib/helper.rb",
+                Private,
+                false,
+                documented,
+                Some(PublicApi),
+                0,
+            ),
+            (
+                FUNCTION,
+                "src/internal/helper.rs",
+                Private,
+                false,
+                documented,
+                Some(DocumentedNontrivial),
+                1,
+            ),
+            (
+                FUNCTION,
+                "src/internal/helper.rs",
+                Private,
+                false,
+                trivial,
+                None,
+                1,
+            ),
+        ];
+        let mut materializations = Vec::new();
+        for (kind, path, access, central, text, expected, expected_calls) in cases {
+            let display_name = if path == "src/main.rs" {
+                "main"
+            } else {
+                "helper"
+            };
+            let node = GraphNode {
+                id: codestory_contracts::graph::NodeId(10),
+                kind,
+                serialized_name: display_name.into(),
+                ..Default::default()
+            };
+            let mut graph = SemanticDocGraphContext::default();
+            if central {
+                graph.centrality.insert(
+                    node.id,
+                    DenseAnchorCentrality {
+                        child_count: 0,
+                        related_count: DENSE_CENTRAL_RELATIONSHIP_THRESHOLD,
+                        edge_count: DENSE_CENTRAL_SCORE_THRESHOLD,
+                    },
+                );
+            }
+            let mut calls = 0;
+            let reason = base_dense_anchor_reason_for_node(
+                &graph,
+                &node,
+                display_name,
+                Some(path),
+                || {
+                    calls += 1;
+                    Cow::Owned(text.to_string())
+                },
+                Some(access),
+            );
+            assert_eq!(reason, expected, "classification for {kind:?} at {path}");
+            materializations.push((path, calls, expected_calls));
+        }
+        for (path, calls, expected_calls) in materializations {
+            assert_eq!(calls, expected_calls, "document production at {path}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2617,7 +2770,7 @@ pub(super) fn dense_anchor_reason_for_node(
         node,
         display_name,
         file_path,
-        doc_text,
+        || Cow::Borrowed(doc_text),
         access,
     )
 }
@@ -2636,7 +2789,7 @@ pub(super) fn dense_anchor_reason_for_node_with_flow_neighbors(
         node,
         display_name,
         file_path,
-        doc_text,
+        || Cow::Borrowed(doc_text),
         access,
     )
     .or_else(|| {
@@ -4291,26 +4444,29 @@ fn build_full_dense_selection_plan(
         for node in &nodes {
             let display_name = node_display_name(node);
             let file_path = graph.file_path_for_node(node);
-            let doc_text = stored_docs
-                .as_ref()
-                .and_then(|docs| docs.get(&node.id).map(|doc| doc.doc_text.clone()))
-                .unwrap_or_else(|| {
-                    build_llm_symbol_doc_text_with_policy(
-                        &graph,
-                        compact_input_views.get(&node.id).unwrap_or(node),
-                        &display_name,
-                        file_path,
-                        &prepared.file_text_cache,
-                        policy.alias_mode,
-                        policy.max_tokens,
-                    )
-                });
             let reason = base_dense_anchor_reason_for_node(
                 &graph,
                 node,
                 &display_name,
                 file_path,
-                &doc_text,
+                || {
+                    Cow::Owned(
+                        stored_docs
+                            .as_ref()
+                            .and_then(|docs| docs.get(&node.id).map(|doc| doc.doc_text.clone()))
+                            .unwrap_or_else(|| {
+                                build_llm_symbol_doc_text_with_policy(
+                                    &graph,
+                                    compact_input_views.get(&node.id).unwrap_or(node),
+                                    &display_name,
+                                    file_path,
+                                    &prepared.file_text_cache,
+                                    policy.alias_mode,
+                                    policy.max_tokens,
+                                )
+                            }),
+                    )
+                },
                 access.get(&node.id).copied(),
             );
             base_reasons.insert(node.id, reason);
@@ -4382,21 +4538,22 @@ fn build_loaded_dense_selection_plan(
             }
             let display_name = node_display_name(node);
             let file_path = graph.file_path_for_node(node);
-            let doc_text = build_llm_symbol_doc_text_with_policy(
-                &graph,
-                compact_input_views.get(&node.id).unwrap_or(node),
-                &display_name,
-                file_path,
-                &file_text_cache,
-                policy.alias_mode,
-                policy.max_tokens,
-            );
             let reason = base_dense_anchor_reason_for_node(
                 &graph,
                 node,
                 &display_name,
                 file_path,
-                &doc_text,
+                || {
+                    Cow::Owned(build_llm_symbol_doc_text_with_policy(
+                        &graph,
+                        compact_input_views.get(&node.id).unwrap_or(node),
+                        &display_name,
+                        file_path,
+                        &file_text_cache,
+                        policy.alias_mode,
+                        policy.max_tokens,
+                    ))
+                },
                 access.get(&node.id).copied(),
             );
             base_reasons.insert(node.id, reason);
