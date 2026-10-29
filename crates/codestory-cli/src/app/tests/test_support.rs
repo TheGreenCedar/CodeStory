@@ -489,8 +489,6 @@ pub(super) fn sample_node_details(id: &str, display_name: &str) -> NodeDetailsDt
 
 pub(super) fn sample_graph_node(id: &str, label: &str) -> GraphNodeDto {
     GraphNodeDto {
-        start_line: None,
-        end_line: None,
         id: NodeId(id.to_string()),
         label: label.to_string(),
         kind: codestory_contracts::api::NodeKind::FUNCTION,
@@ -522,8 +520,6 @@ pub(super) fn sample_graph_edge_with_kind(
     certainty: Option<&str>,
 ) -> GraphEdgeDto {
     GraphEdgeDto {
-        file_path: None,
-        line: None,
         id: EdgeId(id.to_string()),
         source: NodeId(source.to_string()),
         target: NodeId(target.to_string()),

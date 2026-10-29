@@ -157,8 +157,6 @@ mod tests {
             trail: GraphResponse {
                 center_id: id.clone(),
                 nodes: vec![GraphNodeDto {
-                    start_line: None,
-                    end_line: None,
                     id,
                     label: "test_entry".to_string(),
                     kind: NodeKind::FUNCTION,

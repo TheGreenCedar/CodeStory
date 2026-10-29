@@ -655,8 +655,6 @@ mod trail_story_tests {
 
     fn node_of_kind(id: &str, label: &str, file_path: &str, kind: NodeKind) -> GraphNodeDto {
         GraphNodeDto {
-            start_line: None,
-            end_line: None,
             id: NodeId(id.to_string()),
             label: label.to_string(),
             kind,
@@ -673,8 +671,6 @@ mod trail_story_tests {
 
     fn edge(id: usize, source: &str, target: &str, certainty: Option<&str>) -> GraphEdgeDto {
         GraphEdgeDto {
-            file_path: None,
-            line: None,
             id: EdgeId(format!("edge-{id}")),
             source: NodeId(source.to_string()),
             target: NodeId(target.to_string()),
@@ -694,8 +690,6 @@ mod trail_story_tests {
         certainty: Option<&str>,
     ) -> GraphEdgeDto {
         GraphEdgeDto {
-            file_path: None,
-            line: None,
             id: EdgeId(format!("edge-{id}")),
             source: NodeId(source.to_string()),
             target: NodeId(target.to_string()),

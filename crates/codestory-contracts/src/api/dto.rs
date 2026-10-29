@@ -1888,11 +1888,6 @@ pub struct GraphNodeDto {
     pub merged_symbol_examples: Vec<String>,
     #[serde(default)]
     pub file_path: Option<String>,
-    /// Indexed bounds, which may be partial or invalid for a source read.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub start_line: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub end_line: Option<u32>,
     #[serde(default)]
     pub qualified_name: Option<String>,
     #[serde(default)]
@@ -1905,11 +1900,6 @@ pub struct GraphEdgeDto {
     pub source: NodeId,
     pub target: NodeId,
     pub kind: EdgeKind,
-    /// Occurrence location, independent of the effective endpoints' locations.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub file_path: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub line: Option<u32>,
     #[serde(default)]
     pub confidence: Option<f32>,
     /// `certain`, `probable`, or `uncertain`.
@@ -3576,28 +3566,6 @@ pub struct BookmarkCategoryDto {
 #[cfg(test)]
 mod packet_tests {
     use super::*;
-
-    #[test]
-    fn graph_source_anchors_default_absent_in_legacy_json() {
-        let legacy = serde_json::json!({
-            "center_id": "1",
-            "nodes": [{"id": "1", "label": "caller", "kind": "FUNCTION", "depth": 0}],
-            "edges": [{"id": "2", "source": "1", "target": "1", "kind": "CALL"}],
-            "truncated": false
-        });
-        let graph: GraphResponse = serde_json::from_value(legacy).expect("read legacy graph");
-        assert_eq!(graph.nodes[0].start_line, None);
-        assert_eq!(graph.nodes[0].end_line, None);
-        assert_eq!(graph.edges[0].file_path, None);
-        assert_eq!(graph.edges[0].line, None);
-        let encoded = serde_json::to_value(graph).expect("write legacy graph");
-        for field in ["start_line", "end_line"] {
-            assert!(encoded["nodes"][0].get(field).is_none(), "{field}");
-        }
-        for field in ["file_path", "line"] {
-            assert!(encoded["edges"][0].get(field).is_none(), "{field}");
-        }
-    }
 
     #[test]
     fn structural_text_evidence_tier_serializes_as_a_named_public_contract() {

@@ -4647,8 +4647,6 @@ mod tests {
 
     fn sample_graph_node(id: &str, label: &str) -> GraphNodeDto {
         GraphNodeDto {
-            start_line: None,
-            end_line: None,
             id: NodeId(id.to_string()),
             label: label.to_string(),
             kind: NodeKind::FUNCTION,
@@ -4670,8 +4668,6 @@ mod tests {
         depth: u32,
     ) -> GraphNodeDto {
         GraphNodeDto {
-            start_line: None,
-            end_line: None,
             id: NodeId(id.to_string()),
             label: label.to_string(),
             kind: NodeKind::FUNCTION,
@@ -4688,8 +4684,6 @@ mod tests {
 
     fn sample_graph_edge(id: &str, source: &str, target: &str) -> GraphEdgeDto {
         GraphEdgeDto {
-            file_path: None,
-            line: None,
             id: EdgeId(id.to_string()),
             source: NodeId(source.to_string()),
             target: NodeId(target.to_string()),
@@ -4709,8 +4703,6 @@ mod tests {
         confidence: f32,
     ) -> GraphEdgeDto {
         GraphEdgeDto {
-            file_path: None,
-            line: None,
             id: EdgeId(id.to_string()),
             source: NodeId(source.to_string()),
             target: NodeId(target.to_string()),

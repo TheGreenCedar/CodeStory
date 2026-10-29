@@ -3167,14 +3167,8 @@ fn packet_graph_for_resolved_candidate(
     let graph_flags = app_graph_flags();
     let edge_dtos = edges
         .iter()
-        .map(|(edge, _, _, _)| {
-            graph_edge_dto(
-                storage,
-                edge.clone().with_effective_endpoints(),
-                graph_flags,
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|(edge, _, _, _)| graph_edge_dto(edge.clone().with_effective_endpoints(), graph_flags))
+        .collect::<Vec<_>>();
     let nodes = packet_graph_endpoint_nodes(storage, node_names, node_id, &edge_dtos)?;
 
     let mut specific_producers = candidate.provenance.clone();
@@ -3245,8 +3239,6 @@ fn packet_graph_endpoint_nodes(
         let file_path = AppController::file_path_for_node(storage, &node)?;
         let access = storage.get_component_access(node.id).ok().flatten();
         nodes.push(GraphNodeDto {
-            start_line: node.start_line,
-            end_line: node.end_line,
             id: node.id.into(),
             label: node_names
                 .get(&node.id)

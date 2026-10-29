@@ -69,7 +69,7 @@ pub(super) fn graph_neighborhood(
         let edge = edge.with_effective_endpoints();
         let (source, target) = (edge.source, edge.target);
 
-        edge_dtos.push(graph_edge_dto(&storage, edge, graph_flags)?);
+        edge_dtos.push(graph_edge_dto(edge, graph_flags));
 
         if seen.insert(source) {
             ordered_node_ids.push(source);
@@ -81,36 +81,23 @@ pub(super) fn graph_neighborhood(
 
     let mut node_dtos = Vec::with_capacity(ordered_node_ids.len());
     for id in ordered_node_ids {
-        let (label, kind, file_path, start_line, end_line, qualified_name, member_access) =
-            match storage.get_node(id) {
-                Ok(Some(node)) => {
-                    let access = storage.get_component_access(node.id).ok().flatten();
-                    (
-                        node_display_name(&node),
-                        NodeKind::from(node.kind),
-                        AppController::file_path_for_node(&storage, &node)
-                            .ok()
-                            .flatten(),
-                        node.start_line,
-                        node.end_line,
-                        node.qualified_name,
-                        member_access_dto(access),
-                    )
-                }
-                _ => (
-                    id.0.to_string(),
-                    NodeKind::UNKNOWN,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                ),
-            };
+        let (label, kind, file_path, qualified_name, member_access) = match storage.get_node(id) {
+            Ok(Some(node)) => {
+                let access = storage.get_component_access(node.id).ok().flatten();
+                (
+                    node_display_name(&node),
+                    NodeKind::from(node.kind),
+                    AppController::file_path_for_node(&storage, &node)
+                        .ok()
+                        .flatten(),
+                    node.qualified_name,
+                    member_access_dto(access),
+                )
+            }
+            _ => (id.0.to_string(), NodeKind::UNKNOWN, None, None, None),
+        };
 
         node_dtos.push(GraphNodeDto {
-            start_line,
-            end_line,
             id: NodeId::from(id),
             label,
             kind,
@@ -225,8 +212,6 @@ pub(super) fn graph_trail(
         let member_access = storage.get_component_access(node.id).ok().flatten();
 
         node_dtos.push(GraphNodeDto {
-            start_line: node.start_line,
-            end_line: node.end_line,
             id: NodeId::from(node.id),
             label,
             kind: NodeKind::from(node.kind),
@@ -244,7 +229,7 @@ pub(super) fn graph_trail(
     let mut edge_dtos = Vec::with_capacity(edges.len());
     for edge in edges {
         let edge = edge.with_effective_endpoints();
-        edge_dtos.push(graph_edge_dto(&storage, edge, graph_flags)?);
+        edge_dtos.push(graph_edge_dto(edge, graph_flags));
     }
 
     let center_id = NodeId::from(config.root_id);
@@ -317,36 +302,23 @@ pub(super) fn graph_direct_references(
 
     let mut node_dtos = Vec::with_capacity(selected_node_ids.len());
     for id in selected_node_ids {
-        let (label, kind, file_path, start_line, end_line, qualified_name, member_access) =
-            match storage.get_node(id) {
-                Ok(Some(node)) => {
-                    let access = storage.get_component_access(node.id).ok().flatten();
-                    (
-                        node_display_name(&node),
-                        NodeKind::from(node.kind),
-                        AppController::file_path_for_node(&storage, &node)
-                            .ok()
-                            .flatten(),
-                        node.start_line,
-                        node.end_line,
-                        node.qualified_name,
-                        member_access_dto(access),
-                    )
-                }
-                _ => (
-                    id.0.to_string(),
-                    NodeKind::UNKNOWN,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                ),
-            };
+        let (label, kind, file_path, qualified_name, member_access) = match storage.get_node(id) {
+            Ok(Some(node)) => {
+                let access = storage.get_component_access(node.id).ok().flatten();
+                (
+                    node_display_name(&node),
+                    NodeKind::from(node.kind),
+                    AppController::file_path_for_node(&storage, &node)
+                        .ok()
+                        .flatten(),
+                    node.qualified_name,
+                    member_access_dto(access),
+                )
+            }
+            _ => (id.0.to_string(), NodeKind::UNKNOWN, None, None, None),
+        };
 
         node_dtos.push(GraphNodeDto {
-            start_line,
-            end_line,
             id: NodeId::from(id),
             label,
             kind,
@@ -363,8 +335,8 @@ pub(super) fn graph_direct_references(
 
     let edge_dtos = retained_edges
         .into_iter()
-        .map(|edge| graph_edge_dto(&storage, edge, graph_flags))
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|edge| graph_edge_dto(edge, graph_flags))
+        .collect::<Vec<_>>();
     let mut response = GraphResponse {
         center_id: NodeId::from(root_id),
         nodes: node_dtos,
@@ -486,8 +458,6 @@ mod tests {
 
     fn edge(id: i64, source: &str, target: &str) -> GraphEdgeDto {
         GraphEdgeDto {
-            file_path: None,
-            line: None,
             id: codestory_contracts::api::EdgeId(id.to_string()),
             source: NodeId(source.to_string()),
             target: NodeId(target.to_string()),

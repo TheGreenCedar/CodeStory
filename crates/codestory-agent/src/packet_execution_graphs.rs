@@ -34,8 +34,6 @@ mod tests {
         confidence: Option<f32>,
     ) -> GraphEdgeDto {
         GraphEdgeDto {
-            file_path: None,
-            line: None,
             id: EdgeId(id.to_string()),
             source: NodeId("source".to_string()),
             target: NodeId("target".to_string()),
