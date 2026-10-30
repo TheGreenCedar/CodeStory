@@ -5,7 +5,7 @@ description: Select the next useful evidence operation before CodeStory setup or
 
 # CodeStory
 
-Stay within user scope; choose CodeStory or ordinary tools. No preliminary call is required. Keep ordinary file discovery within the selected project root; locate declared dependency sources and other user-authorized targets directly when needed.
+Stay within user scope; choose CodeStory or ordinary tools. No preliminary call is required.
 
 For diff reviews, `affected` can start from changed ranges instead of whole files; [scope requirements](references/affected.md#explicit-changed-ranges) include source hashes and explicit unresolved cases.
 
