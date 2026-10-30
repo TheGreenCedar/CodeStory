@@ -1202,6 +1202,108 @@ fn test_nested_call_attribution_follows_enclosing_callable() -> anyhow::Result<(
 }
 
 #[test]
+fn go_named_struct_fields_keep_exact_declarations_and_member_owners() -> anyhow::Result<()> {
+    let source = r#"package fields
+type Embedded struct{}
+type Config struct {
+    DataPath string `mapstructure:"data-path"`
+    Left, Right *Embedded `json:"pair"`
+    _ string
+    Embedded
+    Nested struct { Hidden string }
+}
+type Other struct { DataPath *string }
+type (
+    First struct { Shared string }
+    Second struct { Shared *Embedded }
+    Reader interface { Read() }
+    Writer interface { Write() }
+)
+type Alias = Config
+type AliasStruct = struct { AliasOnly string }
+type PointerEmbedding struct { *Embedded }
+var anonymous = struct { Unowned string }{}
+func (c *Config) Open() {}
+func (o *Other) Open() {}
+"#;
+    let (nodes, edges) = index_single_file("fields.go", source)?;
+    let by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+    let fields: Vec<_> = nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::FIELD)
+        .collect();
+    assert_eq!(
+        fields.len(),
+        7,
+        "named fields must be indexed, including grouped names"
+    );
+    let expected = [
+        ("Config", "DataPath", 4),
+        ("Config", "Left", 5),
+        ("Config", "Right", 5),
+        ("Config", "Nested", 8),
+        ("Other", "DataPath", 10),
+        ("First", "Shared", 12),
+        ("Second", "Shared", 13),
+    ];
+    for (owner, name, line) in expected {
+        let matches: Vec<_> = fields
+            .iter()
+            .filter(|field| {
+                is_matching_name(&field.serialized_name, name) && field.start_line == Some(line)
+            })
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected one FIELD {owner}.{name} at {line}"
+        );
+        let field = matches[0];
+        let row = source.lines().nth(line as usize - 1).unwrap();
+        let column = row.find(name).unwrap() as u32 + 1;
+        assert_eq!(field.start_col, Some(column), "field declaration anchor");
+        assert_eq!(field.end_line, Some(line));
+        assert_eq!(field.end_col, Some(column + name.len() as u32));
+        let owners: Vec<_> = edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::MEMBER && edge.target == field.id)
+            .filter_map(|edge| by_id.get(&edge.source))
+            .collect();
+        assert_eq!(owners.len(), 1, "one exact owner for {owner}.{name}");
+        assert_eq!(owners[0].kind, NodeKind::STRUCT);
+        assert!(is_matching_name(&owners[0].serialized_name, owner));
+    }
+    for (owner, method, line) in [
+        ("Config", "Open", 21),
+        ("Other", "Open", 22),
+        ("Reader", "Read", 14),
+        ("Writer", "Write", 15),
+    ] {
+        let methods: Vec<_> = nodes
+            .iter()
+            .filter(|node| {
+                node.kind == NodeKind::METHOD
+                    && is_matching_name(&node.serialized_name, method)
+                    && node.start_line == Some(line)
+            })
+            .collect();
+        assert_eq!(methods.len(), 1, "one exact method {owner}.{method}");
+        let owners: Vec<_> = edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::MEMBER && edge.target == methods[0].id)
+            .filter_map(|edge| by_id.get(&edge.source))
+            .collect();
+        assert_eq!(
+            owners.len(),
+            1,
+            "no extra method owner for {owner}.{method}"
+        );
+        assert!(is_matching_name(&owners[0].serialized_name, owner));
+    }
+    Ok(())
+}
+
+#[test]
 fn go_package_initializer_calls_are_file_owned_without_deferred_body_calls() -> anyhow::Result<()> {
     let source = r#"package startup
 

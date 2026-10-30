@@ -72,8 +72,8 @@ use crate::{
     CompiledLanguageRules, GraphNodeSpan, LanguageRuleset, ManualMemberEdgeSpec,
     ManualReceiverCallSpec, ManualReceiverSource, OptionalReceiverOwnerBinding,
     ReceiverCallSiteKey, ReceiverOwnerBinding, collect_receiver_call_specs_in_callable,
-    declaration_name, descendant_by_field_name, enclosing_node_with_kind, member_call_method_col,
-    normalize_parameter_name, normalized_receiver_variable, receiver_call_belongs_to_callable,
+    declaration_name, enclosing_node_with_kind, member_call_method_col, normalize_parameter_name,
+    normalized_receiver_variable, receiver_call_belongs_to_callable,
     receiver_callable_boundary_kinds, receiver_callsite_key, same_ts_span, trimmed_node_text,
     ts_node_graph_span, walk_tree_nodes,
 };
@@ -85,7 +85,7 @@ pub(crate) const PACKAGE_FUNCTION_IMPORT_SET_PREFIX: &str = "syntax:go-package-f
 pub(crate) const RETURN_PATH_OWNER_PREFIX: &str = "go-return-path:";
 
 pub(crate) const INITIALIZER_CALL_REVISION: &str =
-    extraction_revision!("go-callable-value-references-v5");
+    extraction_revision!("go-named-struct-fields-v6");
 
 /// Expand display spans after identifier occurrences, call ownership and IDs are fixed.
 pub(crate) fn apply_package_variable_envelopes(tree: &Tree, nodes: &mut [Node]) {
@@ -316,6 +316,51 @@ pub(crate) fn member_edge_specs(tree: &Tree, source: &str) -> Vec<ManualMemberEd
     walk_tree_nodes(tree.root_node(), &mut |node| {
         count_go_navigation_resolution_work(1);
         match node.kind() {
+            "type_spec" => {
+                let Some(struct_type) = node
+                    .child_by_field_name("type")
+                    .filter(|kind| kind.kind() == "struct_type")
+                else {
+                    return;
+                };
+                let Some(owner) = node
+                    .parent()
+                    .filter(|kind| kind.kind() == "type_declaration")
+                else {
+                    return;
+                };
+                let Some(source_name) = node
+                    .child_by_field_name("name")
+                    .and_then(|name| trimmed_node_text(name, source))
+                else {
+                    return;
+                };
+                let mut cursor = struct_type.walk();
+                let Some(fields) = struct_type
+                    .named_children(&mut cursor)
+                    .find(|child| child.kind() == "field_declaration_list")
+                else {
+                    return;
+                };
+                let mut cursor = fields.walk();
+                for field in fields.named_children(&mut cursor) {
+                    let mut cursor = field.walk();
+                    for name in field.children_by_field_name("name", &mut cursor) {
+                        let Some(target_name) =
+                            trimmed_node_text(name, source).filter(|name| name != "_")
+                        else {
+                            continue;
+                        };
+                        edges.push(ManualMemberEdgeSpec {
+                            source_name: source_name.clone(),
+                            target_name,
+                            source_span: ts_node_graph_span(owner),
+                            target_span: ts_node_graph_span(name),
+                            line: Some(name.start_position().row as u32 + 1),
+                        });
+                    }
+                }
+            }
             "method_declaration" => {
                 if node.has_error() || node.is_error() || node.is_missing() {
                     return;
@@ -351,10 +396,21 @@ pub(crate) fn member_edge_specs(tree: &Tree, source: &str) -> Vec<ManualMemberEd
                 });
             }
             "method_elem" => {
-                let Some(owner_node) = enclosing_node_with_kind(node, &["type_declaration"]) else {
+                let Some(owner_spec) = node
+                    .parent()
+                    .filter(|parent| parent.kind() == "interface_type")
+                    .and_then(|parent| parent.parent())
+                    .filter(|parent| parent.kind() == "type_spec")
+                else {
                     return;
                 };
-                let Some(owner_name_node) = descendant_by_field_name(owner_node, "name") else {
+                let Some(owner_node) = owner_spec
+                    .parent()
+                    .filter(|parent| parent.kind() == "type_declaration")
+                else {
+                    return;
+                };
+                let Some(owner_name_node) = owner_spec.child_by_field_name("name") else {
                     return;
                 };
                 let Some(source_name) = trimmed_node_text(owner_name_node, source) else {

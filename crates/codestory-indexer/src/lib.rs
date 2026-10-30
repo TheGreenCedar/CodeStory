@@ -9399,7 +9399,7 @@ fn manual_member_source_kind(kind: NodeKind) -> bool {
 }
 
 fn manual_member_target_kind(kind: NodeKind) -> bool {
-    kind == NodeKind::METHOD || is_type_like_kind(kind)
+    matches!(kind, NodeKind::METHOD | NodeKind::FIELD) || is_type_like_kind(kind)
 }
 
 fn language_receiver_call_specs(
