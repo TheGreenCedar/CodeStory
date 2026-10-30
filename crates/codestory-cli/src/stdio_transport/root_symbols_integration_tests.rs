@@ -80,6 +80,7 @@ fn root_symbols_resource_pages_round_trip_the_public_dispatcher() {
 
 fn stdio_multi_project_startup_for_root_tests(cache: &Path) -> crate::config::CliStartupConfig {
     crate::config::CliStartupConfig {
+        mcp_result_display: Default::default(),
         user_home: None,
         allow_sensitive_project_root: false,
         project_network_config_allowed: false,

@@ -988,6 +988,642 @@ class Worker:
 }
 
 #[test]
+fn test_python_self_receiver_respects_class_method_bindings() -> anyhow::Result<()> {
+    let cases = [
+        (
+            "normal method",
+            "class C:\n    def update(self):\n        pass\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "unrelated class assignment",
+            "class Other:\n    update = None\nclass C:\n    def update(self):\n        pass\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "method-local assignment",
+            "class C:\n    def update(self):\n        pass\n    def run(self):\n        update = None\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "assignment before final method definition",
+            "class C:\n    update = None\n    def update(self):\n        pass\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "deletion before final method definition",
+            "class C:\n    update = 7\n    del update\n    def update(self):\n        pass\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "unrelated class attribute",
+            "class C:\n    def update(self):\n        pass\n    other = 7\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "annotation without value preserves method",
+            "class C:\n    def update(self):\n        pass\n    update: object\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "nested class write preserves outer method",
+            "class C:\n    def update(self):\n        pass\n    class Inner:\n        def update(self):\n            pass\n        update = 7\n        def inner_run(self):\n            self.update()\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "normal annotated factory receiver",
+            "class C:\n    def update(self):\n        pass\nclass Factory:\n    def make(self) -> C:\n        return C()\n    def run(self):\n        value = self.make()\n        value.update()\n",
+            true,
+            None,
+        ),
+        (
+            "normal imported owner",
+            "class C:\n    def update(self):\n        pass\n",
+            true,
+            Some("from owner import C\ndef run(value: C):\n    value.update()\n"),
+        ),
+        (
+            "repeated method definitions remain unresolved",
+            "class C:\n    def update(self):\n        pass\n    def update(self):\n        pass\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "later lambda replaces method",
+            "class C:\n    def update(self):\n        pass\n    update = lambda self: None\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "later noncallable replaces method",
+            "class C:\n    def update(self):\n        pass\n    update = None\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "class namespace deletion removes method binding",
+            "class C:\n    def update(self):\n        pass\n    del update\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "conditional later write",
+            "class C:\n    def update(self):\n        pass\n    if flag:\n        update = lambda self: None\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "annotation with value replaces method",
+            "class C:\n    def update(self):\n        pass\n    update: object = 7\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "nested class overwritten method",
+            "class C:\n    def update(self):\n        pass\n    class Inner:\n        def update(self):\n            pass\n        update = 7\n        def run(self):\n            self.update()\n    def outer_run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "overwritten factory cannot supply receiver type",
+            "class C:\n    def update(self):\n        pass\nclass Factory:\n    def make(self) -> C:\n        return C()\n    make = lambda self: None\n    def run(self):\n        value = self.make()\n        value.update()\n",
+            false,
+            None,
+        ),
+        (
+            "imported owner overwritten method",
+            "class C:\n    def update(self):\n        pass\n    update = 7\n",
+            false,
+            Some("from owner import C\ndef run(value: C):\n    value.update()\n"),
+        ),
+        (
+            "independent method-local exception alias preserves method",
+            "class C:\n    def update(self):\n        pass\n    def helper(self):\n        try:\n            raise ValueError()\n        except ValueError as update:\n            pass\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "independent exception alias before final method definition",
+            "class C:\n    try:\n        raise ValueError()\n    except ValueError as update:\n        pass\n    def update(self):\n        pass\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "independent exception alias removes final class method binding",
+            "class C:\n    def update(self):\n        pass\n    try:\n        raise ValueError()\n    except ValueError as update:\n        pass\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "independent match capture replaces final class method binding",
+            "class C:\n    def update(self):\n        pass\n    match 7:\n        case update:\n            pass\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "independent starred target replaces final class method binding",
+            "class C:\n    def update(self):\n        pass\n    *update, = (7,)\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: handler exit removes same-name definition",
+            "class C:\n    def update(self):\n        pass\n    try:\n        raise ValueError()\n    except ValueError as update:\n        def update(self):\n            pass\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: except star alias removes binding",
+            "class C:\n    def update(self):\n        pass\n    try:\n        raise ExceptionGroup(\"x\", [ValueError()])\n    except* ValueError as update:\n        pass\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: nested match capture",
+            "class C:\n    def update(self):\n        pass\n    match subject:\n        case [(_, update)]:\n            pass\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: match as capture",
+            "class C:\n    def update(self):\n        pass\n    match subject:\n        case [other] as update:\n            pass\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: match star capture",
+            "class C:\n    def update(self):\n        pass\n    match subject:\n        case [*update]:\n            pass\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: match dictionary rest capture",
+            "class C:\n    def update(self):\n        pass\n    match subject:\n        case {\"x\": _, **update}:\n            pass\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: match keyword value capture",
+            "class C:\n    def update(self):\n        pass\n    match subject:\n        case Shape(value=update):\n            pass\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: match nested keyword value capture",
+            "class C:\n    def update(self):\n        pass\n    match subject:\n        case Shape(value=[update]):\n            pass\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: match union captures",
+            "class C:\n    def update(self):\n        pass\n    match subject:\n        case [update] | (update,):\n            pass\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: match wildcard reference role",
+            "class C:\n    def update(self):\n        pass\n    match subject:\n        case _:\n            pass\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "namespace inventory: match literal reference role",
+            "class C:\n    def update(self):\n        pass\n    match subject:\n        case \"update\":\n            pass\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "namespace inventory: match dotted value reference role",
+            "class C:\n    def update(self):\n        pass\n    match subject:\n        case Tokens.update:\n            pass\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "namespace inventory: match class head reference role",
+            "class C:\n    def update(self):\n        pass\n    match subject:\n        case update():\n            pass\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "namespace inventory: match keyword label reference role",
+            "class C:\n    def update(self):\n        pass\n    match subject:\n        case Shape(update=_):\n            pass\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "namespace inventory: match dictionary key reference role",
+            "class C:\n    def update(self):\n        pass\n    match subject:\n        case {Tokens.update: _}:\n            pass\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "namespace inventory: match wildcard star role",
+            "class C:\n    def update(self):\n        pass\n    match subject:\n        case [*_]:\n            pass\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "namespace inventory: chain assignment target",
+            "class C:\n    def update(self):\n        pass\n    other = update = 7\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: starred nested assignment target",
+            "class C:\n    def update(self):\n        pass\n    (other, [*update]) = (1, [7])\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: for destructured starred target",
+            "class C:\n    def update(self):\n        pass\n    for other, *update in values:\n        pass\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: with destructured starred target",
+            "class C:\n    def update(self):\n        pass\n    with manager as (other, *update):\n        pass\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: for attribute target preserves class",
+            "class C:\n    def update(self):\n        pass\n    for holder.update in values:\n        pass\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "namespace inventory: with attribute target preserves class",
+            "class C:\n    def update(self):\n        pass\n    with manager as holder.update:\n        pass\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "namespace inventory: plain dotted import target",
+            "class C:\n    def update(self):\n        pass\n    import update.module\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: import alias target",
+            "class C:\n    def update(self):\n        pass\n    import package as update\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: from import alias target",
+            "class C:\n    def update(self):\n        pass\n    from package import thing as update\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: import module name reference role",
+            "class C:\n    def update(self):\n        pass\n    from update import other\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "namespace inventory: type alias plain target wrapper",
+            "class C:\n    def update(self):\n        pass\n    type update = int\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: type alias generic target wrapper",
+            "class C:\n    def update(self):\n        pass\n    type update[T] = list[T]\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: type alias right side reference role",
+            "class C:\n    def update(self):\n        pass\n    type Alias = update\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "namespace inventory: type parameter own namespace",
+            "class C:\n    def update(self):\n        pass\n    type Alias[update] = int\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "namespace inventory: multiple bare deletion",
+            "class C:\n    def update(self):\n        pass\n    other = 7\n    del update, other\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: attribute deletion preserves class",
+            "class C:\n    def update(self):\n        pass\n    del holder.update\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "namespace inventory: subscript deletion preserves class",
+            "class C:\n    def update(self):\n        pass\n    del holder[update]\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "namespace inventory: comprehension iteration namespaces",
+            "class C:\n    def update(self):\n        pass\n    other = ([update for update in values], {update for update in values}, {update: update for update in values}, (update for update in values))\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "namespace inventory: function default named expression",
+            "class C:\n    def update(self):\n        pass\n    def other(value=(update := 7)):\n        pass\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: lambda default named expression",
+            "class C:\n    def update(self):\n        pass\n    other = lambda value=(update := 7): None\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: lambda body deferred namespace",
+            "class C:\n    def update(self):\n        pass\n    other = lambda: (update := 7)\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "namespace inventory: nested class base named expression",
+            "class C:\n    def update(self):\n        pass\n    class Other((update := Base)):\n        pass\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: final definition supersedes header named expression",
+            "class C:\n    def update(self, value=(update := 7)):\n        pass\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "namespace inventory: global redirects candidate definition",
+            "class C:\n    global update\n    def update(self):\n        pass\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: unrelated global preserves candidate",
+            "class C:\n    def update(self):\n        pass\n    global other\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+        (
+            "namespace inventory: ordinary nested local class owner",
+            "def enclosing():\n    class C:\n        def update(self):\n            pass\n        def run(self):\n            self.update()\n    return C\n",
+            true,
+            None,
+        ),
+        (
+            "namespace inventory: nonlocal redirects candidate definition",
+            "def enclosing():\n    update = 7\n    class C:\n        nonlocal update\n        def update(self):\n            pass\n        def run(self):\n            self.update()\n    return C\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: nested class definition replaces method",
+            "class C:\n    def update(self):\n        pass\n    class update:\n        pass\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: from import unaliased target",
+            "class C:\n    def update(self):\n        pass\n    from package import update\n    def run(self):\n        self.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: conditional factory overwritten before receiver inference",
+            "class C:\n    def update(self):\n        pass\nclass Factory:\n    if True:\n        def make(self) -> C:\n            return C()\n    make = lambda self: None\n    def run(self):\n        value = self.make()\n        value.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: conditional factory without unconditional reset",
+            "class C:\n    def update(self):\n        pass\nclass Factory:\n    if flag:\n        def make(self) -> C:\n            return C()\n    def run(self):\n        value = self.make()\n        value.update()\n",
+            false,
+            None,
+        ),
+        (
+            "namespace inventory: unrelated conditional method preserves ordinary target",
+            "class C:\n    def update(self):\n        pass\n    if flag:\n        def other(self):\n            pass\n    def run(self):\n        self.update()\n",
+            true,
+            None,
+        ),
+    ];
+
+    let mut failures = Vec::new();
+    for (case_name, source, expect_resolved, imported_caller) in cases {
+        let outcome = std::panic::catch_unwind(|| -> anyhow::Result<()> {
+            let (nodes, edges) = if let Some(caller) = imported_caller {
+                index_files(&[("owner.py", source), ("workflow.py", caller)])?
+            } else {
+                index_single_file("workflow.py", source)?
+            };
+            let expected_declarations = source
+                .lines()
+                .enumerate()
+                .filter_map(|(index, line)| {
+                    line.trim_start()
+                        .starts_with("def update(")
+                        .then_some(index as u32 + 1)
+                })
+                .collect::<Vec<_>>();
+            let mut retained_declarations = nodes
+                .iter()
+                .filter(|node| {
+                    matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                        && is_matching_name(&node.serialized_name, "update")
+                })
+                .filter_map(|node| node.start_line)
+                .collect::<Vec<_>>();
+            retained_declarations.sort_unstable();
+            assert_eq!(
+                retained_declarations, expected_declarations,
+                "Case `{case_name}`: retain every original update declaration and source span, including repeated defs. Nodes: {nodes:?}"
+            );
+            assert_ordinary_call_census(case_name, &nodes, &edges, "run", "update", 1);
+            if expect_resolved {
+                assert_resolved_call_to_method_owner(
+                    case_name, &nodes, &edges, "run", "C", "update",
+                );
+            }
+
+            let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+            let call = edges
+                .iter()
+                .find(|edge| {
+                    edge.kind == EdgeKind::CALL
+                        && node_by_id
+                            .get(&edge.source)
+                            .is_some_and(|source| is_matching_name(&source.serialized_name, "run"))
+                        && node_by_id.get(&edge.target).is_some_and(|target| {
+                            is_matching_name(&target.serialized_name, "update")
+                        })
+                })
+                .expect("ordinary CALL census already proved the run call exists");
+            let target = node_by_id
+                .get(&call.effective_target())
+                .expect("stored CALL effective target must exist");
+            let targets_method = matches!(target.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                && is_matching_name(&target.serialized_name, "update");
+            if case_name.starts_with("namespace inventory:") && !expect_resolved {
+                assert!(
+                    !targets_method,
+                    "Case `{case_name}`: stale FunctionDef is still selected: {target:?}; edge: {call:?}. Calls: {:?}",
+                    describe_call_edges(&edges, &nodes)
+                );
+                return Ok(());
+            }
+            assert_eq!(
+                targets_method,
+                expect_resolved,
+                "Case `{case_name}`: unexpected effective CALL target {target:?}; edge: {call:?}. Calls: {:?}",
+                describe_call_edges(&edges, &nodes)
+            );
+            if expect_resolved {
+                assert_eq!(
+                    call.certainty,
+                    Some(ResolutionCertainty::Certain),
+                    "Case `{case_name}`: supported self receiver must retain Certain resolution: {call:?}"
+                );
+            } else {
+                assert_eq!(
+                    call.resolved_target, None,
+                    "Case `{case_name}`: overwritten or repeated method must remain unresolved: {call:?}"
+                );
+                assert_ne!(
+                    call.certainty,
+                    Some(ResolutionCertainty::Certain),
+                    "Case `{case_name}`: unresolved class binding must not be Certain: {call:?}"
+                );
+            }
+            Ok(())
+        });
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => failures.push(format!("Case `{case_name}`: {error:#}")),
+            Err(payload) => {
+                let message = payload
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| payload.downcast_ref::<&str>().copied())
+                    .unwrap_or("non-string panic payload");
+                failures.push(format!("Case `{case_name}`: {message}"));
+            }
+        }
+    }
+    anyhow::ensure!(
+        failures.is_empty(),
+        "{} method-binding fixture(s) failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    Ok(())
+}
+
+#[test]
+fn test_python_imported_method_binding_refresh_clears_unchanged_caller() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let owner_path = dir.path().join("owner.py");
+    let caller_path = dir.path().join("workflow.py");
+    fs::write(
+        &caller_path,
+        "from owner import C\ndef run(value: C):\n    value.update()\n",
+    )?;
+    let normal = "class C:\n    def update(self):\n        pass\n";
+    let rebound = "class C:\n    def update(self):\n        pass\n    update = 7\n";
+    let mut storage = Storage::new_in_memory()?;
+    let indexer = WorkspaceIndexer::new(dir.path().to_path_buf());
+    let event_bus = EventBus::new();
+    let mut original_method = None;
+    for (phase, source, expect_resolved) in [
+        ("initial imported method", normal, true),
+        ("only target file changed", rebound, false),
+        ("same-revision repeated target refresh", rebound, false),
+    ] {
+        fs::write(&owner_path, source)?;
+        indexer.run_incremental(
+            &mut storage,
+            &codestory_workspace::RefreshInfo {
+                mode: codestory_workspace::BuildMode::Incremental,
+                files_to_index: if original_method.is_none() {
+                    vec![owner_path.clone(), caller_path.clone()]
+                } else {
+                    vec![owner_path.clone()]
+                },
+                files_to_remove: vec![],
+                existing_file_ids: HashMap::new(),
+            },
+            &event_bus,
+            None,
+        )?;
+        let errors = storage.get_errors(None)?;
+        anyhow::ensure!(errors.is_empty(), "{phase}: indexing errors: {errors:?}");
+        let nodes = storage.get_nodes()?;
+        let edges = storage.get_edges()?;
+        assert_ordinary_call_census(phase, &nodes, &edges, "run", "update", 1);
+        let method = nodes
+            .iter()
+            .find(|node| {
+                matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                    && is_matching_owned_method(&node.serialized_name, "C", "update")
+            })
+            .expect("overwritten method declaration must remain navigable");
+        if let Some(original) = original_method {
+            assert_eq!(
+                method.id, original,
+                "{phase}: preserve declaration identity"
+            );
+        } else {
+            original_method = Some(method.id);
+        }
+        let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+        let call = edges
+            .iter()
+            .find(|edge| {
+                edge.kind == EdgeKind::CALL
+                    && node_by_id
+                        .get(&edge.source)
+                        .is_some_and(|source| is_matching_name(&source.serialized_name, "run"))
+            })
+            .expect("CALL census proved the unchanged caller exists");
+        assert_eq!(
+            call.effective_target() == method.id,
+            expect_resolved,
+            "{phase}: unchanged caller must not keep the overwritten target: {call:?}"
+        );
+        if expect_resolved {
+            assert_eq!(
+                call.certainty,
+                Some(ResolutionCertainty::Certain),
+                "{phase}: {call:?}"
+            );
+        } else {
+            assert_eq!(call.resolved_target, None, "{phase}: {call:?}");
+            assert_ne!(
+                call.certainty,
+                Some(ResolutionCertainty::Certain),
+                "{phase}: {call:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn test_python_self_receiver_shadowing_import_does_not_resolve_to_import() -> anyhow::Result<()> {
     let external_source = r#"
 class Widget:
@@ -22494,5 +23130,735 @@ fn test_go_implicit_import_must_use_declared_package_name() -> anyhow::Result<()
         ),
     ])?;
     assert_unresolved_go_package_call(&nodes, &edges, "Caller", "Target");
+    Ok(())
+}
+
+#[test]
+fn test_static_object_property_callable_owners_preserve_source_identity() -> anyhow::Result<()> {
+    let mut cases = Vec::new();
+    for extension in ["js", "ts", "tsx"] {
+        for (name, head) in [
+            ("pair function", "function ()"),
+            ("pair async function", "async function ()"),
+            ("pair arrow", "() =>"),
+            ("pair async arrow", "async () =>"),
+            ("pair generator", "function* ()"),
+        ] {
+            cases.push((
+                format!("owner.{extension}"), name,
+                format!("function target() {{}}\nexport default {{\n  request: {head} {{\n    target();\n  }},\n}};\n"),
+                vec![("request", 3, 12, 5, 4, 4)], Vec::new(), false,
+            ));
+        }
+        cases.push((
+            format!("owner.{extension}"), "shorthand method control",
+            "function target() {}\nexport default {\n  async request() {\n    target();\n  },\n};\n".to_string(),
+            vec![("request", 3, 3, 5, 4, 4)], Vec::new(), false,
+        ));
+        cases.push((
+            format!("owner.{extension}"),
+            "member assignment control",
+            "function target() {}\nconst api = {};\napi.request = function () {\n  target();\n};\n"
+                .to_string(),
+            vec![("request", 3, 15, 5, 2, 4)],
+            Vec::new(),
+            false,
+        ));
+        cases.push((
+            format!("owner.{extension}"), "separate objects private name and free call",
+            "function target() {}\nfunction inner() {}\nfunction request() { target(); }\nconst first = {\n  request: function inner() {\n    inner();\n    target();\n  },\n};\nconst second = {\n  request: () => {\n    target();\n  },\n};\nfunction run() { request(); }\n".to_string(),
+            vec![("request", 3, 1, 3, 33, 3), ("request", 5, 12, 8, 4, 7), ("request", 11, 12, 13, 4, 12)],
+            Vec::new(), true,
+        ));
+        cases.push((
+            format!("owner.{extension}"), "dynamic property and unrelated callback never borrow outer owner",
+            "function target() {}\nfunction outer() {\n  const api = {\n    [key]: function () {\n      target();\n    },\n  };\n  [1].forEach(function () {\n    target();\n  });\n}\n".to_string(),
+            Vec::new(), vec![(5, 4, 12, 6, 6), (9, 8, 15, 10, 4)], false,
+        ));
+    }
+    cases.push((
+        "Owner.vue".to_string(), "admitted Vue JavaScript script through template blanking",
+        "<template><button /></template>\n<script>\nfunction target() {}\nexport default {\n  methods: {\n    request: async function () {\n      target();\n    },\n  },\n};\n</script>\n".to_string(),
+        vec![("request", 6, 14, 8, 6, 7)], Vec::new(), false,
+    ));
+
+    let mut failures = Vec::new();
+    for (filename, case_name, source, owners, anonymous_calls, check_lexical_binding) in cases {
+        let outcome = std::panic::catch_unwind(|| -> anyhow::Result<()> {
+            let (nodes, edges) = index_single_file(&filename, &source)?;
+            let by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+            let target = nodes
+                .iter()
+                .find(|node| {
+                    matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                        && node.serialized_name == "target"
+                })
+                .expect("ordinary target declaration must remain represented");
+            let mut owner_ids = HashSet::new();
+            for (name, start_line, start_col, end_line, end_col, call_line) in &owners {
+                let found = nodes
+                    .iter()
+                    .filter(|node| {
+                        matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                            && is_matching_name(&node.serialized_name, name)
+                            && (node.start_line, node.start_col, node.end_line, node.end_col)
+                                == (
+                                    Some(*start_line),
+                                    Some(*start_col),
+                                    Some(*end_line),
+                                    Some(*end_col),
+                                )
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    found.len(),
+                    1,
+                    "{filename}/{case_name}: missing or ambiguous {name} at {start_line}:{start_col}-{end_line}:{end_col}. Nodes: {nodes:#?}"
+                );
+                let owner = found[0];
+                assert!(
+                    owner_ids.insert(owner.id),
+                    "distinct source declarations shared one ID"
+                );
+                assert!(
+                    snippet_for_node(&source, owner).is_some_and(|body| body.contains("target();")),
+                    "{filename}/{case_name}: callable span lost its body"
+                );
+                let column = source
+                    .lines()
+                    .nth(*call_line as usize - 1)
+                    .and_then(|line| line.find("target("))
+                    .expect("fixture target call") as u32
+                    + 1;
+                let calls = edges
+                    .iter()
+                    .filter(|edge| {
+                        edge.kind == EdgeKind::CALL
+                            && edge.line == Some(*call_line)
+                            && edge
+                                .callsite_identity
+                                .as_deref()
+                                .and_then(parse_canonical_callsite_identity)
+                                .is_some_and(|identity| identity.column_or_ordinal == column)
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    calls.len(),
+                    1,
+                    "{filename}/{case_name}: exact callsite missing or duplicated: {:?}",
+                    describe_call_edges(&edges, &nodes)
+                );
+                assert_eq!(
+                    calls[0].source, owner.id,
+                    "{filename}/{case_name}: CALL borrowed another declaration's owner"
+                );
+                assert_eq!(
+                    calls[0].effective_target(),
+                    target.id,
+                    "{filename}/{case_name}: ordinary lexical target changed"
+                );
+            }
+            for (call_line, start_line, start_col, end_line, end_col) in &anonymous_calls {
+                for call in edges
+                    .iter()
+                    .filter(|edge| edge.kind == EdgeKind::CALL && edge.line == Some(*call_line))
+                {
+                    let owner = by_id.get(&call.source).expect("stored source exists");
+                    assert!(matches!(owner.kind, NodeKind::FUNCTION | NodeKind::METHOD));
+                    assert_eq!(
+                        (
+                            owner.start_line,
+                            owner.start_col,
+                            owner.end_line,
+                            owner.end_col
+                        ),
+                        (
+                            Some(*start_line),
+                            Some(*start_col),
+                            Some(*end_line),
+                            Some(*end_col)
+                        ),
+                        "{filename}/{case_name}: unrepresented anonymous callable borrowed an outer owner: {call:#?}"
+                    );
+                }
+            }
+            if !anonymous_calls.is_empty() {
+                assert!(
+                    !nodes.iter().any(|node| {
+                        matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                            && is_matching_name(&node.serialized_name, "key")
+                    }),
+                    "{filename}/{case_name}: computed key was invented as a static callable name"
+                );
+            }
+            if check_lexical_binding {
+                let global_request = nodes
+                    .iter()
+                    .find(|node| {
+                        matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                            && node.serialized_name == "request"
+                            && node.start_line == Some(3)
+                    })
+                    .expect("free request declaration retained");
+                let global_inner = nodes
+                    .iter()
+                    .find(|node| {
+                        matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                            && node.serialized_name == "inner"
+                            && node.start_line == Some(2)
+                    })
+                    .expect("unrelated global inner retained");
+                let free_call = edges
+                    .iter()
+                    .filter(|edge| edge.kind == EdgeKind::CALL && edge.line == Some(15))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    free_call.len(),
+                    1,
+                    "{filename}/{case_name}: free call census"
+                );
+                assert_eq!(
+                    free_call[0].effective_target(),
+                    global_request.id,
+                    "{filename}/{case_name}: object property hijacked or obscured a free lexical call"
+                );
+                assert!(
+                    !nodes.iter().any(|node| {
+                        matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                            && is_matching_name(&node.serialized_name, "inner")
+                            && node.start_line == Some(5)
+                    }),
+                    "{filename}/{case_name}: private expression name leaked as a public declaration"
+                );
+                assert!(
+                    !edges.iter().any(|edge| {
+                        edge.kind == EdgeKind::CALL
+                            && edge.line == Some(6)
+                            && edge.effective_target() == global_inner.id
+                    }),
+                    "{filename}/{case_name}: private recursive call rebound to global inner"
+                );
+            }
+            Ok(())
+        });
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => failures.push(format!("{filename}/{case_name}: {error:#}")),
+            Err(payload) => {
+                let message = payload
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| payload.downcast_ref::<&str>().copied())
+                    .unwrap_or("non-string panic payload");
+                failures.push(format!("{filename}/{case_name}: {message}"));
+            }
+        }
+    }
+    anyhow::ensure!(
+        failures.is_empty(),
+        "{} static object callable fixture(s) failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    Ok(())
+}
+
+#[test]
+fn test_object_property_callable_identity_does_not_shift_ordinary_declarations()
+-> anyhow::Result<()> {
+    for extension in ["js", "ts", "tsx", "vue"] {
+        let root = tempdir()?;
+        let filename = format!("owner.{extension}");
+        let ordinary = "function request() { helper(); }\nfunction helper() {}\nfunction run() { request(); }\n";
+        let baseline = format!("const api = {{}};\n{ordinary}");
+        let added = format!(
+            "const api = {{ request: function () {{ helper(); }} }}; const other = {{ request: () => {{ helper(); }} }};\n{ordinary}"
+        );
+        let wrap = |source: &str| {
+            if extension == "vue" {
+                format!("<script>\n{source}</script>\n")
+            } else {
+                source.to_string()
+            }
+        };
+        let offset = u32::from(extension == "vue");
+        let (before, _) = index_files_at_root(root.path(), &[(&filename, &wrap(&baseline))])?;
+        let (after, edges) = index_files_at_root(root.path(), &[(&filename, &wrap(&added))])?;
+        for (name, line) in [("request", 2), ("helper", 3), ("run", 4)] {
+            let find = |nodes: &[Node]| {
+                nodes
+                    .iter()
+                    .find(|node| {
+                        matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                            && node.serialized_name == name
+                            && node.start_line == Some(line + offset)
+                    })
+                    .cloned()
+                    .expect("ordinary declaration remains represented")
+            };
+            let old = find(&before);
+            let new = find(&after);
+            assert_eq!(
+                (new.id, new.canonical_id),
+                (old.id, old.canonical_id),
+                "{extension}: a new same-spelled property shifted ordinary {name} identity"
+            );
+        }
+        let properties = after
+            .iter()
+            .filter(|node| {
+                matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                    && is_matching_name(&node.serialized_name, "request")
+                    && node.start_line == Some(1 + offset)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            properties.len(),
+            2,
+            "{extension}: both property declarations must exist"
+        );
+        assert_ne!(properties[0].id, properties[1].id);
+        assert_ne!(properties[0].canonical_id, properties[1].canonical_id);
+        for property in properties {
+            assert!(property.canonical_id.is_some());
+            assert!(
+                edges
+                    .iter()
+                    .any(|edge| edge.kind == EdgeKind::CALL && edge.source == property.id),
+                "{extension}: a source-distinct property lost its own body CALL"
+            );
+        }
+        let ordinary_request = after
+            .iter()
+            .find(|node| node.serialized_name == "request" && node.start_line == Some(2 + offset))
+            .unwrap();
+        let run = after
+            .iter()
+            .find(|node| node.serialized_name == "run")
+            .unwrap();
+        let calls = edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::CALL && edge.source == run.id)
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].effective_target(),
+            ordinary_request.id,
+            "{extension}: property declarations polluted the ordinary lexical target"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_object_property_callable_target_refresh_preserves_unchanged_imported_caller()
+-> anyhow::Result<()> {
+    for extension in ["js", "ts"] {
+        let root = tempdir()?;
+        let owner_path = root.path().join(format!("owner.{extension}"));
+        let caller_path = root.path().join(format!("caller.{extension}"));
+        fs::write(
+            &caller_path,
+            "import { request } from './owner';\nexport function run() { request(); }\n",
+        )?;
+        let ordinary =
+            "const api = {};\nexport function request() { helper(); }\nfunction helper() {}\n";
+        let added = "const api = { request: function () { helper(); } };\nexport function request() { helper(); }\nfunction helper() {}\n";
+        let property_only = "const api = { request: function () { helper(); } };\nfunction helper() {}\nexport default api;\n";
+        let mut store = Storage::new_in_memory()?;
+        let indexer = WorkspaceIndexer::new(root.path().to_path_buf());
+        let mut original_target = None;
+        let mut original_caller = None;
+        for (phase, source, resolves, warm) in [
+            ("ordinary", ordinary, true, false),
+            ("property added in target only", added, true, false),
+            ("warm target with property", added, true, true),
+            (
+                "ordinary export removed from target only",
+                property_only,
+                false,
+                false,
+            ),
+            ("warm property-only target", property_only, false, true),
+        ] {
+            fs::write(&owner_path, source)?;
+            let first = original_target.is_none();
+            let refresh = codestory_workspace::RefreshInfo {
+                mode: codestory_workspace::BuildMode::Incremental,
+                files_to_index: if first {
+                    vec![owner_path.clone(), caller_path.clone()]
+                } else {
+                    vec![owner_path.clone()]
+                },
+                files_to_remove: vec![],
+                existing_file_ids: store
+                    .get_files()?
+                    .into_iter()
+                    .map(|file| (file.path, file.id))
+                    .collect(),
+            };
+            let stats = indexer.run_incremental(&mut store, &refresh, &EventBus::new(), None)?;
+            assert!(
+                store.get_errors(None)?.is_empty(),
+                "{extension}/{phase}: indexing errors"
+            );
+            if warm {
+                assert_eq!(
+                    stats.artifact_cache_hits, 1,
+                    "{extension}/{phase}: actual warm parser artifact replay"
+                );
+            }
+            let nodes = store.get_nodes()?;
+            let edges = store.get_edges()?;
+            let run = nodes
+                .iter()
+                .find(|node| {
+                    node.serialized_name == "run"
+                        && matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                })
+                .unwrap();
+            if let Some(id) = original_caller {
+                assert_eq!(run.id, id, "unchanged caller identity");
+            } else {
+                original_caller = Some(run.id);
+            }
+            let calls = edges
+                .iter()
+                .filter(|edge| edge.kind == EdgeKind::CALL && edge.source == run.id)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                calls.len(),
+                1,
+                "{extension}/{phase}: caller must retain its CALL placeholder or target"
+            );
+            if resolves {
+                let target = nodes
+                    .iter()
+                    .find(|node| {
+                        node.serialized_name == "request"
+                            && node.start_line == Some(2)
+                            && matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                    })
+                    .unwrap();
+                if let Some((id, canonical)) = original_target.as_ref() {
+                    assert_eq!((target.id, &target.canonical_id), (*id, canonical));
+                } else {
+                    original_target = Some((target.id, target.canonical_id.clone()));
+                }
+                assert_eq!(
+                    calls[0].effective_target(),
+                    target.id,
+                    "{extension}/{phase}: property hijacked imported named export"
+                );
+            } else {
+                let property = nodes
+                    .iter()
+                    .find(|node| {
+                        is_matching_name(&node.serialized_name, "request")
+                            && node.start_line == Some(1)
+                            && matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                    })
+                    .expect("retained property declaration");
+                assert_ne!(
+                    calls[0].effective_target(),
+                    property.id,
+                    "{extension}/{phase}: missing named export rebound to object property"
+                );
+                assert_eq!(
+                    calls[0].resolved_target, None,
+                    "{extension}/{phase}: stale ordinary target survived refresh"
+                );
+                assert!(
+                    !nodes
+                        .iter()
+                        .any(|node| Some(node.id) == original_target.as_ref().map(|(id, _)| *id))
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_object_property_callable_owns_qualified_member_call_without_inventing_dispatch()
+-> anyhow::Result<()> {
+    for extension in ["js", "ts", "tsx", "vue"] {
+        let script = "function remove() {}\nexport default {\n  request: async function () {\n    await api.share.remove();\n  },\n};\n";
+        let source = if extension == "vue" {
+            format!("<script>\n{script}</script>\n")
+        } else {
+            script.to_string()
+        };
+        let offset = u32::from(extension == "vue");
+        let (nodes, edges) = index_single_file(&format!("Share.{extension}"), &source)?;
+        let owner = nodes
+            .iter()
+            .find(|node| {
+                matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                    && is_matching_name(&node.serialized_name, "request")
+                    && (node.start_line, node.start_col, node.end_line, node.end_col)
+                        == (Some(3 + offset), Some(12), Some(5 + offset), Some(4))
+            })
+            .expect("property function expression owns its exact source span");
+        let calls = edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::CALL && edge.line == Some(4 + offset))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            calls.len(),
+            1,
+            "{extension}: qualified body call must remain stored"
+        );
+        let call = calls[0];
+        assert_eq!(
+            call.source, owner.id,
+            "{extension}: qualified CALL source owner"
+        );
+        let raw_target = nodes.iter().find(|node| node.id == call.target).unwrap();
+        assert_eq!(raw_target.kind, NodeKind::UNKNOWN);
+        assert_eq!(raw_target.serialized_name, "remove");
+        assert_eq!(
+            (raw_target.start_line, raw_target.start_col),
+            (Some(4 + offset), Some(21))
+        );
+        let identity = call
+            .callsite_identity
+            .as_deref()
+            .and_then(parse_canonical_callsite_identity)
+            .expect("qualified CALL identity");
+        assert_eq!(
+            (identity.line, identity.column_or_ordinal),
+            (4 + offset, 21)
+        );
+        assert_eq!(
+            call.resolved_target, None,
+            "{extension}: unknown receiver must not resolve to same-spelled free remove"
+        );
+        assert_ne!(call.certainty, Some(ResolutionCertainty::Certain));
+    }
+    Ok(())
+}
+
+#[test]
+fn test_default_trail_preserves_source_qualified_and_repository_common_name_calls()
+-> anyhow::Result<()> {
+    use codestory_contracts::graph::{TrailCallerScope, TrailConfig, TrailDirection, TrailMode};
+    struct Case {
+        label: &'static str,
+        extension: &'static str,
+        source: String,
+        owner_span: (u32, u32, u32, u32),
+        callsite: (u32, u32),
+        terminal: &'static str,
+        resolved_declaration: Option<(&'static str, u32)>,
+        default_visible: bool,
+    }
+    let mut cases = Vec::new();
+    for extension in ["js", "ts", "tsx", "vue"] {
+        let script = "function remove() {}\nexport default {\n  request: async function () {\n    await api.share.remove();\n  },\n};\n";
+        let offset = u32::from(extension == "vue");
+        cases.push(Case {
+            label: "qualified API call with unrelated free remove",
+            extension,
+            source: if extension == "vue" {
+                format!("<script>\n{script}</script>\n")
+            } else {
+                script.into()
+            },
+            owner_span: (3 + offset, 12, 5 + offset, 4),
+            callsite: (4 + offset, 21),
+            terminal: "remove",
+            resolved_declaration: None,
+            default_visible: true,
+        });
+    }
+    cases.extend([
+        Case {
+            label: "ordinary qualified API filter",
+            extension: "js",
+            source: "function request() {\n  api.catalog.filter();\n}\n".into(),
+            owner_span: (1, 1, 3, 2),
+            callsite: (2, 15),
+            terminal: "filter",
+            resolved_declaration: None,
+            default_visible: true,
+        },
+        Case {
+            label: "JS low-confidence bare common-name boundary",
+            extension: "js",
+            source: "function remove() {}\nfunction request() {\n  remove();\n}\nexport {};\n"
+                .into(),
+            owner_span: (2, 1, 4, 2),
+            callsite: (3, 3),
+            terminal: "remove",
+            resolved_declaration: None,
+            default_visible: false,
+        },
+        Case {
+            label: "certain repository filter",
+            extension: "ts",
+            source: "function filter() {}\nfunction request() {\n  filter();\n}\n".into(),
+            owner_span: (2, 1, 4, 2),
+            callsite: (3, 3),
+            terminal: "filter",
+            resolved_declaration: Some(("filter", 1)),
+            default_visible: true,
+        },
+        Case {
+            label: "unresolved free len utility control",
+            extension: "js",
+            source: "function request() {\n  len();\n}\n".into(),
+            owner_span: (1, 1, 3, 2),
+            callsite: (2, 3),
+            terminal: "len",
+            resolved_declaration: None,
+            default_visible: false,
+        },
+        Case {
+            label: "unresolved free filter utility control",
+            extension: "ts",
+            source: "function request() {\n  filter();\n}\n".into(),
+            owner_span: (1, 1, 3, 2),
+            callsite: (2, 3),
+            terminal: "filter",
+            resolved_declaration: None,
+            default_visible: false,
+        },
+    ]);
+    let mut failures = Vec::new();
+    for case in cases {
+        let outcome = std::panic::catch_unwind(|| -> anyhow::Result<()> {
+            let root = tempdir()?;
+            let path = root.path().join(format!("workflow.{}", case.extension));
+            fs::write(&path, &case.source)?;
+            let mut store = Storage::new_in_memory()?;
+            WorkspaceIndexer::new(root.path().to_path_buf()).run_incremental(
+                &mut store,
+                &codestory_workspace::RefreshInfo {
+                    mode: codestory_workspace::BuildMode::Incremental,
+                    files_to_index: vec![path],
+                    files_to_remove: vec![],
+                    existing_file_ids: HashMap::new(),
+                },
+                &EventBus::new(),
+                None,
+            )?;
+            let errors = store.get_errors(None)?;
+            anyhow::ensure!(errors.is_empty(), "indexing errors: {errors:?}");
+            let nodes = store.get_nodes()?;
+            let owner = nodes
+                .iter()
+                .find(|node| {
+                    matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                        && node.serialized_name == "request"
+                        && (node.start_line, node.start_col, node.end_line, node.end_col)
+                            == (
+                                Some(case.owner_span.0),
+                                Some(case.owner_span.1),
+                                Some(case.owner_span.2),
+                                Some(case.owner_span.3),
+                            )
+                })
+                .expect("the authored callable must retain its exact source span");
+            let edges = store.get_edges()?;
+            let calls = edges
+                .iter()
+                .filter(|edge| {
+                    edge.kind == EdgeKind::CALL
+                        && edge.source == owner.id
+                        && edge.line == Some(case.callsite.0)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(calls.len(), 1, "raw stored CALL census: {edges:#?}");
+            let call = calls[0];
+            let raw_target = nodes.iter().find(|node| node.id == call.target).unwrap();
+            assert_eq!(raw_target.serialized_name, case.terminal);
+            let identity = call
+                .callsite_identity
+                .as_deref()
+                .and_then(parse_canonical_callsite_identity)
+                .expect("source CALL identity");
+            assert_eq!((identity.line, identity.column_or_ordinal), case.callsite);
+            if let Some((name, line)) = case.resolved_declaration {
+                let target = nodes
+                    .iter()
+                    .find(|node| {
+                        node.kind == NodeKind::FUNCTION
+                            && node.serialized_name == name
+                            && node.start_line == Some(line)
+                    })
+                    .unwrap();
+                assert_eq!(
+                    call.resolved_target,
+                    Some(target.id),
+                    "repository target must actually resolve"
+                );
+                assert_eq!(call.certainty, Some(ResolutionCertainty::Certain));
+            } else {
+                assert_eq!(raw_target.kind, NodeKind::UNKNOWN);
+                assert_eq!(
+                    call.resolved_target, None,
+                    "unknown receiver/free utility must remain unresolved"
+                );
+                assert_ne!(call.certainty, Some(ResolutionCertainty::Certain));
+            }
+            let config = TrailConfig {
+                root_id: owner.id,
+                mode: TrailMode::Neighborhood,
+                target_id: None,
+                depth: 1,
+                direction: TrailDirection::Outgoing,
+                caller_scope: TrailCallerScope::ProductionOnly,
+                edge_filter: vec![EdgeKind::CALL],
+                show_utility_calls: true,
+                node_filter: vec![],
+                max_nodes: 50,
+            };
+            let shown = store.get_trail(&config)?;
+            let shown_call = shown
+                .edges
+                .iter()
+                .find(|edge| edge.id == call.id)
+                .expect("utility-enabled trail must retain the actual stored source CALL");
+            assert_eq!(shown_call.source, owner.id);
+            assert_eq!(shown_call.effective_target(), call.effective_target());
+            assert_eq!(shown_call.resolved_target, call.resolved_target);
+            assert_eq!(shown_call.certainty, call.certainty);
+            assert!(!shown.truncated);
+            let default = store.get_trail(&TrailConfig {
+                show_utility_calls: false,
+                ..config
+            })?;
+            assert_eq!(
+                default.edges.iter().any(|edge| edge.id == call.id),
+                case.default_visible,
+                "{}/{}: default utility filtering changed source/API or repository call visibility; trail={default:#?}",
+                case.extension,
+                case.label
+            );
+            assert!(!default.truncated);
+            Ok(())
+        });
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                failures.push(format!("{}/{}: {error:#}", case.extension, case.label))
+            }
+            Err(payload) => {
+                let message = payload
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| payload.downcast_ref::<&str>().copied())
+                    .unwrap_or("non-string panic payload");
+                failures.push(format!("{}/{}: {message}", case.extension, case.label));
+            }
+        }
+    }
+    anyhow::ensure!(
+        failures.is_empty(),
+        "{} default-trail fixture(s) failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
     Ok(())
 }

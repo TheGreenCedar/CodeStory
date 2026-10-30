@@ -48,6 +48,35 @@ a setup command.
 The shared first-use timeline, platform boundaries, and multi-repository model
 are in the [user guide](README.md#first-use).
 
+## Source context after ordinary searches
+
+Source context is optional. When the executor explicitly reports a
+non-interactive `/bin/zsh` login-shell request, the Codex plugin can append
+complete Python and Rust declarations, plus Go functions and methods, around
+numbered `rg` matches after the original command finishes. Existing pipelines and redirections receive the original
+search bytes. This uses the already installed matching CLI; the hook does not
+provision a runtime, build an index, or call a model.
+
+If the host omits shell or login metadata, the hook leaves input unchanged.
+An operator may set `CODESTORY_SOURCE_CONTEXT_ZSH_LOGIN=1` in the hook's startup
+environment only when the executor has fixed `/bin/zsh` and login-enabled
+defaults with no per-call shell/login overrides. This declaration does not
+configure the executor. Leave it unset when that contract is unknown;
+explicit conflicting fields always retain the ordinary path.
+
+Context is bounded to 12 KiB of literal source and 2 KiB of framing. It describes
+rechecked current files, with gaps and limits, rather than an atomic repository
+snapshot or an exhaustive search. Unsupported commands, changed source,
+unsupported file languages, unavailable CLI, and exhausted bounds retain the raw output.
+Rust context covers functions, trait signatures, and enclosing `impl`, trait and
+module items with attached outer attributes or docs. It does not expand macros
+or establish type or runtime behavior. Go context retains named functions and
+methods with immediately attached comments. Function literals inside a named
+owner stay within that owner; package declarations, interfaces and top-level
+initializers do not become callable context. A single Rust or Go file does not
+need filename-prefixed search output.
+Other shells, interactive/TTY requests and other hosts keep their normal path.
+
 ## Update
 
 Marketplace refresh, package refresh, and host reload are separate:

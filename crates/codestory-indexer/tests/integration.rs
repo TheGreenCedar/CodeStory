@@ -1903,3 +1903,226 @@ class ReferenceVisibility {
 
     Ok(())
 }
+
+#[test]
+fn test_object_property_callable_cache_rebases_to_current_root() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let source_root = dir.path().join("source");
+    let target_root = dir.path().join("target");
+    fs::create_dir_all(source_root.join("src"))?;
+    fs::create_dir_all(target_root.join("src"))?;
+    let relative = "src/owner.js";
+    let source_file = source_root.join(relative);
+    let target_file = target_root.join(relative);
+    let source = "export function request() { helper(); }\n\nexport default {\n  request: function () {\n    helper();\n  },\n};\nfunction helper() {}\n";
+    fs::write(&source_file, source)?;
+    fs::write(&target_file, source)?;
+    let source_db = dir.path().join("source.db");
+    let mut original = Storage::open(&source_db)?;
+    let first = run_incremental_indexing(&source_root, &mut original, vec![source_file.clone()])?;
+    assert_eq!(first.artifact_cache_writes, 1);
+    let graph_identity = |store: &Storage| -> anyhow::Result<_> {
+        let mut nodes = store
+            .get_nodes()?
+            .into_iter()
+            .map(|node| (node.id, node.canonical_id))
+            .collect::<Vec<_>>();
+        nodes.sort();
+        let mut calls = store
+            .get_edges()?
+            .into_iter()
+            .filter(|edge| edge.kind == EdgeKind::CALL)
+            .map(|edge| {
+                (
+                    edge.source,
+                    edge.effective_target(),
+                    edge.line,
+                    edge.callsite_identity,
+                )
+            })
+            .collect::<Vec<_>>();
+        calls.sort();
+        Ok((nodes, calls))
+    };
+    let cold_identity = graph_identity(&original)?;
+    let warm = run_incremental_indexing(&source_root, &mut original, vec![source_file])?;
+    assert_eq!(
+        warm.artifact_cache_hits, 1,
+        "must replay the same-root artifact"
+    );
+    assert_eq!(
+        graph_identity(&original)?,
+        cold_identity,
+        "earlier CALL references must not change ordinary declaration IDs or targets on warm replay"
+    );
+    drop(original);
+    let mut replayed = Storage::new_in_memory()?;
+    assert_eq!(replayed.copy_index_artifact_cache_from(&source_db)?, 1);
+    let replay = run_incremental_indexing(&target_root, &mut replayed, vec![target_file.clone()])?;
+    assert_eq!(
+        replay.artifact_cache_hits, 1,
+        "must exercise actual parser artifact rebasing"
+    );
+    assert_eq!(replay.artifact_cache_misses, 0);
+    let mut fresh = Storage::new_in_memory()?;
+    run_incremental_indexing(&target_root, &mut fresh, vec![target_file.clone()])?;
+    assert_eq!(
+        graph_identity(&replayed)?,
+        graph_identity(&fresh)?,
+        "cross-root cache replay and cold extraction must agree on all source identities and CALL targets"
+    );
+    let nodes = replayed.get_nodes()?;
+    let helper = nodes
+        .iter()
+        .find(|node| {
+            node.kind == NodeKind::FUNCTION
+                && node.serialized_name == "helper"
+                && node.start_line == Some(8)
+        })
+        .expect("ordinary helper declaration after its CALL references must survive replay");
+    let helper_calls = replayed
+        .get_edges()?
+        .into_iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        helper_calls.len(),
+        2,
+        "both earlier helper CALLs must remain represented"
+    );
+    assert!(
+        helper_calls
+            .iter()
+            .all(|edge| edge.effective_target() == helper.id),
+        "cache replay cannot make an earlier helper placeholder the effective target"
+    );
+    let property = nodes
+        .iter()
+        .find(|node| {
+            matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD) && node.start_line == Some(4)
+        })
+        .expect("cache replay must retain the property callable");
+    let fresh_property = fresh
+        .get_nodes()?
+        .into_iter()
+        .find(|node| {
+            matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD) && node.start_line == Some(4)
+        })
+        .expect("fresh extraction must retain the same property callable");
+    assert_eq!(
+        (property.id, &property.canonical_id),
+        (fresh_property.id, &fresh_property.canonical_id)
+    );
+    assert!(
+        !property
+            .canonical_id
+            .as_deref()
+            .unwrap()
+            .contains(source_root.to_string_lossy().as_ref()),
+        "copied identity still authenticates the old source root"
+    );
+    let target_file_id = replayed.get_file_by_path(&target_file)?.unwrap().id;
+    assert_eq!(property.file_node_id, Some(NodeId(target_file_id)));
+    let calls = replayed
+        .get_edges()?
+        .into_iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL && edge.source == property.id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        calls.len(),
+        1,
+        "cache replay cannot pass by dropping owned body CALLs"
+    );
+    let fresh_calls = fresh
+        .get_edges()?
+        .into_iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL && edge.source == fresh_property.id)
+        .collect::<Vec<_>>();
+    assert_eq!(fresh_calls.len(), 1);
+    assert_eq!(
+        (
+            calls[0].source,
+            calls[0].effective_target(),
+            calls[0].line,
+            &calls[0].callsite_identity
+        ),
+        (
+            fresh_calls[0].source,
+            fresh_calls[0].effective_target(),
+            fresh_calls[0].line,
+            &fresh_calls[0].callsite_identity
+        )
+    );
+    let identity = calls[0]
+        .callsite_identity
+        .as_deref()
+        .and_then(codestory_contracts::proof_resolution::parse_canonical_callsite_identity)
+        .unwrap();
+    assert_eq!(identity.file_id.0, target_file_id);
+    Ok(())
+}
+
+#[test]
+fn test_object_property_callable_template_uses_current_path_identity() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let old_root = dir.path().join("old");
+    let new_root = dir.path().join("new");
+    fs::create_dir_all(&old_root)?;
+    fs::create_dir_all(&new_root)?;
+    let source = "<template><button /></template>\n<script>\nfunction helper() {}\nexport default {\n  request: async function () {\n    helper();\n  },\n};\n</script>\n";
+    let old_file = old_root.join("Share.vue");
+    let new_file = new_root.join("Share.vue");
+    fs::write(&old_file, source)?;
+    fs::write(&new_file, source)?;
+    let mut old_store = Storage::new_in_memory()?;
+    let mut new_store = Storage::new_in_memory()?;
+    run_incremental_indexing(&old_root, &mut old_store, vec![old_file])?;
+    run_incremental_indexing(&new_root, &mut new_store, vec![new_file.clone()])?;
+    let old_nodes = old_store.get_nodes()?;
+    let new_nodes = new_store.get_nodes()?;
+    let select = |nodes: &[codestory_contracts::graph::Node]| {
+        nodes
+            .iter()
+            .find(|node| {
+                matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                    && node.start_line == Some(5)
+                    && node.start_col == Some(12)
+            })
+            .cloned()
+            .expect("actual Vue pipeline retains property callable source coordinates")
+    };
+    let old = select(&old_nodes);
+    let new = select(&new_nodes);
+    assert_ne!(
+        old.id, new.id,
+        "distinct source roots must not share a source-bound property identity"
+    );
+    assert_ne!(old.canonical_id, new.canonical_id);
+    assert!(
+        !new.canonical_id
+            .as_deref()
+            .unwrap()
+            .contains(old_root.to_string_lossy().as_ref())
+    );
+    let file_id = new_store.get_file_by_path(&new_file)?.unwrap().id;
+    assert_eq!(new.file_node_id, Some(NodeId(file_id)));
+    let calls = new_store
+        .get_edges()?
+        .into_iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL && edge.source == new.id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        calls.len(),
+        1,
+        "template remapping cannot lose the source-owned body CALL"
+    );
+    assert_eq!(calls[0].line, Some(6));
+    let identity = calls[0]
+        .callsite_identity
+        .as_deref()
+        .and_then(codestory_contracts::proof_resolution::parse_canonical_callsite_identity)
+        .unwrap();
+    assert_eq!(identity.file_id.0, file_id);
+    assert_eq!((identity.line, identity.column_or_ordinal), (6, 5));
+    Ok(())
+}

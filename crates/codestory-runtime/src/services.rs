@@ -2655,14 +2655,12 @@ impl OperationReadClass {
 /// Anything not listed is a pure graph read.
 pub fn operation_read_class(operation: &str) -> OperationReadClass {
     match operation {
-        // Retrieval readiness admits only operations whose results execute
-        // through the retrieval sidecars (`packet`, hybrid `search`, `context`,
-        // `drill`) or resolve evidence against a pinned retrieval generation
-        // (`resolution`, `graph_assisted`).
-        "packet" | "search" | "context" | "drill" | "resolution" | "graph_assisted" => {
+        // Broad evidence and the graph-query DSL retain full retrieval admission.
+        "packet" | "search" | "context" | "drill" | "graph_assisted" => {
             OperationReadClass::Retrieval
         }
-        "exact_search" | "source_snippet" => OperationReadClass::SourceBacked,
+        // Name-selected navigation resolves only the fresh complete Core index.
+        "resolution" | "exact_search" | "source_snippet" => OperationReadClass::SourceBacked,
         "affected" | crate::call_path_kernel::PROOF_DOMAIN => OperationReadClass::PinnedObserver,
         _ => OperationReadClass::GraphOnly,
     }
@@ -4438,6 +4436,15 @@ impl GroundingService {
         Self { controller }
     }
 
+    /// Attach only an existing complete core; no readiness, refresh, or retrieval.
+    pub fn passive_session_map_at(
+        &self,
+        root: PathBuf,
+        storage_path: PathBuf,
+    ) -> Result<crate::SessionMapSnapshot, ApiError> {
+        self.controller.passive_session_map_at(root, storage_path)
+    }
+
     pub fn grounding_snapshot(
         &self,
         budget: GroundingBudgetDto,
@@ -4717,6 +4724,7 @@ mod freshness_gate_tests {
             "graph",
             "exact_search",
             "source_snippet",
+            "resolution",
             "affected",
             crate::call_path_kernel::PROOF_DOMAIN,
         ] {
@@ -4726,14 +4734,7 @@ mod freshness_gate_tests {
                 "{operation}"
             );
         }
-        for operation in [
-            "packet",
-            "search",
-            "context",
-            "drill",
-            "resolution",
-            "graph_assisted",
-        ] {
+        for operation in ["packet", "search", "context", "drill", "graph_assisted"] {
             assert_eq!(
                 operation_read_class(operation).activation_goal(),
                 ActivationGoal::Full,
@@ -5106,6 +5107,554 @@ pub(crate) mod activation_tests {
         );
 
         (project, cache, storage_path, retrieval_pointer)
+    }
+
+    #[test]
+    fn passive_session_map_is_pinned_bounded_and_verifies_selected_sources_only() {
+        let (project, cache, storage_path, retrieval_pointer) =
+            complete_core_without_retrieval_pointer_fixture();
+        let process_cache = tempfile::tempdir().unwrap();
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
+        let before = fs::read(
+            codestory_store::CorePublicationLayout::from_storage_path(&storage_path)
+                .unwrap()
+                .publication_path(),
+        )
+        .ok();
+        let map = runtime
+            .grounding_service()
+            .passive_session_map_at(project.path().to_path_buf(), storage_path.clone())
+            .unwrap();
+        assert_eq!(map.rows.len(), 1);
+        assert_eq!(map.rows[0].path, "fixture.rs");
+        assert!(
+            map.rows[0]
+                .roots
+                .iter()
+                .any(|s| s.name == "retained_core_fixture")
+        );
+        assert_eq!(map.rows[0].content_sha256.len(), 64);
+        assert!(
+            map.gaps.iter().all(|gap| gap.starts_with("root_id=")),
+            "unbound graph roots must remain explicit: {:?}",
+            map.gaps
+        );
+        assert!(!retrieval_pointer.exists());
+        assert_eq!(
+            before,
+            fs::read(
+                codestory_store::CorePublicationLayout::from_storage_path(&storage_path)
+                    .unwrap()
+                    .publication_path()
+            )
+            .ok()
+        );
+        // Unindexed siblings never enter the fixed selected-file verification set.
+        fs::write(
+            project.path().join("unselected.rs"),
+            "fn not_in_publication() {}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            runtime
+                .grounding_service()
+                .passive_session_map_at(project.path().to_path_buf(), storage_path.clone())
+                .unwrap()
+                .rows
+                .len(),
+            1
+        );
+        // Same-length drift is not certified by old index metadata.
+        fs::write(
+            project.path().join("fixture.rs"),
+            "pub fn changed__core_fixture() {}\n",
+        )
+        .unwrap();
+        let stale = runtime
+            .grounding_service()
+            .passive_session_map_at(project.path().to_path_buf(), storage_path.clone())
+            .unwrap();
+        assert!(stale.rows.is_empty());
+        assert!(stale.gaps.iter().any(|s| s.contains("content changed")));
+        // A previously tiny file cannot cause unbounded allocation at startup.
+        fs::write(project.path().join("fixture.rs"), vec![b'x'; 2_000_001]).unwrap();
+        let grown = runtime
+            .grounding_service()
+            .passive_session_map_at(project.path().to_path_buf(), storage_path.clone())
+            .unwrap();
+        assert!(grown.rows.is_empty());
+        assert!(
+            grown
+                .gaps
+                .iter()
+                .any(|s| s.contains("exceeds source policy"))
+        );
+        fs::remove_file(project.path().join("fixture.rs")).unwrap();
+        assert!(
+            runtime
+                .grounding_service()
+                .passive_session_map_at(project.path().to_path_buf(), storage_path.clone())
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+        let absent = cache.path().join("absent").join("codestory.db");
+        assert!(
+            runtime
+                .grounding_service()
+                .passive_session_map_at(project.path().to_path_buf(), absent.clone())
+                .is_err()
+        );
+        assert!(!absent.parent().unwrap().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn passive_session_map_groups_native_aliases_without_rewriting_unix_paths() {
+        use std::os::unix::fs::symlink;
+        let (project, _cache, storage_path, _) = complete_core_without_retrieval_pointer_fixture();
+        let literal = project.path().join("part\\leaf.rs");
+        fs::write(&literal, "pub fn literal_leaf() {}\n").unwrap();
+        fs::create_dir(project.path().join("part")).unwrap();
+        fs::write(
+            project.path().join("part/leaf.rs"),
+            "pub fn separate_leaf() {}\n",
+        )
+        .unwrap();
+        symlink(
+            project.path().join("fixture.rs"),
+            project.path().join("alias.rs"),
+        )
+        .unwrap();
+        let process_cache = tempfile::tempdir().unwrap();
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
+        runtime
+            .grounding_service()
+            .controller
+            .bind_project_paths_for_refresh(project.path().to_path_buf(), storage_path.clone())
+            .unwrap();
+        runtime
+            .index_service()
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .unwrap();
+        let map = runtime
+            .grounding_service()
+            .passive_session_map_at(project.path().to_path_buf(), storage_path.clone())
+            .unwrap();
+        let source_names = map
+            .rows
+            .iter()
+            .flat_map(|r| r.roots.iter().chain(&r.symbols))
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(source_names.contains(&"literal_leaf"));
+        assert!(source_names.contains(&"separate_leaf"));
+        assert_eq!(
+            map.rows.len(),
+            3,
+            "contained alias must occupy only one native group"
+        );
+        assert!(map.rows.iter().any(|r| r.path == "part/leaf.rs"));
+        assert!(map.rows.iter().any(|r| r.path == "part\\leaf.rs"));
+        let selected = runtime
+            .grounding_service()
+            .controller
+            .with_complete_core_snapshot(|_| {
+                runtime
+                    .grounding_service()
+                    .grounding_snapshot(GroundingBudgetDto::Strict)
+            })
+            .unwrap();
+        let storage = runtime
+            .grounding_service()
+            .controller
+            .open_storage_read_only()
+            .unwrap();
+        let selected_ids = selected
+            .root_symbols
+            .iter()
+            .filter(|s| {
+                storage
+                    .get_node(s.id.to_core().unwrap())
+                    .unwrap()
+                    .as_ref()
+                    .and_then(crate::controller_files::source_file_id)
+                    .is_some()
+            })
+            .map(|s| s.id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            map.gaps.len(),
+            selected.root_symbols.len() - selected_ids.len(),
+            "unbound graph roots stay explicit gaps"
+        );
+        let map_ids = map
+            .rows
+            .iter()
+            .flat_map(|r| &r.roots)
+            .map(|s| s.id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            map_ids, selected_ids,
+            "grouping must preserve every selected root"
+        );
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(
+            outside.path().join("outside.rs"),
+            "pub fn literal_leaf() {}\n",
+        )
+        .unwrap();
+        fs::remove_file(&literal).unwrap();
+        symlink(outside.path().join("outside.rs"), &literal).unwrap();
+        let escaped = runtime
+            .grounding_service()
+            .passive_session_map_at(project.path().to_path_buf(), storage_path)
+            .unwrap();
+        assert!(escaped.gaps.iter().any(|g| g.contains("outside project")));
+        assert!(
+            !escaped
+                .rows
+                .iter()
+                .flat_map(|r| r.roots.iter().chain(&r.symbols))
+                .any(|s| s.name == "literal_leaf")
+        );
+        assert!(
+            escaped
+                .rows
+                .iter()
+                .flat_map(|r| r.roots.iter().chain(&r.symbols))
+                .any(|s| s.name == "separate_leaf")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn passive_session_map_keeps_each_alias_members_indexed_content_authority() {
+        use std::os::unix::fs::symlink;
+        // Distinct indexed files may later acquire one native identity. Equal
+        // bytes are a valid coalescing control; drift or missing authority is not.
+        for link in ["hardlink", "symlink"] {
+            for authority in ["different", "equal", "missing"] {
+                let project = tempfile::tempdir().unwrap();
+                let cache = tempfile::tempdir().unwrap();
+                let process_cache = tempfile::tempdir().unwrap();
+                let storage_path = cache.path().join("codestory.db");
+                let a = project.path().join("a.rs");
+                let b = project.path().join("b.rs");
+                let first = "pub fn alpha_entry() {}\n";
+                fs::write(&a, first).unwrap();
+                fs::write(
+                    &b,
+                    if authority == "equal" {
+                        first
+                    } else {
+                        "pub fn beta_entry() {}\n"
+                    },
+                )
+                .unwrap();
+                let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
+                runtime
+                    .project_service()
+                    .open_project_summary_with_storage_path(
+                        project.path().to_path_buf(),
+                        storage_path.clone(),
+                    )
+                    .unwrap();
+                runtime
+                    .index_service()
+                    .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+                    .unwrap();
+                let before = runtime
+                    .grounding_service()
+                    .passive_session_map_at(project.path().to_path_buf(), storage_path.clone())
+                    .unwrap();
+                assert_eq!(
+                    before.rows.len(),
+                    2,
+                    "{link}/{authority}: both source identities must be observed before coalescing"
+                );
+                let b_row = before.rows.iter().find(|row| row.path == "b.rs").unwrap();
+                let b_ids = b_row
+                    .roots
+                    .iter()
+                    .chain(&b_row.symbols)
+                    .map(|symbol| symbol.id.clone())
+                    .collect::<std::collections::HashSet<_>>();
+                assert!(
+                    !b_ids.is_empty(),
+                    "fixture must expose b's own indexed symbol"
+                );
+                let before_ids = before
+                    .rows
+                    .iter()
+                    .flat_map(|row| row.roots.iter().chain(&row.symbols))
+                    .map(|s| s.id.clone())
+                    .collect::<std::collections::HashSet<_>>();
+                if authority == "missing" {
+                    mutate_active_generation_sql(
+                        &storage_path,
+                        &format!(
+                            "UPDATE file SET content_hash = NULL WHERE id = {};",
+                            b_row.file_id
+                        ),
+                    );
+                }
+                fs::remove_file(&b).unwrap();
+                if link == "hardlink" {
+                    fs::hard_link(&a, &b).unwrap();
+                } else {
+                    symlink(&a, &b).unwrap();
+                }
+                let publication = fs::read(
+                    codestory_store::CorePublicationLayout::from_storage_path(&storage_path)
+                        .unwrap()
+                        .publication_path(),
+                )
+                .unwrap();
+                let after = runtime
+                    .grounding_service()
+                    .passive_session_map_at(project.path().to_path_buf(), storage_path.clone())
+                    .unwrap();
+                assert_eq!(after.generation_id, before.generation_id);
+                assert_eq!(after.run_id, before.run_id);
+                assert_eq!(
+                    after.rows.len(),
+                    1,
+                    "{link}/{authority}: one current native group"
+                );
+                let after_ids = after
+                    .rows
+                    .iter()
+                    .flat_map(|row| row.roots.iter().chain(&row.symbols))
+                    .map(|s| s.id.clone())
+                    .collect::<std::collections::HashSet<_>>();
+                if authority == "equal" {
+                    assert_eq!(
+                        after_ids, before_ids,
+                        "{link}: matching indexed raw hashes must preserve every alias symbol"
+                    );
+                    assert!(
+                        !after.gaps.iter().any(|gap| gap.starts_with("file_id=")),
+                        "{link}: valid alias was refused: {:?}",
+                        after.gaps
+                    );
+                } else {
+                    assert!(
+                        after_ids.is_disjoint(&b_ids),
+                        "{link}/{authority}: stale alias symbols were certified by another member's hash"
+                    );
+                    assert!(
+                        after.rows[0]
+                            .roots
+                            .iter()
+                            .any(|symbol| symbol.name == "alpha_entry")
+                    );
+                    assert!(
+                        after.gaps.iter().any(|gap| gap
+                            .starts_with(&format!("file_id={}: indexed content", b_row.file_id))),
+                        "{link}/{authority}: missing authority gap: {:?}",
+                        after.gaps
+                    );
+                }
+                assert_eq!(
+                    publication,
+                    fs::read(
+                        codestory_store::CorePublicationLayout::from_storage_path(&storage_path)
+                            .unwrap()
+                            .publication_path()
+                    )
+                    .unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_name_navigation_uses_fresh_core_without_search_attachment() {
+        use crate::{TargetResolution, TargetSelection};
+        use codestory_contracts::api::{
+            LayoutDirection, TrailCallerScope, TrailDirection, TrailMode,
+        };
+
+        let process_cache = tempfile::tempdir().expect("owned runtime cache root");
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("cache");
+        let storage_path = cache.path().join("codestory.db");
+        let source = project.path().join("anchor.go");
+        fs::write(
+            &source,
+            "package fixture\nfunc indexed_anchor() {}\nfunc invoke_anchor() { indexed_anchor() }\n",
+        )
+        .expect("write production caller fixture");
+        fs::write(
+            project.path().join("anchor_test.go"),
+            "package fixture\nfunc invoke_anchor_test() { indexed_anchor() }\n",
+        )
+        .expect("write path-classified test caller fixture");
+        {
+            let seed = crate::test_runtime_with_owned_cache_root(process_cache.path());
+            seed.project_service()
+                .open_project_summary_with_storage_path(
+                    project.path().to_path_buf(),
+                    storage_path.clone(),
+                )
+                .expect("bind indexed-name fixture");
+            seed.index_service()
+                .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+                .expect("publish complete Core");
+            let storage = seed
+                .controller
+                .open_storage_read_only()
+                .expect("published Core");
+            let nodes = storage.get_nodes().expect("indexed fixture nodes");
+            let declaration = |name| {
+                nodes
+                    .iter()
+                    .find(|node| {
+                        node.kind == codestory_contracts::graph::NodeKind::FUNCTION
+                            && node.serialized_name == name
+                    })
+                    .expect("indexed fixture function")
+            };
+            let anchor = declaration("indexed_anchor");
+            let test_caller = declaration("invoke_anchor_test");
+            assert!(
+                nodes
+                    .iter()
+                    .any(|node| Some(node.id) == test_caller.file_node_id
+                        && node.serialized_name.ends_with("anchor_test.go")),
+                "the caller role must come from a classified test path"
+            );
+            assert!(
+                storage
+                    .get_edges()
+                    .expect("indexed fixture edges")
+                    .iter()
+                    .any(
+                        |edge| edge.kind == codestory_contracts::graph::EdgeKind::CALL
+                            && edge.effective_endpoints() == (test_caller.id, anchor.id)
+                    ),
+                "fixture must contain a resolved test-to-anchor CALL before admission checks"
+            );
+        }
+        let retrieval_pointer =
+            codestory_store::CorePublicationLayout::from_storage_path(&storage_path)
+                .expect("Core layout")
+                .retrieval_publication_path();
+        if retrieval_pointer.exists() {
+            fs::remove_file(&retrieval_pointer)
+                .expect("remove fixture retrieval publication pointer");
+        }
+        assert!(!retrieval_pointer.exists());
+        let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
+        runtime
+            .project_service()
+            .open_core_read_only_with_storage_path(
+                project.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("fresh controller attaches only complete Core");
+        assert!(!retrieval_pointer.exists());
+        assert!(runtime.controller.state.lock().search_engine.is_none());
+        let browser = runtime.browser_service();
+        let query = TargetSelection::Query {
+            query: "indexed_anchor".into(),
+            choose: None,
+        };
+        let TargetResolution::Resolved(target) = browser
+            .resolve_target(query.clone(), None)
+            .expect("indexed-name Browser admission must not require retrieval")
+        else {
+            panic!("unique indexed callable must resolve");
+        };
+        let selected_id = target.selected.node_id.clone();
+        let service = runtime.public_operation_service();
+        for max_nodes in [12, 50] {
+            for caller_scope in [
+                TrailCallerScope::ProductionOnly,
+                TrailCallerScope::IncludeTestsAndBenches,
+            ] {
+                let mut graphs = Vec::new();
+                for (operation, selection) in [
+                    ("resolution", query.clone()),
+                    ("graph", TargetSelection::Id(selected_id.clone())),
+                ] {
+                    let result = service
+                        .run_with_cancel(operation, Arc::new(AtomicBool::new(false)), || {
+                            let TargetResolution::Resolved(resolved) =
+                                browser.resolve_target(selection.clone(), None)?
+                            else {
+                                return Err(ApiError::internal("indexed target did not resolve"));
+                            };
+                            browser
+                                .trail_context(TrailConfigDto {
+                                    root_id: resolved.selected.node_id.clone(),
+                                    mode: TrailMode::Neighborhood,
+                                    target_id: None,
+                                    depth: 2,
+                                    direction: TrailDirection::Incoming,
+                                    caller_scope,
+                                    edge_filter: Vec::new(),
+                                    show_utility_calls: false,
+                                    hide_speculative: false,
+                                    story: false,
+                                    node_filter: Vec::new(),
+                                    max_nodes,
+                                    layout_direction: LayoutDirection::Horizontal,
+                                })
+                                .map(|context| context.trail)
+                        })
+                        .expect("indexed graph navigation must need only fresh complete Core");
+                    assert!(result.core_publication.is_some());
+                    assert!(result.retrieval_publication.is_none());
+                    assert_eq!(result.freshness, OperationFreshness::Fresh);
+                    assert_eq!(result.value.center_id, selected_id);
+                    assert!(
+                        !result.value.edges.is_empty(),
+                        "must return actual caller evidence"
+                    );
+                    assert!(
+                        result
+                            .value
+                            .nodes
+                            .iter()
+                            .any(|node| node.label.contains("invoke_anchor"))
+                    );
+                    assert_eq!(
+                        result
+                            .value
+                            .nodes
+                            .iter()
+                            .any(|node| node.label.contains("invoke_anchor_test")),
+                        caller_scope == TrailCallerScope::IncludeTestsAndBenches
+                    );
+                    graphs.push(serde_json::to_value(result.value).expect("graph JSON"));
+                }
+                assert_eq!(
+                    graphs[0], graphs[1],
+                    "query and ID must preserve the complete graph at cap {max_nodes}"
+                );
+            }
+        }
+        assert!(
+            runtime.controller.state.lock().search_engine.is_none(),
+            "indexed navigation must not attach persisted search state"
+        );
+        assert!(
+            !retrieval_pointer.exists(),
+            "indexed navigation must not prepare retrieval"
+        );
+
+        let cancelled = service
+            .run_with_cancel("resolution", Arc::new(AtomicBool::new(true)), || Ok(()))
+            .expect_err("pre-cancelled name navigation must refuse");
+        assert_eq!(cancelled.code, "cancelled");
+        fs::write(&source, "package fixture\nfunc replacement_anchor() {}\n")
+            .expect("change indexed source");
+        let stale = browser
+            .resolve_target(query, None)
+            .expect_err("stale name navigation must not serve historical Core");
+        assert_eq!(stale.code, "project_unavailable");
     }
 
     fn tree_snapshot(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
@@ -5708,7 +6257,7 @@ pub(crate) mod activation_tests {
     }
 
     #[test]
-    fn packet_public_admission_refuses_missing_retrieval_before_response_building() {
+    fn retrieval_public_admission_refuses_missing_retrieval_before_response_building() {
         let (project, _cache, storage_path, _) = complete_core_without_retrieval_pointer_fixture();
         let process_cache = tempfile::tempdir().expect("owned runtime cache root");
         let runtime = crate::test_runtime_with_owned_cache_root(process_cache.path());
@@ -5720,7 +6269,10 @@ pub(crate) mod activation_tests {
         let request = warm_packet_request();
         let _latency_scope = crate::enter_packet_latency_scope(request.latency_budget_ms);
 
-        for observational in [false, true] {
+        for (operation, observational) in ["packet", "search", "context", "drill", "graph_assisted"]
+            .into_iter()
+            .flat_map(|operation| [false, true].map(|observational| (operation, observational)))
+        {
             let mut body_calls = 0;
             let mut build = || {
                 body_calls += 1;
@@ -5728,12 +6280,12 @@ pub(crate) mod activation_tests {
             };
             let error = if observational {
                 service.run_observational_with_cancel(
-                    "packet",
+                    operation,
                     Arc::new(AtomicBool::new(false)),
                     &mut build,
                 )
             } else {
-                service.run_with_cancel("packet", Arc::new(AtomicBool::new(false)), &mut build)
+                service.run_with_cancel(operation, Arc::new(AtomicBool::new(false)), &mut build)
             }
             .expect_err("missing retrieval must refuse before the response builder");
             assert_eq!(error.code, "retrieval_unavailable", "{error:?}");
@@ -10444,6 +10996,128 @@ pub(crate) mod activation_tests {
     }
 
     #[test]
+    fn outdated_reference_occurrences_refresh_unchanged_parser_files_and_keep_old_publication() {
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("owned runtime cache");
+        let storage_path = project.path().join("cache/codestory.db");
+        let sources = [
+            (
+                "owner.py",
+                "class Owner:\n    @external\n    def worker(self):\n        return 1\n",
+            ),
+            (
+                "owner.go",
+                "package owner\nfunc helper() {}\nfunc worker() { helper() }\n",
+            ),
+        ];
+        for (name, source) in sources {
+            fs::write(project.path().join(name), source).unwrap();
+        }
+        let runtime = crate::test_runtime_with_owned_cache_root(cache.path());
+        runtime
+            .project_service()
+            .open_project_summary_with_storage_path(
+                project.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .unwrap();
+        runtime
+            .index_service()
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .unwrap();
+        let original = Store::open(&storage_path).unwrap();
+        assert!(
+            original
+                .get_occurrences()
+                .unwrap()
+                .iter()
+                .any(|occ| occ.kind == codestory_contracts::graph::OccurrenceKind::REFERENCE)
+        );
+        drop(original);
+        // Emulate a prior producer with identical source bytes; current parser cache
+        // entries remain available to prove that the refresh still replaces rows.
+        mutate_active_generation_sql(
+            &storage_path,
+            "UPDATE occurrence SET kind = 0 WHERE kind = 1; UPDATE file_extraction_identity SET extraction_revision = 'previous-occurrence-producer';",
+        );
+        let old_database = codestory_store::resolve_core_database_path(&storage_path).unwrap();
+        let old_bytes = fs::read(&old_database).unwrap();
+        let observed = runtime
+            .project_service()
+            .inspect_project_summary_with_storage_path(
+                project.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            observed.freshness.as_ref().unwrap().changed_file_count,
+            2,
+            "Python and previously unversioned Go must both be scheduled"
+        );
+        assert_eq!(
+            observed.freshness.as_ref().unwrap().status,
+            IndexFreshnessStatusDto::Stale
+        );
+        runtime
+            .index_service()
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .unwrap();
+        assert_ne!(
+            codestory_store::resolve_core_database_path(&storage_path).unwrap(),
+            old_database
+        );
+        assert_eq!(
+            fs::read(&old_database).unwrap(),
+            old_bytes,
+            "the pinned old publication is not rewritten"
+        );
+        let current = Store::open(&storage_path).unwrap();
+        let python = current
+            .get_file_by_path(&project.path().join("owner.py"))
+            .unwrap()
+            .unwrap();
+        let references = current
+            .get_occurrences_for_file(codestory_contracts::graph::NodeId(python.id))
+            .unwrap();
+        assert!(references.iter().any(|occ| occ.location.start_line == 2
+            && occ.kind == codestory_contracts::graph::OccurrenceKind::REFERENCE));
+        assert!(!references.iter().any(|occ| occ.location.start_line == 2
+            && occ.location.start_col == 6
+            && occ.kind == codestory_contracts::graph::OccurrenceKind::DEFINITION));
+        for (name, source) in sources {
+            assert_eq!(
+                fs::read(project.path().join(name)).unwrap(),
+                source.as_bytes()
+            );
+            let file = current
+                .get_file_by_path(&project.path().join(name))
+                .unwrap()
+                .unwrap();
+            assert!(
+                current
+                    .file_extraction_identity_matches(
+                        file.id,
+                        &file.language,
+                        codestory_indexer::current_file_extraction_revision(&file.language)
+                            .unwrap()
+                    )
+                    .unwrap()
+            );
+        }
+        drop(current);
+        let fresh = runtime
+            .project_service()
+            .inspect_project_summary_with_storage_path(project.path().to_path_buf(), storage_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fresh.freshness.unwrap().status,
+            IndexFreshnessStatusDto::Fresh
+        );
+    }
+
+    #[test]
     fn newer_core_schema_refuses_observation_and_automatic_rebuild() {
         let project = tempfile::tempdir().expect("project");
         let cache = tempfile::tempdir().expect("owned cache");
@@ -11116,8 +11790,25 @@ pub(crate) mod activation_tests {
         assert!(snapshot.allows_operation("exact_search"));
         assert!(snapshot.allows_operation("ground"));
         assert!(!snapshot.allows_operation("graph_assisted"));
-        assert!(!snapshot.allows_operation("resolution"));
+        assert!(snapshot.allows_operation("resolution"));
         assert!(!snapshot.allows_operation("packet"));
+        for state in [ActivationState::Preparing, ActivationState::Updating] {
+            let refreshing = ActivationSnapshot {
+                state,
+                ..snapshot.clone()
+            };
+            assert!(!refreshing.allows_operation("resolution"));
+            assert!(refreshing.allows_operation("ground"));
+        }
+        let retained = ActivationSnapshot {
+            capabilities: ActivationCapabilities {
+                local_navigation: ActivationCapabilityState::Retained,
+                broad_search: ActivationCapabilityState::Unavailable,
+            },
+            ..snapshot
+        };
+        assert!(!retained.allows_operation("resolution"));
+        assert!(retained.allows_operation("ground"));
     }
 }
 

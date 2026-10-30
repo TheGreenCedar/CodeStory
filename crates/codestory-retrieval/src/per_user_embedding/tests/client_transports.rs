@@ -145,11 +145,18 @@ impl EmbeddingClientTransport for ControlledCancelTestTransport {
 #[derive(Debug, Clone, Copy)]
 pub(super) enum BootstrapConnectOutcome {
     Connected,
+    SlowCompatibleHello,
     Loss,
     WriteDisconnect,
     HelloLoss,
     HelloCapacity,
     HelloHandlerCapacity,
+    HelloIdleDraining,
+    HelloIdleDrainingAfterConnectDelay,
+    HelloIdleDrainingUnverifiedPeer,
+    HelloActiveOwner,
+    HelloDrainingAfterDelay,
+    HelloWrongIdentity,
     NoOwner,
     OwnerUnresponsive,
 }
@@ -162,6 +169,7 @@ pub(super) struct BootstrapTestTransport {
     pub(super) fallback: BootstrapConnectOutcome,
     pub(super) budgets: EmbeddingClientBudgets,
     pub(super) compatibility: EmbeddingCompatibility,
+    pub(super) connect_observations: Mutex<Vec<(Duration, u64, bool)>>,
 }
 
 pub(super) struct DeadlineBudgetTransport {
@@ -176,15 +184,25 @@ pub(super) struct ExplicitDeadlineTransport {
     pub(super) connect_count: AtomicUsize,
     pub(super) observed_connect_budget: Mutex<Option<Duration>>,
     pub(super) observed_read_timeout: Arc<Mutex<Option<Duration>>>,
+    initial_idle_drain: bool,
 }
 
 impl ExplicitDeadlineTransport {
     pub(super) fn new() -> Arc<Self> {
+        Self::with_initial_idle_drain(false)
+    }
+
+    pub(super) fn after_idle_drain() -> Arc<Self> {
+        Self::with_initial_idle_drain(true)
+    }
+
+    fn with_initial_idle_drain(initial_idle_drain: bool) -> Arc<Self> {
         Arc::new(Self {
             clock: TestClock::new(),
             connect_count: AtomicUsize::new(0),
             observed_connect_budget: Mutex::new(None),
             observed_read_timeout: Arc::new(Mutex::new(None)),
+            initial_idle_drain,
         })
     }
 }
@@ -196,11 +214,22 @@ impl EmbeddingClientTransport for ExplicitDeadlineTransport {
         budget: Duration,
         _spawn_attempt: Option<&EmbeddingSpawnAttempt>,
     ) -> std::result::Result<EmbeddingConnectOutcome, EmbeddingTransportFailure> {
-        self.connect_count.fetch_add(1, Ordering::AcqRel);
+        let attempt = self.connect_count.fetch_add(1, Ordering::AcqRel);
         *self
             .observed_connect_budget
             .lock()
             .expect("observed connect budget") = Some(budget);
+        if self.initial_idle_drain && attempt == 0 {
+            return Ok(EmbeddingConnectOutcome::Connected(Box::new(
+                ScriptStream::new(
+                    ScriptOutcome::HelloError {
+                        code: "embedding_server_draining",
+                        retry_class: "after_owner_idle",
+                    },
+                    EmbeddingCompatibility::current(true),
+                ),
+            )));
+        }
         Ok(EmbeddingConnectOutcome::Connected(Box::new(
             StallingHelloStream {
                 identity: test_transport_identity(),
@@ -344,6 +373,7 @@ impl BootstrapTestTransport {
                 bulk_request: Duration::from_secs(1),
             },
             compatibility: EmbeddingCompatibility::current(true),
+            connect_observations: Mutex::new(Vec::new()),
         })
     }
 }
@@ -352,10 +382,14 @@ impl EmbeddingClientTransport for BootstrapTestTransport {
     fn connect(
         &self,
         _intent: EmbeddingConnectIntent,
-        _budget: Duration,
-        _spawn_attempt: Option<&EmbeddingSpawnAttempt>,
+        budget: Duration,
+        spawn_attempt: Option<&EmbeddingSpawnAttempt>,
     ) -> std::result::Result<EmbeddingConnectOutcome, EmbeddingTransportFailure> {
         self.connect_count.fetch_add(1, Ordering::AcqRel);
+        self.connect_observations
+            .lock()
+            .expect("connect observations")
+            .push((budget, self.clock.now_ns(), spawn_attempt.is_some()));
         let outcome = self
             .outcomes
             .lock()
@@ -364,6 +398,19 @@ impl EmbeddingClientTransport for BootstrapTestTransport {
             .unwrap_or(self.fallback);
         let server_generation = self.spawn_count.load(Ordering::Acquire) + 1;
         Ok(match outcome {
+            BootstrapConnectOutcome::SlowCompatibleHello => {
+                self.clock.sleep(Duration::from_millis(4));
+                EmbeddingConnectOutcome::Connected(Box::new(
+                    ScriptStream::new(
+                        ScriptOutcome::ClockedHello {
+                            clock: self.clock.clone(),
+                            delay: Duration::from_millis(2),
+                        },
+                        self.compatibility.clone(),
+                    )
+                    .with_server_instance(format!("server-{server_generation}")),
+                ))
+            }
             BootstrapConnectOutcome::Connected => EmbeddingConnectOutcome::Connected(Box::new(
                 ScriptStream::new(ScriptOutcome::Success, self.compatibility.clone())
                     .with_server_instance(format!("server-{server_generation}")),
@@ -394,6 +441,48 @@ impl EmbeddingClientTransport for BootstrapTestTransport {
                     )
                     .with_server_instance(format!("server-{server_generation}")),
                 ))
+            }
+            BootstrapConnectOutcome::HelloIdleDraining
+            | BootstrapConnectOutcome::HelloIdleDrainingAfterConnectDelay
+            | BootstrapConnectOutcome::HelloIdleDrainingUnverifiedPeer
+            | BootstrapConnectOutcome::HelloActiveOwner
+            | BootstrapConnectOutcome::HelloDrainingAfterDelay => {
+                if matches!(
+                    outcome,
+                    BootstrapConnectOutcome::HelloIdleDrainingAfterConnectDelay
+                ) {
+                    self.clock.sleep(Duration::from_millis(2));
+                }
+                let code = if matches!(outcome, BootstrapConnectOutcome::HelloActiveOwner) {
+                    "embedding_server_incompatible_active_owner"
+                } else {
+                    "embedding_server_draining"
+                };
+                let retry_class =
+                    if matches!(outcome, BootstrapConnectOutcome::HelloDrainingAfterDelay) {
+                        "after_delay"
+                    } else {
+                        "after_owner_idle"
+                    };
+                let mut stream = ScriptStream::new(
+                    ScriptOutcome::HelloError { code, retry_class },
+                    self.compatibility.clone(),
+                )
+                .with_server_instance(format!("server-{server_generation}"));
+                if matches!(
+                    outcome,
+                    BootstrapConnectOutcome::HelloIdleDrainingUnverifiedPeer
+                ) {
+                    stream.identity.peer_verified = false;
+                }
+                EmbeddingConnectOutcome::Connected(Box::new(stream))
+            }
+            BootstrapConnectOutcome::HelloWrongIdentity => {
+                let mut stream =
+                    ScriptStream::new(ScriptOutcome::Success, self.compatibility.clone())
+                        .with_server_instance(format!("server-{server_generation}"));
+                stream.identity.peer_verified = false;
+                EmbeddingConnectOutcome::Connected(Box::new(stream))
             }
             BootstrapConnectOutcome::NoOwner => EmbeddingConnectOutcome::NoOwner,
             BootstrapConnectOutcome::OwnerUnresponsive => {

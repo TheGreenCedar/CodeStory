@@ -50,9 +50,19 @@ query execution then stays pinned to those verified files.
 After runtime seals a file's admission, that same pin can read its original
 whole-file lexical content. The newest logical component owns the document;
 tombstones and failed owners never fall back to an older copy. The reader
-checks document identity and current source bytes within a 1-MiB verification
-bound. It returns an authenticated source witness, without inventing a Core
-node or parser coverage. Runtime owns the smaller delivery reservation.
+checks document identity and current UTF-8 source bytes within a 1-MiB verification
+bound. This whole-file route remains lexical-only: parser-backed and structural
+paths use their existing Core admission and runtime hydration routes. It returns
+an authenticated source witness, without inventing a Core node or parser coverage.
+Runtime owns the smaller delivery reservation.
+
+Lexical scans also search decoded structural text. Schema v5 records an additional
+original-byte SHA-256 for BOM UTF-16 source; the immutable document digest binds
+that value separately from decoded content. Missing or altered encoded identity
+invalidates the document. Callable association compares that original-byte hash
+to Core. Older schema rows preserve their UTF-8 document identities. Encoding
+support does not widen the whole-file lexical delivery gate.
+
 The pin retains each successful read's accepted source identity, content hash
 and cancellation flag. The outer response owner verifies these again after
 selection and rendering, with publication checks before and after; the final
@@ -64,6 +74,17 @@ roots. A compatible client joins the existing authority. An incompatible idle
 server drains before replacement; active work or leases return typed retry
 state. Clients never choose another endpoint, kill a remembered PID, or fall
 back to an in-process engine.
+
+An activating, spawn-capable client can wait for a committed idle-owner drain
+and reconnect within its original connect window. Initial transport and Hello
+retain their existing separate bounds. If Hello confirms a drain, time already
+spent reduces the remaining convergence window for owner exit and replacement;
+the caller's shorter deadline and cancellation still apply. Only verified owner
+absence permits
+the existing exact-executable spawn; the replacement still needs a compatible,
+authenticated Hello. Observe-only calls and active-owner refusals remain passive
+or fail closed. This convergence does not replay an embedding RPC or change
+persisted vector compatibility.
 
 Two promotions can put a previously published generation back into service:
 finalize reusing an unchanged generation, and retention recording a verified

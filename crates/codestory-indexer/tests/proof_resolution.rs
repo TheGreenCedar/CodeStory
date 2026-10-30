@@ -8288,6 +8288,16 @@ fn go_unsupported_shadowed_and_open_domains_never_authorize_exact_receipts() -> 
             "Run",
         ),
         (
+            "address_escape.go",
+            concat!(
+                "package proof\n",
+                "type Worker struct{}\n",
+                "func (*Worker) Run() {}\n",
+                "func caller(w *Worker) { _ = &w; w.Run() }\n",
+            ),
+            "Run",
+        ),
+        (
             "pointer_promotion.go",
             concat!(
                 "package proof\n",
@@ -9068,6 +9078,10 @@ fn go_returned_closure_h1_authorizes_only_returned_and_immediate_deferred_child_
         (
             "initializer.go",
             "package proof\nfunc target() {}\nvar handler = func() { target() }\n",
+        ),
+        (
+            "package_initializer_call.go",
+            "package proof\nfunc target() int { return 0 }\nvar initial = target()\n",
         ),
     ];
     for (path, source) in unsupported {

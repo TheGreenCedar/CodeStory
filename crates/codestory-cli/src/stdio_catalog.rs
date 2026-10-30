@@ -369,6 +369,7 @@ pub(crate) struct SchemaProperty {
     items: Option<SchemaItems>,
     object_schema: Option<&'static SchemaObject>,
     nullable: bool,
+    object_alternative: Option<&'static SchemaObject>,
 }
 
 impl SchemaProperty {
@@ -388,6 +389,7 @@ impl SchemaProperty {
             items: None,
             object_schema: None,
             nullable: false,
+            object_alternative: None,
         }
     }
 
@@ -411,6 +413,7 @@ impl SchemaProperty {
             items: None,
             object_schema: None,
             nullable: false,
+            object_alternative: None,
         }
     }
 
@@ -430,6 +433,7 @@ impl SchemaProperty {
             items: None,
             object_schema: None,
             nullable: false,
+            object_alternative: None,
         }
     }
 
@@ -449,6 +453,7 @@ impl SchemaProperty {
             items: None,
             object_schema: None,
             nullable: false,
+            object_alternative: None,
         }
     }
 
@@ -468,6 +473,7 @@ impl SchemaProperty {
             items: None,
             object_schema: None,
             nullable: false,
+            object_alternative: None,
         }
     }
 
@@ -491,6 +497,7 @@ impl SchemaProperty {
             items: Some(SchemaItems::Object(items)),
             object_schema: None,
             nullable: false,
+            object_alternative: None,
         }
     }
 
@@ -525,6 +532,7 @@ impl SchemaProperty {
             }),
             object_schema: None,
             nullable: false,
+            object_alternative: None,
         }
     }
 
@@ -601,6 +609,11 @@ impl SchemaProperty {
         self
     }
 
+    const fn with_object_alternative(mut self, alternative: &'static SchemaObject) -> Self {
+        self.object_alternative = Some(alternative);
+        self
+    }
+
     const fn nullable(mut self) -> Self {
         self.nullable = true;
         self
@@ -661,7 +674,11 @@ impl SchemaProperty {
                 }
             }
         }
-        Value::Object(schema)
+        let schema = Value::Object(schema);
+        match self.object_alternative {
+            Some(alternative) => json!({"anyOf": [schema, alternative.to_json()]}),
+            None => schema,
+        }
     }
 }
 
@@ -1281,6 +1298,69 @@ static INDEXED_FILES_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
     &["code", "message"],
 ]);
 
+static AFFECTED_CHANGED_RANGE_SCHEMA: SchemaObject = SchemaObject::object(
+    "Inclusive physical line range in the explicitly hashed source side.",
+    &[
+        SchemaProperty::integer("start_line", "First changed line (1-based).")
+            .with_bounds(1, 1_000_000),
+        SchemaProperty::integer(
+            "end_line",
+            "Last changed line (inclusive, at or after start_line).",
+        )
+        .with_bounds(1, 1_000_000),
+    ],
+    &["start_line", "end_line"],
+);
+static AFFECTED_CHANGED_SOURCE_SCHEMA: SchemaObject = SchemaObject::object(
+    "One source side; all scopes together allow at most 128 ranges and 4096 physical lines.",
+    &[
+        SchemaProperty::string(
+            "source_sha256",
+            "SHA-256 of the exact source bytes, 64 lowercase hexadecimal characters.",
+        )
+        .with_min_length(64)
+        .with_max_length(64),
+        SchemaProperty::array(
+            "ranges",
+            "Changed ranges in this source side.",
+            &AFFECTED_CHANGED_RANGE_SCHEMA,
+        )
+        .with_item_bounds(1, 128),
+    ],
+    &["source_sha256", "ranges"],
+);
+static AFFECTED_CHANGED_SCOPE_SCHEMA: SchemaObject = SchemaObject::object(
+    "Opt-in changed-range admission. Omit scope to retain broad file expansion. Previous bytes are unresolved unless authenticated historical source is available; no history is read.",
+    &[
+        SchemaProperty::object("current", "Current source coordinates.").with_object_schema(&AFFECTED_CHANGED_SOURCE_SCHEMA),
+        SchemaProperty::object("previous", "Removed or previous source coordinates; never reinterpret against current bytes.").with_object_schema(&AFFECTED_CHANGED_SOURCE_SCHEMA),
+    ], &[],
+).with_any_of_required(&[&["current"], &["previous"]]);
+static AFFECTED_SCOPE_PUBLICATION_SCHEMA: SchemaObject = SchemaObject::object(
+    "Complete core publication authenticating the current source and owner IDs.",
+    &[
+        SchemaProperty::string("project_id", "Logical project identity."),
+        SchemaProperty::string("generation_id", "Pinned core generation identity."),
+        SchemaProperty::string("run_id", "Pinned core run identity."),
+    ],
+    &["project_id", "generation_id", "run_id"],
+);
+static AFFECTED_SCOPE_RESOLUTION_SCHEMA: SchemaObject = SchemaObject::object(
+    "One outcome per original record, side and range. Only independently verified owners are admitted; ambiguous portions admit none.",
+    &[
+        SchemaProperty::integer("record_index", "Zero-based index in the original record array."),
+        SchemaProperty::integer("range_index", "Zero-based range index within the named side."),
+        SchemaProperty::string("path", "Submitted path for this source side."),
+        SchemaProperty::string("side", "Coordinate side.").with_enum(&["current", "previous"]),
+        SchemaProperty::object("range", "Submitted physical range.").with_object_schema(&AFFECTED_CHANGED_RANGE_SCHEMA),
+        SchemaProperty::string("source_sha256", "Submitted source hash.").with_min_length(64).with_max_length(64),
+        SchemaProperty::string("status", "Scope admission outcome; only resolved establishes full unique ownership of this range.").with_enum(&["resolved", "partial", "ambiguous", "unowned", "cross_owner", "caller_hash_mismatch", "source_unavailable", "previous_unavailable", "budget_exceeded", "out_of_bounds"]),
+        SchemaProperty::string_array("owner_ids", "Admitted owner IDs, at most 16 per range.").with_item_bounds(0, 16),
+        SchemaProperty::object("publication", "Publication of verified current source.").with_object_schema(&AFFECTED_SCOPE_PUBLICATION_SCHEMA),
+        SchemaProperty::string("verified_source_sha256", "Hash actually verified against indexed and workspace bytes.").with_min_length(64).with_max_length(64),
+    ], &["record_index", "range_index", "path", "side", "range", "source_sha256", "status", "owner_ids"],
+);
+
 static AFFECTED_CHANGE_RECORD_SCHEMA: SchemaObject = SchemaObject::object(
     "Changed file record.",
     &[
@@ -1295,6 +1375,7 @@ static AFFECTED_CHANGE_RECORD_SCHEMA: SchemaObject = SchemaObject::object(
             "Optional previous path accepted only for renamed or copied records; it can seed bounded proxy graph evidence when the current path is not indexed.",
         )
         .nullable(),
+        SchemaProperty::object("scope", "Optional typed changed ranges; omission retains legacy broad file semantics.").with_object_schema(&AFFECTED_CHANGED_SCOPE_SCHEMA),
     ],
     &["path", "kind"],
 );
@@ -1430,6 +1511,37 @@ static AFFECTED_FOLLOW_UP_SCHEMA: SchemaObject = SchemaObject::object(
     &["action", "reason", "confidence"],
 );
 
+static AFFECTED_SYMBOL_RECORDS_SCHEMA: SchemaProperty = SchemaProperty::array(
+    "impacted_symbols",
+    "Impacted symbol DTOs in order (the default records layout).",
+    &GENERIC_OBJECT_SCHEMA,
+);
+
+static AFFECTED_SHARED_SYMBOLS_SCHEMA: SchemaObject = SchemaObject::object(
+    "Lossless shared-fields-v1 layout. Merge shared_fields into each ordered row to recover the symbol records; absent keys remain absent.",
+    &[
+        SchemaProperty::object(
+            "shared_fields",
+            "Fields present with identical JSON values in every symbol record.",
+        ),
+        SchemaProperty::array(
+            "rows",
+            "Ordered residual symbol records.",
+            &GENERIC_OBJECT_SCHEMA,
+        ),
+    ],
+    &["shared_fields", "rows"],
+);
+
+pub(crate) fn affected_records_output_schema() -> &'static Value {
+    static SCHEMA: OnceLock<Value> = OnceLock::new();
+    SCHEMA.get_or_init(|| {
+        let mut schema = AFFECTED_ANALYSIS_OUTPUT_SCHEMA.to_json();
+        schema["properties"]["impacted_symbols"] = AFFECTED_SYMBOL_RECORDS_SCHEMA.to_json();
+        schema
+    })
+}
+
 static AFFECTED_ANALYSIS_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
     "Changed-file impact analysis DTO from the last complete local index.",
     &[
@@ -1457,11 +1569,7 @@ static AFFECTED_ANALYSIS_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
         ),
         SchemaProperty::integer("matched_file_count", "Number of matched indexed files."),
         SchemaProperty::integer("depth", "Applied dependent graph walk depth."),
-        SchemaProperty::array(
-            "impacted_symbols",
-            "Impacted symbol DTOs.",
-            &GENERIC_OBJECT_SCHEMA,
-        ),
+        AFFECTED_SYMBOL_RECORDS_SCHEMA.with_object_alternative(&AFFECTED_SHARED_SYMBOLS_SCHEMA),
         SchemaProperty::array(
             "impacted_routes",
             "Impacted route or endpoint DTOs.",
@@ -1486,6 +1594,7 @@ static AFFECTED_ANALYSIS_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
             &AFFECTED_FOLLOW_UP_SCHEMA,
         ),
         SchemaProperty::string_array("notes", "Additional analysis notes."),
+        SchemaProperty::array("scope_resolutions", "Present only for scoped requests. Original range outcomes before transport caps are bounded to 128.", &AFFECTED_SCOPE_RESOLUTION_SCHEMA).with_item_bounds(1, 128),
         SchemaProperty::object("counts", "Original result counts before response caps."),
         SchemaProperty::object("limits", "Applied response caps."),
         SchemaProperty::boolean("truncated", "Whether any result collection was capped."),
@@ -2304,6 +2413,9 @@ static AFFECTED_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::integer("depth", "Dependent graph walk depth.")
             .with_default(ValueLiteral::Integer(2))
             .with_bounds(1, 8),
+        SchemaProperty::string("symbol_layout", "Symbol records by default; shared-fields-v1 losslessly factors common fields into shared_fields plus ordered residual rows.")
+            .with_enum(&["records", "shared-fields-v1"])
+            .with_default(ValueLiteral::String("records")),
         SchemaProperty::string(
             "filter",
             "Optional impacted-symbol filter by path or display-name substring.",

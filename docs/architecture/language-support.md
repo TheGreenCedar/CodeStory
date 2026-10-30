@@ -26,8 +26,12 @@ a partial tree. Runtime treats it as `parser_partial` only when the indexed byte
 have a verified content hash, the file carries no file-level error, and storage
 does not require a retry. That row remains `complete=false` so diagnostics do
 not overstate parser coverage, but it does not block an otherwise atomic core
-publication. Malformed, binary/non-UTF-8, unreadable, changed, incompletely
-discovered, or collector-failed source remains a publication blocker.
+publication. Fully read structural source with reverified raw identity may also
+coexist with publication as an explicit `malformed` or `binary` gap, without a
+projection or exact indexed text for opaque bytes. Strict decoding still rejects
+invalid BOMs, binary controls and unsupported encodings. Unverified, unreadable,
+changed, incompletely discovered or collector-failed source remains blocking;
+size limits and verified source-policy exclusions retain their existing contract.
 Verified byte- or structural-unit-bound policy exclusions remain source
 inventory only and make no graph, semantic, typed-target, or sufficiency claim.
 
@@ -40,6 +44,25 @@ inventory only and make no graph, semantic, typed-target, or sufficiency claim.
 
 Agent-facing packet/search quality is separate. Run-specific A/B artifacts are
 not blanket promotion proof for every parser-backed language.
+
+JavaScript and TypeScript additionally support source-verified navigation from
+explicit named public exports to a unique local class/function declaration,
+including one relative import/reexport hop. This is a search navigation
+projection, not a new typed call-resolution tier. Unsupported or ambiguous
+exports remain unresolved. See [indexing pipeline](indexing-pipeline.md#explicit-public-export-navigation)
+for the exact supported forms and publication boundary.
+
+TypeScript and TSX use the MIT-licensed `tree-sitter-typescript` grammar pinned to
+contributor commit `8a43a912d4a941767829a00ff0be80318762a4f1` from
+[`gthb/tree-sitter-typescript`](https://github.com/gthb/tree-sitter-typescript/tree/8a43a912d4a941767829a00ff0be80318762a4f1).
+This is the unmerged [upstream PR358](https://github.com/tree-sitter/tree-sitter-typescript/pull/358)
+type-star fix, not the published registry grammar. The existing Rust binding
+compiles its committed generated C parsers; no grammar generator or additional
+runtime is needed. Valid `export type *` and `export type * as Name` statements
+can coexist with supported named value exports. Type-only stars remain
+unsupported for value navigation, and malformed source still reports partial
+parser coverage. Existing TypeScript/TSX files are re-extracted on their next
+refresh through the durable extraction revision.
 
 ## Claim Ladder
 
@@ -125,11 +148,15 @@ admission evaluates only workspace-relative paths and rejects
 generated/vendor, secret-bearing, lockfile, minified, and declared high-noise
 descendants before inventory metadata or content reads. Repository ancestors
 with those names do not affect admission. A structural file is accepted only
-as a complete UTF-8 projection within the 1 MiB and 2,048-unit bounds
+as a complete decoded UTF-8 projection from UTF-8 or strict BOM-marked
+UTF-16LE/BE within the 1 MiB raw/decoded byte and 2,048-unit bounds
 (policy-carried, and deliberately below the larger parser-backed headroom);
 malformed, binary, unreadable, source-drifted, cancelled, or failed collection
-does not publish reusable units. Cache identity v2 invalidates pre-limit
-artifacts, and cache hits independently enforce the same unit bound.
+does not publish reusable units. Source hashes always bind original bytes;
+source spans and snippets use decoded UTF-8 coordinates without the UTF-16 BOM.
+Parser-backed languages retain their existing UTF-8 contract. Structural cache
+identity remains v4: unchanged admitted UTF-8 artifacts remain reusable, and cache
+hits independently enforce the same unit bound.
 
 Safe wording: structural-text anchors prove only that their collector found the
 cited source span; their `source_range_only` status must not be upgraded into

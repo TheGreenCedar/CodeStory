@@ -22,6 +22,62 @@ pub const STRUCTURAL_COLLECTION_CANONICAL_ID_PREFIXES: &[&str] = &["payload:coll
 /// duplicate declaration captures. Legacy ordinals must never alias these keys.
 pub const RUST_ORDINAL_CANONICAL_ID_PREFIX: &str = "rust-ordinal-v2:";
 
+/// Role-ordered JavaScript/TypeScript identities, including embedded template
+/// scripts. Legacy ordinals could be reassigned by roleless remapping and must
+/// never alias these declaration/reference keys.
+pub const SCRIPT_ORDINAL_CANONICAL_ID_PREFIX: &str = "script-ordinal-v1:";
+
+/// Source identity domain for static JavaScript/TypeScript object-property
+/// callables. These declarations own their bodies but introduce no lexical
+/// function binding. Their authored names remain in the ordinary name fields.
+pub const SCRIPT_PROPERTY_CALLABLE_CANONICAL_ID_PREFIX: &str = "script-property-callable-v1:";
+
+pub fn is_script_property_callable_canonical_id(canonical_id: &str) -> bool {
+    canonical_id.starts_with(SCRIPT_PROPERTY_CALLABLE_CANONICAL_ID_PREFIX)
+}
+
+/// Split a source-ordinal identity's declared namespace from its path/name key.
+/// Unknown namespaces retain the existing unprefixed interpretation.
+pub fn source_ordinal_canonical_id_parts(canonical_id: &str) -> (&str, &str) {
+    for prefix in [
+        RUST_ORDINAL_CANONICAL_ID_PREFIX,
+        SCRIPT_ORDINAL_CANONICAL_ID_PREFIX,
+        SCRIPT_PROPERTY_CALLABLE_CANONICAL_ID_PREFIX,
+    ] {
+        if let Some(key) = canonical_id.strip_prefix(prefix) {
+            return (prefix, key);
+        }
+    }
+    ("", canonical_id)
+}
+
+/// Whether persisted source syntax identifies a receiver/member CALL.
+///
+/// These exact producer tags distinguish member syntax from an unqualified
+/// utility name. They provide no authority to select or resolve a target.
+pub fn callsite_has_source_receiver_marker(callsite_identity: Option<&str>) -> bool {
+    callsite_identity.is_some_and(|identity| {
+        identity.split('|').any(|part| {
+            matches!(
+                part,
+                "syntax:cpp-member-call"
+                    | "syntax:csharp-member-call"
+                    | "syntax:dart-member-call"
+                    | "syntax:go-selector-call"
+                    | "syntax:java-member-call"
+                    | "syntax:js-member-call"
+                    | "syntax:kotlin-member-call"
+                    | "syntax:php-member-call"
+                    | "syntax:python-attribute-call"
+                    | "syntax:ruby-member-call"
+                    | "syntax:rust-method-call"
+                    | "syntax:swift-member-call"
+                    | "syntax:ts-member-call"
+            )
+        })
+    })
+}
+
 pub mod access;
 pub mod definition;
 pub mod error;
@@ -586,4 +642,31 @@ pub enum LayoutDirection {
     #[default]
     Horizontal,
     Vertical,
+}
+
+/// An explicit source export binding; it never replaces a canonical declaration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PublicExportAlias {
+    pub public_name: String,
+    pub local_name: String,
+    pub export_file_id: NodeId,
+    pub export_source_sha256: String,
+    pub export_line: u32,
+    pub export_column: u32,
+    pub import_line: Option<u32>,
+    pub module_specifier: Option<String>,
+    pub target_node_id: Option<NodeId>,
+    pub target_file_id: Option<NodeId>,
+    pub target_source_sha256: Option<String>,
+    pub status: PublicExportAliasStatus,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicExportAliasStatus {
+    Bound,
+    MissingBinding,
+    Ambiguous,
+    Unsupported,
+    Incomplete,
 }

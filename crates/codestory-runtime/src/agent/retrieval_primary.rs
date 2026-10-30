@@ -2447,6 +2447,11 @@ fn candidate_resolution_label(
     if is_phantom_sidecar_hit(candidate) {
         return "phantom_hit";
     }
+    if active_packet_proof_session()
+        .is_some_and(|session| session.is_metadata_excluded_candidate(candidate))
+    {
+        return "whole_file_metadata_excluded";
+    }
     let Some(project_root) = project_root else {
         return "project_unavailable";
     };
@@ -2631,7 +2636,9 @@ fn unresolved_candidate_is_diagnostic(
     resolution_label: &str,
     has_resolved_hit: bool,
 ) -> bool {
-    bare_dense_anchor_unresolved(candidate, resolution_label)
+    active_packet_proof_session()
+        .is_some_and(|session| session.is_metadata_excluded_candidate(candidate))
+        || bare_dense_anchor_unresolved(candidate, resolution_label)
         || (has_resolved_hit
             && non_parser_backed_file_candidate_unresolved(candidate, resolution_label))
 }
@@ -3352,7 +3359,14 @@ fn resolve_sidecar_candidates_in_storage(
                     continue;
                 }
                 PacketAdmissionDecision::SourceBudgetExceeded => {
-                    unresolved_candidates.push((candidate, "source_budget_exceeded"));
+                    unresolved_candidates.push((
+                        candidate,
+                        if identity_scope.is_metadata_excluded_candidate(candidate) {
+                            "whole_file_metadata_excluded"
+                        } else {
+                            "source_budget_exceeded"
+                        },
+                    ));
                     continue;
                 }
             }
@@ -3423,8 +3437,11 @@ fn resolve_sidecar_candidates_in_storage(
         && unresolved_candidate_count == candidates.len()
         && attempted_candidate_indices.len() == candidates.len()
         && unresolved_candidates.iter().all(|(candidate, label)| {
-            *label == "node_unresolved"
-                && candidate_is_unindexed_lexical_artifact(storage, project_root, candidate)
+            identity_scope
+                .as_ref()
+                .is_some_and(|session| session.is_metadata_excluded_candidate(candidate))
+                || (*label == "node_unresolved"
+                    && candidate_is_unindexed_lexical_artifact(storage, project_root, candidate))
         });
     let blocking_unresolved_candidate_count = if unindexed_lexical_artifacts_only {
         0
@@ -3650,6 +3667,16 @@ mod tests {
     }
 
     fn public_packet_fixture_with_lexical_files(files: &[(&str, &str)]) -> PinnedOperationFixture {
+        let files = files
+            .iter()
+            .map(|(path, content)| (*path, content.as_bytes()))
+            .collect::<Vec<_>>();
+        public_packet_fixture_with_lexical_file_bytes(&files)
+    }
+
+    fn public_packet_fixture_with_lexical_file_bytes(
+        files: &[(&str, &[u8])],
+    ) -> PinnedOperationFixture {
         let project = tempfile::tempdir().expect("project");
         let storage = tempfile::tempdir().expect("storage");
         let retrieval_cache = tempfile::tempdir().expect("retrieval cache");
@@ -8167,6 +8194,690 @@ mod tests {
         assert_browser_packet_delivers_small_published_lexical_files(Vec::new());
     }
 
+    fn assert_whole_file_eligibility_skips_proven_decoded_oversize(
+        content: &[u8],
+        extension: &str,
+    ) {
+        use crate::agent::packet_candidate::{PacketProofSession, install_packet_proof_session};
+        use codestory_contracts::compilation::{
+            INTERIM_MAX_ADMITTED_CANDIDATES, INTERIM_SOURCE_ROW_UPPER_BOUND,
+            PacketAdmissionGapKindV1,
+        };
+
+        let mut files = (0..INTERIM_MAX_ADMITTED_CANDIDATES)
+            .map(|index| {
+                (
+                    format!("eligibilityneedle/a{index:02}.{extension}"),
+                    content.to_vec(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let eligible_path = "eligibilityneedle/z.ini";
+        files.push((
+            eligible_path.to_string(),
+            b"eligible_source = true\n".to_vec(),
+        ));
+        let inputs = files
+            .iter()
+            .map(|(path, content)| (path.as_str(), content.as_slice()))
+            .collect::<Vec<_>>();
+        let fixture = public_packet_fixture_with_lexical_file_bytes(&inputs);
+        let pinned = Rc::new(
+            PinnedRetrievalRead::begin_packet_descriptor(&fixture.controller)
+                .expect("pin published lexical descriptors"),
+        );
+        let shard = fixture
+            .controller
+            .runtime_config
+            .layout
+            .lexical_data_dir
+            .join("shards")
+            .join(&pinned.session.publication_identity().sidecar_generation);
+        let components: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(shard.join("lexical-component-set.json"))
+                .expect("use an actual sealed component-set publication"),
+        )
+        .unwrap();
+        let database = shard.join(components["base"]["file_name"].as_str().unwrap());
+        let connection = rusqlite::Connection::open_with_flags(
+            database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let (decoded_bytes, stored_bytes): (i64, i64) = connection
+            .query_row(
+                "SELECT content_decoded_bytes, length(content) FROM lexical_documents
+                 WHERE path = ?1 AND source = 'lexical_source'",
+                [&files[0].0],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(decoded_bytes > INTERIM_SOURCE_ROW_UPPER_BOUND as i64);
+        assert!(
+            stored_bytes < INTERIM_SOURCE_ROW_UPPER_BOUND as i64,
+            "compressed storage length must not masquerade as decoded source length"
+        );
+        drop(connection);
+
+        let session = Rc::new(PacketProofSession::new());
+        with_active_pinned_retrieval_read(&fixture.controller, Rc::clone(&pinned), || {
+            let _guard = install_packet_proof_session(Rc::clone(&session));
+            preadmit_packet_descriptor_queries_with_policy(
+                &fixture.controller,
+                &[PacketRetrievalQuery {
+                    query: "eligibilityneedle".into(),
+                    lexical_policy: LexicalAdmissionPolicy::BroadQuestionV1,
+                }],
+                None,
+            )
+            .expect("query and seal the unchanged descriptor pool");
+            let retained = session
+                .descriptor_result_with_policy(
+                    "eligibilityneedle",
+                    LexicalAdmissionPolicy::BroadQuestionV1,
+                    true,
+                    pinned.session.publication_identity(),
+                )
+                .unwrap();
+            assert_eq!(retained.hits.len(), INTERIM_MAX_ADMITTED_CANDIDATES + 1);
+            assert_eq!(retained.hits.last().unwrap().file_path, eligible_path);
+            assert!(
+                retained.hits[..INTERIM_MAX_ADMITTED_CANDIDATES]
+                    .iter()
+                    .all(|hit| hit.file_path != eligible_path),
+                "the eligible source must really fall beyond the original admission frontier"
+            );
+            assert!(session.retrieval_admission_is_sealed());
+            assert_eq!(canonical_stream_count(&fixture.controller), 0);
+            assert!(
+                session.is_admitted_identity(&format!("path:{eligible_path}")),
+                "proven oversized whole files must not consume all sixteen source admissions"
+            );
+            for (path, _) in files.iter().take(INTERIM_MAX_ADMITTED_CANDIDATES) {
+                let identity = format!("path:{path}");
+                assert!(!session.is_admitted_identity(&identity));
+                assert!(session.gaps().iter().any(|gap| {
+                    gap.stable_identity.as_deref() == Some(identity.as_str())
+                        && gap.kind == PacketAdmissionGapKindV1::SourceBudgetExceeded
+                }));
+            }
+            assert_eq!(session.receipts().len(), 1);
+            assert_eq!(
+                session.receipts()[0].reserved_source_bytes as usize,
+                INTERIM_SOURCE_ROW_UPPER_BOUND
+            );
+            let prepared = super::super::packet_compiler::prepare_packet_compilation(
+                &fixture.controller,
+                pinned.session.project_id(),
+                &[],
+                None,
+                &session,
+                None,
+            )
+            .unwrap();
+            let product = prepared.default_product();
+            for (path, _) in files.iter().take(INTERIM_MAX_ADMITTED_CANDIDATES) {
+                let identity = format!("path:{path}");
+                assert!(
+                    !product
+                        .continuation
+                        .iter()
+                        .any(|selector| selector.stable_identity == identity)
+                );
+                assert!(
+                    !prepared
+                        .replay_input()
+                        .sources
+                        .iter()
+                        .any(|source| source.stable_identity == identity)
+                );
+            }
+            let snapshot = prepared.replay_snapshot();
+            let refusals = snapshot["source_refusals"].as_array().unwrap();
+            assert_eq!(
+                session.early_whole_file_refusals().len(),
+                INTERIM_MAX_ADMITTED_CANDIDATES
+            );
+            assert_eq!(refusals.len(), 1);
+            let text = refusals[0].as_str().unwrap();
+            assert!(text.contains(&format!(
+                "metadata exclusions: {}",
+                INTERIM_MAX_ADMITTED_CANDIDATES
+            )));
+            assert!(text.contains("excluded files received no source admissions or source ranges"));
+            assert!(!text.contains("Admitted") && !text.contains("verified whole-file"));
+            assert!(text.len() <= codestory_contracts::packet_projection_v3::MESSAGE_MAX_BYTES_V3);
+        });
+    }
+
+    #[test]
+    fn whole_file_eligibility_skips_compressed_decoded_oversize_before_count_admission() {
+        assert_whole_file_eligibility_skips_proven_decoded_oversize(
+            "eligibilityneedle ".repeat(64).as_bytes(),
+            "ini",
+        );
+    }
+
+    #[test]
+    fn whole_file_eligibility_counts_utf8_bytes_instead_of_characters() {
+        let content = "é".repeat(257);
+        assert!(content.chars().count() < 512 && content.len() > 512);
+        assert_whole_file_eligibility_skips_proven_decoded_oversize(content.as_bytes(), "ini");
+    }
+
+    #[test]
+    fn whole_file_eligibility_counts_decoded_utf8_instead_of_utf16_file_bytes() {
+        let content = "界".repeat(172);
+        let mut encoded = vec![0xff, 0xfe];
+        for unit in content.encode_utf16() {
+            encoded.extend_from_slice(&unit.to_le_bytes());
+        }
+        assert!(encoded.len() < 512 && content.len() > 512);
+        // BOM-marked UTF-16 is supported only on structural source paths.
+        assert_whole_file_eligibility_skips_proven_decoded_oversize(&encoded, "ps1");
+    }
+
+    #[test]
+    fn whole_file_eligibility_many_metadata_exclusions_preserve_public_source_under_cap() {
+        use crate::agent::packet_candidate::{PacketProofSession, install_packet_proof_session};
+        use codestory_contracts::api::PacketProbeDto;
+        use codestory_contracts::packet_projection_v3::{EvidenceKindV3Dto, PacketProjectionV3Dto};
+        use std::sync::atomic::AtomicBool;
+
+        let mut files = (0..63)
+            .map(|index| {
+                (
+                    format!("eligibilitypressure/a{index:02}_{}.ini", "x".repeat(120)),
+                    "eligibilitypressure ".repeat(40),
+                )
+            })
+            .collect::<Vec<_>>();
+        let eligible_path = "eligibilitypressure/z.ini";
+        files.push((eligible_path.into(), "eligible_source = true\n".into()));
+        let inputs = files
+            .iter()
+            .map(|(path, content)| (path.as_str(), content.as_str()))
+            .collect::<Vec<_>>();
+        let fixture = public_packet_fixture_with_lexical_files(&inputs);
+        let service = crate::PublicOperationService::new(fixture.controller.clone());
+        let browser =
+            crate::ReadOnlyBrowserService::new(fixture.controller.clone(), service.clone());
+        let request = AgentPacketRequestDto {
+            question: "eligibilitypressure".into(),
+            budget: PacketBudgetModeDto::Standard,
+            probes: Vec::new(),
+            latency_budget_ms: Some(30_000),
+            parent_packet_id: None,
+            option_ids: Vec::new(),
+            core_generation_id: None,
+            retrieval_generation: None,
+        };
+        {
+            let pinned =
+                Rc::new(PinnedRetrievalRead::begin_packet_descriptor(&fixture.controller).unwrap());
+            let session = Rc::new(PacketProofSession::new());
+            with_active_pinned_retrieval_read(&fixture.controller, Rc::clone(&pinned), || {
+                let _guard = install_packet_proof_session(Rc::clone(&session));
+                preadmit_packet_descriptor_queries_with_policy(
+                    &fixture.controller,
+                    &[PacketRetrievalQuery {
+                        query: request.question.clone(),
+                        lexical_policy: LexicalAdmissionPolicy::BroadQuestionV1,
+                    }],
+                    request.latency_budget_ms,
+                )
+                .unwrap();
+                let retained = session
+                    .descriptor_result_with_policy(
+                        &request.question,
+                        LexicalAdmissionPolicy::BroadQuestionV1,
+                        true,
+                        pinned.session.publication_identity(),
+                    )
+                    .expect("same-operation descriptor result");
+                assert_eq!(retained.hits.len(), 64, "unchanged finite recall pool");
+                assert_eq!(
+                    retained
+                        .hits
+                        .iter()
+                        .filter(|hit| hit.file_path == eligible_path)
+                        .count(),
+                    1
+                );
+                let eligible_rank = retained
+                    .hits
+                    .iter()
+                    .position(|hit| hit.file_path == eligible_path)
+                    .unwrap();
+                println!("eligibility-pressure eligible_rank={eligible_rank}");
+                for (path, _) in &files[..63] {
+                    let identity = format!("path:{path}");
+                    assert!(retained.hits.iter().any(|hit| hit.file_path == *path));
+                    assert!(!session.is_admitted_identity(&identity));
+                }
+                assert_eq!(session.early_whole_file_refusals().len(), 63);
+                assert_eq!(
+                    session
+                        .gaps()
+                        .iter()
+                        .filter(|gap| gap.kind == PacketAdmissionGapKindV1::SourceBudgetExceeded)
+                        .count(),
+                    63
+                );
+                let receipts = session.receipts();
+                assert_eq!(receipts.len(), 1);
+                assert_eq!(receipts[0].stable_identity, format!("path:{eligible_path}"));
+                assert_eq!(receipts[0].reserved_source_bytes, 512);
+                assert_eq!(canonical_stream_count(&fixture.controller), 0);
+                println!(
+                    "eligibility-pressure precondition pool=64 excluded=63 admitted=z.ini reserved=512"
+                );
+            });
+        }
+        let mut maximum_preview_bytes = 0;
+        let _latency = crate::enter_packet_latency_scope(request.latency_budget_ms);
+        let outcome = service.run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
+            browser.packet_for_representation_v3(
+                request.clone(),
+                "codestory-cli",
+                &mut |projection| {
+                    let bytes = serde_json::to_vec(projection).map_err(|_| ())?.len();
+                    maximum_preview_bytes = maximum_preview_bytes.max(bytes);
+                    Ok(bytes)
+                },
+            )
+        });
+        let represented = outcome
+            .unwrap_or_else(|error| {
+                panic!("validated pressure pool failed public representation: {error:?}")
+            })
+            .value;
+        let serialized = serde_json::to_vec(&represented.product.projection).unwrap();
+        println!(
+            "eligibility-pressure maximum_preview_bytes={maximum_preview_bytes} final_bytes={} projection={}",
+            serialized.len(),
+            String::from_utf8_lossy(&serialized)
+        );
+        assert!(serialized.len() <= 16_384);
+        let PacketProjectionV3Dto::Complete {
+            evidence,
+            gaps,
+            continuation,
+            ..
+        } = &represented.product.projection
+        else {
+            panic!("metadata navigation displaced the already-admitted source into BudgetExceeded");
+        };
+        assert!(
+            evidence.as_slice().iter().any(|row| {
+                row.kind == EvidenceKindV3Dto::ExactSource
+                    && row
+                        .path
+                        .as_ref()
+                        .is_some_and(|path| path.as_str() == eligible_path)
+            }),
+            "the later eligible source must survive the actual public representation"
+        );
+        assert!(
+            gaps.as_slice().iter().all(|gap| {
+                gap.message.as_ref().is_none_or(|message| {
+                    !message.as_str().contains("an admitted source")
+                        && !message.as_str().contains("verified whole-file")
+                })
+            }),
+            "metadata exclusions cannot claim failed admitted source hydration"
+        );
+        assert_eq!(
+            gaps.as_slice()
+                .iter()
+                .filter(|gap| gap.message.as_ref().is_some_and(|message| message
+                    .as_str()
+                    .starts_with("Published whole-file metadata exclusions: 63;")))
+                .count(),
+            1,
+            "all private exclusions must share one truthful public omission receipt"
+        );
+        if let Some(drill) = &represented.packet.disposition.drill {
+            assert!(
+                drill.options.iter().all(|option| {
+                    !files[..63]
+                        .iter()
+                        .any(|(path, _)| option.path.as_ref() == Some(path))
+                }),
+                "excluded whole files must not advertise futile retries"
+            );
+        }
+        if let Some(patch) = continuation
+            .as_ref()
+            .and_then(|continuation| continuation.packet_request_patch.as_ref())
+        {
+            for probe in patch.probes.as_slice() {
+                if let PacketProbeDto::ExactPath { path } = probe {
+                    assert!(!files[..63].iter().any(|(excluded, _)| excluded == path));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn whole_file_eligibility_fallback_preserves_metadata_navigation_and_blocks_unknown_poison() {
+        use crate::agent::packet_candidate::{PacketProofSession, install_packet_proof_session};
+        let oversized = "needle ".repeat(80);
+        let fixture = public_packet_fixture_with_lexical_files(&[
+            ("eligibilityfallback/a.ini", &oversized),
+            ("eligibilityfallback/z.ini", "eligible_source = true\n"),
+        ]);
+        let pinned =
+            Rc::new(PinnedRetrievalRead::begin_packet_descriptor(&fixture.controller).unwrap());
+        let core_file = pinned
+            .session
+            .storage()
+            .get_file_by_path(&fixture._project.path().join("metadata.rs"))
+            .unwrap()
+            .unwrap();
+        let mut core_candidate =
+            CandidateHit::with_source("metadata.rs", None, 0.2, CandidateSource::Lexical);
+        core_candidate.node_id = Some(core_file.id.to_string());
+        core_candidate.source_bytes_upper_bound = Some(512);
+        let session = Rc::new(PacketProofSession::new());
+        with_active_pinned_retrieval_read(&fixture.controller, Rc::clone(&pinned), || {
+            let _guard = install_packet_proof_session(Rc::clone(&session));
+            assert_eq!(
+                session.admit_descriptor(&core_candidate.packet_descriptor().unwrap()),
+                PacketAdmissionDecision::Admitted
+            );
+            preadmit_packet_descriptor_queries_with_policy(
+                &fixture.controller,
+                &[PacketRetrievalQuery {
+                    query: "eligibilityfallback".into(),
+                    lexical_policy: LexicalAdmissionPolicy::BroadQuestionV1,
+                }],
+                None,
+            )
+            .unwrap();
+            let retained = session
+                .descriptor_result_with_policy(
+                    "eligibilityfallback",
+                    LexicalAdmissionPolicy::BroadQuestionV1,
+                    true,
+                    pinned.session.publication_identity(),
+                )
+                .unwrap();
+            let excluded = retained
+                .hits
+                .iter()
+                .find(|hit| hit.file_path == "eligibilityfallback/a.ini")
+                .unwrap()
+                .clone();
+            let live = retained
+                .hits
+                .iter()
+                .find(|hit| hit.file_path == "eligibilityfallback/z.ini")
+                .unwrap()
+                .clone();
+            assert!(session.is_metadata_excluded_candidate(&excluded));
+            assert!(session.is_admitted_identity("path:eligibilityfallback/z.ini"));
+            let receipts = session.receipts();
+            let remaining = session.remaining_source_bytes();
+            let original_gaps = session.gaps();
+            let mut poison = CandidateHit::with_source(
+                "eligibilityfallback/unretained.ini",
+                None,
+                1.0,
+                CandidateSource::Lexical,
+            );
+            poison.source_bytes_upper_bound = Some(512);
+            let absent_root = tempfile::tempdir().unwrap();
+            assert_eq!(
+                candidate_resolution_label(
+                    Some(absent_root.path()),
+                    None,
+                    &HashMap::new(),
+                    &excluded
+                ),
+                "whole_file_metadata_excluded",
+                "diagnostics must use the pinned exclusion before probing the current source path or Core"
+            );
+            assert!(
+                !unresolved_candidate_is_diagnostic(&poison, "whole_file_metadata_excluded", true),
+                "a diagnostic string cannot authorize an unknown candidate"
+            );
+            let mut missing_bound = poison.clone();
+            missing_bound.source_bytes_upper_bound = None;
+            let mut changed_shape = excluded.clone();
+            changed_shape.symbol_name = Some("untrusted".into());
+            for (name, candidates, expected_fallback) in [
+                ("live mixed", vec![excluded.clone(), live.clone()], true),
+                ("exclusion only", vec![excluded.clone()], true),
+                (
+                    "unknown poison",
+                    vec![excluded.clone(), live.clone(), poison.clone()],
+                    false,
+                ),
+                (
+                    "missing bound",
+                    vec![excluded.clone(), live.clone(), missing_bound],
+                    false,
+                ),
+                (
+                    "mixed core",
+                    vec![excluded.clone(), core_candidate.clone()],
+                    false,
+                ),
+                (
+                    "mixed core unknown",
+                    vec![excluded.clone(), core_candidate.clone(), poison],
+                    false,
+                ),
+                ("changed shape", vec![changed_shape, live], false),
+            ] {
+                let resolution = resolve_sidecar_candidates_in_read(
+                    &fixture.controller,
+                    &pinned,
+                    &candidates,
+                    16,
+                )
+                .unwrap();
+                assert_eq!(
+                    resolution.unindexed_lexical_artifacts_only, expected_fallback,
+                    "{name}"
+                );
+                if name == "mixed core" || name == "mixed core unknown" {
+                    assert_eq!(resolution.resolved_hits.len(), 1, "{name}");
+                    assert_eq!(
+                        resolution.blocking_unresolved_candidate_count,
+                        usize::from(name == "mixed core unknown"),
+                        "only actual unknown candidates may be blocking beside a resolved Core hit"
+                    );
+                }
+                if name == "live mixed" || name == "exclusion only" {
+                    assert_eq!(
+                        session.gaps(),
+                        original_gaps,
+                        "known exclusions must not acquire count-cap gaps on reread"
+                    );
+                }
+                assert_eq!(
+                    resolution.attempted_candidate_indices.len(),
+                    candidates.len(),
+                    "{name}"
+                );
+                assert_eq!(
+                    session.receipts(),
+                    receipts,
+                    "{name}: sealed resolution cannot mint or refund receipts"
+                );
+                assert_eq!(session.remaining_source_bytes(), remaining, "{name}");
+                assert_eq!(canonical_stream_count(&fixture.controller), 0, "{name}");
+            }
+        });
+    }
+
+    #[test]
+    fn whole_file_eligibility_live_query_pool_drops_imported_and_conflicting_authority() {
+        use crate::agent::packet_candidate::PacketProofSession;
+        let content = "needle ".repeat(80);
+        let fixture = public_packet_fixture_with_lexical_files(&[
+            ("eligibilitypool/a.ini", &content),
+            ("eligibilitypool/b.ini", "small"),
+        ]);
+        let pinned = PinnedRetrievalRead::begin_packet_descriptor(&fixture.controller).unwrap();
+        let queries = ["eligibilitypool", "\"eligibilitypool/a.ini\"", "\"a.ini\""];
+        let results = with_detached_sidecar_query_cache(&fixture.controller, |cache| {
+            pinned.session.execute_packet_descriptor_batch_with_cache(
+                &queries
+                    .iter()
+                    .map(|query| QueryBatchItem {
+                        query,
+                        lexical_policy: LexicalAdmissionPolicy::BroadQuestionV1,
+                        budget_ms: Some(18_000),
+                    })
+                    .collect::<Vec<_>>(),
+                None,
+                cache,
+            )
+        })
+        .unwrap();
+        let original = results[0]
+            .hits
+            .iter()
+            .find(|hit| hit.file_path == "eligibilitypool/a.ini")
+            .unwrap()
+            .clone();
+        let mut other_owner = results[0]
+            .hits
+            .iter()
+            .find(|hit| hit.file_path == "eligibilitypool/b.ini")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            original.whole_file_decoded_bytes(
+                &pinned.session.publication_identity().sidecar_generation,
+                &pinned.session.publication_identity().sidecar_input_hash
+            ),
+            Some(content.len() as u64)
+        );
+        // Deliberately attach a different real owner's opaque fact to the same claimed identity.
+        other_owner.file_path = original.file_path.clone();
+        for mode in ["live", "imported", "conflict"] {
+            let session = PacketProofSession::new();
+            for (index, result) in results.iter().enumerate() {
+                let mut result = result.clone();
+                result.hits = vec![if mode == "conflict" && index == 1 {
+                    other_owner.clone()
+                } else {
+                    original.clone()
+                }];
+                if mode == "imported" {
+                    let mut json = serde_json::to_value(&result.hits).unwrap();
+                    json[0]["whole_file_length_evidence"] =
+                        serde_json::json!({"decoded_bytes": 560, "trusted": true});
+                    result.hits = serde_json::from_value(json).unwrap();
+                }
+                session
+                    .retain_descriptor_result_with_policy(
+                        &result,
+                        LexicalAdmissionPolicy::BroadQuestionV1,
+                        true,
+                        pinned.session.publication_identity(),
+                    )
+                    .unwrap();
+            }
+            admit_packet_candidate_descriptors_bound(
+                &session,
+                [&original],
+                Some(&pinned.session.publication_identity().sidecar_input_hash),
+            );
+            assert_eq!(
+                session.receipts().len(),
+                usize::from(mode != "live"),
+                "{mode}"
+            );
+            assert_eq!(
+                session.early_whole_file_refusals().len(),
+                usize::from(mode == "live"),
+                "{mode}"
+            );
+            assert_eq!(
+                canonical_stream_count(&fixture.controller),
+                0,
+                "authority handling cannot read Core"
+            );
+        }
+    }
+
+    #[test]
+    fn whole_file_eligibility_does_not_prove_equal_or_small_source_renderable() {
+        use crate::agent::packet_candidate::{PacketProofSession, install_packet_proof_session};
+        use codestory_contracts::compilation::{
+            INTERIM_SOURCE_ROW_UPPER_BOUND, PacketAdmissionGapKindV1,
+        };
+        let files = [
+            (
+                "eligibilityboundary/equal.ini",
+                format!("x={}", "!".repeat(INTERIM_SOURCE_ROW_UPPER_BOUND - 2)),
+            ),
+            (
+                "eligibilityboundary/lines.ini",
+                format!("x=1\n{}", "\n".repeat(80)),
+            ),
+        ];
+        let inputs = files
+            .iter()
+            .map(|(path, content)| (*path, content.as_str()))
+            .collect::<Vec<_>>();
+        let fixture = public_packet_fixture_with_lexical_files(&inputs);
+        let pinned =
+            Rc::new(PinnedRetrievalRead::begin_packet_descriptor(&fixture.controller).unwrap());
+        let session = Rc::new(PacketProofSession::new());
+        with_active_pinned_retrieval_read(&fixture.controller, Rc::clone(&pinned), || {
+            let _guard = install_packet_proof_session(Rc::clone(&session));
+            preadmit_packet_descriptor_queries_with_policy(
+                &fixture.controller,
+                &[PacketRetrievalQuery {
+                    query: "eligibilityboundary".into(),
+                    lexical_policy: LexicalAdmissionPolicy::BroadQuestionV1,
+                }],
+                None,
+            )
+            .unwrap();
+            let receipts = session.receipts();
+            let remaining = session.remaining_source_bytes();
+            for (path, _) in &files {
+                assert!(session.is_admitted_identity(&format!("path:{path}")));
+            }
+            let prepared = super::super::packet_compiler::prepare_packet_compilation(
+                &fixture.controller,
+                pinned.session.project_id(),
+                &[],
+                None,
+                &session,
+                None,
+            )
+            .unwrap();
+            let input = prepared.replay_input();
+            for (path, _) in &files {
+                let identity = format!("path:{path}");
+                assert!(
+                    !input
+                        .sources
+                        .iter()
+                        .any(|source| source.stable_identity == identity)
+                );
+                assert!(input.admission_gaps.iter().any(|gap| {
+                    gap.stable_identity.as_deref() == Some(identity.as_str())
+                        && gap.kind == PacketAdmissionGapKindV1::SourceBudgetExceeded
+                }));
+            }
+            assert_eq!(
+                session.receipts(),
+                receipts,
+                "render failures cannot refund admissions"
+            );
+            assert_eq!(session.remaining_source_bytes(), remaining);
+        });
+    }
+
     #[test]
     fn browser_packet_delivers_small_published_lexical_file_with_exact_probe_and_matching_query() {
         assert_browser_packet_delivers_small_published_lexical_files(vec![
@@ -8717,7 +9428,7 @@ mod tests {
     fn published_file_hydration_checks_freshness_before_budget_and_preserves_admission() {
         use crate::agent::packet_candidate::{PacketProofSession, install_packet_proof_session};
         use codestory_contracts::compilation::{
-            PacketAdmissionGapKindV1, PacketParserCompletenessV1,
+            INTERIM_SOURCE_ROW_UPPER_BOUND, PacketAdmissionGapKindV1, PacketParserCompletenessV1,
         };
         let files = [
             ("short.ini", "short_setting = 1\n".to_string()),
@@ -8741,6 +9452,17 @@ mod tests {
         let session = Rc::new(PacketProofSession::new());
         with_active_pinned_retrieval_read(&fixture.controller, Rc::clone(&pinned), || {
             let _guard = install_packet_proof_session(Rc::clone(&session));
+            // Explicitly requested files still verify freshness before budget despite automatic eligibility.
+            for (ordinal, path) in ["raw.ini", "stale.ini"].into_iter().enumerate() {
+                assert_eq!(
+                    session.admit_exact_selector(
+                        &format!("path:{path}"),
+                        INTERIM_SOURCE_ROW_UPPER_BOUND,
+                        ordinal as u32
+                    ),
+                    PacketAdmissionDecision::Admitted,
+                );
+            }
             preadmit_packet_descriptor_queries_with_policy(
                 &fixture.controller,
                 &[PacketRetrievalQuery {
@@ -8753,6 +9475,7 @@ mod tests {
             for (path, _) in &files {
                 assert!(session.is_admitted_identity(&format!("path:{path}")));
             }
+            assert!(session.early_whole_file_refusals().is_empty());
             pinned.session.validate_full_readiness().unwrap();
             let receipts = session.receipts();
             let queries = session.benchmark_retrieval_proof().descriptor_query_count;

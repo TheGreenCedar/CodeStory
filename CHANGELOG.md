@@ -2,6 +2,84 @@
 
 ## Unreleased
 
+- Go symbol lookup includes named struct fields and keeps their owner relationships distinct, including grouped declarations. Existing Go indexes refresh automatically.
+
+- Symbol-name lookup returns the same matches when a repository moves, without matching unrelated declarations through its checkout path.
+
+- Change-impact analysis accepts exact changed source ranges and reports verified owners and unresolved ranges, helping callers avoid treating every declaration in a changed file as edited.
+
+- Exact-symbol searches, source snippets and name-based relationship lookups wait up to 1.5 seconds for setup to finish before returning resume instructions, so brief setup can complete in the original call.
+
+- Function-body snippets can return long indexed functions without falling back to a single source line when the body fits the source limit.
+
+- Go symbol search finds package variables, including wrapped handlers. Existing Go indexes refresh automatically.
+
+- Call navigation keeps receiver calls such as `api.remove()` and resolved repository calls visible when their names match common utility functions.
+
+- JavaScript and TypeScript navigation recognizes functions stored in named object properties and keeps calls attached to the right source body, including scripts embedded in templates.
+
+- JavaScript and TypeScript source links stay stable across cached indexing and template refreshes. Existing indexes refresh automatically. Old links are rejected rather than silently redirected; bookmarks move only when source evidence supports the match, and unmatched bookmarks keep their notes.
+
+- Python navigation avoids links to methods that class code replaces or removes, and leaves object types unresolved when they depend only on a conditionally defined factory.
+
+- Packets leave more room for source evidence by skipping indexed whole files that cannot fit the response, while retaining navigation and clear limits.
+
+- Go reference navigation includes statically resolved function and method values, including handlers passed to registration functions. These references stay distinct from calls, and existing Go indexes refresh automatically.
+
+- Optional Codex source context can append bounded, verified Python and Rust declarations and Go functions and methods after numbered searches when the executor's non-interactive zsh/login contract is explicit or declared at startup. Unknown callers retain their ordinary path, and pipelines keep the original search output.
+
+- Indexing avoids repeated sorting, metadata preparation and symbol-description work while preserving published records and digests.
+
+- Indexing avoids duplicate proof seal checks while retaining source and graph verification.
+
+- Repository indexing avoids repeated import lookups while preserving per-file resolution.
+
+- Go indexing avoids redundant scope lookups while preserving variable shadowing and call resolution.
+
+- Failed indexing reports repeat less run metadata while retaining every progress and cancellation detail.
+
+- Full repository reindexing avoids redundant file lookups before rebuilding the index.
+
+- Bash call navigation handles commands inside prefix assignments without interrupting indexing or losing links between repeated calls on the same line. Existing Bash indexes rebuild on their next refresh.
+
+- Repository navigation stays available when a structural file has unsupported text bytes, while that file keeps explicit incomplete coverage and no source projection.
+
+- Rust struct and enum source excerpts include their fields, variants and outer attributes. Navigation keeps precise name locations, and existing Rust indexes rebuild on their next refresh.
+
+- Rust struct and enum search documents retain their declaration and comment text when source excerpts expand to include attributes and fields.
+
+- Symbol search finds declarations even when frequent call sites share the same name.
+
+- Codex can discover the grounding skill automatically again. Shared Claude Code/Codex startup hooks remain disabled.
+
+- MCP affected results offer an optional lossless shared-field layout for impacted symbols; the default record array stays unchanged.
+
+- Grounding maps stop treating known decorator and inherited-type references as local declarations. Existing parser indexes rebuild once on their next refresh.
+
+- Explicit symbol-summary generation works on current indexes and refreshes summaries when the selected model changes.
+
+- Claude Code and Codex no longer run the automatic session-start hook. CodeStory tools and the grounding skill remain available on request.
+
+- Grounding maps show production package layouts before repeating roots from the same subsystem.
+
+- Symbol search recognizes generic type definitions and keeps them ahead of incidental same-name matches.
+
+- Symbol search keeps qualified method definitions visible for unqualified names, ahead of incidental references and configuration labels.
+
+- Symbol search finds JavaScript and TypeScript classes and functions through verified named public exports, while keeping their original names and source locations. Export/import witness locations explain the match; unsupported or ambiguous bindings remain explicit.
+
+- TypeScript and TSX files parse type-only star exports, allowing independent named exports beside them to remain searchable. Type-only exports do not become value aliases.
+
+- Source-backed search and navigation stay available after indexing unchanged, partially parsed Rust or Python files, while coverage continues to report the parsing gap.
+
+- Structural source indexing and retrieval accept BOM-marked UTF-16 text, including PowerShell files, while keeping source verification tied to the original bytes. Contained aliases with supported file types remain indexable when an unsupported filename is discovered first.
+
+- Agent guidance can display caller results once when whole-number JSON formatting differs, preserving original text and metadata.
+
+- Symbol-name navigation uses the current Core index without preparing search, so symbol details, callers and trails remain available without broad retrieval.
+
+- Symbol search ranks standalone Go type declarations ahead of incidental matches with the same name, making definitions easier to find among configuration labels and references.
+
 ## 0.18.0
 
 - Packets reuse one repository identity snapshot while selecting a response, avoiding repeated Git status scans within the same request.

@@ -35,11 +35,18 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::OnceLock;
 
+use codestory_contracts::graph::{Node, NodeKind};
 use tree_sitter::{Node as TsNode, Tree};
 
 #[cfg(test)]
 thread_local! {
     static GO_NAVIGATION_RESOLUTION_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GO_PACKAGE_OWNER_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GO_LOCAL_OWNER_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GO_LOCAL_SCOPE_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GO_LOCAL_CONTEXT_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GO_INITIALIZER_CLASSIFICATION_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GO_CAPTURE_PARENT_HOPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[inline]
@@ -62,12 +69,13 @@ fn go_navigation_resolution_work() -> usize {
 
 use super::LanguageExtraction;
 use crate::{
-    CompiledLanguageRules, LanguageRuleset, ManualMemberEdgeSpec, ManualReceiverCallSpec,
-    ManualReceiverSource, OptionalReceiverOwnerBinding, ReceiverCallSiteKey, ReceiverOwnerBinding,
-    collect_receiver_call_specs_in_callable, declaration_name, descendant_by_field_name,
-    enclosing_node_with_kind, member_call_method_col, normalize_parameter_name,
-    normalized_receiver_variable, receiver_call_belongs_to_callable, receiver_callsite_key,
-    trimmed_node_text, ts_node_graph_span, walk_tree_nodes,
+    CompiledLanguageRules, GraphNodeSpan, LanguageRuleset, ManualMemberEdgeSpec,
+    ManualReceiverCallSpec, ManualReceiverSource, OptionalReceiverOwnerBinding,
+    ReceiverCallSiteKey, ReceiverOwnerBinding, collect_receiver_call_specs_in_callable,
+    declaration_name, enclosing_node_with_kind, member_call_method_col, normalize_parameter_name,
+    normalized_receiver_variable, receiver_call_belongs_to_callable,
+    receiver_callable_boundary_kinds, receiver_callsite_key, same_ts_span, trimmed_node_text,
+    ts_node_graph_span, walk_tree_nodes,
 };
 
 /// Callsite marker written onto edges produced from Go selector-call syntax.
@@ -75,6 +83,142 @@ pub(crate) const MEMBER_CALLSITE_MARKER: &str = "syntax:go-selector-call";
 pub(crate) const PACKAGE_FUNCTION_CALLSITE_MARKER: &str = "syntax:go-package-function";
 pub(crate) const PACKAGE_FUNCTION_IMPORT_SET_PREFIX: &str = "syntax:go-package-function:";
 pub(crate) const RETURN_PATH_OWNER_PREFIX: &str = "go-return-path:";
+
+pub(crate) const INITIALIZER_CALL_REVISION: &str =
+    extraction_revision!("go-named-struct-fields-v6");
+
+/// Expand display spans after identifier occurrences, call ownership and IDs are fixed.
+pub(crate) fn apply_package_variable_envelopes(tree: &Tree, nodes: &mut [Node]) {
+    if tree.root_node().has_error() {
+        return;
+    }
+    let mut envelopes = HashMap::<GraphNodeSpan, GraphNodeSpan>::new();
+    let mut cursor = tree.root_node().walk();
+    for declaration in tree.root_node().named_children(&mut cursor) {
+        if declaration.kind() != "var_declaration" {
+            continue;
+        }
+        walk_tree_nodes(declaration, &mut |spec| {
+            if spec.kind() != "var_spec" {
+                return;
+            }
+            let Some(parent) = spec.parent() else {
+                return;
+            };
+            let envelope = if parent.id() == declaration.id() {
+                declaration
+            } else if parent.kind() == "var_spec_list"
+                && parent
+                    .parent()
+                    .is_some_and(|owner| owner.id() == declaration.id())
+            {
+                spec
+            } else {
+                return;
+            };
+            let mut cursor = spec.walk();
+            for name in spec.children_by_field_name("name", &mut cursor) {
+                envelopes.insert(ts_node_graph_span(name), ts_node_graph_span(envelope));
+            }
+        });
+    }
+    for node in nodes {
+        if node.kind != NodeKind::GLOBAL_VARIABLE {
+            continue;
+        }
+        let (Some(start_line), Some(start_col), Some(end_line), Some(end_col)) =
+            (node.start_line, node.start_col, node.end_line, node.end_col)
+        else {
+            continue;
+        };
+        if let Some(envelope) = envelopes.get(&GraphNodeSpan {
+            start_line,
+            start_col,
+            end_line,
+            end_col,
+        }) {
+            node.start_line = Some(envelope.start_line);
+            node.start_col = Some(envelope.start_col);
+            node.end_line = Some(envelope.end_line);
+            node.end_col = Some(envelope.end_col);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PackageInitializerCall {
+    Evaluated,
+    DeferredLiteralBody,
+}
+
+/// Prepare exact graph-callee ownership in one AST pass. Named callable and
+/// literal boundaries travel with the traversal, rather than being rediscovered
+/// by walking every captured call's ancestors.
+pub(crate) fn package_initializer_calls(
+    tree: &Tree,
+) -> HashMap<GraphNodeSpan, PackageInitializerCall> {
+    #[derive(Clone, Copy)]
+    enum Scope {
+        Outside,
+        Declaration,
+        Value(PackageInitializerCall),
+    }
+    let mut calls = HashMap::new();
+    let mut pending = vec![(tree.root_node(), Scope::Outside)];
+    while let Some((node, mut scope)) = pending.pop() {
+        #[cfg(test)]
+        GO_INITIALIZER_CLASSIFICATION_WORK.with(|work| work.set(work.get().saturating_add(1)));
+        match node.kind() {
+            "function_declaration" | "method_declaration" => scope = Scope::Outside,
+            "func_literal" if matches!(scope, Scope::Value(_)) => {
+                scope = Scope::Value(PackageInitializerCall::DeferredLiteralBody);
+            }
+            _ => {}
+        }
+        if node.kind() == "call_expression"
+            && let Scope::Value(classification) = scope
+            && let Some(function) = node.child_by_field_name("function")
+        {
+            // Match go.scm capture addresses exactly: a selector's graph node
+            // uses its field identifier, not the whole receiver expression.
+            let callee = match function.kind() {
+                "identifier" => Some(function),
+                "selector_expression" => function.child_by_field_name("field"),
+                _ => None,
+            };
+            if let Some(callee) = callee {
+                calls.insert(ts_node_graph_span(callee), classification);
+            }
+        }
+        let value_id = if node.kind() == "var_spec" && matches!(scope, Scope::Declaration) {
+            node.child_by_field_name("value").map(|value| value.id())
+        } else {
+            None
+        };
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            #[cfg(test)]
+            GO_INITIALIZER_CLASSIFICATION_WORK.with(|work| work.set(work.get().saturating_add(1)));
+            let child_scope = if node.kind() == "source_file" && child.kind() == "var_declaration" {
+                Scope::Declaration
+            } else if matches!(scope, Scope::Declaration) {
+                if matches!(node.kind(), "var_declaration" | "var_spec_list")
+                    && matches!(child.kind(), "var_spec" | "var_spec_list")
+                {
+                    Scope::Declaration
+                } else if value_id == Some(child.id()) {
+                    Scope::Value(PackageInitializerCall::Evaluated)
+                } else {
+                    Scope::Outside
+                }
+            } else {
+                scope
+            };
+            pending.push((child, child_scope));
+        }
+    }
+    calls
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GoReturnPath {
@@ -128,6 +272,9 @@ impl GoReturnPath {
     }
 }
 
+mod value_uses;
+pub(crate) use value_uses::{GoValueTarget, callable_value_uses};
+
 const GRAPH_QUERY: &str = include_str!("../../rules/go.scm");
 
 static RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
@@ -169,6 +316,51 @@ pub(crate) fn member_edge_specs(tree: &Tree, source: &str) -> Vec<ManualMemberEd
     walk_tree_nodes(tree.root_node(), &mut |node| {
         count_go_navigation_resolution_work(1);
         match node.kind() {
+            "type_spec" => {
+                let Some(struct_type) = node
+                    .child_by_field_name("type")
+                    .filter(|kind| kind.kind() == "struct_type")
+                else {
+                    return;
+                };
+                let Some(owner) = node
+                    .parent()
+                    .filter(|kind| kind.kind() == "type_declaration")
+                else {
+                    return;
+                };
+                let Some(source_name) = node
+                    .child_by_field_name("name")
+                    .and_then(|name| trimmed_node_text(name, source))
+                else {
+                    return;
+                };
+                let mut cursor = struct_type.walk();
+                let Some(fields) = struct_type
+                    .named_children(&mut cursor)
+                    .find(|child| child.kind() == "field_declaration_list")
+                else {
+                    return;
+                };
+                let mut cursor = fields.walk();
+                for field in fields.named_children(&mut cursor) {
+                    let mut cursor = field.walk();
+                    for name in field.children_by_field_name("name", &mut cursor) {
+                        let Some(target_name) =
+                            trimmed_node_text(name, source).filter(|name| name != "_")
+                        else {
+                            continue;
+                        };
+                        edges.push(ManualMemberEdgeSpec {
+                            source_name: source_name.clone(),
+                            target_name,
+                            source_span: ts_node_graph_span(owner),
+                            target_span: ts_node_graph_span(name),
+                            line: Some(name.start_position().row as u32 + 1),
+                        });
+                    }
+                }
+            }
             "method_declaration" => {
                 if node.has_error() || node.is_error() || node.is_missing() {
                     return;
@@ -204,10 +396,21 @@ pub(crate) fn member_edge_specs(tree: &Tree, source: &str) -> Vec<ManualMemberEd
                 });
             }
             "method_elem" => {
-                let Some(owner_node) = enclosing_node_with_kind(node, &["type_declaration"]) else {
+                let Some(owner_spec) = node
+                    .parent()
+                    .filter(|parent| parent.kind() == "interface_type")
+                    .and_then(|parent| parent.parent())
+                    .filter(|parent| parent.kind() == "type_spec")
+                else {
                     return;
                 };
-                let Some(owner_name_node) = descendant_by_field_name(owner_node, "name") else {
+                let Some(owner_node) = owner_spec
+                    .parent()
+                    .filter(|parent| parent.kind() == "type_declaration")
+                else {
+                    return;
+                };
+                let Some(owner_name_node) = owner_spec.child_by_field_name("name") else {
                     return;
                 };
                 let Some(source_name) = trimmed_node_text(owner_name_node, source) else {
@@ -520,12 +723,14 @@ fn collect_go_package_function_call_specs(
     edges: &mut Vec<ManualReceiverCallSpec>,
 ) {
     walk_tree_nodes(callable, &mut |node| {
-        if !receiver_call_belongs_to_callable(node, callable) {
-            return;
-        }
         let Some((receiver_name, method_name)) = selector_call(node, context.source) else {
             return;
         };
+        #[cfg(test)]
+        GO_PACKAGE_OWNER_LOOKUPS.with(|work| work.set(work.get().saturating_add(1)));
+        if !receiver_call_belongs_to_callable(node, callable) {
+            return;
+        }
         let method_col = member_call_method_col(node, context.source, &method_name);
         let key = ReceiverCallSiteKey {
             receiver_name: receiver_name.clone(),
@@ -576,23 +781,145 @@ fn collect_go_package_function_call_specs(
     });
 }
 
-fn collect_go_local_composite_receiver_call_specs(
-    callable: TsNode<'_>,
-    call_source: ManualReceiverSource<'_>,
+#[derive(Clone, Copy)]
+struct GoNavigationAncestors<'tree> {
+    owner: Option<TsNode<'tree>>,
+    scope: Option<TsNode<'tree>>,
+    capture: Option<(usize, usize)>,
+}
+
+impl GoNavigationAncestors<'_> {
+    fn belongs_to(self, callable: TsNode<'_>) -> bool {
+        self.owner
+            .is_some_and(|owner| owner.kind() == callable.kind() && same_ts_span(owner, callable))
+    }
+
+    fn binding_scope(self) -> Option<usize> {
+        self.scope.map(|scope| scope.end_byte())
+    }
+
+    fn is_outer_block(self, callable: TsNode<'_>) -> bool {
+        callable.child_by_field_name("body").is_some_and(|body| {
+            self.scope
+                .is_some_and(|scope| scope.kind() == "block" && scope.id() == body.id())
+        })
+    }
+}
+
+fn walk_go_navigation_nodes<'tree, F>(start: TsNode<'tree>, callable: TsNode<'tree>, visit: &mut F)
+where
+    F: FnMut(TsNode<'tree>, GoNavigationAncestors<'tree>),
+{
+    let boundaries = receiver_callable_boundary_kinds(callable);
+    // Seed with the real queries: subtree roots may have ancestors outside
+    // this traversal, and ownership deliberately excludes the current node.
+    let seed = GoNavigationAncestors {
+        owner: enclosing_node_with_kind(start, boundaries),
+        scope: go_nearest_navigation_lexical_container(start, callable),
+        capture: go_navigation_capture_span(start, callable),
+    };
+    let mut frames = vec![seed];
+    let mut cursor = start.walk();
+    let start_id = start.id();
+    let mut first = true;
+    loop {
+        let node = cursor.node();
+        if first || node.is_named() {
+            first = false;
+            let mut ancestors = *frames.last().expect("current parent frame");
+            ancestors.capture = if node.id() == callable.id() {
+                None
+            } else if node.kind() == "func_literal" {
+                Some((node.start_byte(), node.end_byte()))
+            } else {
+                ancestors.capture
+            };
+            #[cfg(test)]
+            GO_LOCAL_CONTEXT_WORK.with(|work| work.set(work.get().saturating_add(1)));
+            visit(node, ancestors);
+            let children = GoNavigationAncestors {
+                owner: if boundaries.contains(&node.kind()) {
+                    Some(node)
+                } else {
+                    ancestors.owner
+                },
+                scope: if is_go_navigation_lexical_container(node) || node.id() == callable.id() {
+                    Some(node)
+                } else {
+                    ancestors.scope
+                },
+                capture: ancestors.capture,
+            };
+            if cursor.goto_first_child() {
+                frames.push(children);
+                #[cfg(test)]
+                GO_LOCAL_CONTEXT_WORK.with(|work| work.set(work.get().saturating_add(1)));
+                continue;
+            }
+            if node.id() == start_id {
+                return;
+            }
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() || cursor.node().id() == start_id {
+                return;
+            }
+            frames.pop();
+            #[cfg(test)]
+            GO_LOCAL_CONTEXT_WORK.with(|work| work.set(work.get().saturating_add(1)));
+        }
+    }
+}
+
+fn go_navigation_facts<'tree>(
+    callable: TsNode<'tree>,
     context: &GoCallableResolutionContext<'_>,
-    local_binding_callsites: &mut HashSet<ReceiverCallSiteKey>,
-    edges: &mut Vec<ManualReceiverCallSpec>,
+    include_values: bool,
+) -> (
+    Vec<GoNavigationCall<'tree>>,
+    Vec<GoNavigationBindingInterval>,
 ) {
     let source = context.source;
+    let type_origins = include_values.then(|| value_uses::TypeOrigins::prepare(callable, source));
+    let parameter_types = if include_values {
+        collect_go_parameter_types(callable, source)
+    } else {
+        Default::default()
+    };
     let mut calls = Vec::new();
     let mut intervals = Vec::new();
     let mut top_level_return_bindings = HashMap::<String, GoReturnPath>::new();
     let method_receiver_name = callable
         .child_by_field_name("receiver")
         .and_then(|receiver| go_receiver_variable_name(receiver, source));
-    walk_tree_nodes(callable, &mut |node| {
+    walk_go_navigation_nodes(callable, callable, &mut |node, ancestors| {
         count_go_navigation_resolution_work(1);
-        if !receiver_call_belongs_to_callable(node, callable) {
+        // Keep calls, capture identifiers and binding facts; other nodes still
+        // have their descendants visited by the structural cursor.
+        if !matches!(
+            node.kind(),
+            "call_expression"
+                | "selector_expression"
+                | "parameter_declaration"
+                | "variadic_parameter_declaration"
+                | "identifier"
+                | "short_var_declaration"
+                | "assignment_statement"
+                | "var_spec"
+                | "const_spec"
+                | "type_spec"
+                | "range_clause"
+                | "receive_statement"
+                | "type_switch_guard"
+                | "type_switch_statement"
+                | "unary_expression"
+        ) {
+            return;
+        }
+        if !include_values && !ancestors.belongs_to(callable) {
             return;
         }
         if let Some((receiver_name, method_name)) = selector_call(node, source) {
@@ -602,11 +929,59 @@ fn collect_go_local_composite_receiver_call_specs(
                 method_name,
             });
         }
-        let Some(scope_end) = go_navigation_binding_scope(node, callable) else {
-            return;
-        };
+        if include_values
+            && value_uses::selector_value(node).is_some()
+            && let Some((receiver_name, method_name)) = value_uses::selector_names(node, source)
+        {
+            calls.push(GoNavigationCall {
+                node,
+                receiver_name,
+                method_name,
+            });
+        }
         match node.kind() {
+            "parameter_declaration" | "variadic_parameter_declaration" if include_values => {
+                let Some(type_node) = node.child_by_field_name("type") else {
+                    return;
+                };
+                let Some((start_byte, end_byte)) = go_value_parameter_visibility_span(node) else {
+                    return;
+                };
+                let owner = trimmed_node_text(type_node, source)
+                    .as_deref()
+                    .and_then(|surface| {
+                        go_receiver_owner_from_type(surface, context.import_bindings)
+                    });
+                let owner = type_origins.as_ref().map_or_else(
+                    || owner.clone(),
+                    |origins| origins.retain(owner.clone(), type_node.start_byte()),
+                );
+                let mut cursor = node.walk();
+                for name_node in node
+                    .named_children(&mut cursor)
+                    .take_while(|name| name.start_byte() < type_node.start_byte())
+                {
+                    let Some(name) = normalized_receiver_variable(name_node, source) else {
+                        continue;
+                    };
+                    intervals.push(GoNavigationBindingInterval {
+                        name,
+                        start_byte,
+                        end_byte,
+                        binding_priority: GO_NAVIGATION_DECLARATION_PRIORITY,
+                        owner: owner.clone(),
+                    });
+                }
+            }
             "short_var_declaration" | "assignment_statement" => {
+                let scope_end = if node.kind() == "assignment_statement" {
+                    callable.end_byte()
+                } else {
+                    let Some(scope_end) = ancestors.binding_scope() else {
+                        return;
+                    };
+                    scope_end
+                };
                 let left = node
                     .child_by_field_name("left")
                     .map(go_expression_list_items)
@@ -617,7 +992,7 @@ fn collect_go_local_composite_receiver_call_specs(
                     .unwrap_or_default();
                 let left_arity = left.len();
                 let tuple_result = right.len() == 1 && left_arity > 1;
-                let top_level_binding = go_binding_is_in_callable_outer_block(node, callable);
+                let top_level_binding = ancestors.is_outer_block(callable);
                 let builtin_new_unshadowed = !context.import_bindings.contains_key("new")
                     && !context.file_scope_names.contains("new")
                     && !context
@@ -668,6 +1043,15 @@ fn collect_go_local_composite_receiver_call_specs(
                                 })
                             })
                     };
+                    let owner = if let Some(origins) = type_origins.as_ref() {
+                        let origin = right
+                            .get(index)
+                            .or_else(|| right.first())
+                            .map_or(node.start_byte(), |value| value.start_byte());
+                        origins.retain(owner, origin)
+                    } else {
+                        owner
+                    };
                     if top_level_binding {
                         if let Some(path) = owner
                             .as_ref()
@@ -681,11 +1065,7 @@ fn collect_go_local_composite_receiver_call_specs(
                     intervals.push(GoNavigationBindingInterval {
                         name,
                         start_byte: node.end_byte(),
-                        end_byte: if node.kind() == "assignment_statement" {
-                            callable.end_byte()
-                        } else {
-                            scope_end
-                        },
+                        end_byte: scope_end,
                         binding_priority: if node.kind() == "assignment_statement"
                             && owner.is_none()
                         {
@@ -701,11 +1081,18 @@ fn collect_go_local_composite_receiver_call_specs(
                 let Some(type_node) = node.child_by_field_name("type") else {
                     return;
                 };
+                let Some(scope_end) = ancestors.binding_scope() else {
+                    return;
+                };
                 let owner = trimmed_node_text(type_node, source)
                     .as_deref()
                     .and_then(|raw_type| {
                         go_receiver_owner_from_type(raw_type, context.import_bindings)
                     });
+                let owner = type_origins.as_ref().map_or_else(
+                    || owner.clone(),
+                    |origins| origins.retain(owner.clone(), type_node.start_byte()),
+                );
                 let mut cursor = node.walk();
                 for name_node in node
                     .named_children(&mut cursor)
@@ -724,6 +1111,9 @@ fn collect_go_local_composite_receiver_call_specs(
                 }
             }
             "const_spec" | "type_spec" => {
+                let Some(scope_end) = ancestors.binding_scope() else {
+                    return;
+                };
                 for name in go_navigation_declared_names(node, source) {
                     intervals.push(GoNavigationBindingInterval {
                         name,
@@ -790,12 +1180,18 @@ fn collect_go_local_composite_receiver_call_specs(
         if node.kind() != "identifier" {
             return;
         }
-        let Some((capture_start, capture_end)) = go_navigation_capture_span(node, callable) else {
+        let Some((capture_start, capture_end)) = ancestors.capture else {
             return;
         };
         let Some(name) = normalized_receiver_variable(node, source) else {
             return;
         };
+        if include_values
+            && (parameter_types.contains_key(&name)
+                || method_receiver_name.as_deref() == Some(name.as_str()))
+        {
+            return;
+        }
         // Capturing a statically declared method receiver does not change its
         // Go type outside that closure. Keep nested closure calls fail closed,
         // and keep real local shadow intervals above, without erasing the
@@ -818,6 +1214,18 @@ fn collect_go_local_composite_receiver_call_specs(
             owner: None,
         });
     });
+    (calls, intervals)
+}
+
+fn collect_go_local_composite_receiver_call_specs(
+    callable: TsNode<'_>,
+    call_source: ManualReceiverSource<'_>,
+    context: &GoCallableResolutionContext<'_>,
+    local_binding_callsites: &mut HashSet<ReceiverCallSiteKey>,
+    edges: &mut Vec<ManualReceiverCallSpec>,
+) {
+    let source = context.source;
+    let (calls, intervals) = go_navigation_facts(callable, context, false);
     let decisions = go_navigation_binding_decisions(
         callable.start_byte(),
         callable.end_byte(),
@@ -1004,6 +1412,7 @@ fn go_navigation_binding_scope(node: TsNode<'_>, callable: TsNode<'_>) -> Option
     Some(container.end_byte())
 }
 
+#[cfg(test)]
 fn go_binding_is_in_callable_outer_block(node: TsNode<'_>, callable: TsNode<'_>) -> bool {
     let Some(body) = callable.child_by_field_name("body") else {
         return false;
@@ -1012,23 +1421,27 @@ fn go_binding_is_in_callable_outer_block(node: TsNode<'_>, callable: TsNode<'_>)
         .is_some_and(|container| container.kind() == "block" && container.id() == body.id())
 }
 
+fn is_go_navigation_lexical_container(node: TsNode<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "block"
+            | "if_statement"
+            | "for_statement"
+            | "expression_switch_statement"
+            | "type_switch_statement"
+            | "expression_case"
+            | "default_case"
+            | "communication_case"
+    )
+}
+
 fn go_nearest_navigation_lexical_container<'tree>(
     mut node: TsNode<'tree>,
     callable: TsNode<'tree>,
 ) -> Option<TsNode<'tree>> {
     while let Some(parent) = node.parent() {
         count_go_navigation_resolution_work(1);
-        if matches!(
-            parent.kind(),
-            "block"
-                | "if_statement"
-                | "for_statement"
-                | "expression_switch_statement"
-                | "type_switch_statement"
-                | "expression_case"
-                | "default_case"
-                | "communication_case"
-        ) {
+        if is_go_navigation_lexical_container(parent) {
             return Some(parent);
         }
         if parent.id() == callable.id() {
@@ -1114,6 +1527,8 @@ fn go_navigation_capture_span(
         if node.kind() == "func_literal" {
             return Some((node.start_byte(), node.end_byte()));
         }
+        #[cfg(test)]
+        GO_CAPTURE_PARENT_HOPS.with(|work| work.set(work.get().saturating_add(1)));
         node = node.parent()?;
     }
     None
@@ -1302,13 +1717,29 @@ fn go_builtin_new_owner(
 }
 
 fn go_callable_name_visibility(callable: TsNode<'_>, source: &str) -> GoNameVisibilityIndex {
+    go_name_visibility(callable, source, false)
+}
+
+fn go_value_name_visibility(callable: TsNode<'_>, source: &str) -> GoNameVisibilityIndex {
+    go_name_visibility(callable, source, true)
+}
+
+fn go_name_visibility(
+    callable: TsNode<'_>,
+    source: &str,
+    value_parameters: bool,
+) -> GoNameVisibilityIndex {
     let mut spans = HashMap::<String, Vec<(usize, usize)>>::new();
     walk_tree_nodes(callable, &mut |node| {
         count_go_navigation_resolution_work(1);
         let (names, start_byte, end_byte) = match node.kind() {
             "parameter_declaration" | "variadic_parameter_declaration" => {
-                let Some((start_byte, end_byte)) = go_parameter_visibility_span(node, callable)
-                else {
+                let scope = if value_parameters {
+                    go_value_parameter_visibility_span(node)
+                } else {
+                    go_parameter_visibility_span(node, callable)
+                };
+                let Some((start_byte, end_byte)) = scope else {
                     return;
                 };
                 let type_start = node
@@ -1386,6 +1817,31 @@ fn go_callable_name_visibility(callable: TsNode<'_>, source: &str) -> GoNameVisi
         })
         .collect();
     GoNameVisibilityIndex { names }
+}
+
+/// Formal names become locals only in the body of the declaration that
+/// directly owns their exact parameter list. Function types and interface
+/// signatures cannot contribute locals to an enclosing executable body.
+fn go_value_parameter_visibility_span(node: TsNode<'_>) -> Option<(usize, usize)> {
+    count_go_navigation_resolution_work(6);
+    let list = node
+        .parent()
+        .filter(|parent| parent.kind() == "parameter_list")?;
+    let owner = list.parent().filter(|owner| {
+        matches!(
+            owner.kind(),
+            "function_declaration" | "method_declaration" | "func_literal"
+        )
+    })?;
+    if !["parameters", "receiver", "result"].iter().any(|field| {
+        owner
+            .child_by_field_name(field)
+            .is_some_and(|parameters| parameters.id() == list.id())
+    }) {
+        return None;
+    }
+    let body = owner.child_by_field_name("body")?;
+    Some((body.start_byte(), body.end_byte()))
 }
 
 fn go_parameter_visibility_span(
@@ -1982,6 +2438,441 @@ fn go_concrete_result_owner(type_node: TsNode<'_>, source: &str) -> Option<Strin
 mod complexity_tests {
     use super::*;
     use tree_sitter::Parser;
+
+    #[test]
+    fn package_initializer_classification_is_linear_for_nested_calls() {
+        let mut measured = Vec::new();
+        for depth in [32, 64, 128] {
+            let nested = format!("{}0{}", "wrap(".repeat(depth), ")".repeat(depth));
+            let source = format!(
+                "package startup\nvar eager = {nested}\nvar held = wrap(func() {{ _ = {nested}; external.Skip() }})\nvar selected = external.Make()\nfunc ordinary() {{ var local = {nested}; _ = local }}\n"
+            );
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_go::LANGUAGE.into())
+                .expect("Go grammar");
+            let tree = parser.parse(&source, None).expect("Go source");
+            assert!(!tree.root_node().has_error());
+            GO_INITIALIZER_CLASSIFICATION_WORK.with(|work| work.set(0));
+            let calls = package_initializer_calls(&tree);
+            let work = GO_INITIALIZER_CLASSIFICATION_WORK.with(std::cell::Cell::get);
+            assert_eq!(
+                calls
+                    .values()
+                    .filter(|scope| **scope == PackageInitializerCall::Evaluated)
+                    .count(),
+                depth + 2
+            );
+            assert_eq!(
+                calls
+                    .values()
+                    .filter(|scope| **scope == PackageInitializerCall::DeferredLiteralBody)
+                    .count(),
+                depth + 1
+            );
+            assert!(
+                calls.keys().all(|span| span.start_line < 5),
+                "local initializer calls cannot acquire FILE ownership"
+            );
+            for (line, field, expected) in [
+                (3, "Skip", PackageInitializerCall::DeferredLiteralBody),
+                (4, "Make", PackageInitializerCall::Evaluated),
+            ] {
+                let col = source.lines().nth(line - 1).unwrap().find(field).unwrap() as u32 + 1;
+                let span = GraphNodeSpan {
+                    start_line: line as u32,
+                    start_col: col,
+                    end_line: line as u32,
+                    end_col: col + field.len() as u32,
+                };
+                assert_eq!(
+                    calls.get(&span),
+                    Some(&expected),
+                    "selector classification must use go.scm's field capture span"
+                );
+            }
+            assert!(work > depth, "the visited-work counter must be active");
+            assert!(
+                work <= 64 * depth + 256,
+                "nested call trees must have bounded linear work: depth={depth}, work={work}"
+            );
+            measured.push(work);
+        }
+        for pair in measured.windows(2) {
+            assert!(
+                pair[1] <= 2 * pair[0],
+                "doubling nested eager, deferred and local trees must not multiply ancestry work: {measured:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn go_navigation_ancestry_ignores_noncontributing_expression_nodes() {
+        let measure = |depth: usize| {
+            let source = format!(
+                concat!(
+                    "package proof\nimport pkg \"example.com/worker\"\n",
+                    "type Worker struct{{}}\nfunc (w *Worker) Run() {{}}\n",
+                    "func caller() {{\n  worker := &Worker{{}}\n",
+                    "  worker.Run()\n  pkg.New()\n  _ = {}{}0{}{}\n}}\n",
+                ),
+                " ".repeat(64 - depth),
+                "(".repeat(depth),
+                ")".repeat(depth),
+                " ".repeat(64 - depth),
+            );
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_go::LANGUAGE.into())
+                .expect("Go grammar");
+            let tree = parser.parse(&source, None).expect("Go source");
+            assert!(!tree.root_node().has_error());
+            GO_PACKAGE_OWNER_LOOKUPS.with(|work| work.set(0));
+            GO_LOCAL_OWNER_LOOKUPS.with(|work| work.set(0));
+            GO_LOCAL_SCOPE_LOOKUPS.with(|work| work.set(0));
+            GO_LOCAL_CONTEXT_WORK.with(|work| work.set(0));
+            let specs = receiver_call_specs(&tree, &source);
+            let lookups = (
+                GO_PACKAGE_OWNER_LOOKUPS.with(std::cell::Cell::get),
+                GO_LOCAL_OWNER_LOOKUPS.with(std::cell::Cell::get),
+                GO_LOCAL_SCOPE_LOOKUPS.with(std::cell::Cell::get),
+            );
+            assert_eq!(specs.len(), 2, "both navigation paths must contribute");
+            assert!(specs.iter().any(|spec| spec.receiver_name == "worker"
+                && spec.owner_name == "Worker"
+                && spec.method_name == "Run"
+                && spec.owner_module.is_none()
+                && spec.binding_marker.is_none()));
+            assert!(specs.iter().any(|spec| spec.receiver_name == "pkg"
+                && spec.owner_module.as_deref() == Some("example.com/worker")
+                && spec.method_name == "New"
+                && spec.binding_marker.as_deref() == Some(PACKAGE_FUNCTION_CALLSITE_MARKER)));
+            // Debug includes every spec field, preserving order, spans and flags.
+            let complete_specs = format!("{specs:#?}");
+            eprintln!("GO_NAVIGATION_ANCESTRY_LOOKUPS {depth} {lookups:?}");
+            eprintln!(
+                "GO_NAVIGATION_ANCESTRY_FIXTURE {depth} {}",
+                serde_json::to_string(&complete_specs).expect("complete specs")
+            );
+            (lookups, complete_specs)
+        };
+        let shallow = measure(0);
+        let nested = measure(64);
+        assert_eq!(shallow.1, nested.1, "complete navigation specs changed");
+        assert!(
+            shallow.0.0 > 0,
+            "package ownership queries still contribute"
+        );
+        assert_eq!((shallow.0.1, shallow.0.2), (0, 0));
+        assert!(GO_LOCAL_CONTEXT_WORK.with(std::cell::Cell::get) > 0);
+        assert_eq!(
+            shallow.0, nested.0,
+            "irrelevant parentheses added navigation ancestry"
+        );
+    }
+
+    #[test]
+    fn go_local_scope_lookups_ignore_nonbinding_identifier_uses() {
+        let measure = |identifier_uses: bool| {
+            let mut source = String::from(
+                r#"package proof
+import pkg "example.com/worker"
+type Worker struct{}
+func (w *Worker) Run() {}
+func (w *Worker) WithCapture() {
+    func() { w.Run() }()
+    w.Run()
+}
+func caller(v int) {
+    fresh := &Worker{}
+    fresh.Run()
+    pkg.New()
+    shadow := &Worker{}
+    { shadow := 1; _ = shadow }
+    shadow.Run()
+    escaped := &Worker{}
+    _ = &escaped
+    escaped.Run()
+    captured := &Worker{}
+    func() { captured.Run() }()
+"#,
+            );
+            // Same byte widths and line counts keep every output span stable.
+            // Identifier reads still require the existing capture analysis,
+            // but their scope_end value is not consumed by any binding branch.
+            for _ in 0..64 {
+                source.push_str(if identifier_uses {
+                    "    _ = v\n"
+                } else {
+                    "    _ = 0\n"
+                });
+            }
+            source.push_str("}\n");
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_go::LANGUAGE.into())
+                .expect("Go grammar");
+            let tree = parser.parse(&source, None).expect("Go source");
+            assert!(!tree.root_node().has_error(), "valid Go fixture");
+            GO_LOCAL_SCOPE_LOOKUPS.with(|work| work.set(0));
+            GO_LOCAL_CONTEXT_WORK.with(|work| work.set(0));
+            let specs = receiver_call_specs(&tree, &source);
+            let scope_lookups = GO_LOCAL_SCOPE_LOOKUPS.with(std::cell::Cell::get);
+            for receiver in ["fresh", "shadow", "w"] {
+                assert!(
+                    specs.iter().any(|spec| spec.receiver_name == receiver
+                        && spec.owner_name == "Worker"
+                        && spec.method_name == "Run"
+                        && spec.owner_module.is_none()),
+                    "concrete receiver {receiver} must survive capture and scope restoration"
+                );
+            }
+            assert!(specs.iter().any(|spec| spec.receiver_name == "pkg"
+                && spec.method_name == "New"
+                && spec.owner_module.as_deref() == Some("example.com/worker")
+                && spec.binding_marker.as_deref() == Some(PACKAGE_FUNCTION_CALLSITE_MARKER)));
+            assert!(
+                !specs
+                    .iter()
+                    .any(|spec| { matches!(spec.receiver_name.as_str(), "escaped" | "captured") }),
+                "address escape and local capture must remain blocked"
+            );
+            // Preserve every field and its order, including coordinates and
+            // receiver/certainty flags, for the same-fixture RED/GREEN audit.
+            let complete_specs = format!("{specs:#?}");
+            eprintln!("GO_LOCAL_SCOPE_DEMAND_LOOKUPS {identifier_uses} {scope_lookups}");
+            eprintln!(
+                "GO_LOCAL_SCOPE_DEMAND_SOURCE {identifier_uses} {}",
+                serde_json::to_string(&source).expect("complete source")
+            );
+            eprintln!(
+                "GO_LOCAL_SCOPE_DEMAND_OUTPUT {identifier_uses} {}",
+                serde_json::to_string(&complete_specs).expect("complete specs")
+            );
+            (scope_lookups, complete_specs)
+        };
+        let literals = measure(false);
+        let identifiers = measure(true);
+        assert_eq!(
+            literals.1, identifiers.1,
+            "complete navigation specs changed"
+        );
+        assert_eq!(
+            literals.0, 0,
+            "scope context eliminates local parent queries"
+        );
+        assert!(GO_LOCAL_CONTEXT_WORK.with(std::cell::Cell::get) > 0);
+        assert_eq!(
+            literals.0, identifiers.0,
+            "nonbinding identifier reads added unused scope-end lookups"
+        );
+    }
+
+    #[test]
+    fn go_local_capture_ancestry_work_scales_with_tree_size() {
+        let measure = |operands: usize| {
+            let expression = std::iter::repeat_n("v", operands)
+                .collect::<Vec<_>>()
+                .join(" + ");
+            assert!(expression.len() <= 512);
+            let mut source = String::from(
+                "package proof\nimport pkg \"example.com/worker\"\n\
+                 type Worker struct{}\nfunc (w *Worker) Run() {}\n\
+                 func caller(v int) {\n  worker := &Worker{}\n\
+                   worker.Run()\n  pkg.New()\n",
+            );
+            // Left-associated expression depth changes, but every source span
+            // stays fixed because the expression field always occupies 512 bytes.
+            source.push_str(&format!("  _ = {expression:<512}\n}}\n"));
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_go::LANGUAGE.into())
+                .expect("Go grammar");
+            let tree = parser.parse(&source, None).expect("Go source");
+            assert!(!tree.root_node().has_error(), "valid Go expression");
+            GO_CAPTURE_PARENT_HOPS.with(|work| work.set(0));
+            GO_LOCAL_CONTEXT_WORK.with(|work| work.set(0));
+            let specs = receiver_call_specs(&tree, &source);
+            let capture_parent_hops = GO_CAPTURE_PARENT_HOPS.with(std::cell::Cell::get);
+            let context_work = GO_LOCAL_CONTEXT_WORK.with(std::cell::Cell::get);
+            assert_eq!(specs.len(), 2, "both navigation paths must contribute");
+            assert!(specs.iter().any(|spec| spec.receiver_name == "worker"
+                && spec.owner_name == "Worker"
+                && spec.method_name == "Run"
+                && spec.owner_module.is_none()
+                && spec.binding_marker.is_none()));
+            assert!(specs.iter().any(|spec| spec.receiver_name == "pkg"
+                && spec.method_name == "New"
+                && spec.owner_module.as_deref() == Some("example.com/worker")
+                && spec.binding_marker.as_deref() == Some(PACKAGE_FUNCTION_CALLSITE_MARKER)));
+            let mut named_nodes = 0_usize;
+            walk_tree_nodes(tree.root_node(), &mut |_| named_nodes += 1);
+            let complete_specs = format!("{specs:#?}");
+            eprintln!(
+                "GO_LOCAL_ANCESTOR_CONTEXT_WORK {operands} {capture_parent_hops} {named_nodes}"
+            );
+            eprintln!(
+                "GO_LOCAL_ANCESTOR_CONTEXT_SOURCE {operands} {}",
+                serde_json::to_string(&source).expect("complete source")
+            );
+            eprintln!(
+                "GO_LOCAL_ANCESTOR_CONTEXT_OUTPUT {operands} {}",
+                serde_json::to_string(&complete_specs).expect("complete specs")
+            );
+            eprintln!("GO_LOCAL_ANCESTOR_CONTEXT_STEPS {operands} {context_work}");
+            (
+                capture_parent_hops,
+                named_nodes,
+                complete_specs,
+                context_work,
+            )
+        };
+        let small = measure(32);
+        let medium = measure(64);
+        let large = measure(128);
+        assert_eq!(small.2, medium.2, "complete navigation specs changed");
+        assert_eq!(medium.2, large.2, "complete navigation specs changed");
+        assert!(small.1 > 0 && small.1 < medium.1 && medium.1 < large.1);
+        assert!(large.1 <= medium.1 * 2, "fixture tree grew superlinearly");
+        assert!(small.3 > 0, "real context traversal must contribute");
+        assert!(
+            large.3 <= medium.3 * 2 + 128,
+            "context work grew superlinearly"
+        );
+        assert!(
+            large.3 <= large.1 * 4 + 128,
+            "context work exceeded traversal bound"
+        );
+        // Zero parent queries is valid when traversal context replaces them.
+        // Allow a generous affine bound; count actual helper work, not visits.
+        assert!(
+            large.0 <= medium.0 * 2 + 128,
+            "capture parent hops grew faster than tree size: {:?} -> {:?} -> {:?}",
+            (small.0, small.1),
+            (medium.0, medium.1),
+            (large.0, large.1)
+        );
+    }
+
+    #[test]
+    fn go_local_navigation_context_matches_legacy_parent_queries() {
+        let sources = [
+            "package proof\nfunc outer(v int) { if x := v; x > 0 { _ = func() { _ = x; _ = func() { _ = v } } } }\n",
+            "package proof\nfunc broken(v int) { if v > 0 { _ = func() { _ = v }\n",
+            "package proof\nfunc missing(v int) { _ = (v }\n",
+        ];
+        let mut checked = 0;
+        let mut unnamed_roots = 0;
+        let mut proper_subtree_roots = 0;
+        for (index, source) in sources.iter().enumerate() {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_go::LANGUAGE.into())
+                .expect("Go grammar");
+            let tree = parser.parse(source, None).expect("Go source");
+            assert_eq!(tree.root_node().has_error(), index > 0);
+            // Named traversal intentionally skips missing unnamed delimiters.
+            // Discover actual witnesses through raw children, then exercise each
+            // as a root where even an unnamed starting node must be visited.
+            let mut extra_roots = Vec::new();
+            let mut raw_nodes = vec![tree.root_node()];
+            let mut by_span = HashMap::new();
+            let mut missing = 0;
+            let mut equal_spans = 0;
+            while let Some(node) = raw_nodes.pop() {
+                if node.is_missing() {
+                    missing += 1;
+                    extra_roots.push(node);
+                }
+                if let Some(previous) = by_span.insert((node.start_byte(), node.end_byte()), node) {
+                    if previous.id() != node.id() {
+                        equal_spans += 1;
+                        extra_roots.push(previous);
+                        extra_roots.push(node);
+                    }
+                }
+                for child in (0..node.child_count()).rev() {
+                    raw_nodes.push(
+                        node.child(u32::try_from(child).expect("child index"))
+                            .expect("raw child"),
+                    );
+                }
+            }
+            if index == 2 {
+                assert!(missing > 0, "malformed fixture needs actual missing nodes");
+                assert!(
+                    equal_spans > 0,
+                    "malformed fixture needs distinct equal-span nodes"
+                );
+            }
+            eprintln!("GO_LOCAL_CONTEXT_ORACLE_WITNESSES {index} {missing} {equal_spans}");
+            let mut seen = HashSet::new();
+            extra_roots.retain(|node| seen.insert(node.id()));
+            let mut callables = Vec::new();
+            walk_tree_nodes(tree.root_node(), &mut |node| {
+                if matches!(
+                    node.kind(),
+                    "function_declaration" | "method_declaration" | "func_literal"
+                ) {
+                    callables.push(node);
+                }
+            });
+            assert!(!callables.is_empty());
+            for callable in callables {
+                let mut roots = vec![tree.root_node(), callable];
+                if let Some(body) = callable.child_by_field_name("body") {
+                    roots.push(body);
+                }
+                if let Some(first) = callable.child(0) {
+                    roots.push(first);
+                }
+                roots.extend(extra_roots.iter().copied());
+                for root in roots {
+                    unnamed_roots += usize::from(!root.is_named());
+                    proper_subtree_roots += usize::from(root.id() != callable.id());
+                    let mut expected_nodes = Vec::new();
+                    walk_tree_nodes(root, &mut |node| expected_nodes.push(node.id()));
+                    let mut actual_nodes = Vec::new();
+                    walk_go_navigation_nodes(root, callable, &mut |node, ancestors| {
+                        actual_nodes.push(node.id());
+                        checked += 1;
+                        assert_eq!(
+                            ancestors.belongs_to(callable),
+                            receiver_call_belongs_to_callable(node, callable)
+                        );
+                        assert_eq!(
+                            ancestors.binding_scope(),
+                            go_navigation_binding_scope(node, callable)
+                        );
+                        assert_eq!(
+                            ancestors.is_outer_block(callable),
+                            go_binding_is_in_callable_outer_block(node, callable)
+                        );
+                        assert_eq!(
+                            ancestors.capture,
+                            go_navigation_capture_span(node, callable)
+                        );
+                        assert_eq!(
+                            ancestors.scope.map(|scope| (
+                                scope.id(),
+                                scope.kind(),
+                                scope.start_byte(),
+                                scope.end_byte()
+                            )),
+                            go_nearest_navigation_lexical_container(node, callable).map(|scope| (
+                                scope.id(),
+                                scope.kind(),
+                                scope.start_byte(),
+                                scope.end_byte()
+                            ))
+                        );
+                    });
+                    assert_eq!(actual_nodes, expected_nodes, "named preorder changed");
+                }
+            }
+        }
+        assert!(checked > 0 && unnamed_roots > 0 && proper_subtree_roots > 0);
+    }
 
     fn measured_receiver_work(binding_count: usize, call_count: usize) -> usize {
         let mut source = String::from(

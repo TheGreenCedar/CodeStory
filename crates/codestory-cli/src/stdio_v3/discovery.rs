@@ -39,6 +39,13 @@ impl NativeSessionV3 {
         }
     }
 
+    pub(crate) fn with_result_display(mut self, display: super::profile::McpResultDisplay) -> Self {
+        self.negotiated_revision = self.negotiated_revision.with_result_display(display);
+        // Discovery identity remains the full canonical validation contract,
+        // independent of its advertised display view (as in launcher discovery).
+        self
+    }
+
     pub(crate) const fn negotiated_revision(&self) -> McpRevisionV3 {
         self.negotiated_revision
     }
@@ -107,7 +114,7 @@ pub(crate) fn discovery_contract_for_surface_v3(
     revision: McpRevisionV3,
     surface: V3SurfaceSet,
 ) -> DiscoveryContractIdentityV3 {
-    let document = discovery_document_v3(revision, surface);
+    let document = discovery_document_v3(revision.canonical(), surface);
     let canonical = canonical_json_bytes_v3(&document);
     DiscoveryContractIdentityV3 {
         revision,
@@ -219,6 +226,38 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+
+    #[test]
+    fn codex_json_text_advertises_text_contract_without_changing_handoff_identity() {
+        for revision in McpRevisionV3::all() {
+            let session = NativeSessionV3::negotiate(Some(revision.as_str()))
+                .with_result_display(super::super::McpResultDisplay::CodexJsonText);
+            let selected = session.negotiated_revision();
+            assert_eq!(
+                session.initialize_result()["protocolVersion"],
+                revision.as_str()
+            );
+            assert_eq!(
+                session.discovery_identity(),
+                &discovery_contract_v3(*revision)
+            );
+            assert_eq!(
+                discovery_contract_v3(selected).sha256,
+                discovery_contract_v3(*revision).sha256
+            );
+            let expected = super::super::catalog::tools_for_revision_v3(*revision);
+            let actual = super::super::catalog::tools_for_revision_v3(selected);
+            assert!(!actual.is_empty());
+            for (mut original, rendered) in expected.into_iter().zip(actual) {
+                if revision.profile().structured_content {
+                    assert!(original.get("outputSchema").is_some());
+                    original.as_object_mut().unwrap().remove("outputSchema");
+                }
+                assert_eq!(rendered, original);
+                assert!(rendered.get("outputSchema").is_none());
+            }
+        }
+    }
 
     #[test]
     fn discovery_contracts_are_deterministic_distinct_and_initialize_bound() {

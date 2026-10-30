@@ -9,8 +9,9 @@ use codestory_contracts::api::{
 use codestory_contracts::compilation::PACKET_RETRIEVAL_SCORE_VERSION_V1;
 use codestory_contracts::compilation::{
     INTERIM_MAX_ADMITTED_CANDIDATES, INTERIM_MAX_ADMITTED_SOURCE_BYTES,
-    INTERIM_SOURCE_CONTINUATION_UPPER_BOUND, PacketAdmissionGapKindV1, PacketAdmissionGapV1,
-    PacketAdmissionOriginV1, PacketAdmissionReceiptV1, PacketCandidateDescriptorV1,
+    INTERIM_SOURCE_CONTINUATION_UPPER_BOUND, INTERIM_SOURCE_ROW_UPPER_BOUND,
+    PacketAdmissionGapKindV1, PacketAdmissionGapV1, PacketAdmissionOriginV1,
+    PacketAdmissionReceiptV1, PacketCandidateDescriptorV1,
 };
 use codestory_contracts::graph::NodeId as CoreNodeId;
 use codestory_retrieval::LexicalAdmissionPolicy;
@@ -19,7 +20,6 @@ use sha2::{Digest, Sha256};
 #[cfg(any(test, feature = "benchmark-support"))]
 use std::cell::Cell;
 use std::cell::RefCell;
-#[cfg(any(test, feature = "benchmark-support"))]
 use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
@@ -56,6 +56,16 @@ pub(crate) struct PacketProofSession {
     gaps: RefCell<Vec<PacketAdmissionGapV1>>,
     retrieval_admission_sealed: RefCell<bool>,
     descriptor_results: RefCell<Vec<RetainedPacketDescriptorResult>>,
+    whole_file_length_candidates: RefCell<
+        HashMap<
+            String,
+            (
+                RetrievalPublicationIdentity,
+                codestory_retrieval::CandidateHit,
+            ),
+        >,
+    >,
+    early_whole_file_refusals: RefCell<BTreeMap<String, (String, usize)>>,
     admitted_call_annotations:
         RefCell<HashMap<String, codestory_contracts::compilation::PacketPublishedCallsV1>>,
     include_dense_semantic: bool,
@@ -234,6 +244,8 @@ impl PacketProofSession {
             gaps: RefCell::new(Vec::new()),
             retrieval_admission_sealed: RefCell::new(false),
             descriptor_results: RefCell::new(Vec::new()),
+            whole_file_length_candidates: RefCell::new(HashMap::new()),
+            early_whole_file_refusals: RefCell::new(BTreeMap::new()),
             admitted_call_annotations: RefCell::new(HashMap::new()),
             include_dense_semantic: true,
             replay_ranked_descriptors: RefCell::new(None),
@@ -404,6 +416,24 @@ impl PacketProofSession {
         }) {
             return Err("descriptor result was retained twice for one packet query");
         }
+        let mut lengths = self.whole_file_length_candidates.borrow_mut();
+        for candidate in &result.hits {
+            let Some(identity) = candidate.packet_stable_identity() else {
+                continue;
+            };
+            match lengths.entry(identity) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert((publication.clone(), candidate.clone()));
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let (previous_publication, previous) = entry.get_mut();
+                    if previous_publication != publication {
+                        return Err("whole-file length publication changed within packet");
+                    }
+                    previous.merge_whole_file_length_evidence(candidate);
+                }
+            }
+        }
         retained.push(RetainedPacketDescriptorResult {
             lexical_policy: expected_policy,
             query: result.query.clone(),
@@ -524,6 +554,22 @@ impl PacketProofSession {
         {
             return PacketAdmissionDecision::AlreadyAdmitted;
         }
+        if descriptor.exact_selector_ordinal.is_none()
+            && descriptor.symbol.is_none()
+            && self
+                .early_whole_file_refusals
+                .borrow()
+                .get(&descriptor.stable_identity)
+                .is_some_and(|(path, cap)| {
+                    path == &descriptor.path
+                        && descriptor
+                            .source_bytes_upper_bound
+                            .map(|bytes| (bytes as usize).min(INTERIM_SOURCE_ROW_UPPER_BOUND))
+                            == Some(*cap)
+                })
+        {
+            return PacketAdmissionDecision::SourceBudgetExceeded;
+        }
         if *self.retrieval_admission_sealed.borrow() {
             self.record_gap(
                 PacketAdmissionGapKindV1::CandidateCountExceeded,
@@ -540,6 +586,33 @@ impl PacketProofSession {
             );
             return PacketAdmissionDecision::SourceBudgetExceeded;
         };
+        if descriptor.exact_selector_ordinal.is_none()
+            && let Some((publication, candidate)) = self
+                .whole_file_length_candidates
+                .borrow()
+                .get(&descriptor.stable_identity)
+            && candidate.file_path == descriptor.path
+            && descriptor.symbol.is_none()
+            && let Some(decoded_bytes) = candidate.whole_file_decoded_bytes(
+                &publication.sidecar_generation,
+                &publication.sidecar_input_hash,
+            )
+            && decoded_bytes > (source_bytes as usize).min(INTERIM_SOURCE_ROW_UPPER_BOUND) as u64
+        {
+            self.early_whole_file_refusals.borrow_mut().insert(
+                descriptor.stable_identity.clone(),
+                (
+                    candidate.file_path.clone(),
+                    (source_bytes as usize).min(INTERIM_SOURCE_ROW_UPPER_BOUND),
+                ),
+            );
+            self.record_gap(
+                PacketAdmissionGapKindV1::SourceBudgetExceeded,
+                Some(descriptor.stable_identity.clone()),
+                None,
+            );
+            return PacketAdmissionDecision::SourceBudgetExceeded;
+        }
         self.admit_with_receipt(
             &descriptor.stable_identity,
             source_bytes as usize,
@@ -547,6 +620,40 @@ impl PacketProofSession {
             &descriptor.retrieval_score.version,
             descriptor.exact_selector_ordinal,
         )
+    }
+
+    pub(crate) fn is_metadata_excluded_candidate(
+        &self,
+        candidate: &codestory_retrieval::CandidateHit,
+    ) -> bool {
+        if !self.retrieval_admission_is_sealed()
+            || candidate.source != codestory_retrieval::CandidateSource::Lexical
+            || candidate.node_id.is_some()
+            || candidate.symbol_name.is_some()
+            || candidate.qualified_name.is_some()
+            || candidate.start_line.is_some()
+            || candidate.target.is_some()
+            || candidate.source_excerpt.is_some()
+        {
+            return false;
+        }
+        let Some(identity) = candidate.packet_stable_identity() else {
+            return false;
+        };
+        self.early_whole_file_refusals
+            .borrow()
+            .get(&identity)
+            .is_some_and(|(path, cap)| {
+                path == &candidate.file_path
+                    && candidate
+                        .source_bytes_upper_bound
+                        .map(|bytes| (bytes as usize).min(INTERIM_SOURCE_ROW_UPPER_BOUND))
+                        == Some(*cap)
+            })
+    }
+
+    pub(crate) fn early_whole_file_refusals(&self) -> BTreeMap<String, (String, usize)> {
+        self.early_whole_file_refusals.borrow().clone()
     }
 
     pub(crate) fn retrieval_admission_is_sealed(&self) -> bool {

@@ -1202,6 +1202,344 @@ fn test_nested_call_attribution_follows_enclosing_callable() -> anyhow::Result<(
 }
 
 #[test]
+fn go_named_struct_fields_keep_exact_declarations_and_member_owners() -> anyhow::Result<()> {
+    let source = r#"package fields
+type Embedded struct{}
+type Config struct {
+    DataPath string `mapstructure:"data-path"`
+    Left, Right *Embedded `json:"pair"`
+    _ string
+    Embedded
+    Nested struct { Hidden string }
+}
+type Other struct { DataPath *string }
+type (
+    First struct { Shared string }
+    Second struct { Shared *Embedded }
+    Reader interface { Read() }
+    Writer interface { Write() }
+)
+type Alias = Config
+type AliasStruct = struct { AliasOnly string }
+type PointerEmbedding struct { *Embedded }
+var anonymous = struct { Unowned string }{}
+func (c *Config) Open() {}
+func (o *Other) Open() {}
+"#;
+    let (nodes, edges) = index_single_file("fields.go", source)?;
+    let by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+    let fields: Vec<_> = nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::FIELD)
+        .collect();
+    assert_eq!(
+        fields.len(),
+        7,
+        "named fields must be indexed, including grouped names"
+    );
+    let expected = [
+        ("Config", "DataPath", 4),
+        ("Config", "Left", 5),
+        ("Config", "Right", 5),
+        ("Config", "Nested", 8),
+        ("Other", "DataPath", 10),
+        ("First", "Shared", 12),
+        ("Second", "Shared", 13),
+    ];
+    for (owner, name, line) in expected {
+        let matches: Vec<_> = fields
+            .iter()
+            .filter(|field| {
+                is_matching_name(&field.serialized_name, name) && field.start_line == Some(line)
+            })
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected one FIELD {owner}.{name} at {line}"
+        );
+        let field = matches[0];
+        let row = source.lines().nth(line as usize - 1).unwrap();
+        let column = row.find(name).unwrap() as u32 + 1;
+        assert_eq!(field.start_col, Some(column), "field declaration anchor");
+        assert_eq!(field.end_line, Some(line));
+        assert_eq!(field.end_col, Some(column + name.len() as u32));
+        let owners: Vec<_> = edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::MEMBER && edge.target == field.id)
+            .filter_map(|edge| by_id.get(&edge.source))
+            .collect();
+        assert_eq!(owners.len(), 1, "one exact owner for {owner}.{name}");
+        assert_eq!(owners[0].kind, NodeKind::STRUCT);
+        assert!(is_matching_name(&owners[0].serialized_name, owner));
+    }
+    for (owner, method, line) in [
+        ("Config", "Open", 21),
+        ("Other", "Open", 22),
+        ("Reader", "Read", 14),
+        ("Writer", "Write", 15),
+    ] {
+        let methods: Vec<_> = nodes
+            .iter()
+            .filter(|node| {
+                node.kind == NodeKind::METHOD
+                    && is_matching_name(&node.serialized_name, method)
+                    && node.start_line == Some(line)
+            })
+            .collect();
+        assert_eq!(methods.len(), 1, "one exact method {owner}.{method}");
+        let owners: Vec<_> = edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::MEMBER && edge.target == methods[0].id)
+            .filter_map(|edge| by_id.get(&edge.source))
+            .collect();
+        assert_eq!(
+            owners.len(),
+            1,
+            "no extra method owner for {owner}.{method}"
+        );
+        assert!(is_matching_name(&owners[0].serialized_name, owner));
+    }
+    Ok(())
+}
+
+#[test]
+fn go_package_initializer_calls_are_file_owned_without_deferred_body_calls() -> anyhow::Result<()> {
+    let source = r#"package startup
+
+type action func()
+func wrap(fn action) action { return fn }
+func build() action { return deferred }
+func combine(left, right action) action { return left }
+func deferred() {}
+var first = wrap(func() {
+    deferred()
+})
+var inline = wrap(func() { deferred() })
+var reference = wrap(deferred)
+var (
+    grouped = wrap(build())
+    nested = combine(wrap(build()), wrap(build()))
+)
+var sameA, sameB = wrap(deferred), wrap(deferred)
+var held = func() { deferred() }
+func ordinary() { var local = wrap(deferred); _ = local; wrap(deferred); deferred() }; var adjacent = wrap(func() { deferred() })
+"#;
+    let (nodes, edges) = index_single_file("initializers.go", source)?;
+    let files: Vec<_> = nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::FILE)
+        .collect();
+    assert_eq!(
+        files.len(),
+        1,
+        "the real file node must own package initialization"
+    );
+    let file = files[0];
+    let by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+    let named_function = |name: &str| {
+        let matches: Vec<_> = nodes
+            .iter()
+            .filter(|node| {
+                node.kind == NodeKind::FUNCTION && is_matching_name(&node.serialized_name, name)
+            })
+            .collect();
+        assert_eq!(matches.len(), 1, "expected one declared function {name}");
+        matches[0]
+    };
+    let function_name = |id| {
+        ["wrap", "build", "combine", "deferred", "ordinary"]
+            .into_iter()
+            .find(|name| named_function(name).id == id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "CALL target must be an actual declared function: {:?}",
+                    by_id.get(&id)
+                )
+            })
+    };
+    let functions: Vec<_> = nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::FUNCTION)
+        .collect();
+    assert_eq!(
+        functions.len(),
+        5,
+        "initializer bindings and function literals must not fabricate FUNCTION nodes: {functions:?}"
+    );
+    for binding in [
+        "first",
+        "inline",
+        "reference",
+        "grouped",
+        "nested",
+        "sameA",
+        "sameB",
+        "held",
+        "adjacent",
+    ] {
+        assert!(
+            !has_node_with_kind(&nodes, NodeKind::FUNCTION, binding),
+            "{binding} is a variable, not a callable declaration"
+        );
+    }
+    let file_calls: Vec<_> = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL && edge.effective_source() == file.id)
+        .collect();
+    assert_eq!(
+        file_calls.len(),
+        13,
+        "package initializer calls must survive real WorkspaceIndexer persistence as FILE-owned edges; callbacks/reference arguments add no calls. Calls: {:?}",
+        describe_call_edges(&edges, &nodes)
+    );
+    let mut observed = std::collections::BTreeMap::new();
+    let mut callsites = HashSet::new();
+    for edge in &file_calls {
+        assert_eq!(
+            edge.source, file.id,
+            "no fabricated callable owns initialization"
+        );
+        assert_eq!(edge.file_node_id, Some(file.id));
+        assert_ne!(edge.source, edge.target);
+        let target = edge.effective_target();
+        assert_eq!(by_id[&target].kind, NodeKind::FUNCTION);
+        *observed
+            .entry((
+                edge.line.expect("initializer CALL needs its physical line"),
+                function_name(target),
+            ))
+            .or_insert(0usize) += 1;
+        assert!(
+            callsites.insert(
+                edge.callsite_identity
+                    .as_deref()
+                    .expect("each initializer CALL needs a distinct callsite identity")
+            ),
+            "same-line calls must not collapse: {edge:?}"
+        );
+    }
+    let line_of = |prefix: &str| -> u32 {
+        source
+            .lines()
+            .position(|line| line.trim_start().starts_with(prefix))
+            .unwrap() as u32
+            + 1
+    };
+    let mut expected = std::collections::BTreeMap::new();
+    for (prefix, callee, count) in [
+        ("var first =", "wrap", 1),
+        ("var inline =", "wrap", 1),
+        ("var reference =", "wrap", 1),
+        ("grouped =", "wrap", 1),
+        ("grouped =", "build", 1),
+        ("nested =", "combine", 1),
+        ("nested =", "wrap", 2),
+        ("nested =", "build", 2),
+        ("var sameA, sameB =", "wrap", 2),
+        ("func ordinary()", "wrap", 1),
+    ] {
+        expected.insert((line_of(prefix), callee), count);
+    }
+    assert_eq!(
+        observed, expected,
+        "nested arguments, grouped declarations and distinct same-line initializers retain the actual evaluated callsites; deferred literal bodies are excluded"
+    );
+    let ordinary = named_function("ordinary");
+    let mut ordinary_calls = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL && edge.effective_source() == ordinary.id)
+        .map(|edge| {
+            assert_eq!(edge.line, Some(line_of("func ordinary()")));
+            function_name(edge.effective_target())
+        })
+        .collect::<Vec<_>>();
+    ordinary_calls.sort_unstable();
+    assert_eq!(
+        ordinary_calls,
+        ["deferred", "wrap", "wrap"],
+        "local var initializers and ordinary calls retain their function owner"
+    );
+    assert_no_self_call_edges("Go package initialization", &edges);
+    Ok(())
+}
+
+#[test]
+fn go_package_initializer_selectors_preserve_unresolved_target_policy() -> anyhow::Result<()> {
+    let source = r#"package startup
+import external "example.invalid/library"
+type holder struct{}
+func (h holder) Build() int { return 1 }
+func Build() int { return 2 }
+func wrap(value int) int { return value }
+var imported = external.Build(wrap(1))
+var object holder
+var selected = object.Build()
+func ordinary() { var external holder; var local = external.Build(); _ = local }
+"#;
+    let (nodes, edges) = index_single_file("selectors.go", source)?;
+    let by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+    let file = nodes
+        .iter()
+        .find(|node| node.kind == NodeKind::FILE)
+        .unwrap();
+    let file_calls: Vec<_> = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL && edge.effective_source() == file.id)
+        .collect();
+    assert_eq!(
+        file_calls.len(),
+        3,
+        "outer selectors and nested eager argument calls survive: {:?}",
+        describe_call_edges(&edges, &nodes)
+    );
+    let selectors: Vec<_> = file_calls
+        .iter()
+        .filter(|edge| {
+            edge.callsite_identity
+                .as_deref()
+                .is_some_and(|site| site.contains("syntax:go-selector-call"))
+        })
+        .collect();
+    assert_eq!(selectors.len(), 2);
+    for edge in selectors {
+        assert_eq!(edge.source, file.id);
+        assert_eq!(edge.file_node_id, Some(file.id));
+        assert_eq!(
+            edge.resolved_target, None,
+            "FILE ownership cannot invent receiver/import binding: {edge:?}"
+        );
+        assert_eq!(by_id[&edge.effective_target()].kind, NodeKind::UNKNOWN);
+        assert!(matches!(edge.line, Some(7 | 9)));
+    }
+    let wrap = file_calls
+        .iter()
+        .find(|edge| is_matching_name(&by_id[&edge.effective_target()].serialized_name, "wrap"))
+        .unwrap();
+    assert_eq!(wrap.line, Some(7));
+    assert_eq!(by_id[&wrap.effective_target()].kind, NodeKind::FUNCTION);
+    let ordinary = nodes
+        .iter()
+        .find(|node| {
+            node.kind == NodeKind::FUNCTION && is_matching_name(&node.serialized_name, "ordinary")
+        })
+        .unwrap();
+    let local_calls: Vec<_> = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL && edge.effective_source() == ordinary.id)
+        .collect();
+    assert_eq!(
+        local_calls.len(),
+        1,
+        "shadowed local receiver remains callable-owned"
+    );
+    assert_eq!(local_calls[0].line, Some(10));
+    assert!(!file_calls.iter().any(|edge| edge.line == Some(10)));
+    assert_no_self_call_edges("Go initializer selectors", &edges);
+    Ok(())
+}
+
+#[test]
 fn test_rust_struct_enum_and_local_bindings_are_indexed() -> anyhow::Result<()> {
     let (nodes, _) = index_single_file("locals.rs", RUST_SOURCE)?;
     assert!(has_node_name(&nodes, "MemoryRepository"));
@@ -1320,3 +1658,595 @@ fn test_trailing_space_extension_indexes_without_abort() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn public_export_navigation_is_bound_and_refreshes_target_only_edits() -> anyhow::Result<()> {
+    use codestory_store::{IndexPublicationMode, IndexPublicationRecord};
+    let dir = tempdir()?;
+    let root = dir.path();
+    let inputs = [
+        (
+            "owner.ts",
+            "export class _Painter { draw() {} }\nexport function _paint() {}\n",
+        ),
+        (
+            "entry.ts",
+            "import { _Painter as Local } from './owner.js';\nexport { Local as Painter };\nexport { _paint as paint } from './owner.js';\nexport function run() { new Local().draw(); }\n",
+        ),
+        ("local.js", "class _Local {}\nexport { _Local as Local };\n"),
+        ("a.ts", "export { _Painter as Shared } from './owner.js';\n"),
+        ("b.ts", "export { _paint as Shared } from './owner.js';\n"),
+        (
+            "barrel.ts",
+            "export { Painter as Chained } from './entry.js';\nexport * from './owner.js';\n",
+        ),
+        (
+            "unsupported.ts",
+            "import Default from './owner.js';\nexport { Default as NotProven };\nexport type { _Painter as TypeOnly } from './owner.js';\n",
+        ),
+    ];
+    for (path, source) in inputs {
+        fs::write(root.join(path), source)?;
+    }
+    let mut store = Storage::new_in_memory()?;
+    let indexer = WorkspaceIndexer::new(root.to_path_buf());
+    let refresh =
+        |paths: Vec<std::path::PathBuf>, existing_file_ids| codestory_workspace::RefreshInfo {
+            mode: codestory_workspace::BuildMode::Incremental,
+            files_to_index: paths,
+            files_to_remove: vec![],
+            existing_file_ids,
+        };
+    indexer.run_incremental(
+        &mut store,
+        &refresh(
+            inputs.iter().map(|(path, _)| root.join(path)).collect(),
+            HashMap::new(),
+        ),
+        &EventBus::new(),
+        None,
+    )?;
+    let publication = IndexPublicationRecord {
+        generation: 1,
+        generation_id: "exports".into(),
+        run_id: "run".into(),
+        mode: IndexPublicationMode::Full,
+        published_at_epoch_ms: 1,
+    };
+    codestory_indexer::rematerialize_proof_resolution_projection(&mut store, &publication)?;
+    store.put_index_publication(&publication)?;
+    for (name, canonical) in [
+        ("Painter", "_Painter"),
+        ("paint", "_paint"),
+        ("Local", "_Local"),
+    ] {
+        let found = store.public_export_aliases(name)?;
+        assert!(found.ready, "{name}");
+        assert_eq!(
+            found.rows.len(),
+            1,
+            "{name}: {found:?}; nodes: {:?}",
+            store.get_nodes()?
+        );
+        assert!(
+            store
+                .get_node(found.rows[0].target_node_id.unwrap())?
+                .unwrap()
+                .serialized_name
+                .ends_with(canonical)
+        );
+    }
+    let painter = store.public_export_aliases("Painter")?.rows[0]
+        .target_node_id
+        .unwrap();
+    let draw = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .filter(|fact| fact.callsite.raw_target == "draw")
+        .collect::<Vec<_>>();
+    assert!(
+        !draw.is_empty(),
+        "negative control must contain a real callsite"
+    );
+    assert!(
+        draw.iter().all(|fact| fact.status
+            != codestory_contracts::proof_resolution::ProofResolutionStatus::Exact),
+        "navigation aliases cannot broaden exact-call admission"
+    );
+    assert_eq!(store.public_export_aliases("Shared")?.rows.len(), 2);
+    store
+        .get_connection()
+        .execute_batch("SAVEPOINT cache_eviction; DELETE FROM index_artifact_cache;")?;
+    assert_eq!(
+        store.public_export_aliases("Painter")?.rows[0].target_node_id,
+        Some(painter),
+        "parser eviction cannot erase durable query authority"
+    );
+    let missing =
+        codestory_indexer::rematerialize_proof_resolution_projection(&mut store, &publication)
+            .expect_err("missing parser inputs cannot certify an empty replacement");
+    assert!(missing.to_string().contains("coverage is missing"));
+    assert_eq!(
+        store.public_export_aliases("Painter")?.rows.len(),
+        1,
+        "failed staged reconstruction preserves prior rows"
+    );
+    store
+        .get_connection()
+        .execute_batch("ROLLBACK TO cache_eviction; RELEASE cache_eviction;")?;
+    for name in ["Chained", "NotProven", "TypeOnly", "Invented"] {
+        assert!(store.public_export_aliases(name)?.rows.is_empty(), "{name}");
+    }
+    // Only the target is indexed. An unchanged exporter must not retain its old binding.
+    fs::write(
+        root.join("owner.ts"),
+        "export class Other {}\nexport function _paint() {}\n",
+    )?;
+    let existing = store
+        .get_files()?
+        .into_iter()
+        .map(|file| (file.path, file.id))
+        .collect();
+    indexer.run_incremental(
+        &mut store,
+        &refresh(vec![root.join("owner.ts")], existing),
+        &EventBus::new(),
+        None,
+    )?;
+    let mut next = publication.clone();
+    next.generation = 2;
+    next.generation_id = "next".into();
+    codestory_indexer::rematerialize_proof_resolution_projection(&mut store, &next)?;
+    store.put_index_publication(&next)?;
+    assert!(store.public_export_aliases("Painter")?.rows.is_empty());
+    assert!(
+        store.get_node(painter)?.is_none()
+            || store.get_node(painter)?.unwrap().serialized_name != "_Painter"
+    );
+    // A competing concrete .js source makes .js -> .ts navigation ambiguous.
+    fs::write(
+        root.join("owner.js"),
+        "export class _Painter {}\nexport function _paint() {}\n",
+    )?;
+    let existing = store
+        .get_files()?
+        .into_iter()
+        .map(|file| (file.path, file.id))
+        .collect();
+    indexer.run_incremental(
+        &mut store,
+        &refresh(vec![root.join("owner.js")], existing),
+        &EventBus::new(),
+        None,
+    )?;
+    next.generation = 3;
+    next.generation_id = "third".into();
+    codestory_indexer::rematerialize_proof_resolution_projection(&mut store, &next)?;
+    store.put_index_publication(&next)?;
+    let ambiguous = store.public_export_aliases("paint")?;
+    assert!(ambiguous.ready);
+    assert!(!ambiguous.complete);
+    assert!(ambiguous.rows.is_empty());
+    // Drift after extraction must reject the staged rebuild, not invent an empty binding.
+    fs::write(root.join("owner.js"), "export function changed() {}\n")?;
+    assert!(
+        codestory_indexer::rematerialize_proof_resolution_projection(&mut store, &next).is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn public_export_supported_bindings_coexist_with_unsupported_coverage() -> anyhow::Result<()> {
+    use codestory_store::{IndexPublicationMode, IndexPublicationRecord};
+    let cases = [
+        (
+            "supported",
+            "export class _Owner {}\n",
+            "export { _Owner as Public } from './owner.js';\n",
+            1,
+            false,
+        ),
+        (
+            "exporter_const",
+            "export class _Owner {}\n",
+            "export { _Owner as Public } from './owner.js';\nexport const version = 1;\n",
+            1,
+            true,
+        ),
+        (
+            "target_const",
+            "export class _Owner {}\nexport const version = 1;\n",
+            "export { _Owner as Public } from './owner.js';\n",
+            1,
+            true,
+        ),
+        (
+            "mixed_named_import",
+            "export class _Owner {}\nexport const version = 1;\nexport interface Other { size: number }\nexport default function unrelated() {}\n",
+            "import { _Owner as Local } from './owner.js';\nexport { Local as Public };\nexport const version = 2;\nexport declare namespace Other { const size: number; }\nexport type { Other } from './types';\nexport * from './unavailable';\n",
+            1,
+            true,
+        ),
+        (
+            "same_file",
+            "class _Owner {}\nexport { _Owner as Public };\nexport const version = 1;\n",
+            "export const other = 2;\n",
+            1,
+            true,
+        ),
+        (
+            "namespace_reexport_has_no_local_binding",
+            "class _Owner {}\nexport { _Owner as Public };\nexport * as _Owner from './unavailable';\n",
+            "export const version = 1;\n",
+            1,
+            true,
+        ),
+        (
+            "public_name_conflict",
+            "export class _Owner {}\n",
+            "export { _Owner as Public } from './owner.js';\nexport const Public = 1;\n",
+            0,
+            true,
+        ),
+        (
+            "target_name_conflict",
+            "export class _Owner {}\nexport const _Owner = 1;\n",
+            "export { _Owner as Public } from './owner.js';\n",
+            0,
+            true,
+        ),
+        (
+            "public_namespace_conflict",
+            "export class _Owner {}\n",
+            "export { _Owner as Public } from './owner.js';\nexport declare namespace Public { const size: number; }\n",
+            0,
+            true,
+        ),
+        (
+            "target_namespace_conflict",
+            "export class _Owner {}\nexport declare namespace _Owner { const size: number; }\n",
+            "export { _Owner as Public } from './owner.js';\n",
+            0,
+            true,
+        ),
+        (
+            "public_namespace_export_conflict",
+            "export class _Owner {}\n",
+            "export { _Owner as Public } from './owner.js';\nexport * as Public from './unavailable';\n",
+            0,
+            true,
+        ),
+        (
+            "local_namespace_conflict",
+            "class _Owner {}\ndeclare namespace _Owner { const size: number; }\nexport { _Owner as Public };\n",
+            "export const version = 1;\n",
+            0,
+            true,
+        ),
+        (
+            "function_with_unsupported_exports",
+            "export function _Owner() {}\nexport const version = 1;\nexport default class Other {}\n",
+            "export { _Owner as Public } from './owner.js';\nexport * from './unavailable';\nexport type { Other } from './types';\n",
+            1,
+            true,
+        ),
+        (
+            "duplicate_alias",
+            "export class _Owner {}\n",
+            "export { _Owner as Public } from './owner.js';\nexport { _Owner as Public } from './owner.js';\n",
+            0,
+            true,
+        ),
+        (
+            "missing_target",
+            "export class Other {}\n",
+            "export { _Owner as Public } from './owner.js';\n",
+            0,
+            true,
+        ),
+        (
+            "partial_exporter",
+            "export class _Owner {}\n",
+            "export { _Owner as Public } from './owner.js';\nfunction broken( {\n",
+            0,
+            true,
+        ),
+        (
+            "type_star_coexistence",
+            "export class _Owner {}\n",
+            "export { _Owner as Public } from './owner.js';\nexport type * from './types';\n",
+            1,
+            true,
+        ),
+        (
+            "partial_target",
+            "export class _Owner {}\nfunction broken( {\n",
+            "export { _Owner as Public } from './owner.js';\n",
+            0,
+            true,
+        ),
+        (
+            "unsupported_target",
+            "export const _Owner = 1;\n",
+            "export { _Owner as Public } from './owner.js';\n",
+            0,
+            true,
+        ),
+        (
+            "quoted_public_conflict",
+            "class _Owner {}\nclass Other {}\nexport { _Owner as Public };\nexport { Other as \"Public\" };\n",
+            "export const version = 1;\n",
+            0,
+            true,
+        ),
+        (
+            "quoted_public_unrelated",
+            "class _Owner {}\nclass Other {}\nexport { _Owner as Public };\nexport { Other as \"Different\" };\n",
+            "export const version = 1;\n",
+            1,
+            true,
+        ),
+        (
+            "quoted_empty_public_unrelated",
+            "class _Owner {}\nclass Other {}\nexport { _Owner as Public };\nexport { Other as \"\" };\n",
+            "export const version = 1;\n",
+            1,
+            true,
+        ),
+        (
+            "single_quoted_public_conflict",
+            "class _Owner {}\nclass Other {}\nexport { _Owner as Public };\nexport { Other as 'Public' };\n",
+            "export const version = 1;\n",
+            0,
+            true,
+        ),
+        (
+            "quoted_local_conflict",
+            "export class _Owner {}\nexport class Other {}\n",
+            "export { _Owner as Public } from './owner.js';\nexport { \"Other\" as Public } from './owner.js';\n",
+            0,
+            true,
+        ),
+        (
+            "quoted_local_unrelated",
+            "export class _Owner {}\nexport class Other {}\n",
+            "export { _Owner as Public } from './owner.js';\nexport { \"Other\" as Different } from './owner.js';\n",
+            1,
+            true,
+        ),
+        (
+            "quoted_alias_never_resolves",
+            "export class _Owner {}\n",
+            "export { _Owner as \"Public\" } from './owner.js';\n",
+            0,
+            true,
+        ),
+        (
+            "quoted_namespace_conflict",
+            "export class _Owner {}\n",
+            "export { _Owner as Public } from './owner.js';\nexport * as \"Public\" from './other.js';\n",
+            0,
+            true,
+        ),
+        (
+            "quoted_namespace_unrelated",
+            "export class _Owner {}\n",
+            "export { _Owner as Public } from './owner.js';\nexport * as \"Different\" from './other.js';\n",
+            1,
+            true,
+        ),
+        (
+            "escaped_json_public_conflict",
+            "class _Owner {}\nclass Other {}\nexport { _Owner as Public };\nexport { Other as \"Pub\\u006cic\" };\n",
+            "export const version = 1;\n",
+            0,
+            true,
+        ),
+        (
+            "escaped_json_public_unrelated",
+            "class _Owner {}\nclass Other {}\nexport { _Owner as Public };\nexport { Other as \"Diffe\\u0072ent\" };\n",
+            "export const version = 1;\n",
+            1,
+            true,
+        ),
+        (
+            "unknown_single_quoted_public",
+            "class _Owner {}\nclass Other {}\nexport { _Owner as Public };\nexport { Other as 'Pub\\u006cic' };\n",
+            "export const version = 1;\n",
+            0,
+            true,
+        ),
+        (
+            "unknown_identifier_public",
+            "class _Owner {}\nclass Other {}\nexport { _Owner as Public };\nexport { Other as Pub\\u006cic };\n",
+            "export const version = 1;\n",
+            0,
+            true,
+        ),
+        (
+            "unknown_local_declaration",
+            "class _Owner {}\nconst _Ow\\u006eer = 1;\nexport { _Owner as Public };\n",
+            "export const version = 1;\n",
+            0,
+            true,
+        ),
+        (
+            "unknown_local_does_not_poison_direct_reexport",
+            "export class _Owner {}\n",
+            "const Diffe\\u0072ent = 1;\nexport { _Owner as Public } from './owner.js';\nexport const version = 1;\n",
+            1,
+            true,
+        ),
+        (
+            "quoted_target_export_conflict",
+            "export class _Owner {}\nclass Other {}\nexport { Other as \"_Owner\" };\n",
+            "export { _Owner as Public } from './owner.js';\n",
+            0,
+            true,
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (name, target, exporter, expected, partial_coverage) in cases {
+        let dir = tempdir()?;
+        let root = dir.path();
+        fs::write(root.join("owner.ts"), target)?;
+        fs::write(root.join("entry.ts"), exporter)?;
+        let mut store = Storage::new_in_memory()?;
+        WorkspaceIndexer::new(root.to_path_buf()).run_incremental(
+            &mut store,
+            &codestory_workspace::RefreshInfo {
+                mode: codestory_workspace::BuildMode::Incremental,
+                files_to_index: vec![root.join("owner.ts"), root.join("entry.ts")],
+                files_to_remove: vec![],
+                existing_file_ids: HashMap::new(),
+            },
+            &EventBus::new(),
+            None,
+        )?;
+        let publication = IndexPublicationRecord {
+            generation: 1,
+            generation_id: name.into(),
+            run_id: name.into(),
+            mode: IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        codestory_indexer::rematerialize_proof_resolution_projection(&mut store, &publication)?;
+        store.put_index_publication(&publication)?;
+        let found = store.public_export_aliases("Public")?;
+        if !matches!(name, "partial_exporter" | "partial_target") {
+            assert!(
+                store.get_files()?.iter().all(|file| file.complete),
+                "valid fixture must have complete parser coverage: {name}"
+            );
+        }
+        eprintln!(
+            "mixed export matrix {name}: expected={expected} actual={} ready={} complete={}",
+            found.rows.len(),
+            found.ready,
+            found.complete
+        );
+        if !found.ready || found.rows.len() != expected || partial_coverage && found.complete {
+            failures.push(name);
+        }
+        for row in found.rows {
+            assert_eq!(
+                store
+                    .get_node(row.target_node_id.unwrap())?
+                    .unwrap()
+                    .serialized_name,
+                "_Owner"
+            );
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "mixed-export matrix failures: {failures:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn public_export_type_star_grammar_preserves_value_authority() -> anyhow::Result<()> {
+    use codestory_store::{IndexPublicationMode, IndexPublicationRecord};
+    let cases = [
+        ("plain", "export type * from './owner.js';\n", true, true),
+        (
+            "namespace",
+            "export type * as Types from './owner.js';\n",
+            true,
+            true,
+        ),
+        (
+            "type_only",
+            "export type * as Public from './owner.js';\n",
+            true,
+            false,
+        ),
+        ("missing_from", "export type * './owner.js';\n", false, true),
+        (
+            "missing_namespace_name",
+            "export type * as from './owner.js';\n",
+            false,
+            true,
+        ),
+        (
+            "unclosed_string",
+            "export type * from './owner.js\n",
+            false,
+            true,
+        ),
+        (
+            "unrelated_error",
+            "export type * from './owner.js';\nfunction broken( {\n",
+            false,
+            true,
+        ),
+    ];
+    let mut failures = Vec::new();
+    for extension in ["ts", "tsx"] {
+        for (name, type_export, parsed, named_exports) in cases {
+            let dir = tempdir()?;
+            let root = dir.path();
+            let owner = root.join(format!("owner.{extension}"));
+            let entry = root.join(format!("entry.{extension}"));
+            fs::write(
+                &owner,
+                "export class _Owner {}\nexport function _run() {}\n",
+            )?;
+            let mut source = String::new();
+            if named_exports {
+                source.push_str("export { _Owner as Public, _run as Run } from './owner.js';\n");
+            }
+            source.push_str(type_export);
+            fs::write(&entry, source)?;
+            let mut store = Storage::new_in_memory()?;
+            WorkspaceIndexer::new(root.to_path_buf()).run_incremental(
+                &mut store,
+                &codestory_workspace::RefreshInfo {
+                    mode: codestory_workspace::BuildMode::Incremental,
+                    files_to_index: vec![owner, entry.clone()],
+                    files_to_remove: vec![],
+                    existing_file_ids: HashMap::new(),
+                },
+                &EventBus::new(),
+                None,
+            )?;
+            let publication = IndexPublicationRecord {
+                generation: 1,
+                generation_id: format!("{extension}-{name}"),
+                run_id: name.into(),
+                mode: IndexPublicationMode::Full,
+                published_at_epoch_ms: 1,
+            };
+            codestory_indexer::rematerialize_proof_resolution_projection(&mut store, &publication)?;
+            store.put_index_publication(&publication)?;
+            let actual_parsed = store.get_file_by_path(&entry)?.unwrap().complete;
+            let class = store.public_export_aliases("Public")?;
+            let function = store.public_export_aliases("Run")?;
+            let namespace = store.public_export_aliases("Types")?;
+            let expected = usize::from(parsed && named_exports);
+            eprintln!(
+                "type-star matrix {extension}/{name}: parsed={actual_parsed} expected={parsed} class={} function={} expected={expected}",
+                class.rows.len(),
+                function.rows.len()
+            );
+            if actual_parsed != parsed
+                || !class.ready
+                || class.complete
+                || class.rows.len() != expected
+                || function.rows.len() != expected
+                || !namespace.rows.is_empty()
+            {
+                failures.push(format!("{extension}/{name}"));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "type-star matrix failures: {failures:?}"
+    );
+    Ok(())
+}
+
+#[path = "fidelity_regression/go_callable_value_references.rs"]
+mod go_callable_value_references;
