@@ -6,7 +6,7 @@
 
 - Change-impact analysis accepts exact changed source ranges and reports verified owners and unresolved ranges, helping callers avoid treating every declaration in a changed file as edited.
 
-- Exact-symbol searches, source snippets and name-based relationship lookups return resume instructions during longer setup, so agents can receive other tool results while preparation continues.
+- Exact-symbol searches, source snippets and name-based relationship lookups wait up to 1.5 seconds for setup to finish before returning resume instructions, so brief setup can complete in the original call.
 
 - Function-body snippets can return long indexed functions without falling back to a single source line when the body fits the source limit.
 

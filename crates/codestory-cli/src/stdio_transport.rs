@@ -74,7 +74,7 @@ const STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3: usize = 16 * 1024;
 const STDIO_STATUS_CACHE_TTL: Duration = Duration::from_secs(5);
 /// Activation and managed admission share one deadline, never renewed by a slice.
 const STDIO_OPERATION_BUDGET: Duration = Duration::from_secs(120);
-const STDIO_PREPARATION_FOREGROUND_BUDGET: Duration = Duration::from_millis(500);
+const STDIO_PREPARATION_FOREGROUND_BUDGET: Duration = Duration::from_millis(1_500);
 const STDIO_PREPARATION_PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 const STDIO_STATUS_PUBLICATION_ATTEMPTS: usize = 3;
 const STDIO_SOURCE_FINGERPRINT_FILE_CAP: usize = 25_000;
@@ -18412,6 +18412,103 @@ version = "0.11.20"
                 .expect("fresh core generation"),
             retained_generation,
             "snippet must bind the refreshed core generation: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_backed_default_preparation_returns_fresh_evidence_in_one_request() {
+        let mut fixture =
+            live_stdio_fixture(&[("lib.rs", "pub fn source_anchor() -> u32 { 1 }\n")]).await;
+        let warm = warm_fixture_and_symbol_id(&mut fixture, "source_anchor").await;
+        let node_id = warm["node_id"].as_str().expect("symbol id").to_string();
+        let retained_generation = warm["core_generation_id"]
+            .as_str()
+            .expect("retained core generation")
+            .to_string();
+        std::fs::write(
+            fixture.project_root.join("lib.rs"),
+            "pub fn source_anchor() -> u32 { 2 }\npub fn appended_marker() {}\n",
+        )
+        .expect("mutate indexed source");
+        let hold = MidIndexingHold::arm(&fixture.storage_path);
+
+        // Use the public default: no preparation budget override or retry.
+        fixture
+            .send_call(
+                "one-refresh-snippet",
+                "snippet",
+                json!({"project": fixture.project_root, "id": node_id}),
+            )
+            .await;
+        let entered = tokio::time::timeout(Duration::from_secs(5), hold.wait_until_entered()).await;
+        let early = if entered.is_ok() {
+            fixture
+                .collect_frames_for("one-refresh-snippet", Duration::from_millis(750))
+                .await
+        } else {
+            Vec::new()
+        };
+        drop(hold);
+
+        // The old default's terminal response has already been consumed. Keep it
+        // for the assertion instead of waiting for the same response again.
+        let response = if let Some(response) = early.first() {
+            Some(response.clone())
+        } else if entered.is_ok() {
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                fixture.read_response("one-refresh-snippet", Duration::from_secs(5)),
+            )
+            .await
+            .ok()
+        } else {
+            None
+        };
+
+        // Drain before assertions, including a missed hold or response timeout.
+        let shutdown = fixture.input.shutdown().await;
+        fixture.activation.cancel_and_wait();
+        let served = tokio::time::timeout(Duration::from_secs(3), &mut fixture.serving).await;
+        if served.is_err() {
+            fixture.serving.abort();
+            let _ = (&mut fixture.serving).await;
+        }
+        assert!(entered.is_ok(), "refresh must enter its owned hold");
+        shutdown.expect("close request stream");
+        assert_eq!(
+            served
+                .expect("serve task must drain")
+                .expect("serve task")
+                .expect("serve request"),
+            StdioServeOutcome::StdinClosed
+        );
+        assert!(
+            early.is_empty(),
+            "brief preparation must stay in the original request, without retained evidence or a resume: {early:?}"
+        );
+
+        let response = response.expect("one request must complete after releasing the hold");
+        let source = response["result"]["structuredContent"]["snippet"]
+            .as_str()
+            .unwrap_or_else(|| panic!("one request must return fresh source: {response}"));
+        assert!(
+            source.contains("pub fn source_anchor() -> u32 { 2 }")
+                && source.contains("pub fn appended_marker()"),
+            "the answer must contain the changed source, not retained bytes: {response}"
+        );
+        let meta = &response["result"]["_meta"]["codestory_publication"];
+        assert_eq!(meta["freshness"]["state"], json!("fresh"), "{response}");
+        assert_eq!(
+            meta["served_from"],
+            json!("complete_publication"),
+            "{response}"
+        );
+        assert_ne!(
+            meta["core_publication"]["generation_id"]
+                .as_str()
+                .expect("fresh core generation"),
+            retained_generation,
+            "the answer must bind the publication completed after the hold: {response}"
         );
     }
 
