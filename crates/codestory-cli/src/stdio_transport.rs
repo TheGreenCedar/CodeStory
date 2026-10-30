@@ -10254,7 +10254,6 @@ mod tests {
         let context = stdio_tool_call_success("context", context_packet_json(&context_answer));
 
         let search_result = codestory_contracts::api::SearchResultsDto {
-            incoming_sources: Default::default(),
             public_exports: Default::default(),
             query: "AppController".to_string(),
             retrieval_publication: None,
@@ -13693,7 +13692,6 @@ version = "0.11.20"
             score_breakdown: None,
         };
         let result = codestory_contracts::api::SearchResultsDto {
-            incoming_sources: Default::default(),
             public_exports: Default::default(),
             query: "test".to_string(),
             retrieval_publication: None,
@@ -13745,7 +13743,6 @@ version = "0.11.20"
         // that, and retrieval_publication was reaching the wire while only `_meta` declared it.
         let declared = crate::stdio_catalog::SEARCH_RESULTS_SCHEMA.declared_property_names();
         let dto = codestory_contracts::api::SearchResultsDto {
-            incoming_sources: Default::default(),
             public_exports: Default::default(),
             query: "scripted".into(),
             // Must be populated: serde skips a None, so a None fixture cannot observe the field

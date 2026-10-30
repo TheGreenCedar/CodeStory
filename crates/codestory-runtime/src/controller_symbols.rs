@@ -336,23 +336,6 @@ impl AppController {
     ) -> Result<Vec<SearchHit>, ApiError> {
         let storage = self.open_storage_read_only()?;
         let project_root = self.require_project_root()?;
-        Ok(Self::resolve_core_symbol_candidates_with_ids(
-            &storage,
-            &project_root,
-            query,
-            max_results,
-        )?
-        .into_iter()
-        .map(|(_, hit)| hit)
-        .collect())
-    }
-
-    pub(crate) fn resolve_core_symbol_candidates_with_ids(
-        storage: &Storage,
-        project_root: &Path,
-        query: &str,
-        max_results: usize,
-    ) -> Result<Vec<(codestory_contracts::graph::NodeId, SearchHit)>, ApiError> {
         let absolute_query = Path::new(query.trim()).is_absolute();
         let expected_rows = storage
             .get_canonical_search_symbol_count()
@@ -387,7 +370,7 @@ impl AppController {
                     entry.node_kind == Some(codestory_contracts::graph::NodeKind::FILE as i64);
                 let path = Path::new(&entry.display_name);
                 let scoring_name = if is_file || path.is_absolute() {
-                    match codestory_workspace::workspace_relative_path(project_root, path) {
+                    match codestory_workspace::workspace_relative_path(&project_root, path) {
                         Some(_) if absolute_query => entry.display_name.clone(),
                         Some(relative) => relative.to_string_lossy().replace('\\', "/"),
                         None if path.is_absolute() => continue,
@@ -421,26 +404,29 @@ impl AppController {
             .collect();
         let mut hits = matches
             .into_iter()
-            .map(|(id, score)| {
-                Self::build_search_hit(storage, &names, id, score)
-                    .map(|hit| hit.map(|hit| (id, hit)))
-            })
+            .map(|(id, score)| Self::build_search_hit(&storage, &names, id, score))
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
         hits.sort_by(|left, right| {
             compare_search_hits_with_project_root(
-                Some(project_root),
+                Some(project_root.as_path()),
                 query,
-                &left.1,
-                &right.1,
+                left,
+                right,
                 None,
             )
         });
         hits.truncate(max_results.clamp(1, 50));
-        for (id, hit) in &mut hits {
-            if let Some(display_name) = node_names.get(id) {
+        for hit in &mut hits {
+            if let Some(display_name) = hit
+                .node_id
+                .0
+                .parse::<i64>()
+                .ok()
+                .and_then(|id| node_names.get(&codestory_contracts::graph::NodeId(id)))
+            {
                 hit.display_name.clone_from(display_name);
             }
             decorate_lexical_search_hit_evidence(hit);

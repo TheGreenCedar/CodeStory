@@ -1182,28 +1182,6 @@ pub struct SearchPublicExportEvidence {
     pub bounded: bool,
 }
 
-/// Captured indexed source selected through Store-admitted incoming relations.
-/// Relation values are retained in process; public projection asserts only source.
-#[derive(Debug, Clone)]
-pub struct SearchIncomingSource {
-    pub node_id: crate::graph::NodeId,
-    pub path: String,
-    pub display_name: String,
-    pub start_line: u32,
-    pub end_line: u32,
-    pub excerpt: String,
-    pub source_sha256: String,
-    pub relations: Vec<crate::graph::Edge>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct SearchIncomingSources {
-    pub sources: Vec<SearchIncomingSource>,
-    pub inspected: bool,
-    pub unavailable: bool,
-    pub bounded: bool,
-}
-
 /// Search response with product hits and optional diagnostics.
 /// `hits` is the merged list; source-specific lists retain provenance diagnostics.
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -1211,9 +1189,6 @@ pub struct SearchResultsDto {
     #[serde(skip)]
     #[specta(skip)]
     pub public_exports: SearchPublicExportEvidence,
-    #[serde(skip)]
-    #[specta(skip)]
-    pub incoming_sources: SearchIncomingSources,
     pub query: String,
     /// Exact complete retrieval publication used to build this response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
