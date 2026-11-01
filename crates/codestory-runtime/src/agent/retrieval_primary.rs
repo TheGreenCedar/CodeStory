@@ -1429,7 +1429,7 @@ fn complete_file_rendered_bound(decoded_bytes: u64, line_count: u32) -> Option<u
     let bytes = decoded_bytes
         .checked_add(prefix.checked_mul(u64::from(line_count))?)?
         .checked_add(12)?;
-    (bytes <= INTERIM_SOURCE_CONTINUATION_UPPER_BOUND as u64).then(|| bytes as u32)
+    (bytes <= INTERIM_SOURCE_CONTINUATION_UPPER_BOUND as u64).then_some(bytes as u32)
 }
 
 fn retain_existing_file_matches(
