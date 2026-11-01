@@ -144,6 +144,11 @@ budget, including both representations and metadata; use narrower source windows
 when needed. See [response byte accounting](references/snippet.md#response-byte-accounting)
 for a code-mode UTF-8 counter and its measurement boundary.
 
+
+For an optional source-artifact handoff to a fresh counted native helper, see
+[source handoff](references/source-handoff.md). Ordinary source tools can use the
+same workflow; the primary chooses whether to use it.
+
 ## Investigate adaptively
 
 Choose the smallest useful operation; no preliminary `status` or `packet` call

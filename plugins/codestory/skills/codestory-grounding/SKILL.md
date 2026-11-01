@@ -21,4 +21,6 @@ Complete, exact source bodies in ordinary tool results, with file hashes and phy
 
 Tools own preparation; follow returned retry hints. Do not repair shared state. A failed call does not end authorized investigation.
 
+For an optional source-artifact handoff to a counted native helper, see [source handoff](references/source-handoff.md). Ordinary source tools can use the same workflow.
+
 Use [GUIDE.md](GUIDE.md) for needed unfamiliar or complex detail, not routinely for known operations.
