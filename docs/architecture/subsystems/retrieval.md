@@ -56,6 +56,13 @@ paths use their existing Core admission and runtime hydration routes. It returns
 an authenticated source witness, without inventing a Core node or parser coverage.
 Runtime owns the smaller delivery reservation.
 
+A pinned reader also exposes bounded decoded-length metadata for exact source
+paths. It checks the sealed generation and newest logical owner, including
+tombstones, without reading repository source. Runtime combines this metadata
+with canonical Core file metadata for admission planning. A size observation
+does not establish source availability or rendered fit by itself; source
+hydration and final revalidation remain authoritative.
+
 Lexical scans also search decoded structural text. Schema v5 records an additional
 original-byte SHA-256 for BOM UTF-16 source; the immutable document digest binds
 that value separately from decoded content. Missing or altered encoded identity

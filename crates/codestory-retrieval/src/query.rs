@@ -218,6 +218,38 @@ impl PublishedFileSourceWitness {
 }
 
 impl PinnedQuerySession {
+    /// Optional metadata from this exact, already sealed lexical generation.
+    /// Missing facts leave ordinary fragment admission unchanged.
+    pub fn published_file_decoded_lengths(
+        &self,
+        paths: &[String],
+        cancelled: Option<Arc<AtomicBool>>,
+    ) -> Result<std::collections::HashMap<String, u64>> {
+        self.revalidate()?;
+        let generation = self
+            .manifest
+            .sidecar_generation
+            .as_deref()
+            .context("file length generation missing")?;
+        let input_hash = self
+            .manifest
+            .sidecar_input_hash
+            .as_deref()
+            .context("file length input identity missing")?;
+        let lengths = crate::lexical_index::read_published_file_lengths(
+            &crate::lexical_index::shard_dir_for(&self.runtime.layout.lexical_data_dir, generation),
+            input_hash,
+            paths,
+            Arc::new(move || {
+                cancelled
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(Ordering::Acquire))
+            }),
+        )?;
+        self.revalidate()?;
+        Ok(lengths)
+    }
+
     /// Runtime must authorize the exact sealed file receipt first. This method
     /// performs no query and cannot be used during descriptor-only readiness.
     pub fn read_published_file_source(

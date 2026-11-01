@@ -5064,6 +5064,134 @@ pub(crate) fn read_published_file_content(
     }))
 }
 
+/// Exact-path length facts from an already sealed publication. This optional
+/// preadmission read never decodes content or inspects repository files.
+pub(crate) fn read_published_file_lengths(
+    shard: &Path,
+    input_hash: &str,
+    paths: &[String],
+    cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+) -> Result<HashMap<String, u64>> {
+    if paths.len() > codestory_contracts::compilation::INTERIM_MAX_ADMITTED_CANDIDATES {
+        bail!("file length metadata bound exceeded");
+    }
+    let generation = shard
+        .file_name()
+        .and_then(|s| s.to_str())
+        .context("file length generation")?;
+    let components = read_lexical_component_set(shard, Some(generation), Some(input_hash))?;
+    let artifacts = components.as_ref().map_or_else(
+        || sqlite_file_with_sidecars(&shard.join(LEXICAL_INDEX_FILE)),
+        |set| lexical_component_set_artifacts(shard, set),
+    );
+    let sealed = || {
+        if components.is_some() {
+            LEXICAL_COMPONENT_SET_RECEIPTS
+                .reuse_sealed(&shard.join(LEXICAL_COMPONENT_SET_FILE), &artifacts)
+                .is_some()
+        } else {
+            LEXICAL_SHARD_RECEIPTS
+                .reuse_sealed(&shard.join(LEXICAL_INDEX_FILE), &artifacts)
+                .is_some()
+        }
+    };
+    // A cold metadata miss is unknown, never permission to deep-scan source.
+    if !sealed() {
+        return Ok(HashMap::new());
+    }
+    let before = ArtifactSeal::observe_all(&artifacts)?;
+    if before
+        .iter()
+        .any(|seal| seal.is_present() && seal.fidelity() != Some(SealFidelity::InodeChangeTracked))
+    {
+        return Ok(HashMap::new());
+    }
+    let mut lengths = HashMap::new();
+    for expected_path in paths {
+        if cancelled() {
+            bail!("file length metadata cancelled");
+        }
+        if expected_path.is_empty()
+            || expected_path.contains('\\')
+            || expected_path
+                .split('/')
+                .any(|p| p.is_empty() || matches!(p, "." | ".."))
+            || !Path::new(expected_path)
+                .components()
+                .all(|p| matches!(p, std::path::Component::Normal(_)))
+        {
+            continue;
+        }
+        let key = format!("source\0{expected_path}");
+        let descriptor = if let Some(set) = &components {
+            let mut owner = Some(&set.base);
+            for delta in set.deltas.iter().rev() {
+                if delta.tombstone_keys.contains(&key) {
+                    owner = None;
+                    break;
+                }
+                if delta.upsert_keys.contains(&key) {
+                    owner = Some(&delta.component);
+                    break;
+                }
+            }
+            let Some(owner) = owner else {
+                continue;
+            };
+            Some(owner)
+        } else {
+            None
+        };
+        let database = descriptor.map_or_else(
+            || shard.join(LEXICAL_INDEX_FILE),
+            |d| shard.join(&d.file_name),
+        );
+        let connection = open_read_only(&database)?;
+        let stop = Arc::clone(&cancelled);
+        connection.progress_handler(1000, Some(move || stop()))?;
+        if let Some(descriptor) = descriptor {
+            if read_open_database_metadata(&connection, cancelled.as_ref())? != descriptor.metadata
+            {
+                bail!("file length component changed after validation");
+            }
+        } else {
+            validate_open_database_metadata(
+                &connection,
+                shard,
+                generation,
+                input_hash,
+                None,
+                cancelled.as_ref(),
+            )?;
+        }
+        if lexical_database_schema_version(&connection)? < LEXICAL_DATABASE_SCHEMA_V4 {
+            continue;
+        }
+        let row = connection.query_row(
+            "SELECT path,source,node_id,symbol_name,start_line,content_decoded_bytes FROM lexical_documents WHERE document_key=?1",
+            [&key], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<String>>(3)?, r.get::<_, Option<u32>>(4)?, r.get::<_, i64>(5)?)),
+        ).optional()?;
+        if let Some((path, source, node, symbol, start, bytes)) = row
+            && path == *expected_path
+            && source == "lexical_source"
+            && node.is_none()
+            && symbol.is_none()
+            && start.is_none()
+            && let Ok(bytes) = u64::try_from(bytes)
+        {
+            lengths.insert(path, bytes);
+        }
+    }
+    if cancelled() {
+        bail!("file length metadata cancelled");
+    }
+    if !sealed() || ArtifactSeal::observe_all(&artifacts)? != before {
+        bail!("file length publication changed during lookup");
+    }
+    Ok(lengths)
+}
+
 /// Read only producer-sealed metadata for already eligible symbol identities.
 /// No FTS, content decoding, source hydration, Core or graph query is permitted.
 /// Newest component ownership wins even when its annotation is absent.

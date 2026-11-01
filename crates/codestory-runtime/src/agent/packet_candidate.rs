@@ -36,6 +36,13 @@ pub(crate) enum PacketGraphDirection {
     Incoming,
 }
 
+/// Core-bound original focus for an automatic genuine FILE admission.
+#[derive(Debug, Clone)]
+pub(crate) struct AutomaticFileContext {
+    pub(crate) ranges: Vec<codestory_contracts::compilation::PacketSourceRangeV1>,
+    pub(crate) matched: bool,
+}
+
 /// Thread-scoped Horizon A admission counters for one packet operation.
 ///
 /// Formula hydration, trail-scan ledgers, and promotion need-sets no longer
@@ -68,6 +75,8 @@ pub(crate) struct PacketProofSession {
     early_whole_file_refusals: RefCell<BTreeMap<String, (String, usize)>>,
     admitted_call_annotations:
         RefCell<HashMap<String, codestory_contracts::compilation::PacketPublishedCallsV1>>,
+    pub(crate) automatic_file_context: RefCell<HashMap<String, AutomaticFileContext>>,
+    pub(crate) automatic_file_matches: RefCell<HashMap<String, String>>,
     include_dense_semantic: bool,
     replay_ranked_descriptors: RefCell<Option<Vec<PacketCandidateDescriptorV1>>>,
     #[cfg(any(test, feature = "benchmark-support"))]
@@ -247,6 +256,8 @@ impl PacketProofSession {
             whole_file_length_candidates: RefCell::new(HashMap::new()),
             early_whole_file_refusals: RefCell::new(BTreeMap::new()),
             admitted_call_annotations: RefCell::new(HashMap::new()),
+            automatic_file_context: RefCell::new(HashMap::new()),
+            automatic_file_matches: RefCell::new(HashMap::new()),
             include_dense_semantic: true,
             replay_ranked_descriptors: RefCell::new(None),
             #[cfg(any(test, feature = "benchmark-support"))]
@@ -536,6 +547,54 @@ impl PacketProofSession {
             "exact-selector/v1",
             Some(selector_ordinal),
         )
+    }
+
+    pub(crate) fn apply_admitted_file_representation(
+        &self,
+        descriptor: &mut PacketCandidateDescriptorV1,
+    ) {
+        if descriptor.exact_selector_ordinal.is_some() {
+            return;
+        }
+        let matches = self.automatic_file_matches.borrow();
+        let Some(file) = matches.get(&descriptor.stable_identity) else {
+            return;
+        };
+        let admitted = self.admitted_identities.borrow();
+        let Some(bytes) = admitted.get(file) else {
+            return;
+        };
+        descriptor.stable_identity = file.clone();
+        descriptor.symbol = None;
+        descriptor.source_bytes_upper_bound = u32::try_from(*bytes).ok();
+        descriptor.published_calls = None;
+        descriptor.published_calls_conflicted = false;
+    }
+
+    pub(crate) fn descriptor_known_whole_file_overflow(
+        &self,
+        descriptor: &PacketCandidateDescriptorV1,
+    ) -> bool {
+        let Some(cap) = descriptor.source_bytes_upper_bound else {
+            return false;
+        };
+        descriptor.exact_selector_ordinal.is_none()
+            && descriptor.symbol.is_none()
+            && self
+                .whole_file_length_candidates
+                .borrow()
+                .get(&descriptor.stable_identity)
+                .is_some_and(|(publication, candidate)| {
+                    candidate.file_path == descriptor.path
+                        && candidate
+                            .whole_file_decoded_bytes(
+                                &publication.sidecar_generation,
+                                &publication.sidecar_input_hash,
+                            )
+                            .is_some_and(|bytes| {
+                                bytes > (cap as usize).min(INTERIM_SOURCE_ROW_UPPER_BOUND) as u64
+                            })
+                })
     }
 
     pub(crate) fn admit_descriptor(

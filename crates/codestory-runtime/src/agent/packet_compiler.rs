@@ -67,6 +67,8 @@ pub(crate) struct PreparedPacketCompilationV1 {
     // Complete-line alternatives are made during the same authenticated read.
     // They remain private runtime witnesses, never compiler question inputs.
     source_page_alternatives: BTreeMap<usize, Vec<PacketHydratedSourceRangeV1>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    matched_source_floor: Vec<PacketHydratedSourceRangeV1>,
     requested_source_identities: BTreeSet<String>,
     #[serde(default)]
     requested_source_minimum_ends: BTreeMap<String, u32>,
@@ -95,6 +97,7 @@ impl PreparedPacketCompilationV1 {
             file_navigation_paths: HashMap::new(),
             metadata_excluded_identities: BTreeSet::new(),
             source_page_alternatives: BTreeMap::new(),
+            matched_source_floor: Vec::new(),
             requested_source_identities: BTreeSet::new(),
             requested_source_minimum_ends: BTreeMap::new(),
             issued_context_sources: None,
@@ -205,6 +208,9 @@ impl PreparedPacketCompilationV1 {
                     ));
                 }
                 calls += 1;
+                if !matched_source_retained(&product.support, &prepared.matched_source_floor) {
+                    return Ok(None);
+                }
                 measure(prepared, product, baseline)
             };
         let original_sources = self.input.sources.clone();
@@ -961,6 +967,50 @@ pub(crate) fn prepare_packet_compilation(
             &mut source_refusals,
             &mut source_page_alternatives,
         )?;
+    let mut matched_source_floor = Vec::new();
+    for source in &sources {
+        let contexts = session.automatic_file_context.borrow();
+        let Some(context) = contexts.get(&source.stable_identity) else {
+            continue;
+        };
+        let Some(admission) = admissions
+            .iter()
+            .find(|a| a.stable_identity == source.stable_identity)
+        else {
+            continue;
+        };
+        let pages = context
+            .ranges
+            .iter()
+            .filter_map(|range| {
+                focused_authenticated_file(source, *range, source_byte_cap(admission))
+            })
+            .collect::<Vec<_>>();
+        if context.matched {
+            matched_source_floor.extend(pages.clone());
+        }
+        // Served-source records admit one range per identity. Use one
+        // authenticated covering focus, including real intervening lines,
+        // rather than manufacturing disjoint pages/aliases under a FILE ID.
+        if let (Some(start_line), Some(end_line)) = (
+            context.ranges.iter().map(|range| range.start_line).min(),
+            context.ranges.iter().map(|range| range.end_line).max(),
+        ) && let Some(focus) = focused_authenticated_file(
+            source,
+            PacketSourceRangeV1 {
+                start_line,
+                end_line,
+            },
+            source_byte_cap(admission),
+        ) {
+            for cap in [2048, 1024, INTERIM_SOURCE_ROW_UPPER_BOUND] {
+                source_page_alternatives
+                    .entry(cap)
+                    .or_default()
+                    .push(focus.clone());
+            }
+        }
+    }
     let metadata_excluded_identities = early_refusals.keys().cloned().collect();
     file_navigation_paths.extend(
         early_refusals
@@ -1046,6 +1096,7 @@ pub(crate) fn prepare_packet_compilation(
         file_navigation_paths,
         metadata_excluded_identities,
         source_page_alternatives,
+        matched_source_floor,
         requested_source_identities,
         requested_source_minimum_ends,
         issued_context_sources,
@@ -1109,6 +1160,7 @@ pub(crate) fn replay_prepare_from_sealed_admissions(
         file_navigation_paths: navigation,
         metadata_excluded_identities: BTreeSet::new(),
         source_page_alternatives: alternatives,
+        matched_source_floor: Vec::new(),
         requested_source_identities: std::collections::BTreeSet::new(),
         requested_source_minimum_ends: BTreeMap::new(),
         issued_context_sources: None,
@@ -1300,6 +1352,85 @@ fn final_support_identities_for_observation(support: &[SupportUnitDto]) -> Vec<S
         }
     }
     identities
+}
+
+// These lines come only from authenticated numbered source, never prose.
+fn numbered_source_lines(source: &str) -> BTreeMap<u32, &str> {
+    source
+        .lines()
+        .filter_map(|line| {
+            let (number, text) = line.split_once(" | ")?;
+            Some((
+                number.trim().trim_start_matches('>').trim().parse().ok()?,
+                text,
+            ))
+        })
+        .collect()
+}
+
+fn focused_authenticated_file(
+    source: &PacketHydratedSourceRangeV1,
+    range: PacketSourceRangeV1,
+    cap: usize,
+) -> Option<PacketHydratedSourceRangeV1> {
+    let delivery = source.delivery.as_ref()?;
+    if source.start_line != 1
+        || delivery.remaining_source_bytes != 0
+        || !range.is_valid()
+        || range.end_line > source.end_line
+    {
+        return None;
+    }
+    let lines = numbered_source_lines(&source.source);
+    if lines.len() != source.end_line as usize {
+        return None;
+    }
+    let mut text = String::new();
+    for number in 1..=source.end_line {
+        writeln!(text, "{}", lines.get(&number)?).ok()?;
+    }
+    let (markdown, end, delivery) =
+        complete_node_page(&text, range, cap, &delivery.source_sha256).ok()?;
+    if end != range.end_line {
+        return None;
+    }
+    let mut focused = source.clone();
+    focused.start_line = range.start_line;
+    focused.end_line = end;
+    focused.source = markdown;
+    focused.delivery = Some(delivery);
+    focused.callable_body = None;
+    Some(focused)
+}
+
+// Automatic FILE context can expand around the original matched lines. Exact
+// typed/served pages continue to use the stricter unchanged prefix contract.
+fn matched_source_retained(
+    candidate: &[SupportUnitDto],
+    floor: &[PacketHydratedSourceRangeV1],
+) -> bool {
+    floor.iter().all(|old| {
+        let Some(delivery) = &old.delivery else {
+            return false;
+        };
+        let lines = numbered_source_lines(&old.source);
+        candidate.iter().any(|new| {
+            new.kind == SupportUnitKindDto::SourceRange
+                && final_support_stable_identity(new).as_deref()
+                    == Some(old.stable_identity.as_str())
+                && new.path.as_deref() == Some(old.path.as_str())
+                && new
+                    .source_delivery
+                    .as_ref()
+                    .is_some_and(|d| d.source_sha256 == delivery.source_sha256)
+                && new.snippet.as_deref().is_some_and(|snippet| {
+                    let actual = numbered_source_lines(snippet);
+                    lines
+                        .iter()
+                        .all(|(number, text)| actual.get(number) == Some(text))
+                })
+        })
+    })
 }
 
 // Expansion may add complete physical lines, but cannot erase or rewrite a floor.
@@ -1674,10 +1805,9 @@ fn hydrate_admitted_node_source_with_range_cached(
         .map_err(|_| PacketAdmissionGapKindV1::SourceUnavailable)?
         .ok_or(PacketAdmissionGapKindV1::SourceUnavailable)?;
     if node.kind == CoreNodeKind::FILE {
-        if requested.is_some() {
-            return Err(PacketAdmissionGapKindV1::SourceBoundMissing);
-        }
-        return hydrate_admitted_file_source(controller, storage, admission, &file);
+        return hydrate_admitted_file_source_with_range(
+            controller, storage, admission, &file, requested,
+        );
     }
     let (start_line, end_line) = valid_source_bounds(node.start_line, node.end_line)
         .ok_or(PacketAdmissionGapKindV1::SourceBoundMissing)?;
@@ -1875,6 +2005,16 @@ fn hydrate_admitted_file_source(
     admission: &PacketAdmissionReceiptV1,
     file: &FileInfo,
 ) -> Result<PacketHydratedSourceRangeV1, PacketAdmissionGapKindV1> {
+    hydrate_admitted_file_source_with_range(controller, storage, admission, file, None)
+}
+
+fn hydrate_admitted_file_source_with_range(
+    controller: &AppController,
+    storage: &Store,
+    admission: &PacketAdmissionReceiptV1,
+    file: &FileInfo,
+    requested: Option<PacketSourceRangeV1>,
+) -> Result<PacketHydratedSourceRangeV1, PacketAdmissionGapKindV1> {
     // A file identity has no source focus. Preserve a complete short file when
     // its pinned bytes fit the admission; otherwise leave it as navigation.
     // Reading its first few lines would falsely promote an arbitrary header
@@ -1886,6 +2026,28 @@ fn hydrate_admitted_file_source(
         .get_file_content_hash(file.id)
         .map_err(|_| PacketAdmissionGapKindV1::SourceUnavailable)?
         .ok_or(PacketAdmissionGapKindV1::SourceUnavailable)?;
+    if let Some(range) = requested {
+        // The recorder already authenticated caller, publication, question and
+        // issuance MAC. A prior FILE witness authorizes only its exact range
+        // and hash; a fresh typed FILE range still has no such authority.
+        let authorized =
+            super::packet_candidate::active_packet_proof_session().is_some_and(|session| {
+                session
+                    .issued_source_record
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|record| {
+                        record.witnesses.iter().any(|witness| {
+                            witness.stable_identity() == admission.stable_identity
+                                && witness.delivery.requested_range == range
+                                && witness.delivery.source_sha256 == expected_hash
+                        })
+                    })
+            });
+        if !authorized {
+            return Err(PacketAdmissionGapKindV1::SourceBoundMissing);
+        }
+    }
     let path = file.path.to_string_lossy();
     let resolved = controller
         .resolve_project_file_path(&path, false)
@@ -1920,15 +2082,40 @@ fn hydrate_admitted_file_source(
     if text.lines().count() != file.line_count as usize {
         return Err(PacketAdmissionGapKindV1::SourceBoundMissing);
     }
-    if text.len() > cap {
-        return Err(PacketAdmissionGapKindV1::SourceBudgetExceeded);
-    }
-    let markdown = complete_file_markdown(&text, file.line_count, cap)?;
+    let (markdown, parent_delivery) = if let Some(range) = requested {
+        let (markdown, _, delivery) = complete_node_page(&text, range, cap, &expected_hash)?;
+        (markdown, Some(delivery))
+    } else {
+        if text.len() > cap {
+            return Err(PacketAdmissionGapKindV1::SourceBudgetExceeded);
+        }
+        (complete_file_markdown(&text, file.line_count, cap)?, None)
+    };
     let canonical_path = codestory_workspace::workspace_relative_path(&project_root, &resolved)
         .ok_or(PacketAdmissionGapKindV1::SourceUnavailable)?
         .to_string_lossy()
         .replace('\\', "/");
-    hydrated_source(admission, &canonical_path, None, &markdown)
+    let mut source = hydrated_source(admission, &canonical_path, None, &markdown)?;
+    if let Some(delivery) = parent_delivery {
+        source.delivery = Some(delivery);
+    } else if super::packet_candidate::active_packet_proof_session().is_some_and(|session| {
+        session
+            .automatic_file_context
+            .borrow()
+            .contains_key(&admission.stable_identity)
+    }) {
+        source.delivery = Some(PacketSourceDeliveryV1 {
+            requested_range: PacketSourceRangeV1 {
+                start_line: 1,
+                end_line: file.line_count,
+            },
+            source_sha256: expected_hash,
+            remaining_source_bytes: 0,
+            next_start_line: None,
+            blocked_line_rendered_bytes: None,
+        });
+    }
+    Ok(source)
 }
 
 fn hydrate_published_file_source(
@@ -7012,6 +7199,7 @@ mod tests {
             file_navigation_paths: HashMap::new(),
             metadata_excluded_identities: BTreeSet::new(),
             source_page_alternatives: BTreeMap::new(),
+            matched_source_floor: Vec::new(),
             requested_source_identities: BTreeSet::new(),
             requested_source_minimum_ends: BTreeMap::new(),
             issued_context_sources: None,

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Experimental packet requests can return complete small files and related declaration source within their existing output limits. Exact symbol and range requests keep their requested scope.
+
 - Experimental packets search one slash-prefixed reference separately, while retaining the full question and any explicit targets.
 
 - Go reference navigation connects proven struct-field reads to their declarations, including named field paths across files in the same module package. These references remain distinct from calls, and existing Go indexes refresh automatically.

@@ -2345,7 +2345,7 @@ fn merge_scored_hits(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     #[test]
@@ -2445,5 +2445,375 @@ mod tests {
                     .expect("fixture project path")
             )
         );
+    }
+    #[cfg(feature = "benchmark-support")]
+    pub(in crate::agent) fn represented_packet_without_dense(
+        controller: &AppController,
+        request: AgentPacketRequestDto,
+    ) -> Result<crate::RepresentedPacketProductV3, ApiError> {
+        use codestory_contracts::packet_projection_v3::PacketProjectionV3Dto;
+        use std::sync::{Arc, atomic::AtomicBool};
+        let service = crate::PublicOperationService::new(controller.clone());
+        let _latency = crate::enter_packet_latency_scope(request.latency_budget_ms);
+        service.run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
+            service.with_active_packet_owner(&request, || {
+                let capture = crate::evidence_projection_v3::PacketRepresentationCaptureV3::new(&service)?;
+                let reserved = crate::PacketProjectionIdentityV3::new();
+                let mut accepted = None;
+                let mut measure_packet = |candidate: &AgentPacketDto, _baseline: Option<&crate::evidence_projection_v3::PacketRepresentationBaselineV1>| {
+                    let product = capture.project("codestory-cli", &request, candidate, &reserved, |projection| {
+                        let text = serde_json::to_string(projection).map_err(|_| ())?;
+                        serde_json::to_vec(&serde_json::json!({"content":[{"type":"text","text":text}],"structuredContent":null})).map(|v| v.len()).map_err(|_| ())
+                    })?;
+                    if matches!(&product.projection, PacketProjectionV3Dto::Complete { .. }) {
+                        let bytes = serde_json::to_string(&product.projection).map_err(|e| ApiError::internal(e.to_string()))?;
+                        let size = serde_json::to_vec(&serde_json::json!({"content":[{"type":"text","text":bytes}],"structuredContent":null})).map_err(|e| ApiError::internal(e.to_string()))?.len();
+                        accepted = Some(product); Ok(Some(size))
+                    } else { Ok(None) }
+                };
+                let packet = agent_packet_with_session(controller, request.clone(), std::rc::Rc::new(PacketProofSession::without_dense_semantic_for_benchmark()), Some(("codestory-cli", &mut measure_packet)))?;
+                let mut product = accepted.ok_or_else(|| ApiError::internal("no complete represented source fixture"))?;
+                if let Some(record) = crate::agent::packet_served_sources::load(controller, "codestory-cli", &request)? {
+                    assert!(crate::agent::packet_served_sources::projection_preserves(&record, &product.projection));
+                    product.protected_source_witnesses = record.witnesses;
+                }
+                crate::agent::packet_served_sources::commit(controller, "codestory-cli", &product)?;
+                Ok(crate::RepresentedPacketProductV3 { packet, product })
+            }).expect("actual fresh packet owner")
+        }).map(|r| r.value)
+    }
+    #[test]
+    #[cfg(feature = "benchmark-support")]
+    fn matched_small_file_policy_keeps_explicit_scope_and_handles_real_pressure() {
+        use crate::agent::retrieval_primary::tests::public_packet_fixture_with_published_files;
+        use codestory_contracts::api::{PacketProbeDto, SupportUnitKindDto};
+        use codestory_contracts::compilation::PUBLIC_PACKET_SERIALIZED_MAX_BYTES;
+        use codestory_contracts::graph::NodeKind as CoreNodeKind;
+        use codestory_contracts::packet_projection_v3::PacketProjectionV3Dto;
+        use codestory_store::Store;
+        // A fixed escape-heavy but <4KiB rendered FILE forces actual JSON
+        // serialization pressure; the same matched body still fits as a page.
+        let body = "func upload() int { return respond(500) }\nfunc download() int { return respond(400) }\n";
+        let helper = "package sample\n\nfunc respond(code int) int { return 200 }\n";
+        for (label, padding, whole_file_fits) in [
+            ("escaping", "\\".repeat(3600), true),
+            ("oversize", "x".repeat(6000), false),
+        ] {
+            let caller =
+                format!("package sample\n\nimport \"crypto/sha1\"\n\n// {padding}\n\n{body}");
+            let fixture = public_packet_fixture_with_published_files(
+                &[
+                    ("caller.go", caller.as_bytes()),
+                    ("response.go", helper.as_bytes()),
+                ],
+                true,
+            );
+            let core = Store::open_read_only(&fixture.storage_path).unwrap();
+            let upload = core
+                .get_nodes()
+                .unwrap()
+                .into_iter()
+                .find(|n| n.kind == CoreNodeKind::FUNCTION && n.serialized_name == "upload")
+                .unwrap();
+            let request = AgentPacketRequestDto {
+                question: "upload\n\ndownload".into(),
+                budget: PacketBudgetModeDto::Standard,
+                probes: Vec::new(),
+                latency_budget_ms: Some(30_000),
+                parent_packet_id: None,
+                option_ids: Vec::new(),
+                core_generation_id: None,
+                retrieval_generation: None,
+            };
+            let represented =
+                represented_packet_without_dense(&fixture.controller, request.clone()).unwrap();
+            let packet = represented.packet;
+            let projected = represented.product;
+            let measure = |projection: &PacketProjectionV3Dto| {
+                let text = serde_json::to_string(projection).map_err(|_| ())?;
+                serde_json::to_vec(&serde_json::json!({"content":[{"type":"text","text":text}],"structuredContent":null})).map(|v| v.len()).map_err(|_| ())
+            };
+            assert!(
+                measure(&projected.projection).unwrap() <= PUBLIC_PACKET_SERIALIZED_MAX_BYTES,
+                "{label}"
+            );
+            let PacketProjectionV3Dto::Complete { evidence, .. } = &projected.projection else {
+                panic!("matched source must fit fixed {label} fixture")
+            };
+            let row = evidence
+                .as_slice()
+                .iter()
+                .find(|row| {
+                    row.path.as_ref().is_some_and(|p| p.as_str() == "caller.go")
+                        && row
+                            .summary
+                            .as_ref()
+                            .is_some_and(|s| s.as_str().contains("func upload()"))
+                })
+                .expect("matched body must survive actual final serialization");
+            assert!(
+                evidence.as_slice().iter().any(|row| row
+                    .path
+                    .as_ref()
+                    .is_some_and(|p| p.as_str() == "caller.go")
+                    && row
+                        .summary
+                        .as_ref()
+                        .is_some_and(|source| source.as_str().contains("func download()"))),
+                "both actual matched bodies survive the final frame"
+            );
+            let file_id = upload.file_node_id.unwrap().0.to_string();
+            if whole_file_fits {
+                assert!(
+                    caller.len() + caller.lines().count() * 9 + 12 <= 4096,
+                    "genuine complete FILE was eligible before actual serialization"
+                );
+                assert!(
+                    packet
+                        .support
+                        .iter()
+                        .any(|r| r.kind == SupportUnitKindDto::SourceRange
+                            && r.symbol_id.as_deref() == Some(file_id.as_str())),
+                    "pressure keeps the same admitted genuine FILE identity"
+                );
+                assert!(
+                    !row.summary.as_ref().unwrap().as_str().contains(&padding),
+                    "final pressure must exercise the authenticated FILE focus alternative"
+                );
+            } else {
+                assert!(
+                    packet
+                        .support
+                        .iter()
+                        .any(|r| r.kind == SupportUnitKindDto::SourceRange
+                            && r.symbol_id.as_deref() == Some(upload.id.0.to_string().as_str())),
+                    "unknown/oversize whole-file representation keeps the ordinary real callable"
+                );
+            }
+            let mut exact = request;
+            exact.probes = vec![PacketProbeDto::SymbolId {
+                id: upload.id.0.to_string(),
+            }];
+            let exact_packet = fixture
+                .controller
+                .browser_service()
+                .packet_for_benchmark(exact, false)
+                .unwrap()
+                .packet;
+            let row = exact_packet
+                .support
+                .iter()
+                .find(|r| {
+                    r.kind == SupportUnitKindDto::SourceRange
+                        && r.symbol_id.as_deref() == Some(upload.id.0.to_string().as_str())
+                })
+                .expect("typed symbol identity is protected");
+            assert_eq!(
+                (row.start_line, row.end_line),
+                (upload.start_line, upload.end_line)
+            );
+            assert!(
+                row.source_delivery
+                    .as_ref()
+                    .is_some_and(
+                        |d| d.requested_range.start_line == upload.start_line.unwrap()
+                            && d.requested_range.end_line == upload.end_line.unwrap()
+                    )
+            );
+            assert!(
+                !exact_packet
+                    .support
+                    .iter()
+                    .any(|r| r.kind == SupportUnitKindDto::SourceRange
+                        && r.symbol_id.as_deref() == Some(file_id.as_str())),
+                "exact scope cannot be replaced by automatic FILE context"
+            );
+        }
+    }
+    #[test]
+    #[cfg(feature = "benchmark-support")]
+    fn matched_small_file_served_witness_revalidates_on_a_real_second_call_and_refuses_drift() {
+        use crate::agent::retrieval_primary::tests::public_packet_fixture_with_published_files;
+        use codestory_contracts::packet_projection_v3::PacketProjectionV3Dto;
+        let caller = "package sample\n\nimport \"crypto/sha1\"\n\nfunc upload() int { return respond(500) }\nfunc download() int { return respond(400) }\n";
+        let helper = "package sample\n\nfunc respond(code int) int { return 200 }\n";
+        let fixture = public_packet_fixture_with_published_files(
+            &[
+                ("caller.go", caller.as_bytes()),
+                ("response.go", helper.as_bytes()),
+            ],
+            true,
+        );
+        let request = AgentPacketRequestDto {
+            question: "upload".into(),
+            budget: PacketBudgetModeDto::Standard,
+            probes: Vec::new(),
+            latency_budget_ms: Some(30_000),
+            parent_packet_id: None,
+            option_ids: Vec::new(),
+            core_generation_id: None,
+            retrieval_generation: None,
+        };
+        let first = represented_packet_without_dense(&fixture.controller, request.clone()).unwrap();
+        assert!(
+            first.packet.packet_id.starts_with("psr1:"),
+            "actual represented caller must issue this FILE source"
+        );
+        let PacketProjectionV3Dto::Complete { publication, .. } = &first.product.projection else {
+            panic!("actual complete issued parent required")
+        };
+        // A parent-only call is an existing supported revalidation path. Do
+        // not invent an offered continuation action when this packet has none.
+        let mut next = request.clone();
+        next.parent_packet_id = Some(first.packet.packet_id.clone());
+        next.core_generation_id = Some(publication.core.generation_id.as_str().to_owned());
+        next.retrieval_generation = publication
+            .retrieval
+            .as_ref()
+            .map(|pin| pin.retrieval_generation.as_str().to_owned());
+        let second = represented_packet_without_dense(&fixture.controller, next.clone())
+            .expect("unchanged actually issued FILE source must revalidate");
+        for old in first
+            .packet
+            .support
+            .iter()
+            .filter(|r| r.kind == SupportUnitKindDto::SourceRange)
+        {
+            assert!(
+                second
+                    .packet
+                    .support
+                    .iter()
+                    .any(|new| new.kind == SupportUnitKindDto::SourceRange
+                        && new.symbol_id == old.symbol_id
+                        && new.path == old.path
+                        && new.start_line == old.start_line
+                        && new.end_line == old.end_line
+                        && new.snippet == old.snippet
+                        && new.source_delivery == old.source_delivery),
+                "served FILE range/hash/cursor must survive real caller revalidation"
+            );
+        }
+        std::fs::write(
+            fixture._project.path().join("caller.go"),
+            caller.replace("respond(500)", "respond(501)"),
+        )
+        .unwrap();
+        let error = represented_packet_without_dense(&fixture.controller, next)
+            .err()
+            .expect("changed source cannot reuse the actual parent's source receipt");
+        assert!(
+            matches!(error.code.as_str(), "project_unavailable"),
+            "source/publication refusal required: {error:?}"
+        );
+    }
+    #[test]
+    #[cfg(feature = "benchmark-support")]
+    fn matched_small_file_with_partial_callable_follows_the_actual_offered_patch() {
+        use crate::agent::retrieval_primary::tests::public_packet_fixture_with_published_files;
+        use codestory_contracts::packet_projection_v3::PacketProjectionV3Dto;
+        let caller = "package sample\n\nimport \"crypto/sha1\"\n\nfunc upload() int { return respond(500) }\n";
+        let mut helper =
+            String::from("package sample\n\nfunc respond(code int) int {\n\tsum := code\n");
+        for index in 0..240 {
+            helper.push_str(&format!("\tsum += code + {index}\n"));
+        }
+        helper.push_str("\treturn sum\n}\n");
+        let fixture = public_packet_fixture_with_published_files(
+            &[
+                ("caller.go", caller.as_bytes()),
+                ("response.go", helper.as_bytes()),
+            ],
+            true,
+        );
+        let request = AgentPacketRequestDto {
+            question: "upload".into(),
+            budget: PacketBudgetModeDto::Standard,
+            probes: Vec::new(),
+            latency_budget_ms: Some(30_000),
+            parent_packet_id: None,
+            option_ids: Vec::new(),
+            core_generation_id: None,
+            retrieval_generation: None,
+        };
+        let first = represented_packet_without_dense(&fixture.controller, request.clone()).unwrap();
+        assert!(first.packet.support.iter().any(|row| {
+            row.path.as_deref() == Some("caller.go")
+                && row
+                    .source_delivery
+                    .as_ref()
+                    .is_some_and(|d| d.remaining_source_bytes == 0)
+        }));
+        assert!(
+            first
+                .packet
+                .support
+                .iter()
+                .any(|row| row.path.as_deref() == Some("response.go")
+                    && row.source_delivery.as_ref().is_some_and(
+                        |d| d.remaining_source_bytes > 0 && d.next_start_line.is_some()
+                    )),
+            "real indexed callable must actually be partial"
+        );
+        let PacketProjectionV3Dto::Complete {
+            continuation: Some(continuation),
+            ..
+        } = &first.product.projection
+        else {
+            panic!("partial callable must offer a real continuation")
+        };
+        let patch = continuation
+            .packet_request_patch
+            .as_ref()
+            .expect("actual offered executable patch");
+        assert!(!patch.option_ids.as_slice().is_empty());
+        let mut next = request;
+        next.probes = patch.probes.as_slice().to_vec();
+        next.parent_packet_id = patch
+            .parent_packet_id
+            .as_ref()
+            .map(|v| v.as_str().to_owned());
+        next.option_ids = patch
+            .option_ids
+            .as_slice()
+            .iter()
+            .map(|v| v.as_str().to_owned())
+            .collect();
+        next.core_generation_id = Some(patch.core_generation_id.as_str().to_owned());
+        next.retrieval_generation = patch
+            .retrieval_generation
+            .as_ref()
+            .map(|v| v.as_str().to_owned());
+        match represented_packet_without_dense(&fixture.controller, next) {
+            Ok(second) => {
+                let old_file = first
+                    .packet
+                    .support
+                    .iter()
+                    .find(|row| {
+                        row.path.as_deref() == Some("caller.go")
+                            && row.kind == SupportUnitKindDto::SourceRange
+                    })
+                    .unwrap();
+                assert!(
+                    second
+                        .packet
+                        .support
+                        .iter()
+                        .any(|row| row.symbol_id == old_file.symbol_id
+                            && row.path == old_file.path
+                            && row.start_line == old_file.start_line
+                            && row.end_line == old_file.end_line
+                            && row.snippet == old_file.snippet
+                            && row.source_delivery == old_file.source_delivery),
+                    "offered action cannot erase its authenticated FILE context"
+                );
+            }
+            Err(error) => assert_eq!(
+                error.code,
+                crate::agent::packet_compiler::REQUESTED_PAGE_CAPACITY_REFUSAL,
+                "a genuine page-capacity refusal may follow successful old FILE revalidation; source/authentication failure may not: {error:?}"
+            ),
+        }
     }
 }

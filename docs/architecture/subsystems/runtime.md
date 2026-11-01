@@ -18,8 +18,9 @@ adapter syntax, SQLite mechanics, parsers, or model execution.
 - one packet-probe normalization and resolution path for exact paths, stable
   symbol IDs, qualified symbols, file-scoped symbols, free queries, and
   generation-bound continuations;
-- one descriptor-only admission pass across the unchanged question and all
-  typed free queries before candidate source or graph hydration;
+- one bounded admission pass across the unchanged question and all typed free
+  queries, with same-publication Core and lexical metadata association before
+  candidate source or relationship hydration;
 - assembly of `PacketCompilationInputV1` and projection of the pure compiler's
   bounded evidence product;
 - managed retrieval preparation and user-facing gap mapping;
@@ -139,6 +140,22 @@ body-less declarations remain line-context fallbacks; the scanner never borrows
 a later callable's body. A multiline result prefix ending in `interface` or
 `struct` before its opening brace remains unsupported and falls back explicitly.
 The existing scan/byte caps and other languages' ambiguity guards still apply.
+
+Broad packet requests may replace automatic callable fragments with a genuine
+small-file view. Runtime associates the match with its canonical Core file and
+sealed lexical size metadata from the same pinned publication. This selection
+step uses metadata only; source opens remain subject to admission and inspection
+limits. Missing or conflicting metadata retains ordinary fragments. Hydration
+still verifies native identity, source hash, line bounds and the rendered extent.
+
+Coalescing automatic matches can leave capacity for one pass over their
+published direct targets. This context carries no borrowed query score or
+inferred call certainty. Exact selector identities and requested scope remain
+unchanged. If a complete FILE view cannot fit the final response, authenticated
+focused ranges under that same admitted FILE can retain the matched source.
+A later request can revalidate a recorded FILE range through its issued witness;
+this does not grant fresh FILE-range authority. These views establish neither
+answer sufficiency nor callable-body completeness.
 
 ## Extension rules
 

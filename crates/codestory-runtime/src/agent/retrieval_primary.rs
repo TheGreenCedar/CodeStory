@@ -1083,7 +1083,7 @@ pub(crate) fn preadmit_packet_descriptor_queries_with_policy(
     let readiness_deadline = Instant::now()
         .checked_add(Duration::from_millis(readiness_budget_ms))
         .expect("bounded packet descriptor deadline");
-    if queries.is_empty() || session.remaining_hydration_slots() == 0 {
+    if queries.is_empty() {
         let seal_started = Instant::now();
         session.seal_retrieval_admission();
         let admission_seal_wall_ms = packet_descriptor_phase_wall_ms(seal_started);
@@ -1253,7 +1253,8 @@ pub(crate) fn preadmit_packet_descriptor_queries_with_policy(
             &session,
             query_results.iter().flat_map(|result| result.hits.iter()),
             Some(&pinned.session.publication_identity().sidecar_input_hash),
-        );
+            Some(pinned),
+        )?;
         let admission_seal_wall_ms = packet_descriptor_phase_wall_ms(seal_started);
         // The repository-wide freshness and core/vector attestation checks are
         // intentionally deferred until the one packet admission session is
@@ -1298,14 +1299,16 @@ fn admit_packet_candidate_descriptors<'a>(
     session: &crate::agent::packet_candidate::PacketProofSession,
     candidates: impl IntoIterator<Item = &'a CandidateHit>,
 ) {
-    admit_packet_candidate_descriptors_bound(session, candidates, None);
+    admit_packet_candidate_descriptors_bound(session, candidates, None, None)
+        .expect("descriptor admission");
 }
 
 fn admit_packet_candidate_descriptors_bound<'a>(
     session: &crate::agent::packet_candidate::PacketProofSession,
     candidates: impl IntoIterator<Item = &'a CandidateHit>,
     input_hash: Option<&str>,
-) {
+    pinned: Option<&PinnedRetrievalRead>,
+) -> Result<(), ApiError> {
     let mut descriptors = Vec::new();
     for candidate in candidates
         .into_iter()
@@ -1347,6 +1350,11 @@ fn admit_packet_candidate_descriptors_bound<'a>(
             .collect(),
         input_hash,
     );
+    let descriptors = if let Some(pinned) = pinned {
+        matched_file_admission_plan(session, &descriptors, pinned)?.unwrap_or(descriptors)
+    } else {
+        descriptors
+    };
     admit_published_call_descriptors(session, &descriptors);
     session.seal_retrieval_admission();
     let admitted_identities = session
@@ -1358,6 +1366,410 @@ fn admit_packet_candidate_descriptors_bound<'a>(
         &ranked_identities,
         &admitted_identities,
     );
+    Ok(())
+}
+
+// Only pinned Core metadata is consulted here. The eventual source read still
+// requires a sealed real FILE admission, native path checks and indexed hash.
+fn core_file_focus(
+    storage: &Store,
+    root: &Path,
+    identity: &str,
+    expected_path: Option<&str>,
+) -> Option<(
+    codestory_contracts::graph::Node,
+    codestory_store::FileInfo,
+    String,
+    codestory_contracts::compilation::PacketSourceRangeV1,
+)> {
+    let raw = identity.strip_prefix("node:")?;
+    let id = raw.parse::<i64>().ok()?;
+    if id.to_string() != raw {
+        return None;
+    }
+    let node = storage.get_node(CoreNodeId(id)).ok()??;
+    let file = storage.get_file_by_id(node.file_node_id?.0).ok()??;
+    if !file.indexed
+        || !file.complete
+        || file.line_count == 0
+        || storage.get_node(CoreNodeId(file.id)).ok()??.kind != NodeKind::FILE
+        || storage.get_file_content_hash(file.id).ok()??.len() != 64
+    {
+        return None;
+    }
+    let path = if file.path.is_absolute() {
+        file.path
+            .strip_prefix(root)
+            .ok()?
+            .to_string_lossy()
+            .replace('\\', "/")
+    } else {
+        file.path.to_string_lossy().replace('\\', "/")
+    };
+    if expected_path.is_some_and(|expected| expected != path)
+        || path.is_empty()
+        || path
+            .split('/')
+            .any(|part| part.is_empty() || matches!(part, "." | ".."))
+    {
+        return None;
+    }
+    let range = codestory_contracts::compilation::PacketSourceRangeV1 {
+        start_line: node.start_line?,
+        end_line: node.end_line?,
+    };
+    (range.is_valid() && range.end_line <= file.line_count).then_some((node, file, path, range))
+}
+
+fn complete_file_rendered_bound(decoded_bytes: u64, line_count: u32) -> Option<u32> {
+    use codestory_contracts::compilation::INTERIM_SOURCE_CONTINUATION_UPPER_BOUND;
+    // Raw decoded bytes include LF/CRLF when present. One extra byte covers
+    // an unterminated final line; numbered prefixes and fences are not free.
+    let prefix = line_count.to_string().len().max(5) as u64 + 4;
+    let bytes = decoded_bytes
+        .checked_add(prefix.checked_mul(u64::from(line_count))?)?
+        .checked_add(12)?;
+    (bytes <= INTERIM_SOURCE_CONTINUATION_UPPER_BOUND as u64).then(|| bytes as u32)
+}
+
+fn retain_existing_file_matches(
+    session: &crate::agent::packet_candidate::PacketProofSession,
+    ranked: &[codestory_contracts::compilation::PacketCandidateDescriptorV1],
+    pinned: &PinnedRetrievalRead,
+) {
+    use codestory_contracts::compilation::*;
+    let receipts = session.receipts();
+    let issued = session.issued_source_record.borrow();
+    let storage = pinned.session.storage();
+    for descriptor in ranked.iter().take(INTERIM_MAX_ADMITTED_CANDIDATES) {
+        let Some((_, file, path, range)) = core_file_focus(
+            &storage,
+            &pinned.project_root,
+            &descriptor.stable_identity,
+            Some(&descriptor.path),
+        ) else {
+            continue;
+        };
+        let identity = format!("node:{}", file.id);
+        let Some(receipt) = receipts.iter().find(|r| r.stable_identity == identity) else {
+            continue;
+        };
+        let authorized = if let Some(record) = issued.as_ref() {
+            record.witnesses.iter().any(|w| {
+                w.stable_identity() == identity
+                    && w.path == path
+                    && w.start_line <= range.start_line
+                    && w.end_line >= range.end_line
+                    && storage
+                        .get_file_content_hash(file.id)
+                        .ok()
+                        .flatten()
+                        .as_deref()
+                        == Some(w.delivery.source_sha256.as_str())
+            })
+        } else {
+            receipt.origin == PacketAdmissionOriginV1::ExactTypedSelector
+        };
+        if authorized {
+            session
+                .automatic_file_matches
+                .borrow_mut()
+                .insert(descriptor.stable_identity.clone(), identity);
+        }
+    }
+}
+
+fn matched_file_admission_plan(
+    session: &crate::agent::packet_candidate::PacketProofSession,
+    ranked: &[codestory_contracts::compilation::PacketCandidateDescriptorV1],
+    pinned: &PinnedRetrievalRead,
+) -> Result<Option<Vec<codestory_contracts::compilation::PacketCandidateDescriptorV1>>, ApiError> {
+    use crate::agent::packet_candidate::AutomaticFileContext;
+    use codestory_contracts::compilation::*;
+    // Exact pages and served history retain their existing identity, scope,
+    // reservation priority and continuation path.
+    if !session.receipts().is_empty() || session.issued_source_record.borrow().is_some() {
+        retain_existing_file_matches(session, ranked, pinned);
+        return Ok(None);
+    }
+    let mut remaining = session.remaining_source_bytes();
+    let mut window = Vec::new();
+    let mut excluded = Vec::new();
+    for row in ranked {
+        if session.descriptor_known_whole_file_overflow(row) {
+            excluded.push(row);
+            continue;
+        }
+        let Some(bytes) = row.source_bytes_upper_bound else {
+            continue;
+        };
+        if bytes as usize > remaining {
+            continue;
+        }
+        remaining -= bytes as usize;
+        window.push(row.clone());
+        if window.len() == session.remaining_hydration_slots() {
+            break;
+        }
+    }
+    if window.is_empty() {
+        return Ok(None);
+    }
+    let facts = {
+        let storage = pinned.session.storage();
+        window
+            .iter()
+            .map(|row| {
+                core_file_focus(
+                    &storage,
+                    &pinned.project_root,
+                    &row.stable_identity,
+                    Some(&row.path),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut paths = Vec::new();
+    for (node, _, path, _) in facts.iter().flatten() {
+        if matches!(
+            node.kind,
+            NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO
+        ) && !paths.contains(path)
+        {
+            paths.push(path.clone());
+        }
+    }
+    if paths.is_empty() {
+        return Ok(None);
+    }
+    let lengths = pinned
+        .session
+        .published_file_decoded_lengths(
+            &paths,
+            crate::services::active_public_operation_cancellation(),
+        )
+        .map_err(map_pinned_query_error)?;
+    let mut planned_bytes = window
+        .iter()
+        .map(|row| row.source_bytes_upper_bound.unwrap_or(0) as usize)
+        .sum::<usize>();
+    let mut files = HashMap::new();
+    for path in &paths {
+        let members = facts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, fact)| {
+                fact.as_ref()
+                    .filter(|(_, _, p, _)| p == path)
+                    .map(|(_, file, _, range)| (index, file, *range))
+            })
+            .collect::<Vec<_>>();
+        let Some((_, file, _)) = members.first() else {
+            continue;
+        };
+        let Some(bound) = lengths
+            .get(path)
+            .and_then(|bytes| complete_file_rendered_bound(*bytes, file.line_count))
+        else {
+            continue;
+        };
+        let replaced = members
+            .iter()
+            .map(|(index, _, _)| window[*index].source_bytes_upper_bound.unwrap_or(0) as usize)
+            .sum::<usize>()
+            + window
+                .iter()
+                .filter(|row| row.symbol.is_none() && row.stable_identity == format!("path:{path}"))
+                .map(|row| row.source_bytes_upper_bound.unwrap_or(0) as usize)
+                .sum::<usize>();
+        let proposed = planned_bytes
+            .saturating_sub(replaced)
+            .saturating_add(bound as usize);
+        if proposed > session.remaining_source_bytes() {
+            continue;
+        }
+        planned_bytes = proposed;
+        let mut ranges = members
+            .iter()
+            .map(|(_, _, range)| *range)
+            .collect::<Vec<_>>();
+        ranges.sort_by_key(|r| (r.start_line, r.end_line));
+        ranges.dedup();
+        files.insert(file.id, (path.clone(), bound, ranges));
+    }
+    if files.is_empty() {
+        return Ok(None);
+    }
+    let mut output = Vec::new();
+    let mut seen_files = HashSet::new();
+    for (row, fact) in window.iter().zip(&facts) {
+        // A bare automatic row is redundant only after an actual callable
+        // match supplied the genuine FILE witness. PathOnly alone cannot
+        // create this representation or promote a header into source.
+        if row.symbol.is_none()
+            && row.stable_identity == format!("path:{}", row.path)
+            && let Some((file_id, _)) = files.iter().find(|(_, (path, _, _))| path == &row.path)
+        {
+            session
+                .automatic_file_matches
+                .borrow_mut()
+                .insert(row.stable_identity.clone(), format!("node:{file_id}"));
+            continue;
+        }
+        if let Some((_, file, _, _)) = fact
+            && let Some((path, bound, ranges)) = files.get(&file.id)
+        {
+            session
+                .automatic_file_matches
+                .borrow_mut()
+                .insert(row.stable_identity.clone(), format!("node:{}", file.id));
+            if seen_files.insert(file.id) {
+                let mut descriptor = row.clone();
+                descriptor.stable_identity = format!("node:{}", file.id);
+                descriptor.path = path.clone();
+                descriptor.symbol = None;
+                descriptor.source_bytes_upper_bound = Some(*bound);
+                descriptor.published_calls = None;
+                descriptor.published_calls_conflicted = false;
+                session.automatic_file_context.borrow_mut().insert(
+                    descriptor.stable_identity.clone(),
+                    AutomaticFileContext {
+                        ranges: ranges.clone(),
+                        matched: true,
+                    },
+                );
+                output.push(descriptor);
+            }
+        } else {
+            output.push(row.clone());
+        }
+    }
+    // The broad ranked window is fixed before coalescing. Freed count may add
+    // direct published targets, never later broad matches or recursive targets.
+    let baseline_ids = window
+        .iter()
+        .map(|r| r.stable_identity.as_str())
+        .collect::<HashSet<_>>();
+    let mut target_seeds = Vec::new();
+    let mut seen_targets = HashSet::new();
+    let slots = session
+        .remaining_hydration_slots()
+        .saturating_sub(output.len());
+    for parent in window.iter().filter(|_| slots > 0) {
+        if let Some(calls) = &parent.published_calls {
+            for target in &calls.neighborhood.targets {
+                if matches!(
+                    target.certainty,
+                    PacketRelationCertaintyV1::Certain | PacketRelationCertaintyV1::Probable
+                ) && !baseline_ids.contains(target.stable_identity.as_str())
+                    && seen_targets.insert(target.stable_identity.clone())
+                {
+                    target_seeds.push(target.stable_identity.clone());
+                }
+            }
+        }
+    }
+    let targets = {
+        let storage = pinned.session.storage();
+        target_seeds
+            .iter()
+            .filter_map(|id| {
+                let (node, file, path, range) =
+                    core_file_focus(&storage, &pinned.project_root, id, None)?;
+                matches!(
+                    node.kind,
+                    NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO
+                )
+                .then_some((node, file, path, range))
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut target_paths = Vec::new();
+    for (_, file, path, _) in &targets {
+        if !files.contains_key(&file.id) && !target_paths.contains(path) {
+            target_paths.push(path.clone());
+            if target_paths.len() == INTERIM_MAX_ADMITTED_CANDIDATES {
+                break;
+            }
+        }
+    }
+    let target_lengths = pinned
+        .session
+        .published_file_decoded_lengths(
+            &target_paths,
+            crate::services::active_public_operation_cancellation(),
+        )
+        .map_err(map_pinned_query_error)?;
+    for (node, file, path, range) in targets {
+        if seen_files.contains(&file.id) {
+            // One admitted target FILE may cover several original parents'
+            // published targets. Its optional focused extent keeps those real
+            // ranges even after the final free identity slot has been spent.
+            if let Some(context) = session
+                .automatic_file_context
+                .borrow_mut()
+                .get_mut(&format!("node:{}", file.id))
+                && !context.matched
+                && !context.ranges.contains(&range)
+            {
+                context.ranges.push(range);
+                context
+                    .ranges
+                    .sort_by_key(|range| (range.start_line, range.end_line));
+            }
+            continue;
+        }
+        if output.len() == session.remaining_hydration_slots() {
+            continue;
+        }
+        // This source was not returned by a target retrieval query. It has
+        // published-graph provenance and an unranked context version, never a
+        // borrowed parent score or inferred call certainty.
+        let mut descriptor = PacketCandidateDescriptorV1 {
+            stable_identity: format!("node:{}", node.id.0),
+            path: path.clone(),
+            symbol: Some(node.serialized_name.clone()),
+            retrieval_lane: PacketRetrievalLaneV1::Graph,
+            retrieval_score: VersionedRetrievalScoreV1 {
+                version: "published-call-context/v1".into(),
+                value: 0.0,
+            },
+            source_bytes_upper_bound: Some(INTERIM_SOURCE_ROW_UPPER_BOUND as u32),
+            exact_selector_ordinal: None,
+            published_calls: None,
+            published_calls_conflicted: false,
+        };
+        let file_bound = target_lengths
+            .get(&path)
+            .and_then(|bytes| complete_file_rendered_bound(*bytes, file.line_count))
+            .filter(|bound| {
+                planned_bytes.saturating_add(*bound as usize) <= session.remaining_source_bytes()
+            });
+        if let Some(bound) = file_bound {
+            descriptor.stable_identity = format!("node:{}", file.id);
+            descriptor.symbol = None;
+            descriptor.source_bytes_upper_bound = Some(bound);
+            session.automatic_file_context.borrow_mut().insert(
+                descriptor.stable_identity.clone(),
+                AutomaticFileContext {
+                    ranges: vec![range],
+                    matched: false,
+                },
+            );
+            seen_files.insert(file.id);
+        } else {
+            descriptor.source_bytes_upper_bound = Some(INTERIM_SOURCE_ROW_UPPER_BOUND as u32);
+        }
+        let bytes = descriptor.source_bytes_upper_bound.unwrap_or(0) as usize;
+        if planned_bytes.saturating_add(bytes) <= session.remaining_source_bytes() {
+            planned_bytes += bytes;
+            output.push(descriptor);
+        }
+    }
+    for row in excluded {
+        let _ = session.admit_descriptor(row);
+    }
+    Ok(Some(output))
 }
 
 /// Admission remains count/source bounded. Retaining metadata is a separate
@@ -3322,7 +3734,10 @@ fn resolve_sidecar_candidates_in_storage(
         let rel_path = normalize_repo_relative_path(project_root, &candidate.file_path);
         let descriptor = if let Some(identity_scope) = identity_scope.as_ref() {
             match candidate.packet_descriptor() {
-                Some(descriptor) => Some(descriptor),
+                Some(mut descriptor) => {
+                    identity_scope.apply_admitted_file_representation(&mut descriptor);
+                    Some(descriptor)
+                }
                 None => {
                     let stable_identity = candidate.packet_stable_identity();
                     let kind = if stable_identity.is_some() {
@@ -3420,8 +3835,20 @@ fn resolve_sidecar_candidates_in_storage(
             continue;
         };
         let hit = classify_resolved_candidate_hit(hit, candidate);
-        let (graph_provenance, graph) =
-            packet_graph_for_resolved_candidate(storage, node_names, node_id, candidate)?;
+        let substituted_file = identity_scope.as_ref().is_some_and(|session| {
+            candidate.packet_stable_identity().is_some_and(|original| {
+                session
+                    .automatic_file_matches
+                    .borrow()
+                    .get(&original)
+                    .is_some_and(|file| file == &format!("node:{}", node_id.0))
+            })
+        });
+        let (graph_provenance, graph) = if substituted_file {
+            (Vec::new(), None)
+        } else {
+            packet_graph_for_resolved_candidate(storage, node_names, node_id, candidate)?
+        };
         packet_hits.push(PacketSearchHit {
             hit: hit.clone(),
             graph_provenance,
@@ -3567,7 +3994,7 @@ fn candidate_provenance_labels(candidate: &CandidateHit) -> Vec<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::agent::packet_evidence::PacketEvidenceTier;
     use crate::test_support::{git, git_available};
@@ -3595,12 +4022,12 @@ mod tests {
         }
     }
 
-    struct PinnedOperationFixture {
-        _project: tempfile::TempDir,
+    pub(in crate::agent) struct PinnedOperationFixture {
+        pub(in crate::agent) _project: tempfile::TempDir,
         _storage: tempfile::TempDir,
         _retrieval_cache: tempfile::TempDir,
-        storage_path: PathBuf,
-        controller: AppController,
+        pub(in crate::agent) storage_path: PathBuf,
+        pub(in crate::agent) controller: AppController,
     }
 
     fn publish_test_complete_core(
@@ -3677,6 +4104,13 @@ mod tests {
     fn public_packet_fixture_with_lexical_file_bytes(
         files: &[(&str, &[u8])],
     ) -> PinnedOperationFixture {
+        public_packet_fixture_with_published_files(files, false)
+    }
+
+    pub(in crate::agent) fn public_packet_fixture_with_published_files(
+        files: &[(&str, &[u8])],
+        deterministic_dense: bool,
+    ) -> PinnedOperationFixture {
         let project = tempfile::tempdir().expect("project");
         let storage = tempfile::tempdir().expect("storage");
         let retrieval_cache = tempfile::tempdir().expect("retrieval cache");
@@ -3719,14 +4153,23 @@ mod tests {
                 codestory_contracts::api::IndexMode::Full,
             )
             .expect("publish public-ready complete core");
-        let manifest =
+        let manifest = if deterministic_dense {
+            codestory_retrieval::test_support::publish_deterministic_dense_pinned_query_fixture(
+                project.path(),
+                &storage_path,
+                &runtime,
+            )
+        } else {
             publish_zero_dense_pinned_query_fixture(project.path(), &storage_path, &runtime)
-                .expect("publish public-ready retrieval fixture");
-        assert_eq!(
-            manifest.dense_projection_count,
-            Some(0),
-            "public packet fixture must stay zero-dense and must not execute embeddings"
-        );
+        }
+        .expect("publish public-ready retrieval fixture");
+        if !deterministic_dense {
+            assert_eq!(
+                manifest.dense_projection_count,
+                Some(0),
+                "zero-dense fixture must not execute embeddings"
+            );
+        }
 
         PinnedOperationFixture {
             _project: project,
@@ -8152,6 +8595,491 @@ mod tests {
         );
     }
 
+    #[test]
+    #[cfg(feature = "benchmark-support")]
+    fn matched_small_files_keep_source_and_direct_declarations_in_public_frame() {
+        use crate::agent::packet_candidate::{PacketProofSession, install_packet_proof_session};
+        use codestory_contracts::api::SupportUnitKindDto;
+        use codestory_contracts::compilation::PUBLIC_PACKET_SERIALIZED_MAX_BYTES;
+        use codestory_contracts::packet_projection_v3::PacketProjectionV3Dto;
+        use sha2::{Digest, Sha256};
+        use std::sync::atomic::AtomicBool;
+
+        let caller = format!(
+            "package sample\n\nimport (\n\t\"crypto/sha1\"\n\t\"encoding/hex\"\n)\n\n{}\nfunc upload(body []byte) int {{\n\tsum := sha1.Sum(body)\n\t_ = hex.EncodeToString(sum[:])\n\treturn respond(500)\n}}\n\nfunc download() int {{ return respond(400) }}\n",
+            "// retained file context, not part of the matched callable\n".repeat(18),
+        );
+        let helper = format!(
+            "package sample\n\nimport \"net/http\"\n\n{}\nfunc respond(code int) int {{\n\t_ = code\n\treturn http.StatusOK\n}}\n",
+            "// independent declaration context with a different wire status\n".repeat(10),
+        );
+        let fixture = public_packet_fixture_with_published_files(
+            &[
+                ("caller.go", caller.as_bytes()),
+                ("response.go", helper.as_bytes()),
+            ],
+            true,
+        );
+        let core = Store::open_read_only(&fixture.storage_path).unwrap();
+        let nodes = core.get_nodes().unwrap();
+        let upload = nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::FUNCTION && n.serialized_name == "upload")
+            .expect("real indexed caller");
+        let respond = nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::FUNCTION && n.serialized_name == "respond")
+            .expect("real indexed target");
+        let pinned =
+            Rc::new(PinnedRetrievalRead::begin_packet_descriptor(&fixture.controller).unwrap());
+        let session = Rc::new(PacketProofSession::without_dense_semantic_for_benchmark());
+        with_active_pinned_retrieval_read(&fixture.controller, Rc::clone(&pinned), || {
+            let _guard = install_packet_proof_session(Rc::clone(&session));
+            preadmit_packet_descriptor_queries_with_policy(
+                &fixture.controller,
+                &[PacketRetrievalQuery {
+                    query: "upload".into(),
+                    lexical_policy: LexicalAdmissionPolicy::BroadQuestionV1,
+                }],
+                None,
+            )
+            .unwrap();
+            let result = session
+                .descriptor_result_with_policy(
+                    "upload",
+                    LexicalAdmissionPolicy::BroadQuestionV1,
+                    false,
+                    pinned.session.publication_identity(),
+                )
+                .unwrap();
+            let descriptor = result
+                .hits
+                .iter()
+                .filter_map(CandidateHit::packet_descriptor)
+                .find(|d| d.stable_identity == format!("node:{}", upload.id.0))
+                .expect("real retrieved caller descriptor");
+            for path in ["caller.go", "response.go"] {
+                eprintln!(
+                    "batch sealed file length {path}: {:?}",
+                    result
+                        .hits
+                        .iter()
+                        .filter(|hit| hit.file_path == path)
+                        .find_map(|hit| hit.whole_file_decoded_bytes(
+                            &pinned.session.publication_identity().sidecar_generation,
+                            &pinned.session.publication_identity().sidecar_input_hash
+                        ))
+                );
+            }
+            let calls = descriptor
+                .published_calls
+                .expect("real publication call metadata");
+            assert_eq!(
+                calls.sidecar_input_hash,
+                pinned.session.publication_identity().sidecar_input_hash
+            );
+            assert!(
+                calls
+                    .neighborhood
+                    .targets
+                    .iter()
+                    .any(|t| t.stable_identity == format!("node:{}", respond.id.0)),
+                "the actual target must be independently indexed, not guessed from a name"
+            );
+            let shard = fixture
+                .controller
+                .runtime_config
+                .layout
+                .lexical_data_dir
+                .join("shards")
+                .join(&pinned.session.publication_identity().sidecar_generation);
+            let set: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(shard.join("lexical-component-set.json")).unwrap(),
+            )
+            .unwrap();
+            let connection = rusqlite::Connection::open_with_flags(
+                shard.join(set["base"]["file_name"].as_str().unwrap()),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            for (path, source) in [("caller.go", &caller), ("response.go", &helper)] {
+                let bytes: i64 = connection
+                    .query_row(
+                        "SELECT content_decoded_bytes FROM lexical_documents WHERE document_key=?1",
+                        [format!("source\0{path}")],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                let file = super::super::packet_compiler::find_admitted_file(
+                    &core,
+                    fixture._project.path(),
+                    path,
+                )
+                .unwrap()
+                .expect("genuine indexed file");
+                assert_eq!(bytes as usize, source.len());
+                assert_eq!(file.line_count as usize, source.lines().count());
+                assert!(
+                    bytes > 512,
+                    "baseline whole-file eligibility must really reject the initial fragment-sized reservation"
+                );
+                eprintln!(
+                    "published metadata {path}: file={} decoded={bytes} lines={}",
+                    file.id, file.line_count
+                );
+            }
+        });
+        drop(pinned);
+        let request = AgentPacketRequestDto {
+            question: "upload".into(),
+            budget: PacketBudgetModeDto::Standard,
+            probes: Vec::new(),
+            latency_budget_ms: Some(30_000),
+            parent_packet_id: None,
+            option_ids: Vec::new(),
+            core_generation_id: None,
+            retrieval_generation: None,
+        };
+        let execution = fixture
+            .controller
+            .browser_service()
+            .packet_for_benchmark(request.clone(), false)
+            .unwrap();
+        assert_eq!(
+            execution.retrieval_proof["dense_semantic_stage_invocations"],
+            0
+        );
+        let packet = execution.packet;
+        for (path, source, required) in [
+            ("caller.go", &caller, "\"crypto/sha1\""),
+            ("response.go", &helper, "http.StatusOK"),
+        ] {
+            let file = super::super::packet_compiler::find_admitted_file(
+                &core,
+                fixture._project.path(),
+                path,
+            )
+            .unwrap()
+            .unwrap();
+            let row = packet
+                .support
+                .iter()
+                .find(|row| {
+                    row.kind == SupportUnitKindDto::SourceRange
+                        && row.path.as_deref() == Some(path)
+                        && row.symbol_id.as_deref() == Some(file.id.to_string().as_str())
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "matched declaration file missing: {path}; support={:?}",
+                        packet.support
+                    )
+                });
+            assert_eq!(
+                (row.start_line, row.end_line),
+                (Some(1), Some(source.lines().count() as u32))
+            );
+            assert!(row.snippet.as_deref().unwrap().contains(required));
+            let delivery = row
+                .source_delivery
+                .as_ref()
+                .expect("file source must preserve authenticated hash and range");
+            assert_eq!(
+                delivery.source_sha256,
+                format!("{:x}", Sha256::digest(source.as_bytes()))
+            );
+            assert_eq!(delivery.remaining_source_bytes, 0);
+        }
+        let service = crate::PublicOperationService::new(fixture.controller.clone());
+        let _latency = crate::enter_packet_latency_scope(request.latency_budget_ms);
+        let measure = |projection: &PacketProjectionV3Dto| {
+            let body = serde_json::to_string(projection).map_err(|_| ())?;
+            serde_json::to_vec(&serde_json::json!({"content":[{"type":"text","text":body}],"structuredContent":null})).map(|b| b.len()).map_err(|_| ())
+        };
+        let projected = service
+            .run_with_cancel("packet", Arc::new(AtomicBool::new(false)), || {
+                crate::project_packet_v3(&service, "codestory-cli", &request, &packet, measure)
+            })
+            .unwrap()
+            .value;
+        assert!(measure(&projected.projection).unwrap() <= PUBLIC_PACKET_SERIALIZED_MAX_BYTES);
+        let PacketProjectionV3Dto::Complete { evidence, .. } = &projected.projection else {
+            panic!("complete public frame required")
+        };
+        assert!(evidence.as_slice().iter().any(|row| {
+            row.path.as_ref().is_some_and(|p| p.as_str() == "caller.go")
+                && row
+                    .summary
+                    .as_ref()
+                    .is_some_and(|s| s.as_str().contains("crypto/sha1"))
+        }));
+        assert!(evidence.as_slice().iter().any(|row| {
+            row.path
+                .as_ref()
+                .is_some_and(|p| p.as_str() == "response.go")
+                && row
+                    .summary
+                    .as_ref()
+                    .is_some_and(|s| s.as_str().contains("http.StatusOK"))
+        }));
+    }
+
+    #[test]
+    #[cfg(feature = "benchmark-support")]
+    fn matched_small_file_coalescing_preserves_each_published_parent_with_one_spare_slot() {
+        use crate::agent::packet_candidate::{PacketProofSession, install_packet_proof_session};
+        use codestory_contracts::compilation::*;
+        let caller = "package sample\n\ntype Server struct{}\n\nfunc (s *Server) upload() int { return s.local(400) }\nfunc (s *Server) download() int { return s.respond(500) + s.backup(401) }\nfunc (s *Server) local(code int) int { return code }\n";
+        let helper = "package sample\n\nfunc (s *Server) respond(code int) int { return 200 }\nfunc (s *Server) backup(code int) int { return 201 }\n";
+        let mut files = vec![
+            ("caller.go".to_string(), caller.to_string()),
+            ("response.go".to_string(), helper.to_string()),
+        ];
+        for i in 0..14 {
+            files.push((
+                format!("filler{i}.go"),
+                format!("package sample\nfunc filler_{i:02}() int {{ return {i} }}\n"),
+            ));
+        }
+        let inputs = files
+            .iter()
+            .map(|(path, source)| (path.as_str(), source.as_bytes()))
+            .collect::<Vec<_>>();
+        let fixture = public_packet_fixture_with_published_files(&inputs, true);
+        let core = Store::open_read_only(&fixture.storage_path).unwrap();
+        let nodes = core.get_nodes().unwrap();
+        let find = |name: &str| {
+            nodes
+                .iter()
+                .find(|n| {
+                    matches!(n.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                        && n.serialized_name.ends_with(name)
+                })
+                .unwrap()
+        };
+        let upload = find("upload");
+        let download = find("download");
+        let local = find("local");
+        let respond = find("respond");
+        let backup = find("backup");
+        let pinned =
+            Rc::new(PinnedRetrievalRead::begin_packet_descriptor(&fixture.controller).unwrap());
+        with_active_pinned_retrieval_read(&fixture.controller, Rc::clone(&pinned), || {
+            let observed = Rc::new(PacketProofSession::without_dense_semantic_for_benchmark());
+            let question = "upload\n\ndownload\n\nfiller";
+            let plan = codestory_agent::packet_plan::build_packet_plan(
+                question,
+                PacketBudgetModeDto::Standard,
+            );
+            let queries = crate::agent::packet_candidate::packet_retrieval_queries(&plan);
+            let _guard = install_packet_proof_session(Rc::clone(&observed));
+            preadmit_packet_descriptor_queries_with_policy(&fixture.controller, &queries, None)
+                .unwrap();
+            let mut actual = HashMap::new();
+            for query in &queries {
+                let result = observed
+                    .descriptor_result_with_policy(
+                        &query.query,
+                        query.lexical_policy,
+                        false,
+                        pinned.session.publication_identity(),
+                    )
+                    .unwrap();
+                for descriptor in result
+                    .hits
+                    .iter()
+                    .filter_map(CandidateHit::packet_descriptor)
+                {
+                    actual
+                        .entry(descriptor.stable_identity.clone())
+                        .or_insert(descriptor);
+                }
+            }
+            // These are actual returned descriptors from the two-parent public
+            // seed plan, not fabricated IDs or name-only targets.
+            let mut ranked = vec![
+                actual
+                    .get(&format!("node:{}", upload.id.0))
+                    .expect("upload really retrieved")
+                    .clone(),
+                actual
+                    .get(&format!("node:{}", download.id.0))
+                    .expect("download really retrieved")
+                    .clone(),
+            ];
+            for i in 0..14 {
+                ranked.push(
+                    actual
+                        .get(&format!("node:{}", find(&format!("filler_{i:02}")).id.0))
+                        .expect("filler really retrieved")
+                        .clone(),
+                );
+            }
+            let first_targets = &ranked[0]
+                .published_calls
+                .as_ref()
+                .expect("published first-parent neighborhood")
+                .neighborhood
+                .targets;
+            let second_targets = &ranked[1]
+                .published_calls
+                .as_ref()
+                .expect("published second-parent neighborhood")
+                .neighborhood
+                .targets;
+            assert!(
+                first_targets
+                    .iter()
+                    .any(|t| t.stable_identity == format!("node:{}", local.id.0))
+            );
+            assert!(
+                !first_targets
+                    .iter()
+                    .any(|t| t.stable_identity == format!("node:{}", respond.id.0)),
+                "external helper belongs only to second parent"
+            );
+            assert!(
+                second_targets
+                    .iter()
+                    .any(|t| t.stable_identity == format!("node:{}", respond.id.0))
+            );
+            for invalid_second in [false, true] {
+                let session = Rc::new(PacketProofSession::without_dense_semantic_for_benchmark());
+                let _guard = install_packet_proof_session(Rc::clone(&session));
+                let mut input = ranked.clone();
+                if invalid_second {
+                    input[1]
+                        .published_calls
+                        .as_mut()
+                        .unwrap()
+                        .sidecar_input_hash = "foreign-publication".into();
+                }
+                let admitted = published_call_admission_order(
+                    &input,
+                    &HashSet::new(),
+                    Some(&pinned.session.publication_identity().sidecar_input_hash),
+                );
+                let planned = matched_file_admission_plan(&session, &admitted, &pinned)
+                    .unwrap()
+                    .expect("real small matched files");
+                admit_published_call_descriptors(&session, &planned);
+                session.seal_retrieval_admission();
+                let receipts = session.receipts();
+                assert_eq!(receipts.len(), if invalid_second { 15 } else { 16 });
+                assert!(receipts.iter().any(
+                    |r| r.stable_identity == format!("node:{}", upload.file_node_id.unwrap().0)
+                ));
+                assert!(
+                    !receipts
+                        .iter()
+                        .any(|r| r.stable_identity == format!("node:{}", local.id.0)),
+                    "already covered local target does not consume the one spare slot"
+                );
+                let target = receipts.iter().find(|r| {
+                    r.stable_identity == format!("node:{}", respond.file_node_id.unwrap().0)
+                });
+                if invalid_second {
+                    assert!(
+                        target.is_none(),
+                        "foreign second-parent metadata grants no expansion"
+                    );
+                } else {
+                    assert_eq!(
+                        target
+                            .expect("second parent retains its distinct external target")
+                            .score_version,
+                        "published-call-context/v1"
+                    );
+                    let contexts = session.automatic_file_context.borrow();
+                    let focus = &contexts
+                        .get(&format!("node:{}", respond.file_node_id.unwrap().0))
+                        .unwrap()
+                        .ranges;
+                    for target in [respond, backup] {
+                        assert!(
+                            focus.contains(&PacketSourceRangeV1 {
+                                start_line: target.start_line.unwrap(),
+                                end_line: target.end_line.unwrap()
+                            }),
+                            "one optional FILE retains every real target focus after its slot is spent"
+                        );
+                    }
+                }
+                assert!(
+                    receipts
+                        .iter()
+                        .map(|r| r.reserved_source_bytes as usize)
+                        .sum::<usize>()
+                        <= INTERIM_MAX_ADMITTED_SOURCE_BYTES
+                );
+            }
+        });
+        let saturated = AgentPacketRequestDto {
+            question: "upload\n\ndownload".into(),
+            budget: PacketBudgetModeDto::Standard,
+            probes: files
+                .iter()
+                .map(
+                    |(path, _)| codestory_contracts::api::PacketProbeDto::ExactPath {
+                        path: path.clone(),
+                    },
+                )
+                .collect(),
+            latency_budget_ms: Some(30_000),
+            parent_packet_id: None,
+            option_ids: Vec::new(),
+            core_generation_id: None,
+            retrieval_generation: None,
+        };
+        // Retain the original default-caller interaction that previously
+        // failed before returning its cached query result.
+        let smoke = fixture
+            .controller
+            .browser_service()
+            .packet_for_benchmark(saturated.clone(), false)
+            .unwrap();
+        assert_eq!(smoke.retrieval_proof["dense_semantic_stage_invocations"], 0);
+        // Scope/output assertions belong to the actual represented caller,
+        // not the legacy plan fields that its output budget may discard.
+        let exact = crate::agent::orchestrator::tests::represented_packet_without_dense(
+            &fixture.controller,
+            saturated,
+        )
+        .unwrap();
+        let source_rows = exact
+            .packet
+            .support
+            .iter()
+            .filter(|row| row.kind == codestory_contracts::api::SupportUnitKindDto::SourceRange)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            source_rows.len(),
+            INTERIM_MAX_ADMITTED_CANDIDATES,
+            "all sixteen real short explicit files remain delivered"
+        );
+        let codestory_contracts::packet_projection_v3::PacketProjectionV3Dto::Complete {
+            evidence,
+            ..
+        } = &exact.product.projection
+        else {
+            panic!("sixteen real short exact files fit the public frame")
+        };
+        for (path, _) in &files {
+            assert!(
+                source_rows.iter().any(
+                    |row| row.symbol_id.is_none() && row.path.as_deref() == Some(path.as_str())
+                ),
+                "exact path identity remains unmodified: {path}"
+            );
+            assert!(
+                evidence.as_slice().iter().any(|row| row.kind
+                    == codestory_contracts::packet_projection_v3::EvidenceKindV3Dto::ExactSource
+                    && row.path.as_ref().is_some_and(|p| p.as_str() == path)),
+                "actual final exact source remains in scope: {path}"
+            );
+        }
+    }
+
     fn assert_published_file_packet_available(
         fixture: &PinnedOperationFixture,
         request: &AgentPacketRequestDto,
@@ -8787,7 +9715,9 @@ mod tests {
                 &session,
                 [&original],
                 Some(&pinned.session.publication_identity().sidecar_input_hash),
-            );
+                None,
+            )
+            .unwrap();
             assert_eq!(
                 session.receipts().len(),
                 usize::from(mode != "live"),
