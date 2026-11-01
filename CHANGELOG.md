@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Go reference navigation connects proven struct-field reads to their declarations, including named field paths across files in the same module package. These references remain distinct from calls, and existing Go indexes refresh automatically.
+
 - Go symbol lookup includes named struct fields and keeps their owner relationships distinct, including grouped declarations. Existing Go indexes refresh automatically.
 
 - Symbol-name lookup returns the same matches when a repository moves, without matching unrelated declarations through its checkout path.

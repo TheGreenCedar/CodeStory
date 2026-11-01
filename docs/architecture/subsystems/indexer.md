@@ -65,6 +65,17 @@ Decorator callee references remain graph nodes but cannot act as lexical
 callers for argument expressions; canonical declarations, including one-line
 functions, remain eligible owners.
 
+Go field-reference binding shares the existing bounded, hash-verified package
+source pass. It records direct named fields of unique package struct types,
+then resolves typed receiver/parameter/local value selectors and named field
+paths in the same authenticated module package. The source binding retains
+its lexical type origin and complete field path. Alias, generic, interface,
+imported, embedded and anonymous type traversal, grouped-field traversal,
+ambiguous declarations and uncertain bindings stay unresolved. These are USAGE
+relationships with exact edge REFERENCE occurrences, never CALL or invocation
+proof. Declaration-only and removal-only refreshes recompute unchanged readers;
+Go extraction revisions retire old payloads through normal cache/index refresh.
+
 Go package variables retain identifier-only definition occurrences and a
 non-callable graph kind. After identities, occurrences and call proof inputs
 are collected, display ranges expand to the full standalone declaration or

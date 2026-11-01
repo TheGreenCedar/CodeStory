@@ -85,7 +85,7 @@ pub(crate) const PACKAGE_FUNCTION_IMPORT_SET_PREFIX: &str = "syntax:go-package-f
 pub(crate) const RETURN_PATH_OWNER_PREFIX: &str = "go-return-path:";
 
 pub(crate) const INITIALIZER_CALL_REVISION: &str =
-    extraction_revision!("go-named-struct-fields-v6");
+    extraction_revision!("go-ordinary-field-references-v7");
 
 /// Expand display spans after identifier occurrences, call ownership and IDs are fixed.
 pub(crate) fn apply_package_variable_envelopes(tree: &Tree, nodes: &mut [Node]) {
@@ -273,7 +273,9 @@ impl GoReturnPath {
 }
 
 mod value_uses;
-pub(crate) use value_uses::{GoValueTarget, callable_value_uses};
+pub(crate) use value_uses::{
+    GoFieldTarget, GoStructFields, GoValueTarget, struct_fields, value_references,
+};
 
 const GRAPH_QUERY: &str = include_str!("../../rules/go.scm");
 

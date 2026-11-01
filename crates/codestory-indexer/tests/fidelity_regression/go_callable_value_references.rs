@@ -861,3 +861,427 @@ fn go_callable_value_type_shadows_never_bind_package_methods() -> anyhow::Result
     );
     Ok(())
 }
+
+#[test]
+fn go_ordinary_field_references_bind_paths_and_refresh_unchanged_readers() -> anyhow::Result<()> {
+    use codestory_contracts::graph::{TrailCallerScope, TrailConfig, TrailDirection, TrailMode};
+    let types = "package fields\ntype Config struct { DataPath string }\ntype Other struct { DataPath string }\ntype Server struct { config *Config; alternate *Other }\n";
+    let reads = "package fields\nfunc consume(v string) {}\nfunc direct(c *Config) { _ = c.DataPath }\nfunc (s *Server) nested() {\n _ = s.config.DataPath\n _ = s.alternate.DataPath\n consume(s.config.DataPath)\n}\n";
+    let dir = tempdir()?;
+    fs::write(
+        dir.path().join("go.mod"),
+        "module example.com/fields\n\ngo 1.24\n",
+    )?;
+    fs::write(dir.path().join("types.go"), types)?;
+    fs::write(dir.path().join("reads.go"), reads)?;
+    let mut store = Storage::new_in_memory()?;
+    refresh(dir.path(), &mut store, &["go.mod", "types.go", "reads.go"])?;
+    let field = |store: &Storage, name: &str| {
+        let found: Vec<_> = store
+            .get_nodes()
+            .unwrap()
+            .into_iter()
+            .filter(|node| node.kind == NodeKind::FIELD && node.serialized_name == name)
+            .collect();
+        assert_eq!(found.len(), 1, "unique field {name}: {found:?}");
+        found[0].id
+    };
+    let config = field(&store, "Config.DataPath");
+    let other = field(&store, "Other.DataPath");
+    let direct = declared(&store, reads, "func direct(c").id;
+    let nested = declared(&store, reads, "func (s *Server) nested()").id;
+    for (anchor, target, carrier) in [
+        ("func direct(c", config, direct),
+        (" _ = s.config.DataPath", config, nested),
+        (" _ = s.alternate.DataPath", other, nested),
+        (" consume(s.config.DataPath)", config, nested),
+    ] {
+        value_reference(&store, reads, anchor, "DataPath", target, carrier);
+    }
+    let calls = |store: &Storage| {
+        let mut rows: Vec<_> = store
+            .get_edges()
+            .unwrap()
+            .into_iter()
+            .filter(|edge| edge.kind == EdgeKind::CALL)
+            .map(|edge| format!("{edge:?}"))
+            .collect();
+        rows.sort();
+        rows
+    };
+    let original_calls = calls(&store);
+    assert_eq!(original_calls.len(), 1, "only explicit consume invocation");
+    let incoming = store.get_trail(&TrailConfig {
+        root_id: config,
+        mode: TrailMode::AllReferencing,
+        direction: TrailDirection::Incoming,
+        depth: 1,
+        max_nodes: 30,
+        caller_scope: TrailCallerScope::IncludeTestsAndBenches,
+        edge_filter: vec![EdgeKind::USAGE],
+        ..Default::default()
+    })?;
+    assert_eq!(
+        incoming.edges.len(),
+        3,
+        "all Config reads visible through the existing incoming reader"
+    );
+    assert!(incoming.nodes.iter().any(|node| node.id == direct));
+    assert!(incoming.nodes.iter().any(|node| node.id == nested));
+    for edge in incoming.edges {
+        let refs = store.get_occurrences_for_element(edge.id.0)?;
+        assert!(
+            refs.iter().any(|occ| occ.kind == OccurrenceKind::REFERENCE
+                && occ.location.start_line == edge.line.unwrap()
+                && occ.location.end_col - occ.location.start_col == 8),
+            "edge occurrence consumer"
+        );
+    }
+    let warm = refresh(dir.path(), &mut store, &["go.mod", "types.go", "reads.go"])?;
+    assert_eq!(
+        warm.artifact_cache_hits, 2,
+        "both Go files must replay cached artifacts"
+    );
+    value_reference(&store, reads, "func direct(c", "DataPath", config, direct);
+    value_reference(
+        &store,
+        reads,
+        " _ = s.config.DataPath",
+        "DataPath",
+        config,
+        nested,
+    );
+    value_reference(
+        &store,
+        reads,
+        " _ = s.alternate.DataPath",
+        "DataPath",
+        other,
+        nested,
+    );
+    assert_eq!(
+        calls(&store),
+        original_calls,
+        "unchanged warm refresh preserves the CALL multiset"
+    );
+    fs::write(
+        dir.path().join("types.go"),
+        types.replace("config *Config", "config *Other"),
+    )?;
+    refresh(dir.path(), &mut store, &["types.go"])?;
+    for anchor in [" _ = s.config.DataPath", " consume(s.config.DataPath)"] {
+        value_reference(&store, reads, anchor, "DataPath", other, nested);
+        assert!(
+            !store
+                .get_edges()?
+                .iter()
+                .any(|edge| edge.kind == EdgeKind::USAGE
+                    && edge.line == Some(line(reads, anchor))
+                    && edge.effective_target() == config),
+            "unchanged reader must lose stale field binding"
+        );
+    }
+    value_reference(&store, reads, "func direct(c", "DataPath", config, direct);
+    assert_eq!(
+        calls(&store),
+        original_calls,
+        "field metadata edits cannot alter calls"
+    );
+    let removed = store
+        .get_files()?
+        .into_iter()
+        .find(|file| file.path.ends_with("types.go"))
+        .unwrap()
+        .id;
+    let file_ids = store
+        .get_files()?
+        .into_iter()
+        .map(|file| (file.path, file.id))
+        .collect();
+    fs::remove_file(dir.path().join("types.go"))?;
+    WorkspaceIndexer::new(dir.path().to_path_buf()).run_incremental(
+        &mut store,
+        &codestory_workspace::RefreshInfo {
+            mode: codestory_workspace::BuildMode::Incremental,
+            files_to_index: vec![],
+            files_to_remove: vec![removed],
+            existing_file_ids: file_ids,
+        },
+        &EventBus::new(),
+        None,
+    )?;
+    assert!(
+        !store
+            .get_edges()?
+            .iter()
+            .any(|edge| edge.kind == EdgeKind::USAGE && edge.resolved_target.is_some()),
+        "removal-only refresh clears field bindings"
+    );
+    fs::write(dir.path().join("types.go"), types)?;
+    refresh(dir.path(), &mut store, &["types.go"])?;
+    value_reference(&store, reads, "func direct(c", "DataPath", config, direct);
+    value_reference(
+        &store,
+        reads,
+        " _ = s.config.DataPath",
+        "DataPath",
+        config,
+        nested,
+    );
+    value_reference(
+        &store,
+        reads,
+        " _ = s.alternate.DataPath",
+        "DataPath",
+        other,
+        nested,
+    );
+    assert_eq!(
+        calls(&store),
+        original_calls,
+        "restored declarations rebind unchanged readers without changing calls"
+    );
+    Ok(())
+}
+
+#[test]
+fn go_ordinary_field_references_reject_unsupported_and_shadowed_owners() -> anyhow::Result<()> {
+    let types = "package fields\ntype Config struct { DataPath string }\ntype Alias = Config\ntype Generic[T any] struct { DataPath string }\ntype View interface { Read() }\ntype Nested struct { config struct { DataPath string } }\ntype Embedded struct { Config }\ntype Pair struct { left, right *Config }\n";
+    let reads = "package fields\nimport ext \"example.com/missing\"\nfunc alias(c *Alias) { _ = c.DataPath }\nfunc generic(c *Generic[int]) { _ = c.DataPath }\nfunc opaque(c View) { _ = c.DataPath }\nfunc anonymous(c *Nested) { _ = c.config.DataPath }\nfunc embedded(c *Embedded) { _ = c.DataPath }\nfunc grouped(c *Pair) { _ = c.left.DataPath }\nfunc imported(c *ext.Config) { _ = c.DataPath }\nfunc local() { type Config struct { DataPath int }; c := Config{}; _ = c.DataPath }\nfunc shadow(c *Config) { c := unknown; _ = c.DataPath }\nfunc parameterOrigin(c *Config) { type Config struct { DataPath int }; _ = c.DataPath }\n";
+    let dir = tempdir()?;
+    fs::write(
+        dir.path().join("go.mod"),
+        "module example.com/fields\n\ngo 1.24\n",
+    )?;
+    fs::write(dir.path().join("types.go"), types)?;
+    fs::write(dir.path().join("reads.go"), reads)?;
+    let mut store = Storage::new_in_memory()?;
+    refresh(dir.path(), &mut store, &["go.mod", "types.go", "reads.go"])?;
+    let fields: HashSet<_> = store
+        .get_nodes()?
+        .into_iter()
+        .filter(|node| node.kind == NodeKind::FIELD)
+        .map(|node| node.id)
+        .collect();
+    for edge in store.get_edges()? {
+        if edge.kind == EdgeKind::USAGE && fields.contains(&edge.effective_target()) {
+            assert_eq!(
+                edge.line,
+                Some(line(reads, "func parameterOrigin")),
+                "unsupported field owner must not bind by spelling: {edge:?}"
+            );
+        }
+    }
+    let config = store
+        .get_nodes()?
+        .into_iter()
+        .find(|node| {
+            node.kind == NodeKind::FIELD
+                && node.serialized_name == "Config.DataPath"
+                && node.file_node_id
+                    == store
+                        .get_files()
+                        .unwrap()
+                        .iter()
+                        .find(|f| f.path.ends_with("types.go"))
+                        .map(|f| NodeId(f.id))
+        })
+        .unwrap()
+        .id;
+    value_reference_at(
+        &store,
+        reads,
+        "func parameterOrigin",
+        "DataPath",
+        config,
+        declared(&store, reads, "func parameterOrigin(c").id,
+        1,
+    );
+    assert!(
+        !store
+            .get_edges()?
+            .iter()
+            .any(|edge| edge.kind == EdgeKind::CALL),
+        "field reads do not invoke targets"
+    );
+    Ok(())
+}
+
+#[test]
+fn go_ordinary_field_references_fail_closed_on_ambiguous_or_unverified_catalogues()
+-> anyhow::Result<()> {
+    let types = "package fields\ntype Config struct { DataPath string }\n";
+    let reads = "package fields\nfunc read(c *Config) { _ = c.DataPath }\n";
+    for (name, duplicate) in [
+        (
+            "duplicate.go",
+            "package fields\ntype Config struct { DataPath int }\n",
+        ),
+        ("alias.go", "package fields\ntype Config = int\n"),
+        (
+            "generic.go",
+            "package fields\ntype Config[T any] struct { DataPath T }\n",
+        ),
+        (
+            "interface.go",
+            "package fields\ntype Config interface { Read() }\n",
+        ),
+        (
+            "duplicate_test.go",
+            "package fields\ntype Config struct { DataPath int }\n",
+        ),
+    ] {
+        let dir = tempdir()?;
+        fs::write(
+            dir.path().join("go.mod"),
+            "module example.com/fields\n\ngo 1.24\n",
+        )?;
+        fs::write(dir.path().join("types.go"), types)?;
+        fs::write(dir.path().join("reads.go"), reads)?;
+        fs::write(dir.path().join(name), duplicate)?;
+        let mut store = Storage::new_in_memory()?;
+        refresh(
+            dir.path(),
+            &mut store,
+            &["go.mod", "types.go", "reads.go", name],
+        )?;
+        assert!(
+            !store
+                .get_edges()?
+                .iter()
+                .any(|edge| edge.kind == EdgeKind::USAGE && edge.resolved_target.is_some()),
+            "ambiguous owner {name} must not pick one field"
+        );
+    }
+    let dir = tempdir()?;
+    fs::write(
+        dir.path().join("go.mod"),
+        "module example.com/fields\n\ngo 1.24\n",
+    )?;
+    fs::write(dir.path().join("types.go"), types)?;
+    fs::write(dir.path().join("reads.go"), reads)?;
+    let mut store = Storage::new_in_memory()?;
+    refresh(dir.path(), &mut store, &["go.mod", "types.go", "reads.go"])?;
+    assert!(
+        store
+            .get_edges()?
+            .iter()
+            .any(|edge| edge.kind == EdgeKind::USAGE && edge.resolved_target.is_some()),
+        "valid control must first bind"
+    );
+    fs::write(
+        dir.path().join("types.go"),
+        types.replace("DataPath string", "DataPath int"),
+    )?;
+    refresh(dir.path(), &mut store, &["reads.go"])?;
+    assert!(
+        !store
+            .get_edges()?
+            .iter()
+            .any(|edge| edge.kind == EdgeKind::USAGE && edge.resolved_target.is_some()),
+        "unindexed declaration drift must clear old field binding"
+    );
+    Ok(())
+}
+
+#[test]
+fn go_ordinary_field_references_keep_package_and_test_identity() -> anyhow::Result<()> {
+    for duplicate_module in [false, true] {
+        let dir = tempdir()?;
+        fs::write(
+            dir.path().join("go.mod"),
+            "module example.com/identity\n\ngo 1.24\n",
+        )?;
+        let types = "package fields\ntype Config struct { DataPath string }\n";
+        let reads = "package fields\nfunc read(c *Config) { _ = c.DataPath }\n";
+        let mut names = vec!["go.mod".to_string()];
+        for package in ["left", "right"] {
+            fs::create_dir(dir.path().join(package))?;
+            if duplicate_module {
+                fs::write(
+                    dir.path().join(package).join("go.mod"),
+                    "module example.com/collision\n\ngo 1.24\n",
+                )?;
+                names.push(format!("{package}/go.mod"));
+            }
+            fs::write(dir.path().join(package).join("types.go"), types)?;
+            fs::write(dir.path().join(package).join("reads.go"), reads)?;
+            names.extend([format!("{package}/types.go"), format!("{package}/reads.go")]);
+        }
+        // A production reader cannot acquire declarations available only to tests.
+        fs::write(
+            dir.path().join("hidden_test.go"),
+            "package fields\ntype Hidden struct { DataPath string }\n",
+        )?;
+        fs::write(
+            dir.path().join("production.go"),
+            "package fields\nfunc hidden(h *Hidden) { _ = h.DataPath }\n",
+        )?;
+        names.extend(["hidden_test.go".to_string(), "production.go".to_string()]);
+        let mut store = Storage::new_in_memory()?;
+        let names: Vec<_> = names.iter().map(String::as_str).collect();
+        refresh(dir.path(), &mut store, &names)?;
+        let files = store.get_files()?;
+        let nodes = store.get_nodes()?;
+        let edges = store.get_edges()?;
+        let field_usages: Vec<_> = edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::USAGE && edge.resolved_target.is_some())
+            .collect();
+        if duplicate_module {
+            assert!(
+                field_usages.is_empty(),
+                "ambiguous package import path cannot choose one directory: {field_usages:?}"
+            );
+        } else {
+            assert_eq!(
+                field_usages.len(),
+                2,
+                "only two authenticated production-package fields may bind"
+            );
+            for package in ["left", "right"] {
+                let type_file = files
+                    .iter()
+                    .find(|file| file.path.ends_with(format!("{package}/types.go")))
+                    .unwrap()
+                    .id;
+                let read_file = files
+                    .iter()
+                    .find(|file| file.path.ends_with(format!("{package}/reads.go")))
+                    .unwrap()
+                    .id;
+                let target = nodes
+                    .iter()
+                    .find(|node| {
+                        node.kind == NodeKind::FIELD
+                            && node.serialized_name == "Config.DataPath"
+                            && node.file_node_id == Some(NodeId(type_file))
+                    })
+                    .unwrap()
+                    .id;
+                let usage = field_usages
+                    .iter()
+                    .find(|edge| edge.file_node_id == Some(NodeId(read_file)))
+                    .expect("own-package field reference");
+                assert_eq!(
+                    usage.effective_target(),
+                    target,
+                    "same spelling cannot cross package identity"
+                );
+                let refs = store.get_occurrences_for_element(usage.id.0)?;
+                assert!(
+                    refs.iter().any(|occ| occ.kind == OccurrenceKind::REFERENCE
+                        && occ.location.file_node_id == NodeId(read_file)
+                        && occ.location.start_line == 2
+                        && occ.location.end_col - occ.location.start_col == 8),
+                    "exact own-file edge reference"
+                );
+            }
+        }
+        assert!(
+            !edges.iter().any(|edge| edge.kind == EdgeKind::CALL),
+            "field package/test binding cannot manufacture calls"
+        );
+    }
+    Ok(())
+}

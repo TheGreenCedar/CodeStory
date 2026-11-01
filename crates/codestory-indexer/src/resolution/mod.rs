@@ -767,11 +767,15 @@ struct GoReturnDeclarationKey {
 
 type GoReturnResults = Option<Vec<Option<String>>>;
 type GoReturnDeclarationCatalog = HashMap<GoReturnDeclarationKey, GoReturnResults>;
+type GoStructFieldCatalog =
+    HashMap<(String, String, String), Option<(i64, crate::languages::go::GoStructFields)>>;
+type GoFieldNodes = HashMap<(i64, String, u32, u32), Option<i64>>;
 
 #[derive(Default)]
 struct GoReturnDeclarationCatalogs {
     all: GoReturnDeclarationCatalog,
     importable: GoReturnDeclarationCatalog,
+    fields: GoStructFieldCatalog,
 }
 
 #[derive(Debug, Default)]
@@ -781,6 +785,7 @@ struct GoResolutionContext {
     ambiguous_import_paths: HashSet<String>,
     return_declarations: GoReturnDeclarationCatalog,
     importable_return_declarations: GoReturnDeclarationCatalog,
+    fields: GoStructFieldCatalog,
 }
 
 #[derive(Debug)]
@@ -946,6 +951,7 @@ impl GoResolutionContext {
             ambiguous_import_paths,
             return_declarations: return_catalogs.all,
             importable_return_declarations: return_catalogs.importable,
+            fields: return_catalogs.fields,
         })
     }
 
@@ -977,6 +983,8 @@ fn load_go_return_declarations(
     }
     let mut total_bytes = 0usize;
     let mut pending = Vec::new();
+    let mut fields = GoStructFieldCatalog::new();
+    let mut fields_complete = true;
     let mut concrete_types = HashMap::<(String, String), HashSet<String>>::new();
     let mut parser = Parser::new();
     if parser
@@ -1008,6 +1016,29 @@ fn load_go_return_declarations(
         let Some(tree) = parser.parse(&source, None) else {
             return GoReturnDeclarationCatalogs::default();
         };
+        if let Some(declarations) = file
+            .complete
+            .then(|| crate::languages::go::struct_fields(&tree, &source))
+            .flatten()
+        {
+            for declaration in declarations {
+                let key = (
+                    package.import_path.clone(),
+                    package.package_name.clone(),
+                    declaration.owner.clone(),
+                );
+                match fields.entry(key) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(Some((file.id, declaration)));
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        entry.insert(None);
+                    }
+                }
+            }
+        } else {
+            fields_complete = false;
+        }
         concrete_types
             .entry((package.import_path.clone(), package.package_name.clone()))
             .or_default()
@@ -1025,6 +1056,9 @@ fn load_go_return_declarations(
         }
     }
     let mut catalogs = GoReturnDeclarationCatalogs::default();
+    if fields_complete {
+        catalogs.fields = fields;
+    }
     for (key, mut results, is_test_file) in pending {
         let package_types =
             concrete_types.get(&(key.import_path.clone(), key.package_name.clone()));
@@ -1209,10 +1243,9 @@ impl ResolutionPass {
         sql::invalidate_go_return_method_resolutions(storage.get_connection())
     }
 
-    /// Finish only Go callable-value references. The package context and
-    /// declaration index are the same native/module identities used by calls;
-    /// no CALL job, semantic name fallback or invocation proof is involved.
-    pub(crate) fn finalize_go_callable_value_references(
+    /// Resolve Go value references without CALL jobs or invocation proof.
+    /// Field paths use a separate verified declaration catalogue.
+    pub(crate) fn finalize_go_value_references(
         &self,
         storage: &Storage,
         cancel_token: Option<&CancellationToken>,
@@ -1243,7 +1276,32 @@ impl ResolutionPass {
             .filter(|file| file.language == "go" && file.complete)
             .map(|file| file.id)
             .collect();
-        let mut resolved = HashMap::<(i64, Option<String>, String, bool), Option<i64>>::new();
+        let mut field_nodes = GoFieldNodes::new();
+        let mut statement = conn.prepare(
+            "SELECT id,file_node_id,serialized_name,start_line,start_col FROM node WHERE kind=?1 AND file_node_id IS NOT NULL AND start_line IS NOT NULL AND start_col IS NOT NULL",
+        )?;
+        let mapped = statement.query_map([NodeKind::FIELD as i32], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, u32>(3)?,
+                row.get::<_, u32>(4)?,
+            ))
+        })?;
+        for node in mapped {
+            let (id, file, name, line, col) = node?;
+            match field_nodes.entry((file, name, line, col)) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(Some(id));
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    entry.insert(None);
+                }
+            }
+        }
+        let mut resolved =
+            HashMap::<(i64, crate::languages::go::GoValueTarget), Option<i64>>::new();
         let mut update = conn.prepare(
             "UPDATE edge SET resolved_target_node_id=?2,
              resolved_source_node_id=CASE WHEN ?2 IS NULL THEN NULL ELSE source_node_id END,
@@ -1269,13 +1327,14 @@ impl ResolutionPass {
             else {
                 continue;
             };
-            let key = (
-                file,
-                target.owner.clone(),
-                target.name.clone(),
-                target.unresolved,
-            );
+            let key = (file, target.clone());
             let target_id = *resolved.entry(key).or_insert_with(|| {
+                if complete.contains(&file)
+                    && let Some(field) = target.field.as_ref()
+                    && let Some(id) = self.resolve_go_field_value(file, field, &field_nodes)
+                {
+                    return Some(id);
+                }
                 if target.unresolved || !complete.contains(&file) {
                     return None;
                 }
@@ -1361,6 +1420,55 @@ impl ResolutionPass {
             ])?;
         }
         Ok(())
+    }
+
+    fn resolve_go_field_value(
+        &self,
+        file: i64,
+        target: &crate::languages::go::GoFieldTarget,
+        nodes: &GoFieldNodes,
+    ) -> Option<i64> {
+        let context = self.go_context.as_ref()?;
+        let package = context.packages_by_file_node_id.get(&file)?;
+        if context
+            .ambiguous_import_paths
+            .contains(&package.import_path)
+        {
+            return None;
+        }
+        let mut owner = target.owner.as_str();
+        for (index, name) in target.path.iter().enumerate() {
+            let (declaring_file, declaration) = context
+                .fields
+                .get(&(
+                    package.import_path.clone(),
+                    package.package_name.clone(),
+                    owner.to_string(),
+                ))?
+                .as_ref()?;
+            if !package.is_test_file
+                && context
+                    .packages_by_file_node_id
+                    .get(declaring_file)?
+                    .is_test_file
+            {
+                return None;
+            }
+            let field = declaration.fields.as_ref()?.get(name)?.as_ref()?;
+            if index + 1 == target.path.len() {
+                return nodes
+                    .get(&(
+                        *declaring_file,
+                        format!("{owner}.{name}"),
+                        field.span.start_line,
+                        field.span.start_col,
+                    ))
+                    .copied()
+                    .flatten();
+            }
+            owner = field.next_owner.as_deref()?;
+        }
+        None
     }
 
     fn find_go_package_function_readonly(

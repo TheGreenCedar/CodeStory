@@ -1,12 +1,132 @@
-//! Callable values are references, never evidence of invocation.
+//! Proven values are references, never evidence of invocation.
 use super::*;
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(crate) struct GoValueTarget {
     pub owner: Option<String>,
     pub name: String,
     #[serde(default)]
     pub unresolved: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<GoFieldTarget>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub(crate) struct GoFieldTarget {
+    pub owner: String,
+    pub path: Vec<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct GoStructFields {
+    pub owner: String,
+    pub fields: Option<HashMap<String, Option<GoFieldDeclaration>>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct GoFieldDeclaration {
+    pub next_owner: Option<String>,
+    pub span: GraphNodeSpan,
+}
+
+// Only direct named fields of package declarations authorize field paths.
+// Descendant walks would promote anonymous, embedded or local type fields.
+pub(crate) fn struct_fields(tree: &Tree, source: &str) -> Option<Vec<GoStructFields>> {
+    if tree.root_node().has_error() {
+        return None;
+    }
+    let mut declarations = Vec::new();
+    let mut cursor = tree.root_node().walk();
+    for declaration in tree.root_node().named_children(&mut cursor) {
+        if declaration.kind() != "type_declaration" {
+            continue;
+        }
+        let mut cursor = declaration.walk();
+        for spec in declaration.named_children(&mut cursor) {
+            if !matches!(spec.kind(), "type_spec" | "type_alias") {
+                continue;
+            }
+            let Some(owner) = spec
+                .child_by_field_name("name")
+                .and_then(|name| trimmed_node_text(name, source))
+            else {
+                continue;
+            };
+            let mut fields = None;
+            if spec.kind() == "type_spec"
+                && spec.child_by_field_name("type_parameters").is_none()
+                && let Some(ty) = spec
+                    .child_by_field_name("type")
+                    .filter(|ty| ty.kind() == "struct_type")
+            {
+                let mut direct = HashMap::new();
+                let mut cursor = ty.walk();
+                if let Some(list) = ty
+                    .named_children(&mut cursor)
+                    .find(|node| node.kind() == "field_declaration_list")
+                {
+                    let mut cursor = list.walk();
+                    for field in list.named_children(&mut cursor) {
+                        let mut cursor = field.walk();
+                        let names: Vec<_> =
+                            field.children_by_field_name("name", &mut cursor).collect();
+                        let next_owner = (names.len() == 1)
+                            .then(|| field.child_by_field_name("type"))
+                            .flatten()
+                            .and_then(|ty| {
+                                let ty = if ty.kind() == "pointer_type" {
+                                    ty.named_child(0)?
+                                } else {
+                                    ty
+                                };
+                                (ty.kind() == "type_identifier")
+                                    .then(|| trimmed_node_text(ty, source))
+                                    .flatten()
+                            });
+                        for name in names {
+                            let Some(name_text) =
+                                trimmed_node_text(name, source).filter(|name| name != "_")
+                            else {
+                                continue;
+                            };
+                            match direct.entry(name_text) {
+                                std::collections::hash_map::Entry::Vacant(entry) => {
+                                    entry.insert(Some(GoFieldDeclaration {
+                                        next_owner: next_owner.clone(),
+                                        span: ts_node_graph_span(name),
+                                    }));
+                                }
+                                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                                    entry.insert(None);
+                                }
+                            }
+                        }
+                    }
+                }
+                fields = Some(direct);
+            }
+            // Unsupported declarations still deny a same-spelling owner.
+            declarations.push(GoStructFields { owner, fields });
+        }
+    }
+    Some(declarations)
+}
+
+fn field_path(node: TsNode<'_>, source: &str) -> Option<(String, Vec<String>)> {
+    let mut node = node;
+    let mut path = Vec::new();
+    while node.kind() == "selector_expression" {
+        path.push(trimmed_node_text(
+            node.child_by_field_name("field")?,
+            source,
+        )?);
+        node = node.child_by_field_name("operand")?;
+    }
+    if node.kind() != "identifier" {
+        return None;
+    }
+    path.reverse();
+    Some((trimmed_node_text(node, source)?, path))
 }
 
 pub(crate) struct GoValueUse {
@@ -136,7 +256,7 @@ pub(super) fn selector_names(node: TsNode<'_>, source: &str) -> Option<(String, 
     ))
 }
 
-pub(crate) fn callable_value_uses(tree: &Tree, source: &str) -> Vec<GoValueUse> {
+pub(crate) fn value_references(tree: &Tree, source: &str) -> Vec<GoValueUse> {
     if tree.root_node().has_error() {
         return Vec::new();
     }
@@ -169,6 +289,24 @@ pub(crate) fn callable_value_uses(tree: &Tree, source: &str) -> Vec<GoValueUse> 
             &intervals,
             &uses,
         );
+        let field_uses: Vec<_> = uses
+            .iter()
+            .filter_map(|usage| {
+                let (root, _) = field_path(usage.node, source)?;
+                selector_value(usage.node)?;
+                Some(GoNavigationCall {
+                    node: usage.node,
+                    receiver_name: root,
+                    method_name: usage.method_name.clone(),
+                })
+            })
+            .collect();
+        let field_decisions = go_navigation_binding_decisions(
+            callable.start_byte(),
+            callable.end_byte(),
+            &intervals,
+            &field_uses,
+        );
         for usage in uses {
             let Some(field) = selector_value(usage.node) else {
                 continue;
@@ -200,6 +338,17 @@ pub(crate) fn callable_value_uses(tree: &Tree, source: &str) -> Vec<GoValueUse> 
                     owner: proven_owner,
                     name: usage.method_name,
                     unresolved,
+                    field: field_decisions
+                        .get(&usage.node.id())
+                        .cloned()
+                        .flatten()
+                        .filter(|(owner, module)| {
+                            module.is_none() && !owner.starts_with(RETURN_PATH_OWNER_PREFIX)
+                        })
+                        .and_then(|(owner, _)| {
+                            let (_, path) = field_path(usage.node, source)?;
+                            Some(GoFieldTarget { owner, path })
+                        }),
                 },
             });
         }
@@ -227,6 +376,7 @@ pub(crate) fn callable_value_uses(tree: &Tree, source: &str) -> Vec<GoValueUse> 
                     owner: None,
                     name,
                     unresolved: false,
+                    field: None,
                 },
             });
         });

@@ -2187,7 +2187,7 @@ impl WorkspaceIndexer {
             None
         };
         if let Some(resolver) = prepared_resolver.as_ref() {
-            resolver.finalize_go_callable_value_references(storage, cancel_token)?;
+            resolver.finalize_go_value_references(storage, cancel_token)?;
         }
         if (stats.graph_projection_changed || go_return_inputs_changed)
             && (had_edges
@@ -8865,7 +8865,7 @@ fn append_manual_type_argument_edges(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn append_go_callable_value_references(
+fn append_go_value_references(
     tree: &Tree,
     source: &str,
     file_name: &str,
@@ -8912,7 +8912,7 @@ fn append_go_callable_value_references(
                 .or_insert(node.id);
         }
     }
-    for usage in languages::go::callable_value_uses(tree, source) {
+    for usage in languages::go::value_references(tree, source) {
         count_manual_receiver_lookup_work(1);
         let Some(owner) = owners
             .get(&(usage.source_span, usage.source_name.clone()))
@@ -17371,7 +17371,7 @@ fn index_file_with_resolution_inputs(
         &mut callsite_ordinals,
     );
     if language_config.language_name == "go" {
-        append_go_callable_value_references(
+        append_go_value_references(
             &tree,
             source,
             &file_name,
