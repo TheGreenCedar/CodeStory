@@ -3994,7 +3994,10 @@ fn candidate_provenance_labels(candidate: &CandidateHit) -> Vec<String> {
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+pub(super) use tests::public_packet_fixture_with_published_files;
+
+#[cfg(test)]
+mod tests {
     use super::*;
     use crate::agent::packet_evidence::PacketEvidenceTier;
     use crate::test_support::{git, git_available};

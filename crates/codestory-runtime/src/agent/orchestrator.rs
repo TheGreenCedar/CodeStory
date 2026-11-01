@@ -2485,7 +2485,7 @@ pub(super) mod tests {
     #[test]
     #[cfg(feature = "benchmark-support")]
     fn matched_small_file_policy_keeps_explicit_scope_and_handles_real_pressure() {
-        use crate::agent::retrieval_primary::tests::public_packet_fixture_with_published_files;
+        use crate::agent::retrieval_primary::public_packet_fixture_with_published_files;
         use codestory_contracts::api::{PacketProbeDto, SupportUnitKindDto};
         use codestory_contracts::compilation::PUBLIC_PACKET_SERIALIZED_MAX_BYTES;
         use codestory_contracts::graph::NodeKind as CoreNodeKind;
@@ -2633,7 +2633,7 @@ pub(super) mod tests {
     #[test]
     #[cfg(feature = "benchmark-support")]
     fn matched_small_file_served_witness_revalidates_on_a_real_second_call_and_refuses_drift() {
-        use crate::agent::retrieval_primary::tests::public_packet_fixture_with_published_files;
+        use crate::agent::retrieval_primary::public_packet_fixture_with_published_files;
         use codestory_contracts::packet_projection_v3::PacketProjectionV3Dto;
         let caller = "package sample\n\nimport \"crypto/sha1\"\n\nfunc upload() int { return respond(500) }\nfunc download() int { return respond(400) }\n";
         let helper = "package sample\n\nfunc respond(code int) int { return 200 }\n";
@@ -2710,7 +2710,7 @@ pub(super) mod tests {
     #[test]
     #[cfg(feature = "benchmark-support")]
     fn matched_small_file_with_partial_callable_follows_the_actual_offered_patch() {
-        use crate::agent::retrieval_primary::tests::public_packet_fixture_with_published_files;
+        use crate::agent::retrieval_primary::public_packet_fixture_with_published_files;
         use codestory_contracts::packet_projection_v3::PacketProjectionV3Dto;
         let caller = "package sample\n\nimport \"crypto/sha1\"\n\nfunc upload() int { return respond(500) }\n";
         let mut helper =
