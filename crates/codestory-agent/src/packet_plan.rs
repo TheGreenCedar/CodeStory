@@ -7,7 +7,8 @@
 
 use crate::planning::dedupe_packet_plan_queries;
 use codestory_contracts::api::{
-    PacketBudgetModeDto, PacketPlanDto, PacketPlanQueryDto, PacketProbeDto,
+    PACKET_PROBE_MAX_TEXT_LENGTH, PacketBudgetModeDto, PacketPlanDto, PacketPlanQueryDto,
+    PacketProbeDto,
 };
 use codestory_contracts::compilation::{
     PACKET_COMPILATION_CONTRACT_VERSION_V1, PacketSeedSelectorV1, RetrievalSeedPlanV1,
@@ -18,28 +19,34 @@ const GENERIC_RETRIEVAL_PURPOSE: &str =
     "unchanged question for generic lexical and semantic retrieval";
 const TYPED_FREE_QUERY_PURPOSE: &str = "typed free-query retrieval seed";
 
-/// Keep the unchanged query and existing literal paragraph views, then fill
-/// spare slots with uniformly sampled literal sentences. Delimiters are syntax
-/// only: every view receives the same ordinary generic retrieval authority.
+/// Keep the whole query, its first slash-text atom, then literal paragraphs and
+/// sentences within the existing bound. All views have generic retrieval
+/// authority; slash text does not identify a filesystem path or a graph node.
 pub fn generic_retrieval_queries(question: &str) -> Vec<&str> {
     const MAX_SUPPLEMENTAL_QUERIES: usize = 7;
     let whole = question.trim();
     if whole.is_empty() {
         return Vec::new();
     }
+    let mut queries = vec![whole];
+    if let Some(literal) = first_slash_text_literal(question)
+        && !whole.eq_ignore_ascii_case(literal)
+    {
+        queries.push(literal);
+    }
+    let paragraph_cap = MAX_SUPPLEMENTAL_QUERIES - (queries.len() - 1);
     let paragraph_count = literal_paragraphs(question).count();
-    let count = paragraph_count.min(MAX_SUPPLEMENTAL_QUERIES);
+    let count = paragraph_count.min(paragraph_cap);
     let positions = (0..count)
         .map(|position| {
-            if paragraph_count <= MAX_SUPPLEMENTAL_QUERIES {
+            if paragraph_count <= paragraph_cap {
                 position
             } else {
-                position * (paragraph_count - 1) / (MAX_SUPPLEMENTAL_QUERIES - 1)
+                position * (paragraph_count - 1) / (paragraph_cap - 1)
             }
         })
         .collect::<Vec<_>>();
     let mut wanted = positions.into_iter().peekable();
-    let mut queries = vec![whole];
     for (index, paragraph) in literal_paragraphs(question).enumerate() {
         if wanted.peek() != Some(&index) {
             continue;
@@ -77,6 +84,156 @@ pub fn generic_retrieval_queries(question: &str) -> Vec<&str> {
         queries.push(sentences[index]);
     }
     queries
+}
+
+// Syntax alone chooses a fallible text view, including negated/incidental text.
+// Quoted spans and fences must close before their contents can be considered.
+fn first_slash_text_literal(question: &str) -> Option<&str> {
+    let mut chars = question.char_indices().peekable();
+    let mut fence = None;
+    let mut wrapper = None;
+    let mut escaped = false;
+    let mut line_prefix = true;
+    while let Some((index, character)) = chars.next() {
+        let at_line_prefix = line_prefix;
+        // Track prefix eligibility once per character, including inside fences.
+        line_prefix = character == '\n'
+            || (line_prefix
+                && (character.is_whitespace()
+                    || character.is_ascii_digit()
+                    || matches!(character, '>' | '-' | '+' | '*' | '.' | ')')));
+        let mut run = 1;
+        let mut end = index + character.len_utf8();
+        if matches!(character, '`' | '~') {
+            while chars.peek().is_some_and(|(_, next)| *next == character) {
+                let (index, next) = chars.next()?;
+                run += 1;
+                end = index + next.len_utf8();
+            }
+        }
+        if let Some((delimiter, length)) = fence {
+            if character == delimiter
+                && run >= length
+                && at_line_prefix
+                && question[end..].split('\n').next()?.trim().is_empty()
+            {
+                fence = None;
+            }
+            continue;
+        }
+        if let Some((delimiter, length, start)) = wrapper {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' && delimiter != '`' {
+                escaped = true;
+            } else if character == delimiter && run == length {
+                let atom = &question[start..index];
+                if slash_text_atom(atom) {
+                    return Some(atom);
+                }
+                wrapper = None;
+            }
+            continue;
+        }
+        if matches!(character, '`' | '~')
+            && run >= 3
+            && at_line_prefix
+            && (character != '`' || !has_single_token_backtick_close(&question[end..], run))
+        {
+            fence = Some((character, run));
+            continue;
+        }
+        let previous = question[..index].chars().next_back();
+        if character == '`'
+            || character == '"'
+            || (character == '\'' && !previous.is_some_and(char::is_alphanumeric))
+        {
+            wrapper = Some((character, run, end));
+            continue;
+        }
+        if character != '/'
+            || previous.is_some_and(|previous| {
+                !previous.is_whitespace() && !matches!(previous, '(' | '[' | '{' | '<')
+            })
+        {
+            continue;
+        }
+        while let Some((index, next)) = chars.peek().copied() {
+            if next.is_whitespace() {
+                break;
+            }
+            chars.next();
+            end = index + next.len_utf8();
+        }
+        let mut atom = question[index..end].trim_end_matches(['.', ',', ';', ':', '!', '?']);
+        let mut excess_closers = [0_isize; 4];
+        for character in atom.chars() {
+            match character {
+                '(' => excess_closers[0] -= 1,
+                ')' => excess_closers[0] += 1,
+                '[' => excess_closers[1] -= 1,
+                ']' => excess_closers[1] += 1,
+                '{' => excess_closers[2] -= 1,
+                '}' => excess_closers[2] += 1,
+                '<' => excess_closers[3] -= 1,
+                '>' => excess_closers[3] += 1,
+                _ => {}
+            }
+        }
+        // Strip only unmatched closing prose brackets, retaining pairs inside
+        // the atom, such as a placeholder in /items/{key}.
+        while let Some(close) = atom.chars().next_back() {
+            let pair = match close {
+                ')' => 0,
+                ']' => 1,
+                '}' => 2,
+                '>' => 3,
+                _ => break,
+            };
+            if excess_closers[pair] <= 0 {
+                break;
+            }
+            excess_closers[pair] -= 1;
+            atom = atom[..atom.len() - close.len_utf8()]
+                .trim_end_matches(['.', ',', ';', ':', '!', '?']);
+        }
+        if !atom.contains(['\'', '"', '`']) && slash_text_atom(atom) {
+            return Some(atom);
+        }
+    }
+    None
+}
+
+fn has_single_token_backtick_close(tail: &str, length: usize) -> bool {
+    // Only a line-prefix run needs this distinction. Looking ahead over its
+    // first token once keeps the scan linear even for arbitrarily long input.
+    let mut chars = tail.chars().peekable();
+    let mut nonempty = false;
+    while let Some(character) = chars.next() {
+        if character.is_whitespace() {
+            return false;
+        }
+        if character == '`' {
+            let mut run = 1;
+            while chars.peek() == Some(&'`') {
+                chars.next();
+                run += 1;
+            }
+            if run == length {
+                return nonempty;
+            }
+        }
+        nonempty = true;
+    }
+    false
+}
+
+fn slash_text_atom(atom: &str) -> bool {
+    atom.starts_with('/')
+        && !atom.starts_with("//")
+        && atom.chars().count() <= PACKET_PROBE_MAX_TEXT_LENGTH
+        && !atom.chars().any(char::is_whitespace)
+        && atom.chars().any(char::is_alphanumeric)
 }
 
 // Keep punctuation inside quoted strings and matching code delimiters literal.
@@ -376,6 +533,152 @@ fn push_packet_query(queries: &mut Vec<PacketPlanQueryDto>, query: &str, purpose
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slash_text_views_preserve_public_planner_boundaries() {
+        let at_limit = format!("/{}", "界".repeat(239));
+        let oversized = format!("/{}", "界".repeat(240));
+        let many_closers = format!("Inspect /archive{} then /later.", ")]>".repeat(4096));
+        let many_fence_markers = format!(
+            "Before.\n~~~text\n{}{}\n~~~\nInspect /later.",
+            " ".repeat(4096),
+            "~~~ not-a-closer ".repeat(4096),
+        );
+        let cases = vec![
+            ("first", "Inspect /archive then /later.".to_string(), Some("/archive")),
+            ("punctuation", "Inspect (/archive), then /later.".into(), Some("/archive")),
+            ("internal", "Inspect /archive/{id}?version=2 then /later.".into(), Some("/archive/{id}?version=2")),
+            ("double quote", "Inspect \"/archive\" then /later.".into(), Some("/archive")),
+            ("single quote", "Inspect '/archive' then /later.".into(), Some("/archive")),
+            ("backtick", "Inspect `/archive` then /later.".into(), Some("/archive")),
+            ("double backtick", "Inspect ``/archive`` then /later.".into(), Some("/archive")),
+            ("inline triple backtick", "Inspect ```/archive``` then /later.".into(), Some("/archive")),
+            ("line-leading triple wrapper", "```/archive``` before /later.".into(), Some("/archive")),
+            ("line-leading four wrapper", "````/archive```` before /later.".into(), Some("/archive")),
+            ("prefixed triple wrapper", "> - ```/archive``` before /later.".into(), Some("/archive")),
+            ("prefixed four wrapper", "> 1. ````/archive```` before /later.".into(), Some("/archive")),
+            ("escaped quote", r#"Inspect "/archive/\"part" then /later."#.into(), Some(r#"/archive/\"part"#)),
+            ("unicode", "背景 `/café/資料` then /later.".into(), Some("/café/資料")),
+            ("unicode whitespace", "Inspect\u{2003}/Archive\t/later.".into(), Some("/Archive")),
+            ("negated", "Ignore /incidental but inspect /later.".into(), Some("/incidental")),
+            ("repeat", "Inspect /Archive /archive /later.".into(), Some("/Archive")),
+            ("url", "See https://example.invalid/archive and //host/path, then /later.".into(), Some("/later")),
+            ("quoted url", "See `https://example.invalid/archive` and '//host/path', then /later.".into(), Some("/later")),
+            ("non-slash", "Inspect `archive` and `node:123` and src/archive.rs.".into(), None),
+            ("whole atom deduplicated", "/archive".into(), None),
+            ("empty slash", "Inspect / and //host/path only.".into(), None),
+            ("unclosed quote", "Inspect \"/archive then /later.".into(), None),
+            ("unclosed backtick", "Inspect `/archive then /later.".into(), None),
+            ("incomplete bare wrapper", "Inspect /archive\" then /later.".into(), Some("/later")),
+            ("multiword quote", "Inspect \"/archive /hidden\" then /later.".into(), Some("/later")),
+            ("fence", "Before.\n```text\n/archive\n```\nInspect /later.".into(), Some("/later")),
+            ("fence type and length", "Before.\n````text\n/archive\n~~~\n/hidden\n```\n/still-hidden\n````\nInspect /later.".into(), Some("/later")),
+            ("embedded fence marker", "Before.\n```text\nexample ``` /hidden\n``` trailing\n/still-hidden\n```\nInspect /later.".into(), Some("/later")),
+            ("nested fence", "Before.\n> - ```text\n> /hidden\n> ```\nInspect /later.".into(), Some("/later")),
+            ("CRLF nested fence", "Before.\r\n> 1. ````text\r\n> /hidden\r\n> ```\r\n> /still-hidden\r\n> ````\r\nInspect /later.".into(), Some("/later")),
+            ("tilde fence", "Before.\n~~~text\n/archive\n~~~\nInspect /later.".into(), Some("/later")),
+            ("unclosed fence", "Before.\n```text\n/archive\n/later".into(), None),
+            ("limit", format!("Inspect {at_limit} then /later."), Some(at_limit.as_str())),
+            ("oversize", format!("Inspect {oversized} then /later."), Some("/later")),
+            ("quoted oversize", format!("Inspect `{oversized}` then /later."), Some("/later")),
+            ("many unmatched closers", many_closers, Some("/archive")),
+            ("many markers after long prefix", many_fence_markers, Some("/later")),
+        ];
+        for (name, question, expected) in cases {
+            let seed = build_retrieval_seed_plan(&question, &[]);
+            assert_eq!(seed.generic_query, question, "{name}: original bytes");
+            assert!(
+                seed.exact_selectors.is_empty(),
+                "{name}: no identity authority"
+            );
+            assert!(seed.free_queries.is_empty(), "{name}: no caller authority");
+            let plan = build_packet_plan_from_seed_plan(&seed, PacketBudgetModeDto::Standard);
+            assert_eq!(
+                plan.queries[0].query,
+                question.trim(),
+                "{name}: whole first"
+            );
+            let slash_views = plan
+                .queries
+                .iter()
+                .skip(1)
+                .filter(|query| {
+                    query.query.starts_with('/') && !query.query.chars().any(char::is_whitespace)
+                })
+                .map(|query| query.query.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                slash_views,
+                expected.into_iter().collect::<Vec<_>>(),
+                "{name}"
+            );
+            if let Some(expected) = expected {
+                assert_eq!(
+                    plan.queries[1].query, expected,
+                    "{name}: literal before supplements"
+                );
+            }
+            assert!(plan.queries.len() <= 8, "{name}: generic cap");
+            assert!(
+                plan.queries
+                    .iter()
+                    .all(|query| question.contains(&query.query))
+            );
+            assert!(
+                plan.queries
+                    .iter()
+                    .all(|query| !packet_plan_query_is_typed_free_query(query))
+            );
+        }
+
+        let question = "  Inspect /Archive and /later.\n\nSecond.\n\nThird.\n\nFourth.\n\nFifth.\n\nSixth.\n\nSeventh.\n\nEighth.  ";
+        let mut probes = (0..13)
+            .map(|index| PacketProbeDto::FreeQuery {
+                query: format!("explicit {index}"),
+            })
+            .collect::<Vec<_>>();
+        probes.push(PacketProbeDto::FreeQuery {
+            query: "/Archive".into(),
+        });
+        probes.push(PacketProbeDto::ExactPath {
+            path: "src/real.rs".into(),
+        });
+        probes.push(PacketProbeDto::SymbolId {
+            id: "node:42".into(),
+        });
+        let seed = build_retrieval_seed_plan(question, &probes);
+        assert_eq!(seed.generic_query, question);
+        assert_eq!(
+            seed.exact_selectors,
+            [
+                PacketSeedSelectorV1::ExactPath {
+                    path: "src/real.rs".into()
+                },
+                PacketSeedSelectorV1::CanonicalId {
+                    id: "node:42".into()
+                },
+            ]
+        );
+        let generic = build_packet_plan(question, PacketBudgetModeDto::Standard);
+        assert_eq!(generic.queries.len(), 8);
+        assert_eq!(generic.queries[1].query, "/Archive");
+        let tiny = build_packet_plan_from_seed_plan(&seed, PacketBudgetModeDto::Tiny);
+        assert_eq!(tiny.queries.len(), 20);
+        assert_eq!(tiny.queries[0].query, question.trim());
+        assert_eq!(tiny.queries[1].query, "/Archive");
+        assert!(!packet_plan_query_is_typed_free_query(&tiny.queries[1]));
+        assert_eq!(
+            packet_explicit_request_probe_queries(&tiny),
+            seed.free_queries
+        );
+        assert_eq!(
+            tiny.queries
+                .iter()
+                .filter(|query| query.query == "/Archive")
+                .count(),
+            2
+        );
+    }
 
     #[test]
     fn sentence_views_preserve_whole_paragraph_order_and_literal_unicode() {
