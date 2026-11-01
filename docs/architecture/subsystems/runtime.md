@@ -157,6 +157,14 @@ A later request can revalidate a recorded FILE range through its issued witness;
 this does not grant fresh FILE-range authority. These views establish neither
 answer sufficiency nor callable-body completeness.
 
+Continuation records also authenticate the options in the final response. A
+selected whole-file option can authorize an unread file's complete indexed
+extent from the same pinned publication. Runtime verifies the caller, question
+and recorded option before hydration. Older records retain their earlier
+source-witness authority. Paged continuations retain the original requested
+scope and source hash, and must deliver the requested next line when capacity
+permits.
+
 ## Extension rules
 
 - put reusable product workflows here and expose typed contract DTOs;

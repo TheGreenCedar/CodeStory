@@ -52,6 +52,10 @@ pub(crate) struct AutomaticFileContext {
 pub(crate) struct PacketProofSession {
     pub(crate) issued_source_record:
         RefCell<Option<super::packet_served_sources::ServedSourceRecord>>,
+    /// Selected final parent offers, verified against real complete FILE extents.
+    /// These are unread-file intents, never fabricated served-source witnesses.
+    pub(crate) offered_whole_files:
+        RefCell<HashMap<String, codestory_contracts::compilation::PacketSourceRangeV1>>,
     /// Packet-scoped count of candidates selected for source/graph hydration.
     /// Horizon A admits at most [`INTERIM_MAX_ADMITTED_CANDIDATES`] across the
     /// whole packet before hydration, not per subquery.
@@ -247,6 +251,7 @@ impl PacketProofSession {
         Self {
             hydrated_admissions: RefCell::new(0),
             issued_source_record: RefCell::new(None),
+            offered_whole_files: RefCell::new(HashMap::new()),
             admitted_source_bytes: RefCell::new(0),
             admitted_identities: RefCell::new(HashMap::new()),
             receipts: RefCell::new(Vec::new()),

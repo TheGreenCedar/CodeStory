@@ -1,5 +1,6 @@
 //! Product-issued, immutable metadata for the source rows in a finalized public
-//! Complete packet. No source body is stored or loaded before admission.
+//! Complete packet and its final offered actions. No source body is stored or
+//! loaded before admission.
 use crate::AppController;
 use codestory_contracts::{
     api::{AgentPacketRequestDto, ApiError},
@@ -45,14 +46,21 @@ pub(crate) struct ServedSourceRecord {
     issued_at: u64,
     expires_at: u64,
     pub(crate) witnesses: Vec<ServedSourceWitness>,
+    // Omitted for legacy records so their exact signed bytes remain unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    offered_option_ids: Vec<String>,
 }
 impl ServedSourceRecord {
+    pub(crate) fn offered_option(&self, id: &str) -> bool {
+        self.version == 3 && self.offered_option_ids.iter().any(|offered| offered == id)
+    }
+
     pub(crate) fn authorizes_published_file(
         &self,
         identity: &str,
         publication: &codestory_retrieval::RetrievalPublicationIdentity,
     ) -> bool {
-        self.version == 2
+        matches!(self.version, 2 | 3)
             && self.publication.retrieval.as_ref().is_some_and(|p| {
                 p.core_generation_id.as_str() == publication.core_generation_id
                     && p.core_run_id.as_str() == publication.core_run_id
@@ -61,7 +69,9 @@ impl ServedSourceRecord {
                     && p.semantic_generation.as_str() == publication.semantic_generation
             })
             && self.witnesses.iter().any(|w| {
-                w.node_id.is_none() && w.stable_identity() == identity && w.valid_for_version(2)
+                w.node_id.is_none()
+                    && w.stable_identity() == identity
+                    && w.valid_for_version(self.version)
             })
     }
 }
@@ -465,7 +475,7 @@ impl ServedSourceWitness {
         let identity_valid = match &self.node_id {
             Some(id) => id.parse::<i64>().is_ok(),
             None => {
-                version == 2
+                matches!(version, 2 | 3)
                     && !self.path.is_empty()
                     && !self.path.contains('\\')
                     && self
@@ -519,6 +529,27 @@ pub(crate) struct PacketSourceIssuanceSeal {
     identity: codestory_contracts::packet_projection_v3::PacketRequestIdentityV3Dto,
     publication: PublicationIdentityV3Dto,
     witnesses: Vec<ServedSourceWitness>,
+    offered_option_ids: Vec<String>,
+}
+fn offered_option_ids(projection: &PacketProjectionV3Dto) -> Vec<String> {
+    let PacketProjectionV3Dto::Complete {
+        continuation: Some(continuation),
+        ..
+    } = projection
+    else {
+        return Vec::new();
+    };
+    continuation
+        .packet_request_patch
+        .as_ref()
+        .map_or_else(Vec::new, |patch| {
+            patch
+                .option_ids
+                .as_slice()
+                .iter()
+                .map(|id| id.as_str().to_owned())
+                .collect()
+        })
 }
 fn witnesses(projection: &PacketProjectionV3Dto) -> Result<Vec<ServedSourceWitness>, ApiError> {
     let PacketProjectionV3Dto::Complete { evidence, .. } = projection else {
@@ -572,6 +603,7 @@ pub(crate) fn seal(
         identity: identity.clone(),
         publication: publication.clone(),
         witnesses: witnesses(projection).ok()?,
+        offered_option_ids: offered_option_ids(projection),
     })
 }
 pub(crate) fn commit(
@@ -600,9 +632,11 @@ pub(crate) fn commit(
     }
     let seal = product.source_issuance_seal.as_ref().ok_or_else(refused)?;
     let final_witnesses = witnesses(&product.projection)?;
+    let final_offers = offered_option_ids(&product.projection);
     if seal.caller != caller
         || seal.identity != *identity
         || seal.publication != *publication
+        || seal.offered_option_ids != final_offers
         || final_witnesses.iter().any(|w| !seal.witnesses.contains(w))
     {
         return Err(refused());
@@ -618,7 +652,9 @@ pub(crate) fn commit(
                 }
                 let at = now()?;
                 let record = ServedSourceRecord {
-                    version: if final_witnesses.iter().any(|w| w.node_id.is_none()) {
+                    version: if !final_offers.is_empty() {
+                        3
+                    } else if final_witnesses.iter().any(|w| w.node_id.is_none()) {
                         2
                     } else {
                         1
@@ -630,6 +666,7 @@ pub(crate) fn commit(
                     issued_at: at,
                     expires_at: at.checked_add(LEASE_SECONDS).ok_or_else(refused)?,
                     witnesses: final_witnesses,
+                    offered_option_ids: final_offers,
                 };
                 validate_record_without_question(&record)?;
                 persist(&root(controller), record)
@@ -641,7 +678,10 @@ pub(crate) fn commit(
 fn validate_record_without_question(record: &ServedSourceRecord) -> Result<(), ApiError> {
     // The projection builder already bound the question digest; the loader
     // compares it to the actual continuation question. Validate remaining shape.
-    if !matches!(record.version, 1 | 2)
+    if !matches!(record.version, 1..=3)
+        || (record.version == 3 && record.offered_option_ids.is_empty())
+        || (record.version < 3 && !record.offered_option_ids.is_empty())
+        || record.offered_option_ids.len() > 8
         || (record.version == 2 && record.witnesses.iter().all(|w| w.node_id.is_some()))
         || record.question_sha256.len() != 64
         || record.request_id.is_empty()
@@ -649,6 +689,15 @@ fn validate_record_without_question(record: &ServedSourceRecord) -> Result<(), A
         || record.witnesses.len() > 16
     {
         return Err(refused());
+    }
+    let mut offers = std::collections::BTreeSet::new();
+    for id in &record.offered_option_ids {
+        if !offers.insert(id)
+            || id.len() > codestory_contracts::packet_projection_v3::IDENTITY_MAX_BYTES_V3
+            || super::packet_compiler::drill_options_from_ids(std::slice::from_ref(id)).len() != 1
+        {
+            return Err(refused());
+        }
     }
     let mut ids = std::collections::BTreeSet::new();
     let mut total = 0;
@@ -752,6 +801,7 @@ mod tests {
                     semantic_generation: id("semantic"),
                 }),
             },
+            offered_option_ids: Vec::new(),
             witnesses: vec![ServedSourceWitness {
                 node_id: Some("17".into()),
                 path: "source.rs".into(),
@@ -811,6 +861,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(loaded.witnesses, legacy.witnesses);
+        let literal_v2 = LEGACY
+            .replacen("\"version\":1", "\"version\":2", 1)
+            .replace("\"node_id\":\"17\",", "")
+            .replace("source.rs", "settings.ini")
+            .replace("\"end_line\":3", "\"end_line\":1")
+            .replace(
+                "\"remaining_source_bytes\":12",
+                "\"remaining_source_bytes\":0",
+            )
+            .replace("\"next_start_line\":2", "\"next_start_line\":null");
+        let v2: ServedSourceRecord = serde_json::from_str(&literal_v2).unwrap();
+        assert_eq!(serde_json::to_vec(&v2).unwrap(), literal_v2.as_bytes());
+        assert_eq!(
+            mac(&key, literal_v2.as_bytes()),
+            "867ac40902bf073a556a2fa148ef58c39210ab0d8108675bb66911baac329c37"
+        );
+        assert!(validate_record_without_question(&v2).is_ok());
         for version in [0, 2, 3, u32::MAX] {
             let mut invalid = legacy.clone();
             invalid.version = version;
@@ -1504,5 +1571,499 @@ mod tests {
             fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
             assert!(private_directory(&root).is_err());
         }
+    }
+    #[test]
+    #[cfg(feature = "benchmark-support")]
+    fn offered_file_signed_record_authority_controls_real_indexed_source() {
+        use crate::agent::{
+            orchestrator::tests::represented_packet_without_dense,
+            retrieval_primary::public_packet_fixture_with_published_files,
+        };
+        use codestory_contracts::{api::*, compilation::PacketSourceRangeV1, graph::NodeKind};
+        use codestory_store::Store;
+        let visible = "package sample\n\nfunc visible() int { return 1 }\n";
+        let helper = "package sample\n\nfunc respond() int {\n\treturn 200\n}\n";
+        let fixture = public_packet_fixture_with_published_files(
+            &[
+                ("visible.go", visible.as_bytes()),
+                ("response.go", helper.as_bytes()),
+                ("unrelated.go", b"package sample\nfunc unrelated() {}\n"),
+            ],
+            true,
+        );
+        let core = Store::open_read_only(&fixture.storage_path).unwrap();
+        let nodes = core.get_nodes().unwrap();
+        let file = |name: &str| {
+            nodes
+                .iter()
+                .find(|n| n.kind == NodeKind::FILE && n.serialized_name.ends_with(name))
+                .unwrap()
+                .id
+                .0
+                .to_string()
+        };
+        let helper_id = file("response.go");
+        let unrelated_id = file("unrelated.go");
+        let range = PacketSourceRangeV1 {
+            start_line: 1,
+            end_line: helper.lines().count() as u32,
+        };
+        let option = |id: &str, range| {
+            DrillOptionDto::omitted_symbol("unit authority", id)
+                .with_source_range(range)
+                .id
+        };
+        let request = AgentPacketRequestDto {
+            question: "visible".into(),
+            budget: PacketBudgetModeDto::Standard,
+            probes: Vec::new(),
+            latency_budget_ms: Some(30_000),
+            parent_packet_id: None,
+            option_ids: Vec::new(),
+            core_generation_id: None,
+            retrieval_generation: None,
+        };
+        let first = represented_packet_without_dense(&fixture.controller, request.clone()).unwrap();
+        let PacketProjectionV3Dto::Complete { publication, .. } = &first.product.projection else {
+            panic!("complete actual publication")
+        };
+        let mut inventory = read_record(
+            &root(&fixture.controller),
+            publication,
+            "codestory-cli",
+            &first.packet.packet_id,
+            &request.question,
+            now().unwrap(),
+        )
+        .unwrap();
+        // This is an explicitly synthetic *private authority* fixture, not a
+        // claim that the preceding public response offered this action. The
+        // normal retained CLI interaction owns that before/after behavior.
+        inventory.version = 3;
+        inventory.request_id = format!("psr1:{}", uuid::Uuid::new_v4());
+        inventory.witnesses.retain(|w| {
+            w.node_id.as_deref() != Some(&helper_id) && w.node_id.as_deref() != Some(&unrelated_id)
+        });
+        inventory.offered_option_ids = vec![option(&helper_id, range)];
+        persist(&root(&fixture.controller), inventory.clone()).unwrap();
+        let mut next = request.clone();
+        next.parent_packet_id = Some(inventory.request_id.clone());
+        next.core_generation_id = Some(publication.core.generation_id.as_str().to_owned());
+        next.retrieval_generation = publication
+            .retrieval
+            .as_ref()
+            .map(|p| p.retrieval_generation.as_str().to_owned());
+        next.option_ids = inventory.offered_option_ids.clone();
+        let second = represented_packet_without_dense(&fixture.controller, next.clone()).unwrap();
+        let delivered = second
+            .packet
+            .support
+            .iter()
+            .find(|r| {
+                r.kind == SupportUnitKindDto::SourceRange
+                    && r.symbol_id.as_deref() == Some(&helper_id)
+            })
+            .expect("authenticated unread FILE must deliver actual source");
+        assert!(delivered.snippet.as_deref().unwrap().contains("return 200"));
+        let delivery = delivered.source_delivery.as_ref().unwrap();
+        assert_eq!(delivery.requested_range, range);
+        assert_eq!(delivery.source_sha256, digest(helper.as_bytes()));
+        assert_eq!(
+            (delivered.start_line, delivered.end_line),
+            (Some(1), Some(range.end_line))
+        );
+        for (label, id, selected_range) in [
+            (
+                "narrow",
+                helper_id.clone(),
+                PacketSourceRangeV1 {
+                    start_line: 2,
+                    ..range
+                },
+            ),
+            (
+                "wrong end",
+                helper_id.clone(),
+                PacketSourceRangeV1 {
+                    end_line: range.end_line + 1,
+                    ..range
+                },
+            ),
+            (
+                "unoffered",
+                unrelated_id.clone(),
+                PacketSourceRangeV1 {
+                    start_line: 1,
+                    end_line: 2,
+                },
+            ),
+        ] {
+            let mut bad = next.clone();
+            bad.option_ids = vec![option(&id, selected_range)];
+            let response = represented_packet_without_dense(&fixture.controller, bad).unwrap();
+            assert!(
+                !response
+                    .packet
+                    .support
+                    .iter()
+                    .any(|r| r.kind == SupportUnitKindDto::SourceRange
+                        && r.symbol_id.as_deref() == Some(&id)),
+                "{label}"
+            );
+            assert!(
+                response
+                    .packet
+                    .disposition
+                    .omission_receipts
+                    .iter()
+                    .any(|r| r.contains("source bounds are unavailable")),
+                "{label}: actual range guard"
+            );
+        }
+        // Membership alone is insufficient: even a correctly signed offer
+        // cannot authorize a fresh narrow/incorrect FILE extent.
+        for (label, selected_range) in [
+            (
+                "signed narrow",
+                PacketSourceRangeV1 {
+                    start_line: 2,
+                    ..range
+                },
+            ),
+            (
+                "signed short end",
+                PacketSourceRangeV1 {
+                    end_line: range.end_line - 1,
+                    ..range
+                },
+            ),
+            (
+                "signed excessive end",
+                PacketSourceRangeV1 {
+                    end_line: range.end_line + 1,
+                    ..range
+                },
+            ),
+        ] {
+            let mut bounded = inventory.clone();
+            bounded.request_id = format!("psr1:{}", uuid::Uuid::new_v4());
+            bounded.offered_option_ids = vec![option(&helper_id, selected_range)];
+            persist(&root(&fixture.controller), bounded.clone()).unwrap();
+            let mut selected = next.clone();
+            selected.parent_packet_id = Some(bounded.request_id);
+            selected.option_ids = bounded.offered_option_ids;
+            let response = represented_packet_without_dense(&fixture.controller, selected).unwrap();
+            assert!(
+                !response
+                    .packet
+                    .support
+                    .iter()
+                    .any(|r| r.kind == SupportUnitKindDto::SourceRange
+                        && r.symbol_id.as_deref() == Some(&helper_id)),
+                "{label}"
+            );
+            assert!(
+                response
+                    .packet
+                    .disposition
+                    .omission_receipts
+                    .iter()
+                    .any(|r| r.contains("source bounds are unavailable")),
+                "{label}"
+            );
+        }
+        let mut fresh = next.clone();
+        fresh.probes = crate::agent::packet_compiler::continuation_probes_from_options(
+            &fresh,
+            publication.core.project_id.as_str(),
+        )
+        .unwrap();
+        fresh.option_ids.clear();
+        fresh.parent_packet_id = None;
+        let response = represented_packet_without_dense(&fixture.controller, fresh).unwrap();
+        assert!(
+            !response
+                .packet
+                .support
+                .iter()
+                .any(|r| r.kind == SupportUnitKindDto::SourceRange
+                    && r.symbol_id.as_deref() == Some(&helper_id)),
+            "fresh whole FILE range has no offer authority"
+        );
+        for mode in 0..2 {
+            let mut foreign = next.clone();
+            match mode {
+                0 => foreign.question.push_str(" foreign"),
+                _ => foreign.parent_packet_id = Some("psr1:unissued".into()),
+            }
+            assert!(
+                represented_packet_without_dense(&fixture.controller, foreign).is_err(),
+                "foreign/stale mode {mode}"
+            );
+        }
+        // A restricted private served-prefix fixture tests paging authority,
+        // independently of public offer generation. Its bytes/hash come from
+        // the actual indexed helper delivered above.
+        let mut scoped = inventory.clone();
+        scoped.request_id = format!("psr1:{}", uuid::Uuid::new_v4());
+        let scoped_range = PacketSourceRangeV1 {
+            start_line: 3,
+            end_line: range.end_line,
+        };
+        let prefix = format!(
+            "```text\n>{:>5} | {}\n```",
+            3,
+            helper.lines().nth(2).unwrap()
+        );
+        let public_prefix =
+            crate::evidence_projection_v3::compact_numbered_source_page(&prefix, 3, 3).unwrap();
+        scoped.witnesses.push(ServedSourceWitness {
+            node_id: Some(helper_id.clone()),
+            path: "response.go".into(),
+            start_line: 3,
+            end_line: 3,
+            delivery: PacketSourceDeliveryV1 {
+                requested_range: scoped_range,
+                source_sha256: digest(helper.as_bytes()),
+                remaining_source_bytes: helper
+                    .split_inclusive('\n')
+                    .skip(3)
+                    .map(str::len)
+                    .sum::<usize>() as u64,
+                next_start_line: Some(4),
+                blocked_line_rendered_bytes: None,
+            },
+            rendered_bytes: prefix.len(),
+            public_source_sha256: digest(public_prefix.as_bytes()),
+        });
+        scoped.offered_option_ids = vec![option(
+            &helper_id,
+            PacketSourceRangeV1 {
+                start_line: 4,
+                ..range
+            },
+        )];
+        persist(&root(&fixture.controller), scoped.clone()).unwrap();
+        let mut paging = next.clone();
+        paging.parent_packet_id = Some(scoped.request_id);
+        paging.option_ids = scoped.offered_option_ids;
+        let advanced =
+            represented_packet_without_dense(&fixture.controller, paging.clone()).unwrap();
+        let page = advanced
+            .packet
+            .support
+            .iter()
+            .find(|r| {
+                r.kind == SupportUnitKindDto::SourceRange
+                    && r.symbol_id.as_deref() == Some(&helper_id)
+            })
+            .unwrap();
+        assert_eq!(
+            (page.start_line, page.end_line),
+            (Some(3), Some(5)),
+            "requested next line actually delivered"
+        );
+        assert_eq!(
+            page.source_delivery.as_ref().unwrap().requested_range,
+            scoped_range
+        );
+        assert_eq!(
+            page.source_delivery.as_ref().unwrap().source_sha256,
+            digest(helper.as_bytes())
+        );
+        assert!(
+            !page.snippet.as_deref().unwrap().contains("package sample"),
+            "served narrow scope cannot broaden to a header"
+        );
+        paging.option_ids = next.option_ids.clone();
+        let widened = represented_packet_without_dense(&fixture.controller, paging).unwrap();
+        assert!(
+            widened
+                .packet
+                .support
+                .iter()
+                .filter(|r| r.kind == SupportUnitKindDto::SourceRange
+                    && r.symbol_id.as_deref() == Some(&helper_id))
+                .all(|r| r.start_line == Some(3)
+                    && r.source_delivery.as_ref().unwrap().requested_range == scoped_range)
+        );
+        let mut legacy = inventory.clone();
+        legacy.version = 1;
+        legacy.offered_option_ids.clear();
+        legacy.request_id = format!("psr1:{}", uuid::Uuid::new_v4());
+        persist(&root(&fixture.controller), legacy.clone()).unwrap();
+        let mut legacy_request = next.clone();
+        legacy_request.parent_packet_id = Some(legacy.request_id);
+        let response =
+            represented_packet_without_dense(&fixture.controller, legacy_request).unwrap();
+        assert!(
+            !response
+                .packet
+                .support
+                .iter()
+                .any(|r| r.kind == SupportUnitKindDto::SourceRange
+                    && r.symbol_id.as_deref() == Some(&helper_id)),
+            "legacy record cannot acquire offer authority"
+        );
+        std::fs::write(
+            fixture._project.path().join("response.go"),
+            helper.replace("200", "201"),
+        )
+        .unwrap();
+        assert!(
+            represented_packet_without_dense(&fixture.controller, next).is_err(),
+            "source drift cannot reuse the original publication"
+        );
+    }
+    #[test]
+    fn offered_file_record_closes_wire_versions_membership_and_mac() {
+        let mut offered = record();
+        offered.version = 3;
+        offered.offered_option_ids = vec!["ms1:1:3:17".into()];
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("owned");
+        persist(&root, offered.clone()).unwrap();
+        let loaded = read_record(
+            &root,
+            &offered.publication,
+            &offered.caller,
+            &offered.request_id,
+            "ordinary question",
+            offered.issued_at,
+        )
+        .unwrap();
+        assert!(loaded.offered_option("ms1:1:3:17"));
+        assert!(!loaded.offered_option("ms1:2:3:17"));
+        for mode in 0..7 {
+            let mut bad = offered.clone();
+            match mode {
+                0 => bad.version = 1,
+                1 => bad.version = 2,
+                2 => bad.offered_option_ids.clear(),
+                3 => bad
+                    .offered_option_ids
+                    .push(bad.offered_option_ids[0].clone()),
+                4 => bad.offered_option_ids[0] = "malformed".into(),
+                5 => bad.offered_option_ids = vec!["ms1:1:3:17".into(); 9],
+                _ => bad.offered_option_ids[0] = "x".repeat(1024),
+            }
+            assert!(
+                validate_record_without_question(&bad).is_err(),
+                "shape mode {mode}"
+            );
+        }
+        let path = record_path(
+            &root,
+            offered.publication.core.project_id.as_str(),
+            &offered.caller,
+            &offered.request_id,
+        );
+        for mode in 0..3 {
+            let mut publication = offered.publication.clone();
+            let mut at = offered.issued_at;
+            match mode {
+                0 => {
+                    publication.core.generation_id =
+                        codestory_contracts::packet_projection_v3::IdentityTextV3::new("stale-core")
+                            .unwrap()
+                }
+                1 => {
+                    publication.retrieval.as_mut().unwrap().retrieval_generation =
+                        codestory_contracts::packet_projection_v3::IdentityTextV3::new(
+                            "stale-retrieval",
+                        )
+                        .unwrap()
+                }
+                _ => at = offered.expires_at,
+            }
+            assert!(
+                read_record(
+                    &root,
+                    &publication,
+                    &offered.caller,
+                    &offered.request_id,
+                    "ordinary question",
+                    at
+                )
+                .is_err(),
+                "publication/expiry mode {mode}"
+            );
+        }
+        let mut tampered: SignedRecord = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        tampered.record.offered_option_ids[0] = "ms1:1:3:18".into();
+        fs::write(&path, serde_json::to_vec(&tampered).unwrap()).unwrap();
+        assert!(
+            read_record(
+                &root,
+                &offered.publication,
+                &offered.caller,
+                &offered.request_id,
+                "ordinary question",
+                offered.issued_at
+            )
+            .is_err(),
+            "valid-looking changed offer fails MAC"
+        );
+    }
+    #[test]
+    fn offered_file_seal_records_final_public_options_and_rejects_changed_projection() {
+        use crate::evidence_projection_v3::representation_budget_test_support as fixture;
+        use codestory_contracts::compilation::*;
+        let input = PacketCompilationInputV1 {
+            contract_version: 1,
+            publication: PacketCompilationPublicationV1 {
+                project_id: "project-1".into(),
+                core_generation_id: "core-generation-1".into(),
+                retrieval_generation: Some("retrieval-generation-1".into()),
+            },
+            admissions: vec![PacketAdmissionReceiptV1 {
+                packet_ordinal: 0,
+                stable_identity: "node:17".into(),
+                origin: PacketAdmissionOriginV1::Retrieval,
+                score_version: "ordinary".into(),
+                reserved_source_bytes: 512,
+            }],
+            sources: vec![PacketHydratedSourceRangeV1 {
+                stable_identity: "node:17".into(),
+                path: "source.rs".into(),
+                symbol: None,
+                start_line: 1,
+                end_line: 1,
+                source: "```text\n>    1 | row\n```".into(),
+                callable_body: None,
+                parser_completeness: PacketParserCompletenessV1::Unknown,
+                delivery: Some(record().witnesses[0].delivery.clone()),
+            }],
+            relations: Vec::new(),
+            ambiguities: Vec::new(),
+            admission_gaps: Vec::new(),
+        };
+        let request: AgentPacketRequestDto =
+            serde_json::from_value(serde_json::json!({"question":"ordinary question"})).unwrap();
+        let (mut packet, _) = fixture::default_packet(input, &request);
+        packet.packet_id = format!("psr1:{}", uuid::Uuid::new_v4());
+        let mut product = fixture::project_packet(&request, &packet, |p| {
+            Ok(serde_json::to_vec(p).unwrap().len())
+        })
+        .unwrap();
+        let final_ids = offered_option_ids(&product.projection);
+        assert!(
+            final_ids.iter().any(|id| id == "ms1:2:3:17"),
+            "actual compiler/public projection must offer the unread tail"
+        );
+        let issued = product.source_issuance_seal.as_ref().unwrap();
+        assert_eq!(issued.offered_option_ids, final_ids);
+        if let PacketProjectionV3Dto::Complete { continuation, .. } = &mut product.projection {
+            *continuation = None;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let controller = AppController::new_with_owned_cache_root(dir.path());
+        let error = commit(&controller, "codestory-stdio", &product).unwrap_err();
+        assert_eq!(
+            error.message,
+            refused().message,
+            "changed final offers must fail before Core/storage access"
+        );
+        assert!(fs::read_dir(dir.path()).unwrap().next().is_none());
     }
 }

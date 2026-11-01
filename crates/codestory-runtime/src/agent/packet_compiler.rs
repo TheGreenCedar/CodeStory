@@ -882,6 +882,7 @@ pub(crate) fn prepare_packet_compilation(
     }
     let mut ranges =
         authenticated_continuation_ranges(controller, project_id, probe_resolutions, publication)?;
+    authenticate_offered_whole_files(&storage, request, session, &ranges)?;
     let requested_identities = ranges.keys().cloned().collect::<BTreeSet<_>>();
     // Save the actual authenticated cursor before restoring any served prefix.
     let requested_source_minimum_ends = ranges
@@ -1243,6 +1244,59 @@ fn authenticated_continuation_ranges(
         }
     }
     Ok(ranges)
+}
+
+// Option membership was MAC-authenticated by the recorder for this exact
+// caller/question/publication. A selected offer grants only a canonical whole
+// FILE extent, not arbitrary FILE ranges or authority from a matching spelling.
+fn authenticate_offered_whole_files(
+    storage: &Store,
+    request: Option<&AgentPacketRequestDto>,
+    session: &PacketProofSession,
+    ranges: &HashMap<String, PacketSourceRangeV1>,
+) -> Result<(), codestory_contracts::api::ApiError> {
+    let mut granted = session.offered_whole_files.borrow_mut();
+    granted.clear();
+    let issued = session.issued_source_record.borrow();
+    let (Some(request), Some(record)) = (request, issued.as_ref()) else {
+        return Ok(());
+    };
+    for option in drill_options_from_ids(&request.option_ids) {
+        if !record.offered_option(&option.id) {
+            continue;
+        }
+        let (Some(id), Some(range)) = (option.symbol_id, option.source_range) else {
+            continue;
+        };
+        let identity = format!("node:{id}");
+        if ranges.get(&identity) != Some(&range) {
+            continue;
+        }
+        let Some(node) = authenticated_node(storage, &id)? else {
+            continue;
+        };
+        if node.kind != CoreNodeKind::FILE {
+            continue;
+        }
+        let file = storage.get_file_by_id(node.id.0).map_err(|e| {
+            codestory_contracts::api::ApiError::internal(format!(
+                "Failed to authenticate offered FILE: {e}"
+            ))
+        })?;
+        if file.is_some_and(|f| {
+            f.indexed
+                && f.complete
+                && f.line_count > 0
+                && range
+                    == (PacketSourceRangeV1 {
+                        start_line: 1,
+                        end_line: f.line_count,
+                    })
+        }) {
+            granted.insert(identity, range);
+        }
+    }
+    Ok(())
 }
 
 fn attach_file_navigation_paths(support: &mut [SupportUnitDto], paths: &HashMap<String, String>) {
@@ -1806,7 +1860,12 @@ fn hydrate_admitted_node_source_with_range_cached(
         .ok_or(PacketAdmissionGapKindV1::SourceUnavailable)?;
     if node.kind == CoreNodeKind::FILE {
         return hydrate_admitted_file_source_with_range(
-            controller, storage, admission, &file, requested,
+            controller,
+            storage,
+            admission,
+            &file,
+            requested,
+            source_page_alternatives,
         );
     }
     let (start_line, end_line) = valid_source_bounds(node.start_line, node.end_line)
@@ -2005,7 +2064,14 @@ fn hydrate_admitted_file_source(
     admission: &PacketAdmissionReceiptV1,
     file: &FileInfo,
 ) -> Result<PacketHydratedSourceRangeV1, PacketAdmissionGapKindV1> {
-    hydrate_admitted_file_source_with_range(controller, storage, admission, file, None)
+    hydrate_admitted_file_source_with_range(
+        controller,
+        storage,
+        admission,
+        file,
+        None,
+        &mut BTreeMap::new(),
+    )
 }
 
 fn hydrate_admitted_file_source_with_range(
@@ -2014,6 +2080,7 @@ fn hydrate_admitted_file_source_with_range(
     admission: &PacketAdmissionReceiptV1,
     file: &FileInfo,
     requested: Option<PacketSourceRangeV1>,
+    source_page_alternatives: &mut BTreeMap<usize, Vec<PacketHydratedSourceRangeV1>>,
 ) -> Result<PacketHydratedSourceRangeV1, PacketAdmissionGapKindV1> {
     // A file identity has no source focus. Preserve a complete short file when
     // its pinned bytes fit the admission; otherwise leave it as navigation.
@@ -2028,8 +2095,9 @@ fn hydrate_admitted_file_source_with_range(
         .ok_or(PacketAdmissionGapKindV1::SourceUnavailable)?;
     if let Some(range) = requested {
         // The recorder already authenticated caller, publication, question and
-        // issuance MAC. A prior FILE witness authorizes only its exact range
-        // and hash; a fresh typed FILE range still has no such authority.
+        // issuance MAC. A served FILE witness authorizes only its original
+        // range/hash. Separately, a selected final whole-FILE offer authorizes
+        // its verified complete extent. Fresh/narrow FILE ranges gain neither.
         let authorized =
             super::packet_candidate::active_packet_proof_session().is_some_and(|session| {
                 session
@@ -2043,6 +2111,13 @@ fn hydrate_admitted_file_source_with_range(
                                 && witness.delivery.source_sha256 == expected_hash
                         })
                     })
+                    || (session
+                        .offered_whole_files
+                        .borrow()
+                        .get(&admission.stable_identity)
+                        == Some(&range)
+                        && range.start_line == 1
+                        && range.end_line == file.line_count)
             });
         if !authorized {
             return Err(PacketAdmissionGapKindV1::SourceBoundMissing);
@@ -2109,11 +2184,32 @@ fn hydrate_admitted_file_source_with_range(
                 start_line: 1,
                 end_line: file.line_count,
             },
-            source_sha256: expected_hash,
+            source_sha256: expected_hash.clone(),
             remaining_source_bytes: 0,
             next_start_line: None,
             blocked_line_rendered_bytes: None,
         });
+    }
+    // All alternatives come from the same admitted, hash-verified read. An
+    // offered whole FILE may page truthfully within the unchanged public cap.
+    if let Some(range) = requested {
+        for alternative_cap in [2048, 1024, INTERIM_SOURCE_ROW_UPPER_BOUND] {
+            if alternative_cap >= cap {
+                continue;
+            }
+            if let Ok((body, end, delivery)) =
+                complete_node_page(&text, range, alternative_cap, &expected_hash)
+            {
+                let mut alternative = source.clone();
+                alternative.source = body;
+                alternative.end_line = end;
+                alternative.delivery = Some(delivery);
+                source_page_alternatives
+                    .entry(alternative_cap)
+                    .or_default()
+                    .push(alternative);
+            }
+        }
     }
     Ok(source)
 }
