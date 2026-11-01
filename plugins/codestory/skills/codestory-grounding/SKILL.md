@@ -7,11 +7,11 @@ description: Select the next useful evidence operation before CodeStory setup or
 
 Stay within user scope; choose CodeStory or ordinary tools. No preliminary call is required.
 
-For a broad question spanning several files, experimental `packet` accepts `question` and returns bounded source evidence or explicit gaps. Use targeted tools for missing evidence.
+For a broad question spanning several files, experimental `packet` returns bounded source evidence or explicit gaps. If you choose it, the minimal arguments are `{project: "/absolute/repository", question: "your repository question"}`. Use your actual root and question; fill missing evidence with targeted tools.
 
 For diff reviews, `affected` can start from changed ranges instead of whole files; [scope requirements](references/affected.md#explicit-changed-ranges) include source hashes and explicit unresolved cases.
 
-Pass absolute `project`. `search` needs `query`; `repo_text:"off"` finds one symbol pattern without embedding setup. Omit it for behavior search. Use actual bindings and [matching contracts](references/generated-mcp-syntax.md); inspect complete declarations for unfamiliar fields/operations or mismatch. Inventory names only when needed. Never invent fields or IDs.
+Pass absolute `project`. `search` needs `query`; `repo_text:"off"` finds one symbol pattern without embedding setup. Omit it for behavior search. Use actual bindings. Known requests, including the minimal packet above, need no general syntax-reference lookup. For unfamiliar operations or fields, inspect the complete selected live declaration; use the [generated contract reference](references/generated-mcp-syntax.md) when that declaration is unavailable or mismatched. Inventory names only when needed. Never invent fields or IDs.
 
 If the actual inventory exposes only `call` and `describe` (opt-in `family-v1`), invoke `call` with `{operation:"search",arguments:{project:"/absolute/repository",query:"symbol"}}` or another canonical operation. `describe({operation,project})` returns its full contract when needed. The inner `arguments` owns `project`; retry returned canonical operation names through `call`. A `call` grant covers all operations and has no per-operation request/return typing.
 
