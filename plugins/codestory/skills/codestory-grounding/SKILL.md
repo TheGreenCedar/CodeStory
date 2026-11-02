@@ -21,6 +21,8 @@ Use sufficient source for claims; preserve source/publication identities, freshn
 
 Complete, exact source bodies in ordinary tool results, with file hashes and physical ranges, count as source already read. Reuse them for covered claims; fetch missing context, changed source or specific verification as needed. Preserve freshness, gaps and limits, and perform required executable and runtime checks.
 
+For Go dependency functions, optional `go doc -src -c <full-import-path> <ExportedName>` from the target project can supply attached documentation and the whole declaration. Check effective package binding first; preserve lookup diagnostics and limits. See [dependency definitions](GUIDE.md#inspect-go-dependency-definitions).
+
 Tools own preparation; follow returned retry hints. Do not repair shared state. A failed call does not end authorized investigation.
 
 Use [GUIDE.md](GUIDE.md) for needed unfamiliar or complex detail, not routinely for known operations.
