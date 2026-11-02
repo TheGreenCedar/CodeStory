@@ -173,37 +173,6 @@ retrieval readiness and may trigger managed preparation.
 | Review a diff | Obtain the diff with host Git tools. `affected` accepts broad `paths`/`changed_paths` or `change_records`; use optional [changed scopes](references/affected.md#explicit-changed-ranges) for known physical ranges and source hashes. |
 | Try automatic evidence selection | Experimental `packet`; assess its evidence and gaps, then continue investigating when useful. |
 
-### Inspect Go dependency definitions
-
-From the target project directory, optionally inspect an exported dependency
-function with native Go tools:
-
-```sh
-go list -find -json example.org/library/package
-go doc -src -c example.org/library/package ExportedName
-```
-
-First use successful `go list` output's actual `Dir` and `Module` metadata,
-including `Replace` and workspace/vendor resolution. Never construct a cache
-path from a version. If binding fails, retain diagnostics and use other
-authorized reads.
-
-`go doc` supplies attached documentation and the whole declaration. Preserve
-truncation and diagnostics; warnings about unrelated uncached modules do not
-establish a healthy dependency graph.
-
-Only after successful project binding, if project lookup obstructs rendering,
-change to the returned actual `Dir` and run:
-
-```sh
-GO111MODULE=off go doc -src -c ExportedName
-```
-
-This renders that source only. Its header or `installed in .` warning is not
-module identity. It neither compiles nor re-resolves the project and proves no
-runtime behavior. Preserve network limits; do not download missing modules or
-repair shared caches for this lookup. Ordinary source reads remain available.
-
 ### Read around returned anchors
 
 Choose source context for the unresolved relationship. Keep the exact returned
