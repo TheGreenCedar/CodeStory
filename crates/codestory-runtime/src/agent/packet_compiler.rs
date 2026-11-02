@@ -12,8 +12,10 @@ use codestory_agent::evidence_compiler::{
     JointRepresentationSelectionV1, RepositoryDerivedCompilationV1,
     RepresentationBudgetSelectionV1, compile_repository_evidence,
     compile_repository_evidence_baseline_for_representation,
+    compile_repository_evidence_body_aware_baseline_for_representation,
     compile_repository_evidence_for_representation, compile_repository_evidence_joint_additions,
     repository_evidence_baseline_rank, repository_evidence_joint_progress_rank,
+    repository_evidence_selection_rank,
 };
 use codestory_contracts::api::{
     AgentPacketDto, AgentPacketRequestDto, BoundedDrillPlanDto, DrillGapKindDto, DrillOptionDto,
@@ -74,6 +76,10 @@ pub(crate) struct PreparedPacketCompilationV1 {
     requested_source_minimum_ends: BTreeMap<String, u32>,
     #[serde(default)]
     issued_context_sources: Option<Vec<PacketHydratedSourceRangeV1>>,
+    // Captured before hydration from the original public request and session.
+    // Historical replay records fail closed to the existing baseline policy.
+    #[serde(default)]
+    fresh_retrieval_only: bool,
 }
 
 impl PreparedPacketCompilationV1 {
@@ -101,6 +107,7 @@ impl PreparedPacketCompilationV1 {
             requested_source_identities: BTreeSet::new(),
             requested_source_minimum_ends: BTreeMap::new(),
             issued_context_sources: None,
+            fresh_retrieval_only: false,
         }
     }
 
@@ -194,6 +201,15 @@ impl PreparedPacketCompilationV1 {
             Option<&RepositoryDerivedCompilationV1>,
         ) -> Result<Option<usize>, codestory_contracts::api::ApiError>,
     ) -> Result<FrozenPacketCompilationV1, codestory_contracts::api::ApiError> {
+        let fresh_retrieval_only = self.fresh_retrieval_only
+            && self.issued_context_sources.is_none()
+            && self.requested_source_identities.is_empty()
+            && self.requested_source_minimum_ends.is_empty()
+            && self
+                .input
+                .admissions
+                .iter()
+                .all(|admission| admission.origin == PacketAdmissionOriginV1::Retrieval);
         // Preserve the existing whole-request callback bound. Every accepted
         // or rejected callback consumes one slot, including final validation.
         let mut calls = 0usize;
@@ -208,7 +224,11 @@ impl PreparedPacketCompilationV1 {
                     ));
                 }
                 calls += 1;
-                if !matched_source_retained(&product.support, &prepared.matched_source_floor) {
+                if !matched_source_retained(
+                    &product.support,
+                    &prepared.matched_source_floor,
+                    fresh_retrieval_only,
+                ) {
                     return Ok(None);
                 }
                 measure(prepared, product, baseline)
@@ -400,34 +420,46 @@ impl PreparedPacketCompilationV1 {
         let mut best = None;
         for sources in extents {
             self.input.sources = sources;
-            let selection = compile_repository_evidence_baseline_for_representation(
-                &self.input,
-                &self.call_navigation,
-                |product| {
-                    let mut product = product.clone();
-                    attach_file_navigation_paths(&mut product.support, &self.file_navigation_paths);
-                    let retained = self.requested_source_identities.iter().all(|identity| {
-                        product.support.iter().any(|unit| {
-                            unit.kind == SupportUnitKindDto::SourceRange
-                                && final_support_stable_identity(unit).as_ref() == Some(identity)
-                                && self.requested_source_minimum_ends.get(identity).is_none_or(
-                                    |minimum| unit.end_line.is_some_and(|end| end >= *minimum),
-                                )
-                        })
-                    });
-                    if !retained
-                        || context_floor.as_ref().is_some_and(|floor| {
-                            !source_floor_retained(&product.support, &floor.support)
-                        })
-                    {
-                        return Ok(None);
-                    }
-                    bounded_measure(&self, &product, None)
-                },
-            )?;
+            let mut measure_baseline = |product: &RepositoryDerivedCompilationV1| {
+                let mut product = product.clone();
+                attach_file_navigation_paths(&mut product.support, &self.file_navigation_paths);
+                let retained = self.requested_source_identities.iter().all(|identity| {
+                    product.support.iter().any(|unit| {
+                        unit.kind == SupportUnitKindDto::SourceRange
+                            && final_support_stable_identity(unit).as_ref() == Some(identity)
+                            && self.requested_source_minimum_ends.get(identity).is_none_or(
+                                |minimum| unit.end_line.is_some_and(|end| end >= *minimum),
+                            )
+                    })
+                });
+                if !retained
+                    || context_floor.as_ref().is_some_and(|floor| {
+                        !source_floor_retained(&product.support, &floor.support)
+                    })
+                {
+                    return Ok(None);
+                }
+                bounded_measure(&self, &product, None)
+            };
+            let selection = if fresh_retrieval_only {
+                compile_repository_evidence_body_aware_baseline_for_representation(
+                    &self.input,
+                    &self.call_navigation,
+                    &mut measure_baseline,
+                )
+            } else {
+                compile_repository_evidence_baseline_for_representation(
+                    &self.input,
+                    &self.call_navigation,
+                    &mut measure_baseline,
+                )
+            }?;
             if let RepresentationBudgetSelectionV1::Complete { product, .. } = selection {
-                let rank =
-                    repository_evidence_baseline_rank(&self.input, &self.call_navigation, &product);
+                let rank = if fresh_retrieval_only {
+                    repository_evidence_selection_rank(&self.input, &self.call_navigation, &product)
+                } else {
+                    repository_evidence_baseline_rank(&self.input, &self.call_navigation, &product)
+                };
                 if best
                     .as_ref()
                     .is_none_or(|(previous, _, _)| rank > *previous)
@@ -438,7 +470,7 @@ impl PreparedPacketCompilationV1 {
         }
         if let Some((_, sources, baseline)) = best {
             self.input.sources = sources.clone();
-            // Preserve the exact legacy baseline; shorter verified pages may
+            // Preserve the selected baseline; shorter verified pages may
             // compete only beside its original source witnesses. Restoring
             // requested/issued rows collapses both variants of each cap.
             let baseline_sources = sources
@@ -867,6 +899,20 @@ pub(crate) fn prepare_packet_compilation(
     session: &PacketProofSession,
     request: Option<&AgentPacketRequestDto>,
 ) -> Result<PreparedPacketCompilationV1, codestory_contracts::api::ApiError> {
+    // Preserve original intent before ranges are normalized, refused or consumed.
+    // Empty derived ranges alone never establish a fresh retrieval request.
+    let fresh_retrieval_only = request.is_some_and(|request| {
+        request.probes.is_empty()
+            && request.parent_packet_id.is_none()
+            && request.option_ids.is_empty()
+            && request.core_generation_id.is_none()
+            && request.retrieval_generation.is_none()
+    }) && probe_resolutions.is_empty()
+        && session.issued_source_record.borrow().is_none()
+        && session
+            .receipts()
+            .iter()
+            .all(|admission| admission.origin == PacketAdmissionOriginV1::Retrieval);
     if let Some(request) = request {
         validate_requested_publication(controller, request, publication)?;
     }
@@ -955,7 +1001,11 @@ pub(crate) fn prepare_packet_compilation(
         &ranges,
         &requested_source_minimum_ends,
     )?;
-    session.reserve_source_pages_with_demands(&ranges.keys().cloned().collect(), &demands);
+    if fresh_retrieval_only {
+        session.reserve_source_pages_in_admission_order(&demands);
+    } else {
+        session.reserve_source_pages_with_demands(&ranges.keys().cloned().collect(), &demands);
+    }
     let admissions = session.receipts();
     let mut source_page_alternatives = BTreeMap::new();
     let (authenticated_admissions, mut sources, mut file_navigation_paths) =
@@ -1101,6 +1151,7 @@ pub(crate) fn prepare_packet_compilation(
         requested_source_identities,
         requested_source_minimum_ends,
         issued_context_sources,
+        fresh_retrieval_only,
     })
 }
 
@@ -1165,6 +1216,7 @@ pub(crate) fn replay_prepare_from_sealed_admissions(
         requested_source_identities: std::collections::BTreeSet::new(),
         requested_source_minimum_ends: BTreeMap::new(),
         issued_context_sources: None,
+        fresh_retrieval_only: false,
     })
 }
 
@@ -1462,11 +1514,24 @@ fn focused_authenticated_file(
 fn matched_source_retained(
     candidate: &[SupportUnitDto],
     floor: &[PacketHydratedSourceRangeV1],
+    allow_whole_omission: bool,
 ) -> bool {
     floor.iter().all(|old| {
         let Some(delivery) = &old.delivery else {
             return false;
         };
+        // A fresh automatic unit can remain omitted with its ordinary
+        // compiler-generated gap. Same-path sources under other identities and
+        // location-only metadata do not count as retaining this source unit.
+        if allow_whole_omission
+            && !candidate.iter().any(|new| {
+                new.kind == SupportUnitKindDto::SourceRange
+                    && final_support_stable_identity(new).as_deref()
+                        == Some(old.stable_identity.as_str())
+            })
+        {
+            return true;
+        }
         let lines = numbered_source_lines(&old.source);
         candidate.iter().any(|new| {
             new.kind == SupportUnitKindDto::SourceRange
@@ -3343,6 +3408,150 @@ mod tests {
     }
 
     #[test]
+    fn fresh_intent_controls_ordered_authenticated_hydration() {
+        use codestory_contracts::api::PacketProbeDto;
+        use codestory_store::{IndexPublicationMode, IndexPublicationRecord};
+        use std::sync::{Arc, atomic::AtomicBool};
+        let project = tempfile::tempdir().unwrap();
+        let owned = tempfile::tempdir().unwrap();
+        let database = owned.path().join("core.sqlite3");
+        let mut storage = Store::open(&database).unwrap();
+        let mut text = String::new();
+        let mut bounds = Vec::new();
+        for id in 1..=16 {
+            let start = text.lines().count() as u32 + 1;
+            text.push_str(&format!("fn operation_{id}() {{\n"));
+            for line in 0..30 {
+                text.push_str(&format!("    let value_{line} = \"{}\";\n", "x".repeat(24)));
+            }
+            text.push_str("}\n");
+            bounds.push((start, text.lines().count() as u32));
+        }
+        let path = project.path().join("operations.rs");
+        std::fs::write(&path, &text).unwrap();
+        let file = FileInfo {
+            id: 100,
+            path,
+            language: "rust".into(),
+            modification_time: 0,
+            indexed: true,
+            complete: true,
+            line_count: text.lines().count() as _,
+            file_role: FileRole::Source,
+        };
+        storage.insert_file(&file).unwrap();
+        storage
+            .update_file_metadata(
+                &file,
+                Some(&format!("{:x}", Sha256::digest(text.as_bytes()))),
+            )
+            .unwrap();
+        storage
+            .insert_nodes_batch(&[CoreNode {
+                id: CoreNodeId(100),
+                kind: CoreNodeKind::FILE,
+                serialized_name: "operations.rs".into(),
+                ..Default::default()
+            }])
+            .unwrap();
+        for (index, &(start, end)) in bounds.iter().enumerate() {
+            storage
+                .insert_nodes_batch(&[CoreNode {
+                    id: CoreNodeId(index as i64 + 1),
+                    kind: CoreNodeKind::FUNCTION,
+                    serialized_name: format!("operation_{}", index + 1),
+                    file_node_id: Some(CoreNodeId(100)),
+                    start_line: Some(start),
+                    end_line: Some(end),
+                    ..Default::default()
+                }])
+                .unwrap();
+        }
+        storage
+            .put_index_publication(&IndexPublicationRecord {
+                generation: 1,
+                generation_id: "fresh-source-generation".into(),
+                run_id: "fresh-source-run".into(),
+                mode: IndexPublicationMode::Full,
+                published_at_epoch_ms: 1,
+            })
+            .unwrap();
+        drop(storage);
+        let controller = AppController::new_with_owned_cache_root(owned.path());
+        {
+            let mut state = controller.state.lock();
+            state.project_root = Some(project.path().to_owned());
+            state.storage_path = Some(database);
+        }
+        let service = crate::services::PublicOperationService::new(controller.clone());
+        let project_id = codestory_workspace::project_identity_v3(project.path()).project_id;
+        service.run_observational_with_cancel("fresh-source-boundary", Arc::new(AtomicBool::new(false)), || {
+            // Empty resolutions deliberately model consumed or unresolved public
+            // probes. Original intent must survive that loss of derived state.
+            for case in ["fresh", "unresolved-path", "consumed-symbol", "explicit-query", "parent", "option", "exact-admission", "issued-empty", "missing-request"] {
+                let mut request: AgentPacketRequestDto = serde_json::from_value(serde_json::json!({"question":"Read source"})).unwrap();
+                match case {
+                    "unresolved-path" => request.probes.push(PacketProbeDto::ExactPath { path: "missing.rs".into() }),
+                    "consumed-symbol" => request.probes.push(PacketProbeDto::SymbolId { id: "999".into() }),
+                    "explicit-query" => request.probes.push(PacketProbeDto::FreeQuery { query: "operation".into() }),
+                    "parent" => request.parent_packet_id = Some("already-consumed-parent".into()),
+                    "option" => request.option_ids.push("already-consumed-option".into()),
+                    _ => {}
+                }
+                let session = PacketProofSession::new();
+                let consumed_charge = if case == "consumed-symbol" {
+                    assert!(matches!(session.admit_exact_selector("node:999", 512, 0),
+                        crate::agent::packet_candidate::PacketAdmissionDecision::Admitted));
+                    let before = session.remaining_source_bytes();
+                    session.consume_unresolved_reservation("node:999");
+                    assert_eq!(session.remaining_source_bytes(), before, "consumed exact charge stays reserved");
+                    assert!(session.receipts().is_empty());
+                    512
+                } else { 0 };
+                let count = if consumed_charge == 0 { 16 } else { 15 };
+                for id in 1..=count {
+                    let identity = format!("node:{id}");
+                    let admitted = if case == "exact-admission" && id == 1 {
+                        session.admit_exact_selector(&identity, 512, 0)
+                    } else { session.admit(&identity, 512) };
+                    assert!(matches!(admitted, crate::agent::packet_candidate::PacketAdmissionDecision::Admitted));
+                }
+                if case == "issued-empty" {
+                    let publication = serde_json::from_value(serde_json::json!({
+                        "core":{"project_id":project_id,"generation_id":"fresh-source-generation", "run_id":"fresh-source-run"},
+                        "retrieval":null})).unwrap();
+                    let record = crate::agent::packet_served_sources::test_support::validated_empty_record(
+                        publication, &request.question,
+                    );
+                    session.protect_served_sources(record)?;
+                }
+                session.seal_retrieval_admission();
+                let prepared = prepare_packet_compilation(&controller, &project_id, &[], None, &session,
+                    if case == "missing-request" { None } else { Some(&request) })?;
+                let receipts = session.receipts();
+                assert_eq!(receipts.len(), count as usize, "{case}");
+                assert_eq!(session.remaining_hydration_slots(), 0, "consumption cannot free an admission slot: {case}");
+                let visible_charge = receipts.iter().map(|a| a.reserved_source_bytes as usize).sum::<usize>();
+                assert_eq!(visible_charge + consumed_charge,
+                    16_384 - session.remaining_source_bytes(), "all consumed charges remain accounted: {case}");
+                assert!(receipts.iter().all(|a| (512..=4096).contains(&a.reserved_source_bytes)), "{case}");
+                assert!(receipts.iter().map(|a| a.reserved_source_bytes as usize).sum::<usize>() <= 16_384, "{case}");
+                let source = prepared.input.sources.iter().find(|source| source.stable_identity == "node:1").unwrap();
+                let fresh = case == "fresh";
+                assert_eq!(source.end_line == bounds[0].1, fresh, "only fresh ordered top-up completes the leading unit: {case}");
+                assert_eq!(prepared.replay_snapshot()["fresh_retrieval_only"].as_bool().unwrap_or(false), fresh,
+                    "original intent must gate both allocation and selection: {case}");
+                assert_eq!(source.delivery.as_ref().unwrap().remaining_source_bytes == 0, fresh, "{case}");
+                if !fresh { assert!(source.delivery.as_ref().unwrap().next_start_line.is_some(), "{case}"); }
+                let _again = prepare_packet_compilation(&controller, &project_id, &[], None, &session,
+                    if case == "missing-request" { None } else { Some(&request) })?;
+                assert_eq!(session.receipts(), receipts, "repeated allocation cannot refund or mint charges: {case}");
+            }
+            Ok(())
+        }).unwrap();
+    }
+
+    #[test]
     fn continuation_source_labels_preserve_identity_execution_and_pins() {
         let selector = PacketContinuationSelectorV1 {
             stable_identity: "node:7".into(),
@@ -4711,6 +4920,255 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn automatic_file_omission_permission_and_fresh_body_selection_reach_actual_caller() {
+        use codestory_contracts::compilation::PacketCallableBodyV1;
+        let mut input = PacketCompilationInputV1 {
+            contract_version: PACKET_COMPILATION_CONTRACT_VERSION_V1,
+            publication: PacketCompilationPublicationV1 {
+                project_id: "project-1".into(),
+                core_generation_id: "core-1".into(),
+                retrieval_generation: None,
+            },
+            admissions: vec![],
+            sources: vec![],
+            relations: vec![],
+            ambiguities: vec![],
+            admission_gaps: vec![],
+        };
+        for (id, path, text, callable) in [
+            (0, "container.rs", "fn matched() {\n    keep();\n}\n", false),
+            (1, "worker.rs", "fn execute() {\n    run();\n}\n", true),
+        ] {
+            let hash = format!("{:x}", Sha256::digest(text.as_bytes()));
+            let range = PacketSourceRangeV1 {
+                start_line: 1,
+                end_line: 3,
+            };
+            let (source, end_line, delivery) =
+                complete_node_page(text, range, 4096, &hash).unwrap();
+            input.admissions.push(PacketAdmissionReceiptV1 {
+                packet_ordinal: id,
+                stable_identity: format!("node:{id}"),
+                score_version: "fixture".into(),
+                reserved_source_bytes: 4096,
+                origin: PacketAdmissionOriginV1::Retrieval,
+            });
+            input.sources.push(PacketHydratedSourceRangeV1 {
+                stable_identity: format!("node:{id}"),
+                path: path.into(),
+                symbol: callable.then(|| "execute".into()),
+                start_line: 1,
+                end_line,
+                source,
+                delivery: Some(delivery),
+                parser_completeness: PacketParserCompletenessV1::Complete,
+                callable_body: callable.then(|| PacketCallableBodyV1 {
+                    unit_range: range,
+                    body_range: range,
+                    source_sha256: hash,
+                }),
+            });
+        }
+        let floor = focused_authenticated_file(
+            &input.sources[0],
+            PacketSourceRangeV1 {
+                start_line: 1,
+                end_line: 3,
+            },
+            4096,
+        )
+        .unwrap();
+        for state in [
+            "fresh",
+            "original-false",
+            "missing-fresh-bit",
+            "issued-empty",
+            "exact-other",
+        ] {
+            let mut prepared = PreparedPacketCompilationV1::from_fixture_input(input.clone());
+            prepared.fresh_retrieval_only = true;
+            prepared.matched_source_floor = vec![floor.clone()];
+            match state {
+                "original-false" => prepared.fresh_retrieval_only = false,
+                "missing-fresh-bit" => {
+                    let mut snapshot = prepared.replay_snapshot();
+                    snapshot
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("fresh_retrieval_only");
+                    prepared = serde_json::from_value(snapshot).unwrap();
+                }
+                "issued-empty" => prepared.issued_context_sources = Some(vec![]),
+                "exact-other" => {
+                    prepared.input.admissions[1].origin =
+                        PacketAdmissionOriginV1::ExactTypedSelector
+                }
+                _ => {}
+            }
+            assert!(prepared.requested_source_identities.is_empty());
+            assert!(
+                prepared
+                    .issued_context_sources
+                    .as_ref()
+                    .is_none_or(Vec::is_empty)
+            );
+            let mut omission_callbacks = 0;
+            let mut retained_callbacks = 0;
+            let result = prepared.select_for_representation(|_, product| {
+                let retains = product.support.iter().any(|row| {
+                    row.kind == SupportUnitKindDto::SourceRange
+                        && final_support_stable_identity(row).as_deref() == Some("node:0")
+                });
+                if retains {
+                    retained_callbacks += 1;
+                } else {
+                    omission_callbacks += 1;
+                }
+                // The permission boundary is measured independently of context
+                // floors. This one-source viewport separates the fresh body
+                // objective from the legacy admitted-reach preference.
+                Ok((product.support.len() <= 1).then_some(1000))
+            });
+            assert!(
+                retained_callbacks > 0,
+                "actual retention gate must be reached without an earlier context-floor refusal: {state}"
+            );
+            if state == "fresh" {
+                assert!(
+                    omission_callbacks > 0,
+                    "fresh implicit source omission must reach callback"
+                );
+                let frozen = result.unwrap();
+                assert_eq!(frozen.product.support.len(), 1);
+                assert_eq!(
+                    final_support_stable_identity(&frozen.product.support[0]).as_deref(),
+                    Some("node:1"),
+                    "fresh path must use body-aware baseline selection"
+                );
+            } else {
+                assert_eq!(
+                    omission_callbacks, 0,
+                    "strict actual caller must not bypass its computed fresh permission: {state}"
+                );
+                if let Ok(frozen) = result {
+                    assert!(
+                        frozen
+                            .product
+                            .support
+                            .iter()
+                            .any(|row| final_support_stable_identity(row).as_deref()
+                                == Some("node:0")),
+                        "strict result retains automatic FILE: {state}"
+                    );
+                }
+            }
+            println!(
+                "automatic FILE actual caller PASS {state} omission_callbacks={omission_callbacks} retained_callbacks={retained_callbacks}"
+            );
+        }
+    }
+
+    #[test]
+    fn retained_automatic_file_matches_and_malformed_delivery_stay_protected() {
+        let text = "header\nfirst matched line\nseparator\nsecond matched line\ntrailer\n";
+        let hash = format!("{:x}", Sha256::digest(text.as_bytes()));
+        let range = PacketSourceRangeV1 {
+            start_line: 1,
+            end_line: 5,
+        };
+        let (source, end, delivery) = complete_node_page(text, range, 4096, &hash).unwrap();
+        let whole = PacketHydratedSourceRangeV1 {
+            stable_identity: "node:1".into(),
+            path: "shared.rs".into(),
+            symbol: None,
+            start_line: 1,
+            end_line: end,
+            source,
+            delivery: Some(delivery),
+            parser_completeness: PacketParserCompletenessV1::Complete,
+            callable_body: None,
+        };
+        let floors = [2, 4]
+            .into_iter()
+            .map(|line| {
+                focused_authenticated_file(
+                    &whole,
+                    PacketSourceRangeV1 {
+                        start_line: line,
+                        end_line: line,
+                    },
+                    4096,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let input = PacketCompilationInputV1 {
+            contract_version: PACKET_COMPILATION_CONTRACT_VERSION_V1,
+            publication: PacketCompilationPublicationV1 {
+                project_id: "project-1".into(),
+                core_generation_id: "core-1".into(),
+                retrieval_generation: None,
+            },
+            admissions: vec![PacketAdmissionReceiptV1 {
+                packet_ordinal: 0,
+                stable_identity: "node:1".into(),
+                score_version: "fixture".into(),
+                reserved_source_bytes: 4096,
+                origin: PacketAdmissionOriginV1::Retrieval,
+            }],
+            sources: vec![whole],
+            relations: vec![],
+            ambiguities: vec![],
+            admission_gaps: vec![],
+        };
+        let product = compile_repository_evidence(&input);
+        assert_eq!(product.support.len(), 1);
+        assert!(matched_source_retained(&product.support, &floors, true));
+        for mutation in 0..4 {
+            let mut changed = product.support.clone();
+            match mutation {
+                0 => {
+                    changed[0].snippet = Some(
+                        changed[0]
+                            .snippet
+                            .as_ref()
+                            .unwrap()
+                            .replace("second matched line", "erased"),
+                    )
+                }
+                1 => {
+                    changed[0].snippet = Some(
+                        changed[0]
+                            .snippet
+                            .as_ref()
+                            .unwrap()
+                            .replace("first matched line", "altered"),
+                    )
+                }
+                2 => changed[0].path = Some("other.rs".into()),
+                _ => changed[0].source_delivery.as_mut().unwrap().source_sha256 = "0".repeat(64),
+            }
+            assert!(
+                !matched_source_retained(&changed, &floors, true),
+                "retained-unit mutation {mutation}"
+            );
+        }
+        assert!(matched_source_retained(&[], &floors, true));
+        assert!(!matched_source_retained(&[], &floors, false));
+        assert!(matched_source_retained(&product.support, &floors, false));
+        let mut malformed = floors.clone();
+        malformed[0].delivery = None;
+        assert!(!matched_source_retained(&product.support, &malformed, true));
+        assert!(
+            !matched_source_retained(&[], &malformed, true),
+            "missing old delivery refuses before whole omission"
+        );
+        println!(
+            "retained automatic FILE guards PASS: two disjoint matches; changed bytes/path/hash; deliveryNone retained or omitted"
+        );
     }
 
     #[test]
@@ -7299,6 +7757,7 @@ mod tests {
             requested_source_identities: BTreeSet::new(),
             requested_source_minimum_ends: BTreeMap::new(),
             issued_context_sources: None,
+            fresh_retrieval_only: false,
         };
         let mut measured = Vec::new();
         let mut accepted = None;

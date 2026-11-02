@@ -2067,3 +2067,36 @@ mod tests {
         assert!(fs::read_dir(dir.path()).unwrap().next().is_none());
     }
 }
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    pub(crate) fn validated_empty_record(
+        publication: PublicationIdentityV3Dto,
+        question: &str,
+    ) -> ServedSourceRecord {
+        let at = now().unwrap();
+        let record = ServedSourceRecord {
+            version: 1,
+            caller: "test".into(),
+            request_id: "psr1:empty-fixture".into(),
+            question_sha256: digest(question.as_bytes()),
+            publication,
+            issued_at: at,
+            expires_at: at + LEASE_SECONDS,
+            witnesses: Vec::new(),
+            offered_option_ids: Vec::new(),
+        };
+        validate_record(
+            &record,
+            &record.publication,
+            "test",
+            "psr1:empty-fixture",
+            question,
+            at,
+        )
+        .expect("legacy empty witness inventory must pass the real record validator");
+        record
+    }
+}

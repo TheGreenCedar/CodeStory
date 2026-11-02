@@ -923,6 +923,42 @@ impl PacketProofSession {
         }
     }
 
+    /// Fresh retrieval keeps every admission's initial charge, then completes
+    /// known authenticated pages in sealed order within the same source budget.
+    pub(crate) fn reserve_source_pages_in_admission_order(&self, demands: &HashMap<String, usize>) {
+        if !self.retrieval_admission_is_sealed() || self.issued_source_record.borrow().is_some() {
+            return;
+        }
+        let mut receipts = self.receipts.borrow_mut();
+        if receipts
+            .iter()
+            .any(|receipt| receipt.origin != PacketAdmissionOriginV1::Retrieval)
+        {
+            return;
+        }
+        let mut identities = self.admitted_identities.borrow_mut();
+        let mut used = self.admitted_source_bytes.borrow_mut();
+        for receipt in receipts.iter_mut() {
+            let Some(demand) = demands.get(&receipt.stable_identity) else {
+                // Complete FILE reservations and unknown source demands retain
+                // their original charge. No unverified tail earns a top-up.
+                continue;
+            };
+            let current = receipt.reserved_source_bytes as usize;
+            let extra = (*demand)
+                .min(INTERIM_SOURCE_CONTINUATION_UPPER_BOUND)
+                .saturating_sub(current)
+                .min(INTERIM_MAX_ADMITTED_SOURCE_BYTES.saturating_sub(*used));
+            let Some(reserved) = identities.get_mut(&receipt.stable_identity) else {
+                continue;
+            };
+            debug_assert_eq!(*reserved, current);
+            *reserved += extra;
+            *used += extra;
+            receipt.reserved_source_bytes += extra as u32;
+        }
+    }
+
     pub(crate) fn receipts(&self) -> Vec<PacketAdmissionReceiptV1> {
         self.receipts.borrow().clone()
     }
@@ -1707,6 +1743,102 @@ mod tests {
             after,
             "a smaller observation cannot refund a charge"
         );
+
+        for consume in [false, true] {
+            let session = PacketProofSession::new();
+            for id in 0..16 {
+                let bytes = if id == 2 { 2400 } else { 512 };
+                assert_eq!(
+                    session.admit(&format!("node:{id}"), bytes),
+                    PacketAdmissionDecision::Admitted
+                );
+            }
+            let charged_before = 16_384 - session.remaining_source_bytes();
+            if consume {
+                session.consume_unresolved_reservation("node:4");
+                assert_eq!(16_384 - session.remaining_source_bytes(), charged_before);
+                assert!(
+                    !session
+                        .receipts()
+                        .iter()
+                        .any(|row| row.stable_identity == "node:4")
+                );
+            }
+            assert_eq!(session.remaining_hydration_slots(), 0);
+            assert_eq!(
+                session.admit("node:extra", 512),
+                PacketAdmissionDecision::CountBudgetExceeded
+            );
+            session.seal_retrieval_admission();
+            let before = session.receipts();
+            let mut demands = (3..16)
+                .map(|id| (format!("node:{id}"), 4096))
+                .collect::<HashMap<_, _>>();
+            demands.insert("node:1".into(), 600);
+            demands.insert("node:3".into(), 9000);
+            // node:0 is unknown before the known small unit. node:2 carries
+            // the runtime's complete-FILE reservation and no node demand.
+            session.reserve_source_pages_in_admission_order(&demands);
+            let after = session.receipts();
+            let charge = |id: &str| {
+                after
+                    .iter()
+                    .find(|row| row.stable_identity == id)
+                    .unwrap()
+                    .reserved_source_bytes
+            };
+            assert_eq!(
+                charge("node:0"),
+                512,
+                "unknown demand must not consume known-unit capacity"
+            );
+            assert_eq!(
+                charge("node:1"),
+                600,
+                "known small demand gets its exact top-up"
+            );
+            assert_eq!(
+                charge("node:2"),
+                2400,
+                "complete FILE charge stays unchanged"
+            );
+            assert_eq!(charge("node:3"), 4096, "large demand remains page-capped");
+            assert_eq!(after.len(), 16 - usize::from(consume));
+            assert!(
+                after
+                    .iter()
+                    .all(|row| (512..=4096).contains(&row.reserved_source_bytes))
+            );
+            assert!(before.iter().all(|old| {
+                after.iter().any(|new| {
+                    new.stable_identity == old.stable_identity
+                        && new.reserved_source_bytes >= old.reserved_source_bytes
+                })
+            }));
+            let visible = after
+                .iter()
+                .map(|row| row.reserved_source_bytes as usize)
+                .sum::<usize>();
+            let consumed = if consume { 512 } else { 0 };
+            assert_eq!(
+                visible + consumed,
+                16_384 - session.remaining_source_bytes()
+            );
+            assert_eq!(
+                visible + consumed,
+                16_384,
+                "global charge includes the consumed reservation"
+            );
+            session.reserve_source_pages_in_admission_order(&demands);
+            assert_eq!(session.receipts(), after, "repeated allocation is stable");
+            demands.insert("node:1".into(), 1);
+            session.reserve_source_pages_in_admission_order(&demands);
+            assert_eq!(
+                session.receipts(),
+                after,
+                "smaller demands cannot refund prior charges"
+            );
+        }
     }
 
     #[test]

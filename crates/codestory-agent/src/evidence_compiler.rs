@@ -249,13 +249,27 @@ pub fn compile_repository_evidence_for_representation_with_navigation<E>(
 pub fn compile_repository_evidence_baseline_for_representation<E>(
     current: &PacketCompilationInputV1,
     navigation: &[PacketDirectedRelationV1],
-    mut measure_complete: impl FnMut(&RepositoryDerivedCompilationV1) -> Result<Option<usize>, E>,
+    measure_complete: impl FnMut(&RepositoryDerivedCompilationV1) -> Result<Option<usize>, E>,
 ) -> Result<RepresentationBudgetSelectionV1, E> {
     let mut view = current.clone();
     for source in &mut view.sources {
         source.callable_body = None;
     }
-    let input = &view;
+    compile_repository_evidence_body_aware_baseline_for_representation(
+        &view,
+        navigation,
+        measure_complete,
+    )
+}
+
+/// The same three bounded prefix families, ranked with authenticated callable
+/// metadata when present. The caller owns request eligibility; this compiler
+/// receives only repository-derived evidence, never request policy.
+pub fn compile_repository_evidence_body_aware_baseline_for_representation<E>(
+    input: &PacketCompilationInputV1,
+    navigation: &[PacketDirectedRelationV1],
+    mut measure_complete: impl FnMut(&RepositoryDerivedCompilationV1) -> Result<Option<usize>, E>,
+) -> Result<RepresentationBudgetSelectionV1, E> {
     let full = compile_repository_evidence(input);
     let source_first = compile_repository_evidence_with_row_allocation(
         input,

@@ -153,6 +153,10 @@ published direct targets. This context carries no borrowed query score or
 inferred call certainty. Exact selector identities and requested scope remain
 unchanged. If a complete FILE view cannot fit the final response, authenticated
 focused ranges under that same admitted FILE can retain the matched source.
+A fresh implicit request may omit an automatic source unit through bounded
+selection, with its omission and continuation reported explicitly. Every FILE
+source unit that is returned must retain all of its authenticated matched ranges.
+Exact requests and previously issued source retain their existing protection.
 A later request can revalidate a recorded FILE range through its issued witness;
 this does not grant fresh FILE-range authority. These views establish neither
 answer sufficiency nor callable-body completeness.

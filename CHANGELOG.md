@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Experimental packets can prefer fuller function excerpts while keeping omitted context explicit. Returned file context preserves its matched source.
+
 - Experimental packet requests can return complete small files and related declaration source within their existing output limits, and follow-up requests can open offered file context. Exact symbol and range requests keep their requested scope.
 
 - Experimental packets search one slash-prefixed reference separately, while retaining the full question and any explicit targets.
