@@ -1964,6 +1964,31 @@ fn handle_stdio_request(
                 ));
             }
             let tool_name = name.to_string();
+            if name == "source_context_hook" {
+                let arguments = request.pointer("/params/arguments");
+                let root =
+                    if crate::stdio_arguments::validate_tool_arguments(name, arguments).is_ok() {
+                        crate::app::source_context::hook_output(
+                            arguments.unwrap_or(&serde_json::Value::Null),
+                            &codestory_runtime::CancellationToken::from_shared_flag(Arc::clone(
+                                cancelled,
+                            )),
+                        )
+                    } else {
+                        serde_json::json!({})
+                    };
+                return Some(
+                    match build_served_tool_result_v3(
+                        session.protocol_v3.negotiated_revision(),
+                        name,
+                        &root,
+                        None,
+                    ) {
+                        Ok(result) => stdio_jsonrpc_success(id, result),
+                        Err(error) => crate::stdio_v3::jsonrpc_internal_error_v3(id, &error),
+                    },
+                );
+            }
             let resume_from_arguments = if stdio_tool_reads_publication(&tool_name) {
                 match stdio_resume_arguments(&mut request) {
                     Ok(resume) => resume,
@@ -20148,3 +20173,7 @@ mod representation_budget_tests {
         assert_eq!(selected.packet.support.len(), 16);
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "stdio_transport/source_hints_hook_tests.rs"]
+mod source_hints_hook_tests;

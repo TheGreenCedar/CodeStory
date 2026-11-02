@@ -156,7 +156,8 @@ test("fail-open tool schemas are the generated canonical MCP catalog", async () 
   const catalog = JSON.parse(await readFile(join(pluginRoot, "generated-mcp-catalog.json"), "utf8"));
   assert.deepEqual(launcherTest.failOpenToolCatalog(), catalog.tools);
   for (const [revision, profile] of Object.entries(catalog.revisionProfiles)) {
-    assert.equal(profile.tools.length, 20, `${revision} must advertise exactly 20 navigation tools`);
+    assert.equal(profile.tools.length, 21, `${revision} must advertise 20 navigation tools and one optional source hook`);
+    assert.equal(profile.tools.filter(({ name }) => name === "source_context_hook").length, 1);
     assert.equal(
       profile.tools.filter(({ name }) => name === "verify_indexed_direct_calls").length,
       0,
@@ -168,7 +169,7 @@ test("fail-open tool schemas are the generated canonical MCP catalog", async () 
       `${revision} must not advertise legacy prove_call_path in the public catalog`,
     );
   }
-  assert.equal(catalog.tools.length, 20);
+  assert.equal(catalog.tools.length, 21);
   assert.equal(catalog.tools.filter(({ name }) => name === "verify_indexed_direct_calls").length, 0);
   assert.equal(catalog.tools.filter(({ name }) => name === "prove_call_path").length, 0);
   assert.deepEqual(catalog.resources.map(({ uri }) => uri), ["codestory://agent-guide"]);
@@ -1208,7 +1209,7 @@ test("fail-open preparing is a successful revision-native result in every profil
 test("managed provisioning replies satisfy every non-status tool output schema", () => {
   const status = { managed_retrieval: { state: "preparing" }, warnings: [], readiness: [] };
   const tools = generatedCatalog.tools.filter((tool) => tool.name !== "status");
-  assert.equal(tools.length, 19);
+  assert.equal(tools.length, 20);
   for (const tool of tools) {
     assert.ok(tool.outputSchema && typeof tool.outputSchema === "object", `${tool.name} requires its full schema`);
     const result = launcherTest.failOpenToolResult(tool.name, status, { project: repoRoot });
@@ -1221,10 +1222,18 @@ test("managed provisioning replies satisfy every non-status tool output schema",
     invalid.retry_after_ms = "invalid";
     assert.ok(launcherTest.validatePublishedSchemaValue(tool.outputSchema, invalid, "/result").length > 0,
       `${tool.name} full schema must reject malformed preparing results`);
-    assert.deepEqual(result.structuredContent.minimum_next, {
-      kind: "retry_same_request",
-      after_ms: result.structuredContent.retry_after_ms,
-    });
+    if (tool.name === "source_context_hook") {
+      assert.deepEqual(result.structuredContent, {}, "unavailable source hints are a strict no-op");
+      assert.equal(result.isError, false);
+      assert.equal(result.content.length, 1);
+      assert.equal(result.content[0].type, "text");
+      assert.deepEqual(JSON.parse(result.content[0].text), result.structuredContent);
+    } else {
+      assert.deepEqual(result.structuredContent.minimum_next, {
+        kind: "retry_same_request",
+        after_ms: result.structuredContent.retry_after_ms,
+      });
+    }
   }
 });
 
@@ -6411,7 +6420,7 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
       id: "cold-tools",
       method: "tools/list",
     });
-    assert.equal(coldTools.result.tools.length, 20);
+    assert.equal(coldTools.result.tools.length, 21);
     assert.ok(coldTools.result.tools.some((tool) => tool.name === "ground"));
     assert.equal(
       coldTools.result.tools.filter((tool) => tool.name === "verify_indexed_direct_calls").length,
@@ -9895,4 +9904,20 @@ test("native Codex client negotiates the existing JSON text profile once unless 
     }
     assert.equal(probe.stdout.split(/\r?\n/u).includes(delegated), true, "delegated structural content and numeric lexemes remain lossless");
   }
+});
+
+
+test("source hint hook cold launcher returns a no-op without starting runtime", () => {
+  const call = { jsonrpc: "2.0", id: "source-hint", method: "tools/call", params: {
+    name: "source_context_hook", arguments: { project: repoRoot, cwd: repoRoot, output: "source.py:2:    return 'untrusted'\n" },
+  } };
+  const probe = familyWireFixture(`init();send(${JSON.stringify(call)});`, { surface: "named" });
+  assert.equal(probe.status, 0, probe.stderr);
+  const response = probe.frames.find(({ id }) => id === "source-hint");
+  assert.ok(response?.result, "cold hook has a normal MCP result rather than an ordinary retry envelope");
+  assert.notEqual(response.result.isError, true);
+  assert.equal(response.result.content.length, 1);
+  assert.equal(response.result.content[0].type, "text");
+  assert.deepEqual(JSON.parse(response.result.content[0].text), {});
+  assert.equal(probe.trace.starts, 0, "cold source hints cannot activate a runtime");
 });

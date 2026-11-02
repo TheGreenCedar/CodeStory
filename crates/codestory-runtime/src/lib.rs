@@ -36,7 +36,7 @@ use codestory_contracts::language_support::{
     LanguageSupportProfile, language_support_profile_for_ext,
     language_support_profile_for_language_name,
 };
-use codestory_indexer::CancellationToken;
+pub use codestory_indexer::CancellationToken;
 #[cfg(test)]
 use codestory_store::SearchSymbolProjection;
 use codestory_store::{

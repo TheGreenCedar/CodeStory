@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- An experimental Codex post-tool hook can add verified Python, Rust and Go source context after ordinary searches without rewriting or rerunning commands.
+
 - Experimental packets can prefer fuller function excerpts while keeping omitted context explicit. Returned file context preserves its matched source.
 
 - Experimental packet requests can return complete small files and related declaration source within their existing output limits, and follow-up requests can open offered file context. Exact symbol and range requests keep their requested scope.

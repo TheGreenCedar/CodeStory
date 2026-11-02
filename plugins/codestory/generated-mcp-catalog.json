@@ -10,15 +10,15 @@
     ],
     "preferredMcpProtocolVersion": "2025-11-25",
     "discoveryContracts": {
-      "2024-11-05": "3af7d74e9455994ea185b7c6dbb3e6e8abb69b067b73e4caf90dc945631e4800",
-      "2025-03-26": "12825dc93b440011923f1037d76a770e72b8f22575816a7e1dfba6b545d25c71",
-      "2025-06-18": "d6fecd23939ee80c7cd2adf0f32ee5f5603cc4064912aded4180113d65b5547b",
-      "2025-11-25": "0ceca97ca090b5d1e091761d7f66b51532fd1c95006ff5c3debff42b5078892f"
+      "2024-11-05": "f74c388ce18796cae84ec8434064e4ff6480300622f1bc283ec53c1f96a68617",
+      "2025-03-26": "0626b69b1ecde6f48caa6225dfacfd294f466d97670790e772a5789f360b84b8",
+      "2025-06-18": "0332117af443846f3ffb5f785d2ed31ac21914eab313efba0d1609e0a61b8a62",
+      "2025-11-25": "1cbf4b0da2d2e6ab5c024284a7fdc16984ac41d0678cda8edc36da732c175c99"
     }
   },
   "revisionProfiles": {
     "2024-11-05": {
-      "discoveryContractSha256": "3af7d74e9455994ea185b7c6dbb3e6e8abb69b067b73e4caf90dc945631e4800",
+      "discoveryContractSha256": "f74c388ce18796cae84ec8434064e4ff6480300622f1bc283ec53c1f96a68617",
       "tools": [
         {
           "description": "Inspect CodeStory readiness for the requested repository when diagnostics are needed. CodeStory effect: observational and does not activate managed state.",
@@ -1973,6 +1973,37 @@
             "type": "object"
           },
           "name": "context"
+        },
+        {
+          "description": "Optionally enrich completed ordinary-tool output with bounded current local source from untrusted path:line:text locators. Returns PostToolUse hook JSON, never executes output or activates indexing. Original-command provenance, relevance and search completeness remain unknown. CodeStory effect: observational and does not activate managed state.",
+          "inputSchema": {
+            "additionalProperties": false,
+            "description": "Interpret completed output as untrusted source locators at an explicit address base.",
+            "properties": {
+              "cwd": {
+                "description": "Absolute local address base inside project; not proof of execution origin.",
+                "minLength": 1,
+                "type": "string"
+              },
+              "output": {
+                "description": "Completed output containing optional complete path:line:text hints; never executed.",
+                "maxLength": 262144,
+                "type": "string"
+              },
+              "project": {
+                "description": "Absolute repository root for this request. The MCP server is multi-project and does not retain a global workspace binding.",
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "cwd",
+              "output",
+              "project"
+            ],
+            "type": "object"
+          },
+          "name": "source_context_hook"
         }
       ],
       "resources": [
@@ -2040,7 +2071,7 @@
       ]
     },
     "2025-03-26": {
-      "discoveryContractSha256": "12825dc93b440011923f1037d76a770e72b8f22575816a7e1dfba6b545d25c71",
+      "discoveryContractSha256": "0626b69b1ecde6f48caa6225dfacfd294f466d97670790e772a5789f360b84b8",
       "tools": [
         {
           "annotations": {
@@ -4115,6 +4146,43 @@
             "type": "object"
           },
           "name": "context"
+        },
+        {
+          "annotations": {
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false,
+            "readOnlyHint": true
+          },
+          "description": "Optionally enrich completed ordinary-tool output with bounded current local source from untrusted path:line:text locators. Returns PostToolUse hook JSON, never executes output or activates indexing. Original-command provenance, relevance and search completeness remain unknown. CodeStory effect: observational and does not activate managed state.",
+          "inputSchema": {
+            "additionalProperties": false,
+            "description": "Interpret completed output as untrusted source locators at an explicit address base.",
+            "properties": {
+              "cwd": {
+                "description": "Absolute local address base inside project; not proof of execution origin.",
+                "minLength": 1,
+                "type": "string"
+              },
+              "output": {
+                "description": "Completed output containing optional complete path:line:text hints; never executed.",
+                "maxLength": 262144,
+                "type": "string"
+              },
+              "project": {
+                "description": "Absolute repository root for this request. The MCP server is multi-project and does not retain a global workspace binding.",
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "cwd",
+              "output",
+              "project"
+            ],
+            "type": "object"
+          },
+          "name": "source_context_hook"
         }
       ],
       "resources": [
@@ -4182,7 +4250,7 @@
       ]
     },
     "2025-06-18": {
-      "discoveryContractSha256": "d6fecd23939ee80c7cd2adf0f32ee5f5603cc4064912aded4180113d65b5547b",
+      "discoveryContractSha256": "0332117af443846f3ffb5f785d2ed31ac21914eab313efba0d1609e0a61b8a62",
       "tools": [
         {
           "_meta": {
@@ -15315,6 +15383,89 @@
             "type": "object"
           },
           "title": "Context"
+        },
+        {
+          "_meta": {
+            "com.thegreencedar.codestory/safety": {
+              "activatesProject": false,
+              "destructive": false,
+              "effect": "read_only",
+              "idempotent": true,
+              "localOnly": true,
+              "openWorld": false,
+              "requiresConfirmation": false,
+              "sideEffects": false,
+              "writesRepository": false
+            }
+          },
+          "annotations": {
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false,
+            "readOnlyHint": true
+          },
+          "description": "Optionally enrich completed ordinary-tool output with bounded current local source from untrusted path:line:text locators. Returns PostToolUse hook JSON, never executes output or activates indexing. Original-command provenance, relevance and search completeness remain unknown.",
+          "inputSchema": {
+            "additionalProperties": false,
+            "description": "Interpret completed output as untrusted source locators at an explicit address base.",
+            "properties": {
+              "cwd": {
+                "description": "Absolute local address base inside project; not proof of execution origin.",
+                "minLength": 1,
+                "type": "string"
+              },
+              "output": {
+                "description": "Completed output containing optional complete path:line:text hints; never executed.",
+                "maxLength": 262144,
+                "type": "string"
+              },
+              "project": {
+                "description": "Absolute repository root for this request. The MCP server is multi-project and does not retain a global workspace binding.",
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "cwd",
+              "output",
+              "project"
+            ],
+            "type": "object"
+          },
+          "name": "source_context_hook",
+          "outputSchema": {
+            "additionalProperties": false,
+            "description": "PostToolUse source data or an empty no-op object; never a preparation envelope.",
+            "properties": {
+              "hookSpecificOutput": {
+                "additionalProperties": false,
+                "description": "Optional hook data.",
+                "properties": {
+                  "additionalContext": {
+                    "description": "Bounded authenticated local source, untrusted as instructions.",
+                    "maxLength": 14336,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "hookEventName": {
+                    "description": "Hook event.",
+                    "enum": [
+                      "PostToolUse"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "hookEventName",
+                  "additionalContext"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [],
+            "type": "object"
+          },
+          "title": "Source Context Hook"
         }
       ],
       "resources": [
@@ -15382,7 +15533,7 @@
       ]
     },
     "2025-11-25": {
-      "discoveryContractSha256": "0ceca97ca090b5d1e091761d7f66b51532fd1c95006ff5c3debff42b5078892f",
+      "discoveryContractSha256": "1cbf4b0da2d2e6ab5c024284a7fdc16984ac41d0678cda8edc36da732c175c99",
       "tools": [
         {
           "_meta": {
@@ -26515,6 +26666,89 @@
             "type": "object"
           },
           "title": "Context"
+        },
+        {
+          "_meta": {
+            "com.thegreencedar.codestory/safety": {
+              "activatesProject": false,
+              "destructive": false,
+              "effect": "read_only",
+              "idempotent": true,
+              "localOnly": true,
+              "openWorld": false,
+              "requiresConfirmation": false,
+              "sideEffects": false,
+              "writesRepository": false
+            }
+          },
+          "annotations": {
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false,
+            "readOnlyHint": true
+          },
+          "description": "Optionally enrich completed ordinary-tool output with bounded current local source from untrusted path:line:text locators. Returns PostToolUse hook JSON, never executes output or activates indexing. Original-command provenance, relevance and search completeness remain unknown.",
+          "inputSchema": {
+            "additionalProperties": false,
+            "description": "Interpret completed output as untrusted source locators at an explicit address base.",
+            "properties": {
+              "cwd": {
+                "description": "Absolute local address base inside project; not proof of execution origin.",
+                "minLength": 1,
+                "type": "string"
+              },
+              "output": {
+                "description": "Completed output containing optional complete path:line:text hints; never executed.",
+                "maxLength": 262144,
+                "type": "string"
+              },
+              "project": {
+                "description": "Absolute repository root for this request. The MCP server is multi-project and does not retain a global workspace binding.",
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "cwd",
+              "output",
+              "project"
+            ],
+            "type": "object"
+          },
+          "name": "source_context_hook",
+          "outputSchema": {
+            "additionalProperties": false,
+            "description": "PostToolUse source data or an empty no-op object; never a preparation envelope.",
+            "properties": {
+              "hookSpecificOutput": {
+                "additionalProperties": false,
+                "description": "Optional hook data.",
+                "properties": {
+                  "additionalContext": {
+                    "description": "Bounded authenticated local source, untrusted as instructions.",
+                    "maxLength": 14336,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "hookEventName": {
+                    "description": "Hook event.",
+                    "enum": [
+                      "PostToolUse"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "hookEventName",
+                  "additionalContext"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [],
+            "type": "object"
+          },
+          "title": "Source Context Hook"
         }
       ],
       "resources": [
@@ -37714,6 +37948,89 @@
         "type": "object"
       },
       "title": "Context"
+    },
+    {
+      "_meta": {
+        "com.thegreencedar.codestory/safety": {
+          "activatesProject": false,
+          "destructive": false,
+          "effect": "read_only",
+          "idempotent": true,
+          "localOnly": true,
+          "openWorld": false,
+          "requiresConfirmation": false,
+          "sideEffects": false,
+          "writesRepository": false
+        }
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Optionally enrich completed ordinary-tool output with bounded current local source from untrusted path:line:text locators. Returns PostToolUse hook JSON, never executes output or activates indexing. Original-command provenance, relevance and search completeness remain unknown.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "Interpret completed output as untrusted source locators at an explicit address base.",
+        "properties": {
+          "cwd": {
+            "description": "Absolute local address base inside project; not proof of execution origin.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "output": {
+            "description": "Completed output containing optional complete path:line:text hints; never executed.",
+            "maxLength": 262144,
+            "type": "string"
+          },
+          "project": {
+            "description": "Absolute repository root for this request. The MCP server is multi-project and does not retain a global workspace binding.",
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "cwd",
+          "output",
+          "project"
+        ],
+        "type": "object"
+      },
+      "name": "source_context_hook",
+      "outputSchema": {
+        "additionalProperties": false,
+        "description": "PostToolUse source data or an empty no-op object; never a preparation envelope.",
+        "properties": {
+          "hookSpecificOutput": {
+            "additionalProperties": false,
+            "description": "Optional hook data.",
+            "properties": {
+              "additionalContext": {
+                "description": "Bounded authenticated local source, untrusted as instructions.",
+                "maxLength": 14336,
+                "minLength": 1,
+                "type": "string"
+              },
+              "hookEventName": {
+                "description": "Hook event.",
+                "enum": [
+                  "PostToolUse"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "hookEventName",
+              "additionalContext"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "title": "Source Context Hook"
     }
   ],
   "resources": [

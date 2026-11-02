@@ -55,7 +55,14 @@ fn default_navigation_surface_rejects_proof_before_project_activation() {
         let tools = assert_success_envelope(&listed, json!("list"))["tools"]
             .as_array()
             .expect("tools array");
-        assert_eq!(tools.len(), 20);
+        assert_eq!(tools.len(), 21);
+        assert_eq!(
+            tools
+                .iter()
+                .filter(|tool| tool["name"] == "source_context_hook")
+                .count(),
+            1
+        );
         assert!(!tools.iter().any(|tool| matches!(
             tool["name"].as_str(),
             Some("verify_indexed_direct_calls" | "prove_call_path")
@@ -212,7 +219,14 @@ fn public_v3_negotiates_revision_native_evidence_discovery() {
         let tools = assert_success_envelope(&listed, json!("list"))["tools"]
             .as_array()
             .expect("tools array");
-        assert_eq!(tools.len(), 20);
+        assert_eq!(tools.len(), 21);
+        assert_eq!(
+            tools
+                .iter()
+                .filter(|tool| tool["name"] == "source_context_hook")
+                .count(),
+            1
+        );
         for route in ["packet", "context", "search"] {
             assert_eq!(
                 tools.iter().filter(|tool| tool["name"] == route).count(),
@@ -1962,7 +1976,7 @@ fn project_resource_uri(base_uri: &str, project: &Path) -> String {
 
 fn assert_tool_safety_metadata(tool: &Value) {
     let name = tool["name"].as_str().expect("tool name");
-    let observational = name == "status";
+    let observational = matches!(name, "status" | "source_context_hook");
     let safety = tool
         .pointer("/_meta/com.thegreencedar.codestory~1safety")
         .unwrap_or_else(|| panic!("{name} should include namespaced safety metadata: {tool}"));
@@ -3101,6 +3115,7 @@ fn tool_catalog_keeps_stable_product_tool_names() {
             "search",
             "shortest_path",
             "snippet",
+            "source_context_hook",
             "status",
             "symbol",
             "symbols",

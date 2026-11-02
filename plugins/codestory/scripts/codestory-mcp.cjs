@@ -4126,6 +4126,10 @@ function managedProvisioningOperation() {
 }
 
 function failOpenToolResult(tool, status, argumentsValue = {}) {
+  // A post-tool observer is optional: unavailable source adds no hook output.
+  if (tool === 'source_context_hook') {
+    return { content: [{ type: 'text', text: '{}' }], structuredContent: {}, isError: false };
+  }
   const preparing = status.managed_retrieval?.state === 'preparing';
   const readiness = Array.isArray(status.readiness) ? status.readiness[0] : null;
   const degradedReason = status.degraded_reason || readiness?.reason || (preparing ? 'managed_cli_provisioning' : 'runtime_unavailable');

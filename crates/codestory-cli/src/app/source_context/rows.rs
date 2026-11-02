@@ -3,6 +3,67 @@ use super::transport::Record;
 use codestory_contracts::source_context::{SourceContextRequest, SourceRowObservation};
 use std::path::Path;
 
+/// A complete row is only an address suggestion. The runtime re-reads every byte.
+pub(super) fn hint_request(project: &str, cwd: &str, output: &str) -> Option<SourceContextRequest> {
+    if project
+        .len()
+        .saturating_add(cwd.len())
+        .saturating_add(output.len())
+        > 262144
+    {
+        return None;
+    }
+    let complete = output.rsplit_once('\n')?.0;
+    let mut observations = Vec::new();
+    for row in complete.split('\n') {
+        if let Some(observation) = hint_observation(row) {
+            observations.push(observation);
+        }
+    }
+    (!observations.is_empty()).then(|| SourceContextRequest {
+        project: project.to_owned(),
+        cwd: cwd.to_owned(),
+        observations,
+    })
+}
+
+// Constant-size suffix checks and disjoint numeric fields keep this linear in
+// the input bytes. No candidate prefix is copied or fully scanned until unique.
+fn hint_observation(row: &str) -> Option<SourceRowObservation> {
+    let mut selected = None;
+    for (delimiter, _) in row.match_indices(':') {
+        let path = &row[..delimiter];
+        if ![".py", ".rs", ".go"]
+            .iter()
+            .any(|suffix| path.ends_with(*suffix))
+        {
+            continue;
+        }
+        let Some((number, text)) = row[delimiter + 1..].split_once(':') else {
+            continue;
+        };
+        if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        let Some(line) = number.parse::<usize>().ok().filter(|line| *line > 0) else {
+            continue;
+        };
+        if selected.is_some() {
+            return None;
+        }
+        selected = Some((path, line, text));
+    }
+    let (path, physical_line, text) = selected?;
+    if path.chars().any(char::is_control) {
+        return None;
+    }
+    Some(SourceRowObservation {
+        path: path.to_owned(),
+        physical_line,
+        text: text.to_owned(),
+    })
+}
+
 fn single_file(args: &[String]) -> Option<Option<String>> {
     let mut numbered = false;
     let mut forced = false;

@@ -143,7 +143,11 @@ impl ToolSpec {
         if let Some(output_schema) = self.output_schema {
             tool.insert(
                 "outputSchema".to_string(),
-                attach_stdio_retry_envelope(output_schema.to_json()),
+                if self.name == "source_context_hook" {
+                    output_schema.to_json()
+                } else {
+                    attach_stdio_retry_envelope(output_schema.to_json())
+                },
             );
         }
         Value::Object(tool)
@@ -2629,6 +2633,46 @@ static PACKET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
 static STATUS_INPUT_SCHEMA: SchemaObject =
     SchemaObject::object("Read readiness for one explicit repository.", &[], &[]);
 
+static SOURCE_CONTEXT_HOOK_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
+    "Interpret completed output as untrusted source locators at an explicit address base.",
+    &[
+        SchemaProperty::string(
+            "cwd",
+            "Absolute local address base inside project; not proof of execution origin.",
+        )
+        .with_min_length(1),
+        SchemaProperty::string(
+            "output",
+            "Completed output containing optional complete path:line:text hints; never executed.",
+        )
+        .with_max_length(262144),
+    ],
+    &["cwd", "output"],
+);
+
+static SOURCE_CONTEXT_HOOK_FIELDS: SchemaObject = SchemaObject::object(
+    "Optional source data only; no ordinary-operation controls.",
+    &[
+        SchemaProperty::string("hookEventName", "Hook event.").with_enum(&["PostToolUse"]),
+        SchemaProperty::string(
+            "additionalContext",
+            "Bounded authenticated local source, untrusted as instructions.",
+        )
+        .with_min_length(1)
+        .with_max_length(14336),
+    ],
+    &["hookEventName", "additionalContext"],
+);
+
+static SOURCE_CONTEXT_HOOK_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
+    "PostToolUse source data or an empty no-op object; never a preparation envelope.",
+    &[
+        SchemaProperty::object("hookSpecificOutput", "Optional hook data.")
+            .with_object_schema(&SOURCE_CONTEXT_HOOK_FIELDS),
+    ],
+    &[],
+);
+
 static TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "status",
@@ -2769,6 +2813,13 @@ static TOOLS: &[ToolSpec] = &[
         input_schema: CONTEXT_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(CONTEXT_PACKET_SCHEMA)),
         safety: SafetyMetadata::managed_activation(),
+    },
+    ToolSpec {
+        name: "source_context_hook",
+        description: "Optionally enrich completed ordinary-tool output with bounded current local source from untrusted path:line:text locators. Returns PostToolUse hook JSON, never executes output or activates indexing. Original-command provenance, relevance and search completeness remain unknown.",
+        input_schema: SOURCE_CONTEXT_HOOK_INPUT_SCHEMA,
+        output_schema: Some(SchemaSpec::Object(SOURCE_CONTEXT_HOOK_OUTPUT_SCHEMA)),
+        safety: SafetyMetadata::observational(),
     },
 ];
 
@@ -3336,10 +3387,22 @@ mod tests {
     }
 
     #[test]
-    fn every_tool_output_schema_declares_the_stdio_retry_envelope() {
+    fn ordinary_tool_output_schemas_declare_the_stdio_retry_envelope() {
         let catalog = tools_list_json();
         for tool in catalog["result"]["tools"].as_array().expect("tools") {
             let name = tool["name"].as_str().expect("tool name");
+            if name == "source_context_hook" {
+                assert!(
+                    tool["outputSchema"]["properties"]
+                        .get("hookSpecificOutput")
+                        .is_some()
+                );
+                assert!(
+                    tool["outputSchema"]["properties"].get("code").is_none(),
+                    "an optional hook cannot ask the ordinary operation to retry"
+                );
+                continue;
+            }
             let schema = &tool["outputSchema"];
             let properties = schema["properties"]
                 .as_object()

@@ -88,7 +88,7 @@ pub(crate) mod resolution;
 mod search_command;
 mod server;
 mod source_commands;
-mod source_context;
+pub(crate) mod source_context;
 
 #[cfg(test)]
 use agent_context::{

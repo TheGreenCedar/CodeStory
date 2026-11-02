@@ -77,6 +77,48 @@ initializers do not become callable context. A single Rust or Go file does not
 need filename-prefixed search output.
 Other shells, interactive/TTY requests and other hosts keep their normal path.
 
+### Post-tool source hints
+
+For hosts that support a trusted PostToolUse MCP hook, `source_context_hook`
+can instead interpret complete `path:line:text` rows from finished ordinary-tool
+output. It uses an explicit repository and local address base, re-reads the
+source, and returns bounded source data with hashes and physical ranges. It
+does not rewrite or rerun the original command, prepare an index, or call a model.
+Original-command provenance, relevance and search completeness remain unknown;
+the returned repository text is untrusted data, not instructions.
+
+This optional endpoint uses the existing CodeStory MCP connection. Register and
+trust its exact definition through the host's normal native hook settings;
+the endpoint does not enable hooks for a portable plugin that the host excludes.
+For Codex, add this definition to your user `hooks.json`, then review it with
+`/hooks`. Set `server` to the name of your enabled CodeStory connection shown
+by `/mcp`.
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [{
+      "matcher": "^Bash$",
+      "hooks": [{
+        "type": "mcp_tool",
+        "server": "codestory",
+        "tool": "source_context_hook",
+        "input": {
+          "project": "${cwd}",
+          "cwd": "${cwd}",
+          "output": "${tool_response}"
+        },
+        "timeout": 2
+      }]
+    }]
+  }
+}
+```
+
+Unsupported rows, unavailable source and exhausted bounds add no context and
+leave the ordinary operation unchanged. The same source and display limits
+above apply.
+
 ## Update
 
 Marketplace refresh, package refresh, and host reload are separate:
