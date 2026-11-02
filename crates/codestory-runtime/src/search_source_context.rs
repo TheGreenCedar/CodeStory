@@ -10,7 +10,7 @@ use codestory_contracts::source_context::{
 use codestory_indexer::CancellationToken;
 
 #[cfg(unix)]
-pub(crate) mod io;
+mod io;
 
 pub fn search_source_context(
     request: &SourceContextRequest,
@@ -366,7 +366,7 @@ fn collect(
 // Private deterministic mutation/observation seam; absent from product builds.
 // These run at the actual pinned open/read/recheck boundary, not a mock.
 #[cfg(all(test, unix))]
-pub(crate) enum SourceContextTestStage<'a> {
+enum SourceContextTestStage<'a> {
     BeforeOpen {
         relative: &'a std::path::Path,
     },
@@ -389,7 +389,7 @@ thread_local! {
 }
 
 #[cfg(all(test, unix))]
-pub(crate) fn source_context_test_stage(stage: SourceContextTestStage<'_>) {
+fn source_context_test_stage(stage: SourceContextTestStage<'_>) {
     SOURCE_CONTEXT_TEST_HOOK.with(|hook| {
         if let Some(hook) = hook.borrow_mut().as_mut() {
             hook(stage);

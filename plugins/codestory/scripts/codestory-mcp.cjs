@@ -4126,18 +4126,6 @@ function managedProvisioningOperation() {
 }
 
 function failOpenToolResult(tool, status, argumentsValue = {}) {
-  if (tool === 'analyze_expression') {
-    // No request echo or invented source identity. Startup provisioning policy
-    // stays unchanged; this observational operation cannot prepare an index.
-    const root = { result: {
-      status: 'unavailable', complete_local: false,
-      limits: { max_result_bytes: 16384, max_source_bytes: 262144, max_read_bytes: 2097152,
-        max_work: 8000000, max_depth: 256, max_input_bytes: 262144 },
-      decline: 'runtime_unavailable', segments: [], witnesses: [], boundaries: [], gaps: [],
-      source_is_untrusted_data: true,
-    } };
-    return { content: [{ type: 'text', text: JSON.stringify(root) }], structuredContent: root, isError: false };
-  }
   // A post-tool observer is optional: unavailable source adds no hook output.
   if (tool === 'source_context_hook') {
     return { content: [{ type: 'text', text: '{}' }], structuredContent: {}, isError: false };

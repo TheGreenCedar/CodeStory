@@ -1964,37 +1964,6 @@ fn handle_stdio_request(
                 ));
             }
             let tool_name = name.to_string();
-            if name == "analyze_expression" {
-                let arguments = request.pointer("/params/arguments");
-                if let Err(violations) =
-                    crate::stdio_arguments::validate_tool_arguments(name, arguments)
-                {
-                    return Some(stdio_invalid_params_error(id, name, &violations));
-                }
-                let cancellation =
-                    codestory_runtime::CancellationToken::from_shared_flag(Arc::clone(cancelled));
-                let response = match arguments.cloned().and_then(|value| serde_json::from_value::<codestory_contracts::source_expression::SourceExpressionRequest>(value).ok()) {
-                    Some(arguments) => codestory_runtime::source_expression::analyze_expression(&arguments, &cancellation),
-                    None => codestory_contracts::source_expression::SourceExpressionResponse::unavailable(
-                        codestory_contracts::source_expression::AnalysisDecline::InvalidRequest),
-                };
-                let response = if cancellation.is_cancelled() {
-                    codestory_contracts::source_expression::SourceExpressionResponse::unavailable(
-                        codestory_contracts::source_expression::AnalysisDecline::Cancelled,
-                    )
-                } else {
-                    response
-                };
-                return Some(
-                    match build_source_expression_result_v3(
-                        session.protocol_v3.negotiated_revision(),
-                        &response,
-                    ) {
-                        Ok(result) => stdio_jsonrpc_success(id, result),
-                        Err(error) => crate::stdio_v3::jsonrpc_internal_error_v3(id, &error),
-                    },
-                );
-            }
             if name == "source_context_hook" {
                 let arguments = request.pointer("/params/arguments");
                 let root =
@@ -3236,35 +3205,6 @@ fn reserve_packet_diagnostics_capability_v3(
         serde_json::Value::from(wall_expiry_epoch_ms),
     );
     Ok(())
-}
-
-fn build_source_expression_result_v3(
-    revision: crate::stdio_v3::McpRevisionV3,
-    response: &codestory_contracts::source_expression::SourceExpressionResponse,
-) -> std::result::Result<serde_json::Value, crate::stdio_v3::StdioV3InternalError> {
-    use codestory_contracts::source_expression::{
-        AnalysisDecline, MAX_RESULT_BYTES, SourceExpressionResponse,
-    };
-    let root = serde_json::json!({"result": response});
-    let result = build_served_tool_result_v3(revision, "analyze_expression", &root, None)?;
-    let bytes = v3_serialize_call_tool_result(&result)
-        .map_err(|error| crate::stdio_v3::StdioV3InternalError::Serialization(error.to_string()))?;
-    if bytes.len() <= MAX_RESULT_BYTES {
-        return Ok(result);
-    }
-    // All required evidence or none: never clip a semantic projection to fit.
-    let fallback = serde_json::json!({"result": SourceExpressionResponse::unavailable(AnalysisDecline::ResultBudgetExceeded)});
-    let result = build_served_tool_result_v3(revision, "analyze_expression", &fallback, None)?;
-    let actual = v3_serialize_call_tool_result(&result)
-        .map_err(|error| crate::stdio_v3::StdioV3InternalError::Serialization(error.to_string()))?
-        .len();
-    if actual > MAX_RESULT_BYTES {
-        return Err(crate::stdio_v3::StdioV3InternalError::ResultExceedsBudget {
-            maximum_bytes: MAX_RESULT_BYTES,
-            actual_bytes: actual,
-        });
-    }
-    Ok(result)
 }
 
 fn build_served_tool_result_v3(
@@ -20237,7 +20177,3 @@ mod representation_budget_tests {
 #[cfg(all(test, unix))]
 #[path = "stdio_transport/source_hints_hook_tests.rs"]
 mod source_hints_hook_tests;
-
-#[cfg(test)]
-#[path = "stdio_source_expression_tests.rs"]
-mod source_expression_tests;

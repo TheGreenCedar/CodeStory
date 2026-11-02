@@ -12,7 +12,7 @@ CLI docs. Do not send CLI flags as MCP arguments.
 Live tools: `status`, `packet`, `search`, `ground`, `files`, `affected`,
 `symbol`, `trail`, `callers`, `callees`, `trace`, `get_node`, `neighbors`,
 `shortest_path`, `query_subgraph`, `definition`, `references`, `symbols`,
-`snippet`, `context`, `source_context_hook`, `analyze_expression`.
+`snippet`, `context`, `source_context_hook`.
 
 There is no MCP `index`, `doctor`, `ready`, `explore`, `drill`, `query`,
 `bookmark`, `serve`, or `cache` tool. Product tools own activation.
@@ -41,7 +41,6 @@ There is no MCP `index`, `doctor`, `ready`, `explore`, `drill`, `query`,
 | `symbols` | | `parent_id`, `limit` | Root symbols, or children of `parent_id`. |
 | `snippet` | `query`, `id`, `paths`, `path`, `file_path`, or `symbol_id` | `line`, `start_line`, `end_line`, `context`, `lines`, `scope`, `function_body`, `choose`, `max_tool_result_bytes` (path reads only, 256..524288) | Read a selected source target; ordinary host reads remain available. The optional path allowance bounds the served tool result, excluding outer JSON-RPC and host framing; cumulative task limits remain separate. |
 | `context` | `query`, `id`, or `bookmark` | `include_evidence`, `max_results` | One concrete target, not a broad question. |
-| `analyze_expression` | `path`, `line`, `expression` | | Optional current Go expression analysis without indexing. Exact text must start on the one-based physical LF line. Source segments occur once; typed role/range references retain local dependencies, controls and gaps. `unresolved_binding` is not proof of a declared package variable; mutation boundaries are possible opaque effects. `max_result_bytes=16384` bounds the complete revision-native MCP tool result, including text escaping/structured mirror/final metadata, excluding outer JSON-RPC. All necessary evidence fits or the result is unavailable; `partial` means semantic incompleteness, never clipped evidence. Native-reader absence returns unavailable. |
 | `source_context_hook` | `cwd`, `output` | | Observational PostToolUse JSON for configured hooks, not broad retrieval. Complete `path:line:text` rows are untrusted local source hints; original-command provenance, relevance and search completeness are UNKNOWN. No indexing or preparation. |
 ## Resources and prompts
 

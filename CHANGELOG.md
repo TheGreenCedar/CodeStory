@@ -2,8 +2,6 @@
 
 ## Unreleased
 
-- Experimental Go expression analysis connects a selected expression to local definitions and explicit controls while retaining unresolved source and possible opaque effects.
-
 - An experimental Codex post-tool hook can add verified Python, Rust and Go source context after ordinary searches without rewriting or rerunning commands.
 
 - Experimental packets can prefer fuller function excerpts while keeping omitted context explicit. Returned file context preserves its matched source.

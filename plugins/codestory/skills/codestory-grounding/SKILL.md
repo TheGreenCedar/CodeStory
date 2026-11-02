@@ -9,8 +9,6 @@ Stay within user scope; choose CodeStory or ordinary tools. No preliminary call 
 
 For a broad question spanning several files, experimental `packet` accepts `question` and returns bounded source evidence or explicit gaps. Use targeted tools for missing evidence.
 
-For a discovered Go expression, optional `analyze_expression` accepts `project`, `path`, one-based physical `line`, and exact `expression` text. It returns bounded local definitions/controls and necessary source once, or a typed refusal. Unresolved bindings and possible opaque effects do not prove declared package variables, runtime behavior or external API semantics. No byte offsets or preliminary call are needed.
-
 For diff reviews, `affected` can start from changed ranges instead of whole files; [scope requirements](references/affected.md#explicit-changed-ranges) include source hashes and explicit unresolved cases.
 
 Pass absolute `project`. `search` needs `query`; `repo_text:"off"` finds one symbol pattern without embedding setup. Omit it for behavior search. Use actual bindings and [matching contracts](references/generated-mcp-syntax.md); inspect complete declarations for unfamiliar fields/operations or mismatch. Inventory names only when needed. Never invent fields or IDs.
