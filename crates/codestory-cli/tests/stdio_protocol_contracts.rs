@@ -55,7 +55,7 @@ fn default_navigation_surface_rejects_proof_before_project_activation() {
         let tools = assert_success_envelope(&listed, json!("list"))["tools"]
             .as_array()
             .expect("tools array");
-        assert_eq!(tools.len(), 21);
+        assert_eq!(tools.len(), 22);
         assert_eq!(
             tools
                 .iter()
@@ -219,7 +219,7 @@ fn public_v3_negotiates_revision_native_evidence_discovery() {
         let tools = assert_success_envelope(&listed, json!("list"))["tools"]
             .as_array()
             .expect("tools array");
-        assert_eq!(tools.len(), 21);
+        assert_eq!(tools.len(), 22);
         assert_eq!(
             tools
                 .iter()
@@ -1976,7 +1976,10 @@ fn project_resource_uri(base_uri: &str, project: &Path) -> String {
 
 fn assert_tool_safety_metadata(tool: &Value) {
     let name = tool["name"].as_str().expect("tool name");
-    let observational = matches!(name, "status" | "source_context_hook");
+    let observational = matches!(
+        name,
+        "status" | "source_context_hook" | "analyze_expression"
+    );
     let safety = tool
         .pointer("/_meta/com.thegreencedar.codestory~1safety")
         .unwrap_or_else(|| panic!("{name} should include namespaced safety metadata: {tool}"));
@@ -3101,6 +3104,7 @@ fn tool_catalog_keeps_stable_product_tool_names() {
         tool_names,
         vec![
             "affected",
+            "analyze_expression",
             "callees",
             "callers",
             "context",
@@ -8983,4 +8987,58 @@ fn mcp_graph_caller_scope_hides_stored_test_call_until_explicitly_included() {
         "/arguments/caller_scope",
         "invalid_enum_value",
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn analyze_expression_actual_stdio_is_source_only_and_project_explicit() {
+    for revision in ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"] {
+        let fixture = unindexed_fixture();
+        fs::write(
+            fixture.workspace.path().join("unit.go"),
+            "package sample\nfunc run(seed int) {\n value := seed\n target(value)\n}\n",
+        )
+        .unwrap();
+        let mut server = spawn_stdio_server(&fixture);
+        send_json(
+            &mut server,
+            json!({"jsonrpc":"2.0","id":"init-analysis","method":"initialize",
+            "params":{"protocolVersion":revision,"capabilities":{},"clientInfo":{"name":"source-analysis-contract","version":"1"}}}),
+        );
+        let response = send_json(
+            &mut server,
+            json!({"jsonrpc":"2.0","id":"analysis","method":"tools/call",
+            "params":{"name":"analyze_expression","arguments":{"project":fixture.workspace.path(),"path":"unit.go","line":4,"expression":"value"}}}),
+        );
+        let result = &response["result"];
+        assert_ne!(result["isError"], true, "{response}");
+        assert!(serde_json::to_vec(result).unwrap().len() <= 16384);
+        let root: Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_ne!(root["result"]["status"], "unavailable", "{response}");
+        assert_eq!(root["result"]["snapshot"]["revalidated"], true);
+        assert_eq!(root["result"]["snapshot"]["indexed_proof"], false);
+        assert_eq!(root["result"]["limits"]["max_result_bytes"], 16384);
+        if let Some(structured) = result.get("structuredContent") {
+            assert_eq!(structured, &root);
+        }
+        assert!(!fixture.cache_dir.path().join("core").exists());
+        assert!(!fixture.cache_dir.path().join("search-generations").exists());
+        fs::write(
+            fixture.workspace.path().join("unit.go"),
+            "package sample\nfunc run(value int) {\n target(value, value)\n}\n",
+        )
+        .unwrap();
+        let declined = send_json(
+            &mut server,
+            json!({"jsonrpc":"2.0","id":"ambiguous-analysis","method":"tools/call",
+            "params":{"name":"analyze_expression","arguments":{"project":fixture.workspace.path(),"path":"unit.go","line":3,"expression":"value"}}}),
+        );
+        let root: Value =
+            serde_json::from_str(declined["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(root["result"]["decline"], "ambiguous_expression");
+        assert!(root["result"].get("snapshot").is_none());
+        assert!(serde_json::to_vec(&declined["result"]).unwrap().len() <= 16384);
+    }
 }

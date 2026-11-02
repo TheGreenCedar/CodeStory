@@ -27,6 +27,7 @@ pub mod packet_projection_v3;
 pub mod proof_resolution;
 pub mod query;
 pub mod source_context;
+pub mod source_expression;
 pub mod source_text;
 pub mod trail;
 pub mod validation_receipts;

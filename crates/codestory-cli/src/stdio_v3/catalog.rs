@@ -646,7 +646,7 @@ mod tests {
                 assert!(names.contains(required), "missing evidence tool {required}");
             }
             assert!(names.contains("source_context_hook"));
-            assert_eq!(tools.len(), 21);
+            assert_eq!(tools.len(), 22);
         }
     }
 
@@ -656,7 +656,7 @@ mod tests {
             let tools = tools_for_surface_v3(*revision, super::super::V3SurfaceSet::WithProof);
             assert_eq!(
                 tools.len(),
-                22,
+                23,
                 "{revision:?} should include the dark proof tool"
             );
             let expected = revision

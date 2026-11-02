@@ -86,74 +86,8 @@ pub fn compile_source_units(
         budget,
         cancellation,
     };
-    // Scan physical terminators once. A final LF does not invent an empty line.
-    let mut starts = Vec::new();
-    let mut ends = Vec::new();
-    if !source.is_empty() {
-        starts.push(0);
-    }
-    for (offset, byte) in source.bytes().enumerate() {
-        work.charge(1)?;
-        if byte == b'\n' {
-            ends.push(offset + 1);
-            if offset + 1 < source.len() {
-                starts.push(offset + 1);
-            }
-        }
-    }
-    if ends.len() < starts.len() {
-        ends.push(source.len());
-    }
-
-    let mut parser = Parser::new();
-    let language =
-        crate::get_language_for_ext(extension).ok_or(SourceUnitError::ParserUnavailable)?;
-    parser
-        .set_language(&language.language)
-        .map_err(|_| SourceUnitError::ParserUnavailable)?;
-    // Both lexer input and native parser progress debit this same allowance.
-    // Tree-sitter's progress callback supplies cooperative cancellation during
-    // parsing; these are bounded work units, not an instruction/wall-clock meter.
-    let (tree, parse_error) = {
-        let shared = RefCell::new(&mut work);
-        let error = Cell::new(None);
-        let mut input = |offset: usize, _| {
-            let bytes = source.as_bytes();
-            let chunk = bytes
-                .get(offset..offset.saturating_add(1024).min(bytes.len()))
-                .unwrap_or_default();
-            if let Err(reason) = shared.borrow_mut().charge(chunk.len().max(1)) {
-                error.set(Some(reason));
-                return &[][..];
-            }
-            chunk
-        };
-        let mut progress = |_: &tree_sitter::ParseState| {
-            if error.get().is_some() {
-                return ControlFlow::Break(());
-            }
-            match shared.borrow_mut().charge(1) {
-                Ok(()) => ControlFlow::Continue(()),
-                Err(reason) => {
-                    error.set(Some(reason));
-                    ControlFlow::Break(())
-                }
-            }
-        };
-        let tree = parser.parse_with_options(
-            &mut input,
-            None,
-            Some(ParseOptions::new().progress_callback(&mut progress)),
-        );
-        (tree, error.get())
-    };
-    if let Some(error) = parse_error {
-        return Err(error);
-    }
-    let tree = tree.ok_or(SourceUnitError::ParserUnavailable)?;
-    if tree.root_node().has_error() {
-        return Err(SourceUnitError::MalformedSource);
-    }
+    let (starts, ends) = physical_lines(source, &mut work)?;
+    let tree = parse_source(extension, source, &mut work)?;
 
     let braced = matches!(extension, "rs" | "go");
     let candidates = if braced {
@@ -240,6 +174,88 @@ impl Work<'_> {
         self.budget.remaining_work -= amount;
         Ok(())
     }
+}
+
+fn physical_lines(
+    source: &str,
+    work: &mut Work<'_>,
+) -> Result<(Vec<usize>, Vec<usize>), SourceUnitError> {
+    // Scan physical terminators once. A final LF does not invent an empty line.
+    let mut starts = Vec::new();
+    let mut ends = Vec::new();
+    if !source.is_empty() {
+        starts.push(0);
+    }
+    for (offset, byte) in source.bytes().enumerate() {
+        work.charge(1)?;
+        if byte == b'\n' {
+            ends.push(offset + 1);
+            if offset + 1 < source.len() {
+                starts.push(offset + 1);
+            }
+        }
+    }
+    if ends.len() < starts.len() {
+        ends.push(source.len());
+    }
+    Ok((starts, ends))
+}
+
+fn parse_source(
+    extension: &str,
+    source: &str,
+    work: &mut Work<'_>,
+) -> Result<tree_sitter::Tree, SourceUnitError> {
+    let mut parser = Parser::new();
+    let language =
+        crate::get_language_for_ext(extension).ok_or(SourceUnitError::ParserUnavailable)?;
+    parser
+        .set_language(&language.language)
+        .map_err(|_| SourceUnitError::ParserUnavailable)?;
+    // Both lexer input and native parser progress debit this same allowance.
+    // Tree-sitter's progress callback supplies cooperative cancellation during
+    // parsing; these are bounded work units, not an instruction/wall-clock meter.
+    let (tree, parse_error) = {
+        let shared = RefCell::new(work);
+        let error = Cell::new(None);
+        let mut input = |offset: usize, _| {
+            let bytes = source.as_bytes();
+            let chunk = bytes
+                .get(offset..offset.saturating_add(1024).min(bytes.len()))
+                .unwrap_or_default();
+            if let Err(reason) = shared.borrow_mut().charge(chunk.len().max(1)) {
+                error.set(Some(reason));
+                return &[][..];
+            }
+            chunk
+        };
+        let mut progress = |_: &tree_sitter::ParseState| {
+            if error.get().is_some() {
+                return ControlFlow::Break(());
+            }
+            match shared.borrow_mut().charge(1) {
+                Ok(()) => ControlFlow::Continue(()),
+                Err(reason) => {
+                    error.set(Some(reason));
+                    ControlFlow::Break(())
+                }
+            }
+        };
+        let tree = parser.parse_with_options(
+            &mut input,
+            None,
+            Some(ParseOptions::new().progress_callback(&mut progress)),
+        );
+        (tree, error.get())
+    };
+    if let Some(error) = parse_error {
+        return Err(error);
+    }
+    let tree = tree.ok_or(SourceUnitError::ParserUnavailable)?;
+    if tree.root_node().has_error() {
+        return Err(SourceUnitError::MalformedSource);
+    }
+    Ok(tree)
 }
 
 struct Candidate {
@@ -704,3 +720,10 @@ fn unit(start: usize, end: usize, kind: &str, starts: &[usize], ends: &[usize]) 
 #[cfg(test)]
 #[path = "source_units_go_tests.rs"]
 mod go_tests;
+
+#[path = "source_units_go_slice.rs"]
+pub mod go_expression_slice;
+
+#[cfg(test)]
+#[path = "source_units_go_slice_tests.rs"]
+mod go_slice_tests;

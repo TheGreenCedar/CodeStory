@@ -195,6 +195,7 @@ mod search_terms;
 mod semantic_projection;
 mod semantic_republish;
 mod snippets;
+pub mod source_expression;
 #[cfg(feature = "v3-evidence-separation-support")]
 #[doc(hidden)]
 pub mod v3_evidence_qualification_support;

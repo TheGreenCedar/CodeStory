@@ -12,14 +12,14 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 
-pub(super) struct Directory {
+pub(crate) struct Directory {
     file: File,
     logical: PathBuf,
     canonical: PathBuf,
     identity: WorkspacePathIdentity,
 }
 
-pub(super) struct SourceRead {
+pub(crate) struct SourceRead {
     pub bytes: Vec<u8>,
     pub identity: WorkspacePathIdentity,
 }

@@ -302,12 +302,14 @@ impl SchemaType {
 #[derive(Debug, Clone, Copy)]
 enum SchemaSpec {
     Object(SchemaObject),
+    Generated(fn() -> Value),
 }
 
 impl SchemaSpec {
     fn to_json(self) -> Value {
         match self {
             Self::Object(object) => object.to_json(),
+            Self::Generated(schema) => schema(),
         }
     }
 }
@@ -2673,6 +2675,17 @@ static SOURCE_CONTEXT_HOOK_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
     &[],
 );
 
+static ANALYZE_EXPRESSION_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
+    "Analyze one exact Go expression in current local source, without index activation.",
+    &[
+        SchemaProperty::string("path", "Contained source path, relative to project or an admitted absolute path.")
+            .with_min_length(1).with_max_length(262144),
+        SchemaProperty::integer("line", "One-based physical LF line where the exact expression starts.").with_bounds(1, 1_000_000),
+        SchemaProperty::string("expression", "Exact expression text from discovered source; no byte offsets, normalization or occurrence guessing.")
+            .with_min_length(1).with_max_length(262144),
+    ], &["path", "line", "expression"],
+);
+
 static TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "status",
@@ -2819,6 +2832,15 @@ static TOOLS: &[ToolSpec] = &[
         description: "Optionally enrich completed ordinary-tool output with bounded current local source from untrusted path:line:text locators. Returns PostToolUse hook JSON, never executes output or activates indexing. Original-command provenance, relevance and search completeness remain unknown.",
         input_schema: SOURCE_CONTEXT_HOOK_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(SOURCE_CONTEXT_HOOK_OUTPUT_SCHEMA)),
+        safety: SafetyMetadata::observational(),
+    },
+    ToolSpec {
+        name: "analyze_expression",
+        description: "Analyze local definitions and explicit controls for one discovered Go expression. Current-source evidence with unresolved bindings, possible opaque effects and located gaps; not external API or execution proof. Source appears once in the canonical result. max_result_bytes=16384 bounds the complete serialized revision-native MCP tool result, not outer JSON-RPC. No indexing or preparation.",
+        input_schema: ANALYZE_EXPRESSION_INPUT_SCHEMA,
+        output_schema: Some(SchemaSpec::Generated(
+            codestory_contracts::source_expression::result_schema,
+        )),
         safety: SafetyMetadata::observational(),
     },
 ];

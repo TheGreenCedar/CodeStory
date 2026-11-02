@@ -664,3 +664,41 @@ fn go_source_mismatch_and_actual_final_drift_clear_all_extra_units() {
     raw(&drift);
     assert!(has_reason(&drift, Reason::SourceDrift));
 }
+
+#[test]
+fn expression_consumer_rechecks_retained_bytes_before_serving() {
+    use codestory_contracts::source_expression::{
+        AnalysisDecline, AnalysisStatus, SourceExpressionRequest,
+    };
+    let fixture = Fixture::new();
+    let source = "package sample\nfunc run() {\n value := 1\n target(value)\n}\n";
+    fixture.write("unit.go", source);
+    let request = SourceExpressionRequest {
+        project: fixture.root.to_str().unwrap().into(),
+        path: "unit.go".into(),
+        line: 4,
+        expression: "value".into(),
+    };
+    let valid = crate::source_expression::analyze_expression(&request, &CancellationToken::new());
+    assert_ne!(valid.status, AnalysisStatus::Unavailable, "{valid:?}");
+    assert!(valid.snapshot.as_ref().unwrap().revalidated);
+    let path = fixture.root.join("unit.go");
+    let observed = Rc::new(Cell::new(0));
+    let seen = observed.clone();
+    let _guard = HookGuard::install(move |stage| {
+        if matches!(stage, SourceContextTestStage::BeforeFinalRecheck) {
+            seen.set(seen.get() + 1);
+            fs::write(&path, source.replace("value := 1", "value := 2")).unwrap();
+        }
+    });
+    let response =
+        crate::source_expression::analyze_expression(&request, &CancellationToken::new());
+    assert_eq!(
+        observed.get(),
+        1,
+        "the real consumer must reach final recheck"
+    );
+    assert_eq!(response.status, AnalysisStatus::Unavailable);
+    assert_eq!(response.decline, Some(AnalysisDecline::SourceDrift));
+    assert!(response.snapshot.is_none() && response.segments.is_empty());
+}

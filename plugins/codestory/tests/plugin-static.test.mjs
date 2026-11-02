@@ -156,7 +156,7 @@ test("fail-open tool schemas are the generated canonical MCP catalog", async () 
   const catalog = JSON.parse(await readFile(join(pluginRoot, "generated-mcp-catalog.json"), "utf8"));
   assert.deepEqual(launcherTest.failOpenToolCatalog(), catalog.tools);
   for (const [revision, profile] of Object.entries(catalog.revisionProfiles)) {
-    assert.equal(profile.tools.length, 21, `${revision} must advertise 20 navigation tools and one optional source hook`);
+    assert.equal(profile.tools.length, 22, `${revision} must advertise 20 navigation tools, expression analysis and one optional source hook`);
     assert.equal(profile.tools.filter(({ name }) => name === "source_context_hook").length, 1);
     assert.equal(
       profile.tools.filter(({ name }) => name === "verify_indexed_direct_calls").length,
@@ -169,7 +169,7 @@ test("fail-open tool schemas are the generated canonical MCP catalog", async () 
       `${revision} must not advertise legacy prove_call_path in the public catalog`,
     );
   }
-  assert.equal(catalog.tools.length, 21);
+  assert.equal(catalog.tools.length, 22);
   assert.equal(catalog.tools.filter(({ name }) => name === "verify_indexed_direct_calls").length, 0);
   assert.equal(catalog.tools.filter(({ name }) => name === "prove_call_path").length, 0);
   assert.deepEqual(catalog.resources.map(({ uri }) => uri), ["codestory://agent-guide"]);
@@ -1209,7 +1209,7 @@ test("fail-open preparing is a successful revision-native result in every profil
 test("managed provisioning replies satisfy every non-status tool output schema", () => {
   const status = { managed_retrieval: { state: "preparing" }, warnings: [], readiness: [] };
   const tools = generatedCatalog.tools.filter((tool) => tool.name !== "status");
-  assert.equal(tools.length, 20);
+  assert.equal(tools.length, 21);
   for (const tool of tools) {
     assert.ok(tool.outputSchema && typeof tool.outputSchema === "object", `${tool.name} requires its full schema`);
     const result = launcherTest.failOpenToolResult(tool.name, status, { project: repoRoot });
@@ -1228,6 +1228,13 @@ test("managed provisioning replies satisfy every non-status tool output schema",
       assert.equal(result.content.length, 1);
       assert.equal(result.content[0].type, "text");
       assert.deepEqual(JSON.parse(result.content[0].text), result.structuredContent);
+    } else if (tool.name === "analyze_expression") {
+      assert.equal(result.structuredContent.result.status, "unavailable");
+      assert.equal(result.structuredContent.result.decline, "runtime_unavailable");
+      assert.equal(result.structuredContent.result.snapshot, undefined);
+      assert.deepEqual(result.structuredContent.result.segments, []);
+      assert.deepEqual(JSON.parse(result.content[0].text), result.structuredContent);
+      assert.equal(result.isError, false);
     } else {
       assert.deepEqual(result.structuredContent.minimum_next, {
         kind: "retry_same_request",
@@ -6420,7 +6427,7 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
       id: "cold-tools",
       method: "tools/list",
     });
-    assert.equal(coldTools.result.tools.length, 21);
+    assert.equal(coldTools.result.tools.length, 22);
     assert.ok(coldTools.result.tools.some((tool) => tool.name === "ground"));
     assert.equal(
       coldTools.result.tools.filter((tool) => tool.name === "verify_indexed_direct_calls").length,
@@ -9920,4 +9927,23 @@ test("source hint hook cold launcher returns a no-op without starting runtime", 
   assert.equal(response.result.content[0].type, "text");
   assert.deepEqual(JSON.parse(response.result.content[0].text), {});
   assert.equal(probe.trace.starts, 0, "cold source hints cannot activate a runtime");
+});
+
+
+test("expression analysis cold launcher returns bounded typed unavailable without source or activation", () => {
+  const call = { jsonrpc: "2.0", id: "expression", method: "tools/call", params: {
+    name: "analyze_expression", arguments: { project: repoRoot, path: "unit.go", line: 1, expression: "target(value)" },
+  } };
+  const probe = familyWireFixture(`init();send(${JSON.stringify(call)});`, { surface: "named" });
+  assert.equal(probe.status, 0, probe.stderr);
+  const result = probe.frames.find(({ id }) => id === "expression")?.result;
+  assert.ok(result);
+  assert.notEqual(result.isError, true);
+  const root = JSON.parse(result.content[0].text);
+  assert.equal(root.result.status, "unavailable");
+  assert.equal(root.result.decline, "runtime_unavailable");
+  assert.equal(root.result.snapshot, undefined);
+  assert.deepEqual(root.result.segments, []);
+  assert.ok(Buffer.byteLength(JSON.stringify(result), "utf8") <= root.result.limits.max_result_bytes);
+  assert.equal(probe.trace.starts, 0, "cold analysis cannot activate an index/runtime");
 });
