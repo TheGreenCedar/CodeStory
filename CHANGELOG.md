@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Search results can include verified source excerpts around selected locations while retaining existing result limits. Excerpts shortened to the response limit report the missing source context.
+
 - An experimental Codex post-tool hook can add verified Python, Rust and Go source context after ordinary searches without rewriting or rerunning commands.
 
 - Experimental packets can prefer fuller function excerpts while keeping omitted context explicit. Returned file context preserves its matched source.
