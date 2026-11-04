@@ -859,7 +859,6 @@ pub fn project_search_v3(
         rows: evidence,
         missing_source,
         was_bounded,
-        source_excerpt_was_bounded,
     } = search_evidence_selection(results);
     let mut gaps = Vec::new();
     if results.public_exports.incomplete {
@@ -897,13 +896,6 @@ pub fn project_search_v3(
             "search-projection-bounded",
             GapKindV3Dto::OutputBudgetExceeded,
             Some("Additional search rows were omitted from the bounded public projection."),
-        )?);
-    }
-    if source_excerpt_was_bounded {
-        gaps.push(gap_row(
-            "search-source-excerpt-bytes",
-            GapKindV3Dto::OutputBudgetExceeded,
-            Some("A search source excerpt was truncated to its byte budget; additional source context remains outside the excerpt."),
         )?);
     }
     if results.repo_text_enabled
@@ -964,7 +956,6 @@ struct SearchEvidenceSelectionV3 {
     rows: Vec<SearchEvidenceRowV3Dto>,
     missing_source: bool,
     was_bounded: bool,
-    source_excerpt_was_bounded: bool,
 }
 
 fn search_evidence_selection(results: &SearchResultsDto) -> SearchEvidenceSelectionV3 {
@@ -974,7 +965,6 @@ fn search_evidence_selection(results: &SearchResultsDto) -> SearchEvidenceSelect
     let mut seen = HashSet::new();
     let mut missing_source = false;
     let mut was_bounded = false;
-    let mut source_excerpt_was_bounded = false;
     for hit in results.hits.iter().chain(&results.repo_text_hits) {
         // A derived report has no physical source to lose. Ordinary unlocated
         // source hits still produce the explicit source-unavailable gap.
@@ -995,9 +985,6 @@ fn search_evidence_selection(results: &SearchResultsDto) -> SearchEvidenceSelect
             continue;
         }
         let mut row = search_evidence_row(rows.len(), hit).expect("search hit has a path");
-        source_excerpt_was_bounded |= hit.source_excerpt.as_ref().is_some_and(|excerpt| {
-            excerpt.len() > codestory_contracts::packet_projection_v3::EXCERPT_MAX_BYTES_V3
-        });
         if let Some(binding) = results
             .public_exports
             .matches
@@ -1012,7 +999,6 @@ fn search_evidence_selection(results: &SearchResultsDto) -> SearchEvidenceSelect
         rows,
         missing_source,
         was_bounded,
-        source_excerpt_was_bounded,
     }
 }
 
@@ -2554,44 +2540,6 @@ mod tests {
     }
 
     #[test]
-    fn full_search_leaves_unknown_source_anchors_unexpanded() {
-        let (_project, _state, _process_cache, controller, service) =
-            indexed_full_search_fixture_with_files(1);
-        for mode in [SearchRepoTextMode::Auto, SearchRepoTextMode::On] {
-            service
-                .run_observational_with_cancel("search", Arc::new(AtomicBool::new(false)), || {
-                    let mut request = core_search_request("layout.css");
-                    request.repo_text = mode;
-                    request.limit_per_source = 1;
-                    let results = controller.search_results(request)?;
-                    assert_eq!(results.query, "layout.css");
-                    assert_eq!(results.limit_per_source, 1);
-                    let hit = results.hits.first().expect("selected physical source hit");
-                    let projected = project_search_v3(&service, "test", &results)?;
-                    let json = serde_json::to_value(projected).unwrap();
-                    let rows = json["evidence"].as_array().unwrap();
-                    assert_eq!(rows.len(), 1);
-                    assert_eq!(
-                        rows[0]["symbol_id"].as_str(),
-                        hit.resolvable.then_some(hit.node_id.0.as_str())
-                    );
-                    assert_eq!(rows[0]["path"].as_str(), hit.file_path.as_deref());
-                    assert_eq!(rows[0]["start_line"].as_u64(), hit.line.map(u64::from));
-                    assert!(
-                        hit.line.is_none(),
-                        "this physical file has no source anchor"
-                    );
-                    assert!(
-                        rows[0]["excerpt"].is_null(),
-                        "an unknown anchor must not become fabricated source"
-                    );
-                    Ok(())
-                })
-                .expect("full search and projection use the same pinned publication");
-        }
-    }
-
-    #[test]
     fn core_search_keeps_qualified_callable_definitions_within_small_limits() {
         let (project, _state, _process_cache, controller, service) = indexed_search_fixture();
         fs::write(
@@ -3426,58 +3374,6 @@ mod tests {
                 },
             )
             .expect("pinned search projection");
-    }
-
-    #[test]
-    fn search_projection_reports_excerpt_bounds_only_for_visible_rows() {
-        let (_project, _state, _process_cache, controller, service) = indexed_search_fixture();
-        service
-            .run_observational_with_cancel(
-                crate::services::search_operation_name(SearchRepoTextMode::Off),
-                Arc::new(AtomicBool::new(false)),
-                || {
-                    let mut request = core_search_request("layout.css");
-                    request.limit_per_source = 1;
-                    let original = controller.search_results(request)?;
-                    let maximum = codestory_contracts::packet_projection_v3::EXCERPT_MAX_BYTES_V3;
-                    for (text, duplicate_tail, expected_gap) in [
-                        ("x".repeat(maximum), None, false),
-                        ("é".repeat(maximum / 2 + 1), None, true),
-                        ("x".repeat(maximum), Some(true), false),
-                        ("x".repeat(maximum), Some(false), false),
-                    ] {
-                        let mut results = original.clone();
-                        let mut selected = results.hits[0].clone();
-                        selected.source_excerpt = Some(text.clone());
-                        results.hits = vec![selected.clone()];
-                        results.repo_text_hits.clear();
-                        if let Some(duplicate) = duplicate_tail {
-                            let mut tail = selected;
-                            tail.source_excerpt = Some("é".repeat(maximum / 2 + 1));
-                            if !duplicate {
-                                tail.node_id.0 = "omitted-excerpt".into();
-                            }
-                            results.repo_text_hits.push(tail);
-                        }
-                        let projected = project_search_v3(&service, "test", &results)?;
-                        let rows = projected.evidence.as_slice();
-                        assert_eq!(rows.len(), 1);
-                        let excerpt = rows[0].excerpt.as_ref().unwrap().as_str();
-                        assert!(excerpt.len() <= maximum);
-                        assert!(text.starts_with(excerpt));
-                        assert_eq!(
-                            projected.gaps.as_slice().iter().any(|gap| {
-                                gap.kind == GapKindV3Dto::OutputBudgetExceeded
-                                    && gap.identity.gap_id.as_str() == "search-source-excerpt-bytes"
-                            }),
-                            expected_gap,
-                            "only a clipped visible excerpt requires the byte-limit gap"
-                        );
-                    }
-                    Ok(())
-                },
-            )
-            .expect("excerpt limits remain explicit and UTF-8 safe");
     }
 
     #[test]

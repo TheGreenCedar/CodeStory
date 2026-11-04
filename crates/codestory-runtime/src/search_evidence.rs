@@ -106,13 +106,6 @@ pub(super) fn attach_pinned_search_evidence(
         let Some(file_path) = hit.file_path.as_deref() else {
             continue;
         };
-        if hit.source_excerpt.is_none()
-            && project_root.is_some()
-            && let Some(line) = hit.line.filter(|line| *line > 0)
-            && let Some(source) = files.verified_hit(file_path)
-        {
-            hit.source_excerpt = bounded_source_window_at_line(&source.content, line);
-        }
         if !is_cxx_header_path(file_path) {
             continue;
         }
@@ -646,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn search_source_is_hash_bound_and_preserves_surface_paths() {
+    fn exact_search_source_is_hash_bound_and_project_relative() {
         let project = tempfile::tempdir().expect("project");
         let relative = PathBuf::from("src/lib.rs");
         let source = b"fn before() {}\npub fn exact_anchor() {}\nfn after() {}\n";
@@ -667,45 +660,12 @@ mod tests {
             ..project_hit()
         };
 
-        let mut full_hit = hit.clone();
-        let absolute_path = full_hit.file_path.clone();
-        attach_pinned_search_evidence(
-            &storage,
-            Some(project.path()),
-            std::slice::from_mut(&mut full_hit),
-        );
-        assert_eq!(full_hit.file_path, absolute_path);
-        assert_eq!(
-            full_hit.source_excerpt.as_deref(),
-            Some("fn before() {}\npub fn exact_anchor() {}\nfn after() {}"),
-            "the full-search evidence boundary attaches verified source at the original location"
-        );
-
         attach_pinned_exact_search_source(&storage, project.path(), std::slice::from_mut(&mut hit));
 
         assert_eq!(hit.file_path.as_deref(), Some("src/lib.rs"));
         assert_eq!(
             hit.source_excerpt.as_deref(),
             Some("fn before() {}\npub fn exact_anchor() {}\nfn after() {}")
-        );
-
-        let original_path = full_hit.file_path.clone();
-        full_hit.source_excerpt = Some("operation-bound excerpt".into());
-        let reads = super::verified_source_read_count();
-        attach_pinned_search_evidence(
-            &storage,
-            Some(project.path()),
-            std::slice::from_mut(&mut full_hit),
-        );
-        assert_eq!(
-            full_hit.source_excerpt.as_deref(),
-            Some("operation-bound excerpt")
-        );
-        assert_eq!(full_hit.file_path, original_path);
-        assert_eq!(
-            super::verified_source_read_count(),
-            reads,
-            "existing source is not reopened"
         );
 
         std::fs::write(project.path().join(&relative), "fn changed() {}\n").expect("mutate source");
@@ -721,17 +681,6 @@ mod tests {
             line: Some(2),
             ..project_hit()
         };
-        let mut full_changed = changed.clone();
-        attach_pinned_search_evidence(
-            &storage,
-            Some(project.path()),
-            std::slice::from_mut(&mut full_changed),
-        );
-        assert!(
-            full_changed.source_excerpt.is_none(),
-            "full search must reject source drift"
-        );
-        assert_eq!(full_changed.file_path, changed.file_path);
         attach_pinned_exact_search_source(
             &storage,
             project.path(),
@@ -765,18 +714,6 @@ mod tests {
             line: Some(1),
             ..project_hit()
         };
-
-        let mut full_hit = hit.clone();
-        attach_pinned_search_evidence(
-            &storage,
-            Some(project.path()),
-            std::slice::from_mut(&mut full_hit),
-        );
-        assert!(
-            full_hit.source_excerpt.is_none(),
-            "full search must reject escaping source"
-        );
-        assert_eq!(full_hit.file_path, hit.file_path);
 
         attach_pinned_exact_search_source(&storage, project.path(), std::slice::from_mut(&mut hit));
 
