@@ -4416,6 +4416,9 @@ pub fn current_file_extraction_revision(language: &str) -> Option<&'static str> 
         "rust" => Some(languages::rust::DECLARATION_REVISION),
         "go" => Some(languages::go::INITIALIZER_CALL_REVISION),
         "bash" => Some(extraction_revision!("bash-callsite-source-order-v1")),
+        "csharp" | "swift" | "dart" => {
+            Some(extraction_revision!("nominal-callsite-source-order-v1"))
+        }
         "javascript" => Some(extraction_revision!(
             "script-ordinal-and-property-callable-v4"
         )),

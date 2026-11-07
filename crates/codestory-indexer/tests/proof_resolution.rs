@@ -79,6 +79,165 @@ fn index_files(
     Ok(paths)
 }
 
+#[test]
+fn nominal_nested_receiver_call_order_survives_cache_replay() -> anyhow::Result<()> {
+    let cases = [
+        (
+            "swift",
+            "Sources/App/Calls.swift",
+            "func target() {}\nfunc caller() { DispatchQueue./*call*/global(qos: .userInitiated)./*call*/async { /*call*/target() } }\nfunc other() { /*call*/target() }\n",
+            &["global", "async", "target", "target"][..],
+        ),
+        (
+            "csharp",
+            "src/Calls.cs",
+            "sealed class Worker { static Worker Factory() { return new Worker(); } void Run() {} void Caller() { /*call*/Factory()./*call*/Run(); this./*call*/Run(); } void Other() { this./*call*/Run(); } }\n",
+            &["Factory", "Run", "Run", "Run"][..],
+        ),
+        (
+            "dart",
+            "lib/calls.dart",
+            "class Worker { Worker make() { return Worker(); } void run() {} void caller() { make()./*call*/run(); /*call*/run(); } void other() { /*call*/run(); } }\n",
+            &["run", "run", "run"][..],
+        ),
+        (
+            "java",
+            "src/Calls.java",
+            "class Worker { static Worker factory() { return new Worker(); } void run() {} void caller() { /*call*/factory()./*call*/run(); this./*call*/run(); } void other() { this./*call*/run(); } }\n",
+            &["factory", "run", "run", "run"][..],
+        ),
+        (
+            "kotlin",
+            "src/calls.kt",
+            "class Worker {\n  fun factory(): Worker { return this }\n  fun run() {}\n  fun caller() { /*call*/factory()./*call*/run(); this./*call*/run() }\n  fun other() { this./*call*/run() }\n}\n",
+            &["factory", "run", "run", "run"][..],
+        ),
+    ];
+    for (language, path, marked_source, expected) in cases {
+        let decoded = marked_source.replace("/*call*/", "");
+        let source = decoded.as_str();
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        let paths = index_files(project.path(), &mut store, &[(path, source)])?;
+        assert!(
+            store.get_files()?.iter().all(|file| file.complete),
+            "{language}: regression source must parse completely"
+        );
+        let cached = |store: &Store| -> anyhow::Result<serde_json::Value> {
+            let blob: Vec<u8> = store.get_connection().query_row(
+                "SELECT artifact_blob FROM index_artifact_cache",
+                [],
+                |row| row.get(0),
+            )?;
+            decode_index_artifact_json(&blob)
+        };
+        let initial = cached(&store)?;
+        let calls = initial["call_resolution_inputs"]
+            .as_array()
+            .expect("cached calls");
+        let names = calls
+            .iter()
+            .map(|call| call["callsite"]["raw_target"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names, expected,
+            "{language}: preserve every nested, implicit and sibling call"
+        );
+        let spans = calls
+            .iter()
+            .map(|call| {
+                let site = &call["callsite"];
+                let start = site["start_byte"].as_u64().unwrap() as usize;
+                let end = site["end_byte_exclusive"].as_u64().unwrap() as usize;
+                assert_eq!(
+                    &source[start..end],
+                    site["raw_target"].as_str().unwrap(),
+                    "{language}: source-bound callee"
+                );
+                (start, end)
+            })
+            .collect::<Vec<_>>();
+        let expected_spans = marked_source
+            .match_indices("/*call*/")
+            .zip(expected)
+            .enumerate()
+            .map(|(index, ((offset, marker), name))| {
+                let start = offset - index * marker.len();
+                (start, start + name.len())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            spans, expected_spans,
+            "{language}: independently marked source callsites, no deletion or duplicated substitute"
+        );
+        assert!(
+            spans.windows(2).all(|pair| pair[0] <= pair[1]),
+            "{language}: callee order, not enclosing expression preorder: {spans:?}"
+        );
+        let nodes = store.get_nodes()?;
+        for call in calls {
+            if let Some(caller) = call["caller"].as_i64() {
+                let owner = nodes
+                    .iter()
+                    .find(|node| node.id.0 == caller)
+                    .expect("real caller");
+                let line = call["callsite"]["line"].as_u64().unwrap() as u32;
+                assert!(
+                    owner.start_line.unwrap() <= line && line <= owner.end_line.unwrap(),
+                    "{language}: caller scope preserved"
+                );
+            }
+        }
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        let facts = store.get_proof_resolution_facts()?;
+        // Simulate a stale producer identity on a real current payload. It must
+        // reparse before reuse, never silently normalize a cache during replay.
+        let mut stale = initial.clone();
+        stale["resolution_file"]["adapter_version"] = "reference-v0".into();
+        for call in stale["call_resolution_inputs"].as_array_mut().unwrap() {
+            call["adapter_version"] = "reference-v0".into();
+        }
+        store.get_connection().execute(
+            "UPDATE index_artifact_cache SET artifact_blob=?1",
+            [serde_json::to_vec(&stale)?],
+        )?;
+        assert!(
+            rematerialize_proof_resolution_projection(&mut store, &publication(2)).is_err(),
+            "{language}: stale inputs cannot replay"
+        );
+        for (generation, hits) in [(2, 0), (3, 1)] {
+            let result = WorkspaceIndexer::new(project.path().to_path_buf()).run_incremental(
+                &mut store,
+                &RefreshInfo {
+                    mode: BuildMode::Incremental,
+                    files_to_index: paths.clone(),
+                    files_to_remove: Vec::new(),
+                    existing_file_ids: HashMap::new(),
+                },
+                &EventBus::new(),
+                None,
+            )?;
+            assert_eq!(
+                result.artifact_cache_hits, hits,
+                "{language}: reparse then reuse"
+            );
+            assert_eq!(
+                cached(&store)?["call_resolution_inputs"],
+                initial["call_resolution_inputs"],
+                "{language}: stable record closure and bindings"
+            );
+            rematerialize_proof_resolution_projection(&mut store, &publication(generation))?;
+            assert_eq!(
+                store.get_proof_resolution_facts()?,
+                facts,
+                "{language}: no proof promotion or lost facts"
+            );
+        }
+        assert_eq!(fs::read(&paths[0])?, source.as_bytes());
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug)]
 enum RelationMutation {
     Missing,
@@ -15080,10 +15239,9 @@ fn stale_jvm_swift_owner_policy_inputs_refuse_then_reparse_and_reuse() -> anyhow
             )?;
             assert_eq!(
                 matching[0].provenance.language_adapter_version,
-                if language == "java" {
-                    "reference-v4"
-                } else {
-                    "reference-v3"
+                match language {
+                    "java" | "swift" => "reference-v4",
+                    _ => "reference-v3",
                 }
             );
         }
@@ -15456,9 +15614,9 @@ fn proof_resolution_roster_tracks_the_current_adapter_version() -> anyhow::Resul
     for (language, expected) in [
         ("java", "reference-v4"),
         ("kotlin", "reference-v3"),
-        ("csharp", "reference-v2"),
-        ("swift", "reference-v3"),
-        ("dart", "reference-v2"),
+        ("csharp", "reference-v3"),
+        ("swift", "reference-v4"),
+        ("dart", "reference-v3"),
     ] {
         assert_eq!(
             receipt

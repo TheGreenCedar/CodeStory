@@ -260,9 +260,9 @@ const C_ADAPTER_VERSION: &str = "reference-v2";
 const CPP_ADAPTER_VERSION: &str = "reference-v5";
 const RUBY_ADAPTER_VERSION: &str = "reference-v5";
 const PHP_ADAPTER_VERSION: &str = "reference-v4";
-const CSHARP_ADAPTER_VERSION: &str = "reference-v2";
-const SWIFT_ADAPTER_VERSION: &str = "reference-v3";
-const DART_ADAPTER_VERSION: &str = "reference-v2";
+const CSHARP_ADAPTER_VERSION: &str = "reference-v3";
+const SWIFT_ADAPTER_VERSION: &str = "reference-v4";
+const DART_ADAPTER_VERSION: &str = "reference-v3";
 const BASH_ADAPTER_VERSION: &str = "reference-v3";
 const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 28;
 const INSTALLED_ADAPTERS: &[(&str, &str)] = &[
@@ -4354,23 +4354,33 @@ fn c_cpp_source_role(path: &Path) -> CachedCCppSourceRole {
 }
 
 fn c_cpp_sort_calls_by_span(calls: &mut Vec<IndexedCCppCall<'_>>) {
+    sort_calls_by_span(
+        calls,
+        |call| (call.callee.start_byte(), call.callee.end_byte()),
+        count_c_cpp_resolution_work,
+    );
+}
+
+// Tree preorder is not callee order: the member in factory().run() follows
+// the nested receiver's callee. Sort whole records after collecting bindings,
+// before building span lookups. Stable byte passes retain equal-span records.
+fn sort_calls_by_span<T>(
+    calls: &mut Vec<T>,
+    span: impl Fn(&T) -> (usize, usize),
+    count_work: fn(usize),
+) {
     for end_byte_first in [true, false] {
         for shift in (0..usize::BITS).step_by(8) {
-            let mut buckets = (0..=u8::MAX)
-                .map(|_| Vec::new())
-                .collect::<Vec<Vec<IndexedCCppCall<'_>>>>();
+            let mut buckets = (0..=u8::MAX).map(|_| Vec::new()).collect::<Vec<Vec<T>>>();
             for call in std::mem::take(calls) {
-                count_c_cpp_resolution_work(1);
-                let coordinate = if end_byte_first {
-                    call.callee.end_byte()
-                } else {
-                    call.callee.start_byte()
-                };
+                count_work(1);
+                let (start, end) = span(&call);
+                let coordinate = if end_byte_first { end } else { start };
                 let bucket = (coordinate >> shift) & usize::from(u8::MAX);
                 buckets[bucket].push(call);
             }
             for bucket in buckets {
-                count_c_cpp_resolution_work(bucket.len());
+                count_work(bucket.len());
                 calls.extend(bucket);
             }
         }
@@ -4787,6 +4797,12 @@ impl<'tree> JavaKotlinResolutionIndex<'tree> {
             result
                 .calls
                 .sort_by_key(|call| (call.callee.start_byte(), call.callee.end_byte()));
+        } else {
+            sort_calls_by_span(
+                &mut result.calls,
+                |call| (call.callee.start_byte(), call.callee.end_byte()),
+                count_java_kotlin_resolution_work,
+            );
         }
         for (index, call) in result.calls.iter().enumerate() {
             count_java_kotlin_resolution_work(1);
@@ -21820,6 +21836,89 @@ mod java_kotlin_complexity_tests {
     use codestory_workspace::{BuildMode, RefreshInfo};
     use std::fs;
     use tree_sitter::Parser;
+
+    #[test]
+    fn nominal_span_ordering_preserves_equal_spans_and_counts_every_pass() {
+        let original = vec![((8, 20), 0), ((2, 9), 1), ((8, 12), 2), ((8, 12), 3)];
+        let mut calls = original.clone();
+        reset_java_kotlin_resolution_work();
+        sort_calls_by_span(&mut calls, |call| call.0, count_java_kotlin_resolution_work);
+        assert_eq!(
+            calls,
+            vec![original[1], original[2], original[3], original[0]]
+        );
+        assert_eq!(
+            java_kotlin_resolution_work(),
+            calls.len() * 4 * std::mem::size_of::<usize>()
+        );
+    }
+
+    #[test]
+    fn nominal_nested_receiver_order_work_is_linear_and_counted() {
+        for (language, path, source) in [
+            (
+                "csharp",
+                Path::new("Calls.cs"),
+                "class C { void caller() { factory().run(); } }",
+            ),
+            (
+                "swift",
+                Path::new("Sources/App/Calls.swift"),
+                "func caller() { queue.global().async { target() } }",
+            ),
+            (
+                "dart",
+                Path::new("lib/calls.dart"),
+                "void caller() { factory().run(); other().run(); }",
+            ),
+        ] {
+            let grammar = match language {
+                "csharp" => tree_sitter_c_sharp::LANGUAGE.into(),
+                "swift" => tree_sitter_swift::LANGUAGE.into(),
+                "dart" => tree_sitter_dart_orchard::LANGUAGE.into(),
+                _ => unreachable!(),
+            };
+            let mut parser = Parser::new();
+            parser.set_language(&grammar).unwrap();
+            let tree = parser.parse(source, None).unwrap();
+            let index =
+                JavaKotlinResolutionIndex::build(&tree, source, path, language, NodeId(1), &[]);
+            assert!(
+                index.calls.len() >= 2,
+                "{language}: real nested receiver calls"
+            );
+            let spans = index
+                .calls
+                .iter()
+                .map(|call| (call.callee.start_byte(), call.callee.end_byte()))
+                .collect::<Vec<_>>();
+            assert!(spans.windows(2).all(|pair| pair[0] <= pair[1]));
+            let mut measured = Vec::new();
+            for copies in [64, 128] {
+                let mut rows = spans
+                    .iter()
+                    .copied()
+                    .cycle()
+                    .take(copies * spans.len())
+                    .collect::<Vec<_>>();
+                rows.reverse();
+                reset_java_kotlin_resolution_work();
+                sort_calls_by_span(&mut rows, |span| *span, count_java_kotlin_resolution_work);
+                let work = java_kotlin_resolution_work();
+                assert_eq!(
+                    work,
+                    rows.len() * 4 * std::mem::size_of::<usize>(),
+                    "{language}: nonzero counted radix work"
+                );
+                measured.push(work);
+            }
+            assert_eq!(
+                measured[1],
+                2 * measured[0],
+                "{language}: doubled nested-call sorting work"
+            );
+        }
+    }
 
     #[test]
     fn overlapping_resolution_work_measurements_are_isolated() {

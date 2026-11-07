@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Indexing handles chained receiver calls in C#, Swift and Dart without interrupting repository preparation. Existing indexes refresh their cached call records automatically.
+
 - An experimental Codex post-tool hook can add verified Python, Rust and Go source context after ordinary searches without rewriting or rerunning commands.
 
 - Experimental packets can prefer fuller function excerpts while keeping omitted context explicit. Returned file context preserves its matched source.
