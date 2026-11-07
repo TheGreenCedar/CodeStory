@@ -258,6 +258,14 @@ coverage. Source-row selection remains a separate measured allocation over
 admitted evidence; below-cutoff identities remain absent unless independently
 admitted through supported selectors.
 
+Fresh implicit retrieval uses authenticated callable-body progress when selecting
+its baseline from the existing bounded families. Known source-page demands receive
+spare capacity in admission order within the existing per-source and total limits.
+Automatic FILE substitution does not make a never-served source unit mandatory:
+omitted units retain their canonical gaps and continuation authority. A returned
+FILE source still preserves every matched range. Requested and issued context
+retain their existing source-floor and prefix protections.
+
 The additive joint stage accepts a partial callable page only when verified body
 metadata intersects its delivered physical lines. It preserves every baseline
 source/graph row, subtracts their physical coverage as a union, and ranks positive

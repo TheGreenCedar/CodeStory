@@ -314,78 +314,236 @@ fn bash_executable_effect_matrix_preserves_argument_and_literal_controls() -> an
 
 #[test]
 fn bash_previous_effect_adapter_refuses_then_reparses_and_reuses() -> anyhow::Result<()> {
-    let project = tempfile::tempdir()?;
-    let mut store = Store::new_in_memory()?;
-    let paths = index_files(
-        project.path(),
-        &mut store,
-        &[("proof.sh", DYNAMIC_EXECUTABLE_SOURCE)],
-    )?;
-    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
-    store.validate_proof_resolution_publication(&publication(1))?;
-    assert_later_target_fact(
-        &store,
-        project.path(),
-        DYNAMIC_EXECUTABLE_SOURCE,
-        Some(ProofResolutionStatus::Unsupported),
-    )?;
-    let before = store.get_proof_resolution_facts()?;
-    let blob = store.get_connection().query_row(
-        "SELECT artifact_blob FROM index_artifact_cache",
-        [],
-        |row| row.get::<_, Vec<u8>>(0),
-    )?;
-    let mut artifact = decode_index_artifact_json(&blob)?;
-    // Simulated prior identity on current syntax payload, not an old binary
-    // payload claim. The baseline separately established the prior false Exact.
-    artifact["resolution_file"]["adapter_version"] = "reference-v1".into();
-    for call in artifact["call_resolution_inputs"]
-        .as_array_mut()
-        .expect("cached calls")
-    {
-        call["adapter_version"] = "reference-v1".into();
-    }
-    store.get_connection().execute(
-        "UPDATE index_artifact_cache SET artifact_blob = ?1",
-        [serde_json::to_vec(&artifact)?],
-    )?;
-    let error = rematerialize_proof_resolution_projection(&mut store, &publication(2))
-        .expect_err("prior effect policy must not remain eligible");
-    assert!(
-        error.to_string().contains("adapter") || error.to_string().contains("stale"),
-        "{error}"
-    );
-    assert_eq!(
-        store.get_proof_resolution_facts()?,
-        before,
-        "rejected cache leaves the prior complete projection intact"
-    );
-    for (generation, expected_hits) in [(2, 0), (3, 1)] {
-        let result = WorkspaceIndexer::new(project.path().to_path_buf()).run_incremental(
+    for prior_adapter in ["reference-v1", "reference-v2"] {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        let paths = index_files(
+            project.path(),
             &mut store,
-            &RefreshInfo {
-                mode: BuildMode::Incremental,
-                files_to_index: paths.clone(),
-                files_to_remove: Vec::new(),
-                existing_file_ids: HashMap::new(),
-            },
-            &EventBus::new(),
-            None,
+            &[("proof.sh", DYNAMIC_EXECUTABLE_SOURCE)],
         )?;
-        assert_eq!(
-            result.artifact_cache_hits, expected_hits,
-            "actual unchanged-source reparse/reuse"
-        );
-        assert_eq!(fs::read(&paths[0])?, DYNAMIC_EXECUTABLE_SOURCE.as_bytes());
-        rematerialize_proof_resolution_projection(&mut store, &publication(generation))?;
-        store.validate_proof_resolution_publication(&publication(generation))?;
-        let fact = assert_later_target_fact(
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        store.validate_proof_resolution_publication(&publication(1))?;
+        assert_later_target_fact(
             &store,
             project.path(),
             DYNAMIC_EXECUTABLE_SOURCE,
             Some(ProofResolutionStatus::Unsupported),
         )?;
-        assert_eq!(fact.provenance.language_adapter_version, "reference-v2");
+        let before = store.get_proof_resolution_facts()?;
+        let blob = store.get_connection().query_row(
+            "SELECT artifact_blob FROM index_artifact_cache",
+            [],
+            |row| row.get::<_, Vec<u8>>(0),
+        )?;
+        let mut artifact = decode_index_artifact_json(&blob)?;
+        // Simulated prior identity on current syntax payload, not an old binary
+        // payload claim. The v1 baseline separately established the prior false Exact; v2 also
+        // requires normal reparse after the source-order compatibility change.
+        artifact["resolution_file"]["adapter_version"] = prior_adapter.into();
+        for call in artifact["call_resolution_inputs"]
+            .as_array_mut()
+            .expect("cached calls")
+        {
+            call["adapter_version"] = prior_adapter.into();
+        }
+        store.get_connection().execute(
+            "UPDATE index_artifact_cache SET artifact_blob = ?1",
+            [serde_json::to_vec(&artifact)?],
+        )?;
+        let error = rematerialize_proof_resolution_projection(&mut store, &publication(2))
+            .expect_err("prior effect policy must not remain eligible");
+        assert!(
+            error.to_string().contains("adapter") || error.to_string().contains("stale"),
+            "{error}"
+        );
+        assert_eq!(
+            store.get_proof_resolution_facts()?,
+            before,
+            "rejected cache leaves the prior complete projection intact"
+        );
+        for (generation, expected_hits) in [(2, 0), (3, 1)] {
+            let result = WorkspaceIndexer::new(project.path().to_path_buf()).run_incremental(
+                &mut store,
+                &RefreshInfo {
+                    mode: BuildMode::Incremental,
+                    files_to_index: paths.clone(),
+                    files_to_remove: Vec::new(),
+                    existing_file_ids: HashMap::new(),
+                },
+                &EventBus::new(),
+                None,
+            )?;
+            assert_eq!(
+                result.artifact_cache_hits, expected_hits,
+                "actual unchanged-source reparse/reuse"
+            );
+            assert_eq!(fs::read(&paths[0])?, DYNAMIC_EXECUTABLE_SOURCE.as_bytes());
+            rematerialize_proof_resolution_projection(&mut store, &publication(generation))?;
+            store.validate_proof_resolution_publication(&publication(generation))?;
+            let fact = assert_later_target_fact(
+                &store,
+                project.path(),
+                DYNAMIC_EXECUTABLE_SOURCE,
+                Some(ProofResolutionStatus::Unsupported),
+            )?;
+            assert_eq!(fact.provenance.language_adapter_version, "reference-v3");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn bash_prefix_substitutions_preserve_callee_bindings_without_order_assumptions()
+-> anyhow::Result<()> {
+    // A command's name follows its prefix assignments in source, but the parser
+    // visits the outer command before commands nested in those assignments.
+    // Argument substitutions exercise the opposite, already-working layout.
+    for (name, command, exact, inner_name) in [
+        (
+            "argument substitution",
+            "target \"$(nested)\"",
+            true,
+            "nested",
+        ),
+        (
+            "prefix substitution",
+            "VALUE=$(nested) target",
+            true,
+            "nested",
+        ),
+        (
+            "same-target prefix",
+            "VALUE=$(target) target",
+            true,
+            "target",
+        ),
+        (
+            "quoted prefix substitution",
+            "VALUE=\"$(nested)\" target",
+            true,
+            "nested",
+        ),
+        (
+            "prefix process substitution",
+            "VALUE=<(nested) target",
+            true,
+            "nested",
+        ),
+        ("prefix backticks", "VALUE=`nested` target", true, "nested"),
+        (
+            "argument process substitution",
+            "target <(nested)",
+            true,
+            "nested",
+        ),
+        (
+            "dynamic executable",
+            "VALUE=$(nested) \"$target\"",
+            false,
+            "nested",
+        ),
+        (
+            "enclosing dynamic callee",
+            "\"$(nested)\" argument",
+            false,
+            "nested",
+        ),
+    ] {
+        let source =
+            format!("target() {{ :; }}\nnested() {{ :; }}\ncaller() {{\n  {command}\n}}\n");
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &[("proof.sh", &source)])?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        store.validate_proof_resolution_publication(&publication(1))?;
+        let file = store
+            .get_files()?
+            .into_iter()
+            .find(|file| file.path == project.path().join("proof.sh"))
+            .expect("fixture file");
+        let nodes = store.get_nodes()?;
+        let function_at = |line| {
+            nodes
+                .iter()
+                .find(|node| {
+                    node.kind == NodeKind::FUNCTION
+                        && node.file_node_id == Some(NodeId(file.id))
+                        && node.start_line == Some(line)
+                })
+                .expect("independent positional function declaration")
+                .id
+        };
+        let caller = function_at(3);
+        let facts = store
+            .get_proof_resolution_facts()?
+            .into_iter()
+            .filter(|fact| fact.callsite.file_id == FileId(file.id) && fact.caller == caller)
+            .collect::<Vec<_>>();
+        assert_eq!(facts.len(), 2, "{name}: both command sites: {facts:#?}");
+        let edges = store.get_edges()?;
+        for fact in &facts {
+            assert_eq!(
+                source.get(
+                    fact.callsite.start_byte as usize..fact.callsite.end_byte_exclusive as usize
+                ),
+                Some(fact.callsite.raw_target.as_str()),
+                "{name}: exact callsite bytes"
+            );
+            if exact {
+                let target = match fact.callsite.raw_target.as_str() {
+                    "target" => function_at(1),
+                    "nested" => function_at(2),
+                    other => panic!("{name}: unexpected callee {other}"),
+                };
+                assert_eq!(
+                    fact.status,
+                    ProofResolutionStatus::Exact,
+                    "{name}: {fact:#?}"
+                );
+                assert_eq!(fact.target, Some(target), "{name}: {fact:#?}");
+                let edge_id = fact.edge_id.expect("exact receipt has a graph edge");
+                let edge = edges
+                    .iter()
+                    .find(|edge| edge.id == edge_id)
+                    .expect("receipt edge");
+                assert_eq!(edge.kind, EdgeKind::CALL, "{name}");
+                assert_eq!(edge.effective_source(), caller, "{name}");
+                assert_eq!(edge.effective_target(), target, "{name}");
+                assert_eq!(
+                    store.get_exact_proof_resolution_fact_by_edge(edge_id)?,
+                    Some(fact.clone())
+                );
+            } else {
+                assert_eq!(
+                    fact.status,
+                    ProofResolutionStatus::Unsupported,
+                    "{name}: {fact:#?}"
+                );
+                assert!(
+                    fact.target.is_none()
+                        && fact.edge_id.is_none()
+                        && fact.evidence_chain.is_empty(),
+                    "{name}: dynamic command gained authority: {fact:#?}"
+                );
+                assert!(
+                    fact.raw_edge_target.is_none() && fact.raw_callsite_identity.is_none(),
+                    "{name}: dynamic receipt retained graph authority: {fact:#?}"
+                );
+            }
+        }
+        if exact {
+            for expected in ["target", "nested"] {
+                assert_eq!(
+                    facts
+                        .iter()
+                        .filter(|fact| fact.callsite.raw_target == expected)
+                        .count(),
+                    usize::from(expected == "target") + usize::from(expected == inner_name),
+                    "{name}: expected {expected} callsites"
+                );
+            }
+        }
     }
     Ok(())
 }

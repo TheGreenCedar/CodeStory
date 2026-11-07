@@ -1875,7 +1875,7 @@ fn assert_exact_search_uses_core_without_full_sidecars(
 
 #[cfg(unix)]
 #[test]
-fn exact_search_reads_the_immutable_core_when_the_search_catalog_is_unwritable() {
+fn core_navigation_reads_the_immutable_core_when_the_search_catalog_is_unwritable() {
     let workspace = tempdir().expect("workspace dir");
     let cache_dir = tempdir().expect("cache dir");
     write_tiny_rust_workspace(workspace.path());
@@ -1912,6 +1912,25 @@ fn exact_search_reads_the_immutable_core_when_the_search_catalog_is_unwritable()
         ],
     );
 
+    let named_outputs = ["symbol", "callers"].map(|command| {
+        (
+            command,
+            run_cli(
+                workspace.path(),
+                cache_dir.path(),
+                &[
+                    command,
+                    "--query",
+                    "AppController",
+                    "--refresh",
+                    "none",
+                    "--format",
+                    "json",
+                ],
+            ),
+        )
+    });
+
     fs::set_permissions(&catalog_lock, fs::Permissions::from_mode(0o600))
         .expect("restore search catalog lock permissions");
     assert!(
@@ -1931,10 +1950,30 @@ fn exact_search_reads_the_immutable_core_when_the_search_catalog_is_unwritable()
             })),
         "core-only exact search should return source evidence: {search:#}"
     );
+    for (command, named) in named_outputs {
+        assert!(
+            named.status.success(),
+            "{command} by indexed name must not initialize retrieval or attach search: stdout={} stderr={}",
+            String::from_utf8_lossy(&named.stdout),
+            String::from_utf8_lossy(&named.stderr)
+        );
+        let named: Value =
+            serde_json::from_slice(&named.stdout).expect("parse name-selected navigation");
+        if command == "symbol" {
+            assert_eq!(named["symbol"]["node"]["display_name"], "AppController");
+        } else {
+            assert!(
+                named["trail"]["trail"]["nodes"]
+                    .as_array()
+                    .is_some_and(|nodes| nodes.iter().any(|node| node["label"] == "AppController")),
+                "{named:#}"
+            );
+        }
+    }
     assert_eq!(
         cache_file_snapshots(cache_dir.path()),
         before,
-        "core-only exact search must not mutate cache bytes or mtimes"
+        "Core navigation must not mutate cache bytes or mtimes"
     );
 }
 

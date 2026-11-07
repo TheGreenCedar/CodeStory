@@ -80,6 +80,7 @@ pub(crate) struct OrientationHitEvidence {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct OrientationEvidence {
     by_node: HashMap<NodeId, OrientationHitEvidence>,
+    pub(crate) public_exports: HashMap<NodeId, String>,
     graph_evaluated: usize,
 }
 
@@ -442,10 +443,28 @@ fn search_match_rank(
     hit: &SearchHit,
     evidence: Option<&OrientationEvidence>,
 ) -> SearchMatchRank {
-    let (rank, matched_symbol_query) = best_symbol_name_match(query, &hit.display_name);
+    let (canonical_rank, mut matched_symbol_query) =
+        best_symbol_name_match(query, &hit.display_name);
+    let alias = evidence.and_then(|value| value.public_exports.get(&hit.node_id));
+    let rank = alias
+        .map(|name| best_symbol_name_match(query, name).0)
+        .filter(|rank| *rank > canonical_rank)
+        .unwrap_or(canonical_rank);
+    let alias_exact = rank > canonical_rank;
+    if alias_exact {
+        matched_symbol_query = hit.display_name.clone();
+    }
     let is_exact_match =
         rank.exact_display != 0 || rank.exact_terminal != 0 || rank.exact_leading != 0;
-    let full_definition = full_definition_bucket(project_root, query, hit);
+    let full_definition = full_definition_bucket(
+        project_root,
+        if alias_exact {
+            &hit.display_name
+        } else {
+            query
+        },
+        hit,
+    );
     let definition_quality =
         exact_definition_quality_bucket(project_root, &matched_symbol_query, hit, is_exact_match);
     let qualified_prefix_path = qualified_prefix_path_bucket(query, hit);
@@ -507,6 +526,14 @@ fn search_match_rank(
 }
 
 fn full_definition_bucket(project_root: Option<&Path>, query: &str, hit: &SearchHit) -> u8 {
+    // A verified method definition need not repeat its owner in an unqualified query.
+    if hit.origin == SearchHitOrigin::IndexedSymbol
+        && is_callable_like_kind(hit.kind)
+        && symbol_name_match_rank_single(query, &hit.display_name).exact_terminal != 0
+        && callable_hit_line_quality(project_root, query, hit) == 2
+    {
+        return 2;
+    }
     if normalize_symbol_query(&hit.display_name) != normalize_symbol_query(query) {
         return 0;
     }
@@ -624,8 +651,26 @@ fn type_hit_line_quality(project_root: Option<&Path>, query: &str, hit: &SearchH
     if expected_name.is_empty() {
         return 1;
     }
+    if hit.origin == SearchHitOrigin::IndexedSymbol
+        && Path::new(path).extension().is_some_and(|ext| ext == "go")
+    {
+        // Go has no forward type declarations; the name after `type` owns the declaration.
+        let mut declaration = trimmed.split_whitespace();
+        if declaration.next() != Some("type") {
+            return 0;
+        }
+        let Some(name) = declaration.next() else {
+            return 0;
+        };
+        let name = name.split('[').next().unwrap_or(name);
+        return if normalize_symbol_query(name) == expected_name {
+            2
+        } else {
+            0
+        };
+    }
     let tokens = trimmed
-        .split(|ch: char| ch.is_whitespace() || ch == ':' || ch == ';' || ch == '{')
+        .split(|ch: char| ch.is_whitespace() || matches!(ch, ':' | ';' | '{' | '<' | '(' | '['))
         .map(|token| token.trim_matches(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')))
         .filter(|token| !token.is_empty())
         .collect::<Vec<_>>();
@@ -755,20 +800,21 @@ fn read_source_line(project_root: Option<&Path>, path: &str, line: u32) -> Optio
         raw_path
     };
 
-    let contents = fs::read_to_string(candidate)
+    let bytes = fs::read(candidate)
         .or_else(|_| {
             #[cfg(windows)]
             {
                 path.strip_prefix(r"\\?\")
-                    .map(fs::read_to_string)
-                    .unwrap_or_else(|| fs::read_to_string(path))
+                    .map(fs::read)
+                    .unwrap_or_else(|| fs::read(path))
             }
             #[cfg(not(windows))]
             {
-                fs::read_to_string(path)
+                fs::read(path)
             }
         })
         .ok()?;
+    let contents = codestory_contracts::source_text::decode_source_text(candidate, &bytes).ok()?;
     contents
         .lines()
         .nth(line.saturating_sub(1) as usize)
@@ -857,6 +903,170 @@ mod tests {
         let mut hit = hit_at_path(id, display_name, kind, score, path);
         hit.line = Some(line);
         hit
+    }
+
+    #[test]
+    fn terminal_callable_queries_require_implementation_source_and_keep_owner_specificity() {
+        let temp = tempdir().unwrap();
+        let incidental_path = temp.path().join("settings.py");
+        fs::write(&incidental_path, "pack = 1\n").unwrap();
+        let incidental = hit_at_path_line(
+            "incidental",
+            "pack",
+            NodeKind::VARIABLE,
+            1.0,
+            incidental_path.to_str().unwrap(),
+            1,
+        );
+        let mut failures = Vec::new();
+        for (label, source, kind, origin, should_precede) in [
+            (
+                "python",
+                Some("def pack(self):\n    return 1\n"),
+                NodeKind::METHOD,
+                SearchHitOrigin::IndexedSymbol,
+                true,
+            ),
+            (
+                "go",
+                Some("func (s *Store) pack() {}\n"),
+                NodeKind::METHOD,
+                SearchHitOrigin::IndexedSymbol,
+                true,
+            ),
+            (
+                "declaration",
+                Some("void pack();\n"),
+                NodeKind::METHOD,
+                SearchHitOrigin::IndexedSymbol,
+                false,
+            ),
+            (
+                "import",
+                Some("from elsewhere import pack\n"),
+                NodeKind::METHOD,
+                SearchHitOrigin::IndexedSymbol,
+                false,
+            ),
+            (
+                "wrong_name",
+                Some("def unpack(self):\n    return 1\n"),
+                NodeKind::METHOD,
+                SearchHitOrigin::IndexedSymbol,
+                false,
+            ),
+            (
+                "wrong_declaration",
+                Some("fn other() { pack(); }\n"),
+                NodeKind::UNKNOWN,
+                SearchHitOrigin::IndexedSymbol,
+                false,
+            ),
+            (
+                "callsite",
+                Some("return pack()\n"),
+                NodeKind::UNKNOWN,
+                SearchHitOrigin::IndexedSymbol,
+                false,
+            ),
+            (
+                "missing",
+                None,
+                NodeKind::METHOD,
+                SearchHitOrigin::IndexedSymbol,
+                false,
+            ),
+            (
+                "unknown",
+                Some("def pack(self):\n    return 1\n"),
+                NodeKind::UNKNOWN,
+                SearchHitOrigin::IndexedSymbol,
+                false,
+            ),
+            (
+                "text",
+                Some("def pack(self):\n    return 1\n"),
+                NodeKind::METHOD,
+                SearchHitOrigin::TextMatch,
+                false,
+            ),
+        ] {
+            let path = temp.path().join(format!("{label}.txt"));
+            if let Some(source) = source {
+                fs::write(&path, source).unwrap();
+            }
+            let mut candidate =
+                hit_at_path_line(label, "Store.pack", kind, 0.1, path.to_str().unwrap(), 1);
+            candidate.origin = origin;
+            let mut ranked = [candidate.clone(), incidental.clone()];
+            ranked.sort_by(|a, b| {
+                compare_search_hits_with_project_root(Some(temp.path()), "pack", a, b, None)
+            });
+            if (ranked[0].node_id == candidate.node_id) != should_precede {
+                failures.push(label);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "incorrect implementation eligibility: {failures:?}"
+        );
+
+        let definition_path = temp.path().join("implementation.py");
+        fs::write(&definition_path, "def pack(self):\n    return 1\n").unwrap();
+        for separator in [".", "::"] {
+            let owner = format!("Store{separator}pack");
+            let correct = hit_at_path_line(
+                "correct",
+                &owner,
+                NodeKind::METHOD,
+                0.1,
+                definition_path.to_str().unwrap(),
+                1,
+            );
+            let other = hit_at_path_line(
+                "other",
+                &format!("Other{separator}pack"),
+                NodeKind::METHOD,
+                1.0,
+                definition_path.to_str().unwrap(),
+                1,
+            );
+            let label_path = temp.path().join("settings.json");
+            fs::write(&label_path, format!("{{\"{owner}\": true}}\n")).unwrap();
+            let exact_label = hit_at_path_line(
+                "exact_label",
+                &owner,
+                NodeKind::ANNOTATION,
+                0.1,
+                label_path.to_str().unwrap(),
+                1,
+            );
+            let mut fallback = [other.clone(), exact_label.clone()];
+            fallback.sort_by(|a, b| {
+                compare_search_hits_with_project_root(Some(temp.path()), &owner, a, b, None)
+            });
+            assert_eq!(
+                fallback[0].node_id, exact_label.node_id,
+                "a wrong owner's terminal must not borrow an extracted query term"
+            );
+            for mut ranked in [
+                [other.clone(), correct.clone()],
+                [correct.clone(), other.clone()],
+            ] {
+                ranked.sort_by(|a, b| {
+                    compare_search_hits_with_project_root(Some(temp.path()), &owner, a, b, None)
+                });
+                assert_eq!(
+                    ranked[0].node_id, correct.node_id,
+                    "owner specificity for {owner}"
+                );
+                ranked.sort_by(|a, b| {
+                    compare_search_hits_with_project_root(Some(temp.path()), "pack", a, b, None)
+                });
+                assert_eq!(ranked[0].node_id, other.node_id);
+                assert_eq!(ranked[1].node_id, correct.node_id);
+            }
+        }
     }
 
     #[test]
@@ -1643,6 +1853,216 @@ mod tests {
         assert_eq!(
             hits.first().map(|hit| &hit.node_id),
             Some(&external.node_id)
+        );
+    }
+
+    #[test]
+    fn exact_type_queries_prefer_standalone_go_declarations_over_labels() {
+        let temp = tempdir().expect("create temp dir");
+        std::fs::write(
+            temp.path().join("labels.json"),
+            "{\"accesspolicy\": \"Policy\"}\n",
+        )
+        .expect("write label");
+        let label = hit_at_path_line(
+            "label",
+            "accesspolicy",
+            NodeKind::ANNOTATION,
+            0.95,
+            "labels.json",
+            1,
+        );
+
+        for source in [
+            "type AccessPolicy struct { Enabled bool }\n",
+            "type AccessPolicy interface { Allowed() bool }\n",
+            "type AccessPolicy bool\n",
+            "type AccessPolicy[T any] struct { Value T }\n",
+        ] {
+            std::fs::write(temp.path().join("types.go"), source).expect("write Go declaration");
+            // The Go type_spec rule emits STRUCT for each of these declarations.
+            let declaration = hit_at_path_line(
+                "declaration",
+                "AccessPolicy",
+                NodeKind::STRUCT,
+                0.40,
+                "types.go",
+                1,
+            );
+            let mut hits = [label.clone(), declaration.clone()];
+            hits.sort_by(|left, right| {
+                compare_search_hits_with_project_root_for_test(
+                    Some(temp.path()),
+                    "AccessPolicy",
+                    left,
+                    right,
+                )
+            });
+
+            assert_eq!(hits[0].node_id, declaration.node_id, "source: {source}");
+        }
+    }
+
+    #[test]
+    fn go_type_definition_ranking_preserves_source_and_identity_guards() {
+        let temp = tempdir().expect("create temp dir");
+        std::fs::write(
+            temp.path().join("labels.json"),
+            "{\"accesspolicy\": \"Policy\"}\n",
+        )
+        .expect("write label");
+        let label = hit_at_path_line(
+            "label",
+            "accesspolicy",
+            NodeKind::ANNOTATION,
+            0.95,
+            "labels.json",
+            1,
+        );
+
+        for (source, path, origin) in [
+            (
+                "type AccessPolicyExtra struct {}\n",
+                "types.go",
+                SearchHitOrigin::IndexedSymbol,
+            ),
+            (
+                "type Other struct { AccessPolicy int }\n",
+                "types.go",
+                SearchHitOrigin::IndexedSymbol,
+            ),
+            (
+                "var item AccessPolicy\n",
+                "types.go",
+                SearchHitOrigin::IndexedSymbol,
+            ),
+            (
+                "type Other = AccessPolicy\n",
+                "types.go",
+                SearchHitOrigin::IndexedSymbol,
+            ),
+            (
+                "type (\nAccessPolicy struct {}\nOther struct {}\n)\n",
+                "types.go",
+                SearchHitOrigin::IndexedSymbol,
+            ),
+            (
+                "type AccessPolicy struct {}\n",
+                "types.txt",
+                SearchHitOrigin::IndexedSymbol,
+            ),
+            (
+                "type AccessPolicy struct {}\n",
+                "types.go",
+                SearchHitOrigin::TextMatch,
+            ),
+            ("", "missing.go", SearchHitOrigin::IndexedSymbol),
+        ] {
+            if !source.is_empty() {
+                std::fs::write(temp.path().join(path), source).expect("write source control");
+            }
+            let mut candidate =
+                hit_at_path_line("candidate", "AccessPolicy", NodeKind::STRUCT, 0.40, path, 1);
+            candidate.origin = origin;
+            let mut hits = [candidate, label.clone()];
+            hits.sort_by(|left, right| {
+                compare_search_hits_with_project_root_for_test(
+                    Some(temp.path()),
+                    "AccessPolicy",
+                    left,
+                    right,
+                )
+            });
+
+            assert_eq!(
+                hits[0].node_id, label.node_id,
+                "path: {path}, source: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn type_declaration_name_boundaries_preserve_definition_guards() {
+        let temp = tempdir().unwrap();
+        let cases = [
+            (
+                "owner.ts",
+                "export class _Painter<Input = string, Output = string> {",
+                NodeKind::CLASS,
+                2,
+            ),
+            (
+                "owner.java",
+                "class _Painter<T extends Base> {",
+                NodeKind::CLASS,
+                2,
+            ),
+            ("owner.rs", "pub struct _Painter<T> {", NodeKind::STRUCT, 2),
+            (
+                "owner.ts",
+                "export interface _Painter<T> {",
+                NodeKind::INTERFACE,
+                2,
+            ),
+            ("owner.py", "class _Painter(Base):", NodeKind::CLASS, 2),
+            ("owner.py", "class _Painter[T](Base):", NodeKind::CLASS, 2),
+            (
+                "owner.kt",
+                "class _Painter(value: Int) : Base(value) {",
+                NodeKind::CLASS,
+                2,
+            ),
+            (
+                "owner.cpp",
+                "class _Painter: public Base {",
+                NodeKind::CLASS,
+                2,
+            ),
+            ("owner.cpp", "class _Painter<T>;", NodeKind::CLASS, 0),
+            ("owner.cpp", "class _Painter;", NodeKind::CLASS, 0),
+            ("owner.ts", "class _PainterExtra<T> {", NodeKind::CLASS, 0),
+            ("owner.ts", "class Other<_Painter> {", NodeKind::CLASS, 0),
+            (
+                "owner.ts",
+                "import { _Painter } from './owner';",
+                NodeKind::CLASS,
+                0,
+            ),
+            (
+                "owner.ts",
+                "export { _Painter } from './owner';",
+                NodeKind::CLASS,
+                0,
+            ),
+            (
+                "owner.ts",
+                "const object = new _Painter<string>();",
+                NodeKind::CLASS,
+                0,
+            ),
+            (
+                "owner.go",
+                "type _Painter[T any] struct { Value T }",
+                NodeKind::STRUCT,
+                2,
+            ),
+            ("owner.go", "type Other = _Painter", NodeKind::STRUCT, 0),
+        ];
+        let mut failures = Vec::new();
+        for (path, source, kind, expected) in cases {
+            std::fs::write(temp.path().join(path), source).unwrap();
+            let candidate = hit_at_path_line("owner", "_Painter", kind, 0.1, path, 1);
+            let actual = type_hit_line_quality(Some(temp.path()), "_Painter", &candidate);
+            eprintln!(
+                "type-name boundary {path}: {source:?}: expected={expected}, actual={actual}"
+            );
+            if actual != expected {
+                failures.push(source);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "type declaration boundary failures: {failures:?}"
         );
     }
 

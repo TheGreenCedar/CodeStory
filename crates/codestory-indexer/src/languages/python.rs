@@ -70,6 +70,9 @@ pub(crate) const CONTEXT_MANAGER_SELF_RETURN_REQUIRED_MARKER: &str =
 pub(crate) const CONTEXT_MANAGER_SELF_RETURN_MEMBER_MARKER: &str =
     "member-contract:python-context-manager-self-return";
 
+pub(crate) const REBOUND_CLASS_METHOD_MEMBER_MARKER: &str =
+    "member-contract:python-rebound-class-method";
+
 const GRAPH_QUERY: &str = include_str!("../../rules/python.scm");
 
 static RULES: OnceLock<Result<CompiledLanguageRules, String>> = OnceLock::new();
@@ -107,7 +110,476 @@ fn python_language() -> tree_sitter::Language {
     tree_sitter_python::LANGUAGE.into()
 }
 
-pub(crate) const CALLABLE_DECLARATION_REVISION: &str = "python-callable-declaration-v1";
+pub(crate) const CALLABLE_DECLARATION_REVISION: &str =
+    extraction_revision!("python-callable-declaration-v2");
+
+pub(crate) fn rebound_class_method_spans(tree: &Tree, source: &str) -> HashSet<GraphNodeSpan> {
+    let mut blocked = HashSet::new();
+    walk_tree_nodes(tree.root_node(), &mut |class| {
+        if class.kind() != "class_definition" {
+            return;
+        }
+        let Some(body) = class.child_by_field_name("body") else {
+            return;
+        };
+        let mut namespace = PythonClassNamespace::default();
+        namespace.collect(body, body, source);
+        for (name, declarations) in namespace.declarations {
+            let Some(reset) = namespace.resets.get(&name).copied() else {
+                blocked.extend(declarations.into_iter().map(ts_node_graph_span));
+                continue;
+            };
+            let last_definition = (reset, false);
+            let conditional_overwrite = declarations
+                .iter()
+                .any(|declaration| declaration.end_byte() > reset);
+            if namespace.redirected.contains(&name)
+                || namespace
+                    .writes
+                    .get(&name)
+                    .is_some_and(|write| *write > last_definition)
+                || namespace
+                    .unknown_write
+                    .is_some_and(|write| write > last_definition)
+                || conditional_overwrite
+            {
+                blocked.extend(declarations.into_iter().map(ts_node_graph_span));
+            }
+        }
+    });
+    blocked
+}
+
+#[derive(Default)]
+struct PythonClassNamespace<'tree> {
+    declarations: HashMap<String, Vec<TsNode<'tree>>>,
+    resets: HashMap<String, usize>,
+    writes: HashMap<String, (usize, bool)>,
+    redirected: HashSet<String>,
+    unknown_write: Option<(usize, bool)>,
+}
+
+impl<'tree> PythonClassNamespace<'tree> {
+    fn record_names(&mut self, names: HashSet<String>, complete: bool, position: usize) {
+        self.record_event(names, complete, (position, false));
+    }
+
+    fn record_event(&mut self, names: HashSet<String>, complete: bool, position: (usize, bool)) {
+        if !complete && names.is_empty() {
+            self.unknown_write = Some(self.unknown_write.unwrap_or_default().max(position));
+        }
+        for name in names {
+            let previous = self.writes.entry(name).or_default();
+            *previous = (*previous).max(position);
+        }
+    }
+
+    fn record_target(&mut self, target: TsNode<'tree>, source: &str, position: usize) {
+        let mut names = HashSet::new();
+        let complete = python_class_target_names(target, source, &mut names);
+        self.record_names(names, complete, position);
+    }
+
+    fn collect(&mut self, node: TsNode<'tree>, class_body: TsNode<'tree>, source: &str) {
+        match node.kind() {
+            "function_definition" | "class_definition" => {
+                if let Some(name) = declaration_name(node, source) {
+                    if node.kind() == "function_definition" {
+                        self.declarations
+                            .entry(name.clone())
+                            .or_default()
+                            .push(node);
+                    }
+                    if node.kind() == "function_definition"
+                        && callable_declaration_node(node).parent() == Some(class_body)
+                    {
+                        self.resets.insert(name, node.end_byte());
+                    } else if node.kind() == "class_definition" {
+                        self.record_names(HashSet::from([name]), true, node.end_byte());
+                    }
+                } else {
+                    self.record_names(HashSet::new(), false, node.end_byte());
+                }
+                // Definition headers execute here; their bodies and type-parameter scopes do not.
+                let body = node.child_by_field_name("body");
+                let parameters = node.child_by_field_name("type_parameters");
+                let annotation = node.child_by_field_name("return_type");
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    if Some(child) != body && Some(child) != parameters && Some(child) != annotation
+                    {
+                        self.collect(child, class_body, source);
+                    }
+                }
+                return;
+            }
+            "lambda" => {
+                if let Some(parameters) = node.child_by_field_name("parameters") {
+                    self.collect(parameters, class_body, source);
+                }
+                return;
+            }
+            "list_comprehension"
+            | "set_comprehension"
+            | "dictionary_comprehension"
+            | "generator_expression" => {
+                self.collect_comprehension_named_expressions(node, source);
+                return;
+            }
+            "assignment" | "augmented_assignment"
+                if node.child_by_field_name("right").is_some() =>
+            {
+                if let Some(left) = node.child_by_field_name("left") {
+                    self.record_target(left, source, node.end_byte());
+                } else {
+                    self.record_names(HashSet::new(), false, node.end_byte());
+                }
+            }
+            "named_expression" => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    self.record_target(name, source, node.end_byte());
+                } else {
+                    self.record_names(HashSet::new(), false, node.end_byte());
+                }
+            }
+            "type_alias_statement" => {
+                let name = node
+                    .child_by_field_name("left")
+                    .and_then(|left| python_class_type_alias_name(left, source));
+                let complete = name.is_some();
+                self.record_names(name.into_iter().collect(), complete, node.end_byte());
+                return;
+            }
+            "import_statement" | "import_from_statement" => {
+                let from_import = node.kind() == "import_from_statement";
+                let mut found = false;
+                let mut cursor = node.walk();
+                for imported in node.children_by_field_name("name", &mut cursor) {
+                    found = true;
+                    if imported.kind() == "aliased_import" {
+                        if let Some(alias) = imported.child_by_field_name("alias") {
+                            self.record_target(alias, source, node.end_byte());
+                        } else {
+                            self.record_names(HashSet::new(), false, node.end_byte());
+                        }
+                    } else if imported.kind() == "dotted_name" {
+                        if !from_import || imported.named_child_count() == 1 {
+                            if let Some(name) = imported.named_child(0) {
+                                self.record_target(name, source, node.end_byte());
+                            }
+                        } else {
+                            let mut names = HashSet::new();
+                            python_unknown_class_target_names(imported, source, &mut names);
+                            self.record_names(names, false, node.end_byte());
+                        }
+                    } else {
+                        let mut names = HashSet::new();
+                        python_unknown_class_target_names(imported, source, &mut names);
+                        self.record_names(names, false, node.end_byte());
+                    }
+                }
+                if !found {
+                    self.record_names(HashSet::new(), false, node.end_byte());
+                }
+                return;
+            }
+            "for_statement" => {
+                if let Some(left) = node.child_by_field_name("left") {
+                    self.record_target(left, source, node.end_byte());
+                } else {
+                    self.record_names(HashSet::new(), false, node.end_byte());
+                }
+            }
+            "with_item" => {
+                if let Some(alias) = python_with_item_alias(node) {
+                    self.record_target(alias, source, node.end_byte());
+                }
+            }
+            "except_clause" => {
+                let value = node.child_by_field_name("value");
+                let alias = node.child_by_field_name("alias").or_else(|| {
+                    value
+                        .filter(|value| value.kind() == "as_pattern")
+                        .and_then(|value| value.child_by_field_name("alias"))
+                });
+                if let Some(alias) = alias {
+                    let alias =
+                        if alias.kind() == "as_pattern_target" && alias.named_child_count() == 1 {
+                            alias.named_child(0).unwrap()
+                        } else {
+                            alias
+                        };
+                    // Cleanup follows the final handler definition even when their byte ends match.
+                    if let Some(name) = python_plain_identifier_name(alias, source) {
+                        self.record_event(HashSet::from([name]), true, (node.end_byte(), true));
+                    } else {
+                        let mut names = HashSet::new();
+                        python_unknown_class_target_names(alias, source, &mut names);
+                        self.record_event(names, false, (node.end_byte(), true));
+                    }
+                } else if value.is_some_and(|value| value.kind() == "as_pattern") {
+                    self.record_event(HashSet::new(), false, (node.end_byte(), true));
+                }
+            }
+            "delete_statement" => {
+                let mut cursor = node.walk();
+                for target in node.named_children(&mut cursor) {
+                    self.record_target(target, source, node.end_byte());
+                }
+            }
+            "case_clause" => {
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    if child.kind() == "case_pattern" {
+                        let mut names = HashSet::new();
+                        let complete = python_class_match_names(child, source, &mut names);
+                        self.record_names(names, complete, child.end_byte());
+                    } else {
+                        self.collect(child, class_body, source);
+                    }
+                }
+                return;
+            }
+            "global_statement" | "nonlocal_statement" => {
+                let mut cursor = node.walk();
+                for name in node.named_children(&mut cursor) {
+                    if let Some(name) = python_plain_identifier_name(name, source) {
+                        self.redirected.insert(name);
+                    } else {
+                        self.record_names(HashSet::new(), false, node.end_byte());
+                    }
+                }
+                return;
+            }
+            "ERROR" => {
+                self.record_names(HashSet::new(), false, class_body.end_byte());
+                return;
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            self.collect(child, class_body, source);
+        }
+    }
+
+    fn collect_comprehension_named_expressions(&mut self, node: TsNode<'tree>, source: &str) {
+        if node.kind() == "lambda" {
+            if let Some(parameters) = node.child_by_field_name("parameters") {
+                self.collect_comprehension_named_expressions(parameters, source);
+            }
+            return;
+        }
+        // Class-body comprehension walrus scope is unsupported; never infer absence of its target.
+        if node.kind() == "named_expression" {
+            if let Some(name) = node.child_by_field_name("name") {
+                if let Some(name) = python_plain_identifier_name(name, source) {
+                    self.redirected.insert(name);
+                } else {
+                    self.record_names(HashSet::new(), false, node.end_byte());
+                }
+            } else {
+                self.record_names(HashSet::new(), false, node.end_byte());
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            self.collect_comprehension_named_expressions(child, source);
+        }
+    }
+}
+
+fn python_class_type_alias_name(node: TsNode<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" | "keyword_identifier" => {
+            trimmed_node_text(node, source).and_then(|name| normalize_parameter_name(&name))
+        }
+        "type" if node.named_child_count() == 1 => {
+            python_class_type_alias_name(node.named_child(0)?, source)
+        }
+        "generic_type" => python_plain_identifier_name(node.named_child(0)?, source),
+        _ => None,
+    }
+}
+
+fn python_unknown_class_target_names(node: TsNode<'_>, source: &str, names: &mut HashSet<String>) {
+    if matches!(node.kind(), "attribute" | "subscript") {
+        return;
+    }
+    if let Some(name) = python_plain_identifier_name(node, source) {
+        names.insert(name);
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        python_unknown_class_target_names(child, source, names);
+    }
+}
+
+fn python_class_target_names(node: TsNode<'_>, source: &str, names: &mut HashSet<String>) -> bool {
+    match node.kind() {
+        "identifier" | "keyword_identifier" => {
+            if let Some(name) =
+                trimmed_node_text(node, source).and_then(|name| normalize_parameter_name(&name))
+            {
+                names.insert(name);
+                true
+            } else {
+                false
+            }
+        }
+        "attribute" | "subscript" => true,
+        "list"
+        | "tuple"
+        | "list_pattern"
+        | "tuple_pattern"
+        | "pattern_list"
+        | "expression_list"
+        | "parenthesized_expression"
+        | "as_pattern_target"
+        | "list_splat_pattern"
+        | "dictionary_splat_pattern" => {
+            let mut complete = true;
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                complete &= python_class_target_names(child, source, names);
+            }
+            complete
+        }
+        _ => {
+            python_unknown_class_target_names(node, source, names);
+            false
+        }
+    }
+}
+
+fn python_class_match_names(node: TsNode<'_>, source: &str, names: &mut HashSet<String>) -> bool {
+    match node.kind() {
+        "dotted_name" => {
+            if node.named_child_count() == 1 {
+                if let Some(name) = node
+                    .named_child(0)
+                    .and_then(|name| python_plain_identifier_name(name, source))
+                {
+                    if name != "_" {
+                        names.insert(name);
+                    }
+                } else {
+                    return false;
+                }
+            }
+            true
+        }
+        "identifier" | "splat_pattern" => {
+            let target = if node.kind() == "identifier" {
+                Some(node)
+            } else {
+                node.named_child(0)
+            };
+            if let Some(target) = target {
+                if let Some(name) = python_plain_identifier_name(target, source) {
+                    if name != "_" {
+                        names.insert(name);
+                    }
+                    true
+                } else {
+                    false
+                }
+            } else {
+                true
+            }
+        }
+        "union_pattern" => {
+            let mut complete = true;
+            let mut first = None;
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                let mut branch = HashSet::new();
+                complete &= python_class_match_names(child, source, &mut branch);
+                if let Some(first) = first.as_ref() {
+                    complete &= first == &branch;
+                } else {
+                    first = Some(branch.clone());
+                }
+                names.extend(branch);
+            }
+            complete
+        }
+        "case_pattern" | "list_pattern" | "tuple_pattern" => {
+            let mut complete = true;
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                complete &= python_class_match_names(child, source, names);
+            }
+            complete
+        }
+        "as_pattern" => {
+            let mut complete = true;
+            let alias = node.child_by_field_name("alias");
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if Some(child) == alias {
+                    complete &= python_class_target_names(child, source, names);
+                } else {
+                    complete &= python_class_match_names(child, source, names);
+                }
+            }
+            complete
+        }
+        "class_pattern" | "keyword_pattern" => {
+            let expected_head = if node.kind() == "class_pattern" {
+                "dotted_name"
+            } else {
+                "identifier"
+            };
+            if node
+                .named_child(0)
+                .is_none_or(|head| head.kind() != expected_head)
+            {
+                python_unknown_class_target_names(node, source, names);
+                return false;
+            }
+            if node.kind() == "keyword_pattern" && node.named_child_count() == 1 {
+                let mut cursor = node.walk();
+                return node
+                    .children(&mut cursor)
+                    .any(|child| !child.is_named() && child.kind() == "_");
+            }
+            let mut complete = true;
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor).skip(1) {
+                complete &= python_class_match_names(child, source, names);
+            }
+            complete
+        }
+        "dict_pattern" => {
+            let mut complete = true;
+            let mut cursor = node.walk();
+            for value in node.children_by_field_name("value", &mut cursor) {
+                complete &= python_class_match_names(value, source, names);
+            }
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if child.kind() == "splat_pattern" {
+                    complete &= python_class_match_names(child, source, names);
+                }
+            }
+            complete
+        }
+        "integer"
+        | "float"
+        | "true"
+        | "false"
+        | "none"
+        | "string"
+        | "concatenated_string"
+        | "complex_pattern" => true,
+        _ => {
+            python_unknown_class_target_names(node, source, names);
+            false
+        }
+    }
+}
 
 pub(crate) fn callable_declaration_node(node: TsNode<'_>) -> TsNode<'_> {
     node.parent()
@@ -226,6 +698,7 @@ pub(crate) fn decorator_call_specs(tree: &Tree, source: &str) -> Vec<ManualEdgeS
 }
 
 pub(crate) fn receiver_call_specs(tree: &Tree, source: &str) -> Vec<ManualReceiverCallSpec> {
+    let rebound_methods = rebound_class_method_spans(tree, source);
     let mut edges = Vec::new();
     let module_types = python_module_type_bindings(tree.root_node(), source);
     let mut local_annotation_callsites = HashSet::new();
@@ -254,6 +727,7 @@ pub(crate) fn receiver_call_specs(tree: &Tree, source: &str) -> Vec<ManualReceiv
                 span: call_source.span,
             },
             &imported_type_bindings,
+            &rebound_methods,
             &mut local_receiver_callsites,
             &mut edges,
         );
@@ -780,6 +1254,7 @@ fn collect_python_annotated_factory_receiver_call_specs(
     source: &str,
     call_source: ManualReceiverSource<'_>,
     imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+    rebound_methods: &HashSet<GraphNodeSpan>,
     local_receiver_callsites: &mut HashSet<ReceiverCallSiteKey>,
     edges: &mut Vec<ManualReceiverCallSpec>,
 ) {
@@ -796,6 +1271,7 @@ fn collect_python_annotated_factory_receiver_call_specs(
             &receiver_name,
             source,
             imported_type_bindings,
+            rebound_methods,
         ) else {
             return;
         };
@@ -832,6 +1308,7 @@ fn python_visible_local_annotated_factory_receiver_owner(
     receiver_name: &str,
     source: &str,
     imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+    rebound_methods: &HashSet<GraphNodeSpan>,
 ) -> Option<OptionalReceiverOwnerBinding> {
     let mut visible_bindings = Vec::new();
     walk_tree_nodes(callable, &mut |node| {
@@ -849,7 +1326,13 @@ fn python_visible_local_annotated_factory_receiver_owner(
         }
         let owner = if python_plain_identifier_name(left, source).as_deref() == Some(receiver_name)
         {
-            python_annotated_factory_receiver_owner(node, callable, source, imported_type_bindings)
+            python_annotated_factory_receiver_owner(
+                node,
+                callable,
+                source,
+                imported_type_bindings,
+                rebound_methods,
+            )
         } else {
             None
         };
@@ -864,13 +1347,15 @@ fn python_annotated_factory_receiver_owner(
     callable: TsNode<'_>,
     source: &str,
     imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+    rebound_methods: &HashSet<GraphNodeSpan>,
 ) -> OptionalReceiverOwnerBinding {
     let class_node = enclosing_node_with_kind(callable, &["class_definition"])?;
     let self_name = python_instance_self_parameter(callable, source)?;
     let factory_name = assignment
         .child_by_field_name("right")
         .and_then(|right| python_self_method_call_name(right, source, &self_name))?;
-    let return_type = python_unique_class_method_return_type(class_node, &factory_name, source)?;
+    let return_type =
+        python_unique_class_method_return_type(class_node, &factory_name, source, rebound_methods)?;
     if let Some(binding) = imported_type_bindings.get(&return_type) {
         return Some((
             binding.owner_name.clone(),
@@ -901,6 +1386,7 @@ fn python_unique_class_method_return_type(
     class_node: TsNode<'_>,
     method_name: &str,
     source: &str,
+    rebound_methods: &HashSet<GraphNodeSpan>,
 ) -> Option<String> {
     let mut return_types = Vec::new();
     walk_tree_nodes(class_node, &mut |node| {
@@ -908,6 +1394,10 @@ fn python_unique_class_method_return_type(
             || !python_method_belongs_to_class(node, class_node)
             || declaration_name(node, source).as_deref() != Some(method_name)
         {
+            return;
+        }
+        if rebound_methods.contains(&ts_node_graph_span(node)) {
+            return_types.push(None);
             return;
         }
         let return_type = node
@@ -1697,6 +2187,7 @@ fn collect_python_assignment_target_bindings(
         }
         "list"
         | "list_pattern"
+        | "expression_list"
         | "parenthesized_expression"
         | "pattern_list"
         | "tuple"

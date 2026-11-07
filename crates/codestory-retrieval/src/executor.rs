@@ -1219,6 +1219,7 @@ fn merge_candidates(acc: &mut Vec<CandidateHit>, incoming: Vec<CandidateHit>) ->
                     (left, right) => left.or(right),
                 };
             }
+            existing.merge_whole_file_length_evidence(&hit);
             existing.merge_lane_scores(&hit.lane_scores);
             if existing.node_id.is_none() {
                 existing.node_id = hit.node_id.clone();

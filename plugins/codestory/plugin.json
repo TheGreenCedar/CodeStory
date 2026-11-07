@@ -10,5 +10,37 @@
   "homepage": "https://github.com/TheGreenCedar/CodeStory/tree/main/plugins/codestory",
   "repository": "https://github.com/TheGreenCedar/CodeStory",
   "license": "Apache-2.0",
-  "keywords": ["codestory", "grounding", "mcp", "local"]
+  "keywords": [
+    "codestory",
+    "grounding",
+    "mcp",
+    "local"
+  ],
+  "extensions": {
+    "com.openai": {
+      "hooks": "./hooks/codex-source-context-hooks.json",
+      "interface": {
+        "displayName": "CodeStory",
+        "shortDescription": "Use local CodeStory grounding from Codex",
+        "longDescription": "CodeStory gives Codex a fast local map and evidence-backed search for the repository in each request. It prepares its managed runtime automatically and keeps setup details out of normal sessions.",
+        "developerName": "The Green Cedar",
+        "category": "Developer Tools",
+        "capabilities": [
+          "Interactive",
+          "Read",
+          "Lifecycle hooks"
+        ],
+        "websiteURL": "https://github.com/TheGreenCedar/CodeStory",
+        "privacyPolicyURL": "https://github.com/TheGreenCedar/CodeStory",
+        "termsOfServiceURL": "https://github.com/TheGreenCedar/CodeStory",
+        "defaultPrompt": [
+          "Where is [SYMBOL] defined and what is the call path into [OWNING_MODULE]?",
+          "I am editing a file in this repo. What symbols are affected and what tests should I run first?",
+          "Explain how [SUBSYSTEM] works in this repository and cite the files and symbols that own the behavior."
+        ],
+        "brandColor": "#2563EB",
+        "screenshots": []
+      }
+    }
+  }
 }

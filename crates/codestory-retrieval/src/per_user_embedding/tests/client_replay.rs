@@ -1,6 +1,6 @@
 use super::super::{
-    EmbeddingCompatibility, EmbeddingConnectIntent, EmbeddingOperation, EmbeddingResult,
-    PerUserEmbeddingClient, PerUserEmbeddingError, RETRIEVAL_EMBEDDING_DIM,
+    AwakeMonotonicClock, EmbeddingCompatibility, EmbeddingConnectIntent, EmbeddingOperation,
+    EmbeddingResult, PerUserEmbeddingClient, PerUserEmbeddingError, RETRIEVAL_EMBEDDING_DIM,
     embedding_capacity_pressure, embedding_retry_state, embedding_scope_id, is_server_loss,
 };
 use super::{
@@ -569,4 +569,295 @@ fn post_spawn_owner_convergence_is_hard_bounded() {
     assert!(error.to_string().contains("embedding_server_start_timeout"));
     assert_eq!(transport.spawn_count.load(Ordering::Acquire), 1);
     assert_eq!(transport.connect_count.load(Ordering::Acquire), 4);
+}
+
+#[test]
+fn idle_drain_preserves_compatible_connect_and_hello_budgets() {
+    let transport = BootstrapTestTransport::with_connect_budget(
+        [BootstrapConnectOutcome::SlowCompatibleHello],
+        BootstrapConnectOutcome::Connected,
+        Duration::from_millis(5),
+        Duration::from_millis(20),
+    );
+    let client = test_client(transport.clone());
+    let started = transport.clock.now_ns();
+    client
+        .connect(EmbeddingConnectIntent::Activate, true)
+        .expect("compatible owner retains separate existing transport/Hello bounds");
+    assert_eq!(
+        Duration::from_nanos(transport.clock.now_ns() - started),
+        Duration::from_millis(6),
+        "4ms connect plus2ms Hello each fit the existing5ms per-stage bound"
+    );
+    assert_eq!(transport.connect_count.load(Ordering::Acquire), 1);
+    assert_eq!(transport.spawn_count.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn idle_drain_activation_converges_to_one_authenticated_replacement_rpc() {
+    let transport = BootstrapTestTransport::with_connect_budget(
+        [
+            BootstrapConnectOutcome::HelloIdleDraining,
+            BootstrapConnectOutcome::NoOwner,
+            BootstrapConnectOutcome::OwnerUnresponsive,
+            BootstrapConnectOutcome::Connected,
+        ],
+        BootstrapConnectOutcome::Connected,
+        Duration::from_millis(10),
+        Duration::from_millis(20),
+    );
+    let client = test_client(transport.clone());
+    let (vector, attempts) = client
+        .embed_query_with_qualification_attempts("x")
+        .expect("one activation must converge after the idle owner commits to drain");
+    assert_eq!(vector.len(), RETRIEVAL_EMBEDDING_DIM);
+    assert_eq!(vector[0], 1.0);
+    assert_eq!(
+        attempts.len(),
+        1,
+        "Hello convergence must not replay an embedding RPC"
+    );
+    assert_eq!(attempts[0].outcome, "completed");
+    assert_eq!(attempts[0].server_instance_id, "server-2");
+    assert_eq!(transport.connect_count.load(Ordering::Acquire), 4);
+    assert_eq!(transport.spawn_count.load(Ordering::Acquire), 1);
+    let observations = transport.connect_observations.lock().unwrap();
+    assert_eq!(
+        observations
+            .iter()
+            .map(|(_, _, spawned)| *spawned)
+            .collect::<Vec<_>>(),
+        [false, false, true, true],
+        "spawn authority is obtained only after NoOwner"
+    );
+}
+
+#[test]
+fn idle_drain_and_post_spawn_wait_share_one_absolute_convergence_budget() {
+    let budget = Duration::from_millis(5);
+    for (outcomes, fallback, expected_spawns) in [
+        (
+            vec![BootstrapConnectOutcome::HelloIdleDrainingAfterConnectDelay],
+            BootstrapConnectOutcome::HelloIdleDraining,
+            0,
+        ),
+        (
+            vec![
+                BootstrapConnectOutcome::HelloIdleDrainingAfterConnectDelay,
+                BootstrapConnectOutcome::HelloIdleDraining,
+                BootstrapConnectOutcome::NoOwner,
+            ],
+            BootstrapConnectOutcome::OwnerUnresponsive,
+            1,
+        ),
+    ] {
+        let transport = BootstrapTestTransport::with_connect_budget(
+            outcomes,
+            fallback,
+            budget,
+            Duration::from_millis(20),
+        );
+        let client = test_client(transport.clone());
+        let started = transport.clock.now_ns();
+        let error = match client.connect(EmbeddingConnectIntent::Activate, true) {
+            Ok(_) => panic!("persistent drain/startup must be bounded"),
+            Err(error) => error,
+        };
+        assert!(
+            embedding_retry_state(&error).is_some(),
+            "bounded refusal remains typed: {error:#}"
+        );
+        let elapsed = Duration::from_nanos(transport.clock.now_ns() - started);
+        assert!(
+            elapsed >= Duration::from_millis(3),
+            "must wait beyond the first2ms connect/Hello cost, rather than immediately returning: {error:#}"
+        );
+        assert!(
+            elapsed <= budget,
+            "NoOwner/spawn cannot reset the original drain deadline: {elapsed:?}"
+        );
+        assert_eq!(
+            transport.spawn_count.load(Ordering::Acquire),
+            expected_spawns
+        );
+        assert!(
+            transport.connect_count.load(Ordering::Acquire) >= 2,
+            "committed drain must actually reconnect before its budget expires"
+        );
+        assert!(
+            transport.connect_count.load(Ordering::Acquire) <= 8,
+            "no hot reconnect loop"
+        );
+        for (connect_budget, at_ns, _) in transport
+            .connect_observations
+            .lock()
+            .unwrap()
+            .iter()
+            .skip(1)
+        {
+            let remaining = budget.saturating_sub(Duration::from_nanos(*at_ns - started));
+            assert!(
+                !connect_budget.is_zero() && *connect_budget <= remaining,
+                "each reconnect/Hello shares the original remaining convergence budget: requested={connect_budget:?}, remaining={remaining:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn idle_drain_wait_honors_caller_cancellation_before_reconnect_or_spawn() {
+    let transport = BootstrapTestTransport::new(
+        [
+            BootstrapConnectOutcome::HelloIdleDraining,
+            BootstrapConnectOutcome::NoOwner,
+        ],
+        BootstrapConnectOutcome::Connected,
+        Duration::from_millis(10),
+    );
+    let client = test_client(transport.clone());
+    let error = client
+        .embed_query_with_control("x", None, &|| {
+            transport.connect_count.load(Ordering::Acquire) != 0
+        })
+        .expect_err("caller cancellation during drain must stop bootstrap");
+    assert_eq!(
+        embedding_retry_state(&error)
+            .expect("typed cancellation")
+            .code,
+        "embedding_cancelled"
+    );
+    assert_eq!(transport.connect_count.load(Ordering::Acquire), 1);
+    assert_eq!(transport.spawn_count.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn idle_drain_reconnect_hello_keeps_the_original_caller_deadline() {
+    let transport = ExplicitDeadlineTransport::after_idle_drain();
+    let client = test_client(transport.clone());
+    let started = Instant::now();
+    let error = client
+        .embed_query_with_control("x", Some(Duration::from_millis(50)), &|| false)
+        .expect_err("the pending replacement Hello is bounded by the original caller deadline");
+    assert_eq!(
+        embedding_retry_state(&error).expect("typed deadline").code,
+        "embedding_deadline_exceeded"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "drain cannot reset the500ms local budget"
+    );
+    assert_eq!(transport.connect_count.load(Ordering::Acquire), 2);
+    let timeout = transport
+        .observed_read_timeout
+        .lock()
+        .unwrap()
+        .expect("replacement Hello has a bounded read timeout");
+    assert!(timeout <= Duration::from_millis(50));
+    assert!(
+        transport
+            .observed_connect_budget
+            .lock()
+            .unwrap()
+            .expect("reconnect budget")
+            <= Duration::from_millis(50)
+    );
+}
+
+#[test]
+fn idle_drain_convergence_requires_activating_spawn_authority_and_exact_retry_state() {
+    for (intent, may_spawn, outcome, expected_code) in [
+        (
+            EmbeddingConnectIntent::Observe,
+            false,
+            BootstrapConnectOutcome::HelloIdleDraining,
+            "embedding_server_draining",
+        ),
+        (
+            EmbeddingConnectIntent::Observe,
+            true,
+            BootstrapConnectOutcome::HelloIdleDraining,
+            "embedding_server_draining",
+        ),
+        (
+            EmbeddingConnectIntent::Activate,
+            false,
+            BootstrapConnectOutcome::HelloIdleDraining,
+            "embedding_server_draining",
+        ),
+        (
+            EmbeddingConnectIntent::Activate,
+            true,
+            BootstrapConnectOutcome::HelloActiveOwner,
+            "embedding_server_incompatible_active_owner",
+        ),
+        (
+            EmbeddingConnectIntent::Activate,
+            true,
+            BootstrapConnectOutcome::HelloDrainingAfterDelay,
+            "embedding_server_draining",
+        ),
+        (
+            EmbeddingConnectIntent::Activate,
+            true,
+            BootstrapConnectOutcome::HelloIdleDrainingUnverifiedPeer,
+            "embedding_server_draining",
+        ),
+    ] {
+        let transport = BootstrapTestTransport::new(
+            [outcome, BootstrapConnectOutcome::NoOwner],
+            BootstrapConnectOutcome::Connected,
+            Duration::from_millis(5),
+        );
+        let client = test_client(transport.clone());
+        let started = transport.clock.now_ns();
+        let error = match client.connect(intent, may_spawn) {
+            Ok(_) => panic!("observe/non-spawning/other owner failures must not converge"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            embedding_retry_state(&error)
+                .expect("typed owner refusal")
+                .code,
+            expected_code
+        );
+        assert_eq!(transport.connect_count.load(Ordering::Acquire), 1);
+        assert_eq!(transport.spawn_count.load(Ordering::Acquire), 0);
+        assert_eq!(
+            transport.clock.now_ns(),
+            started,
+            "passive/active-owner failures must not wait"
+        );
+    }
+}
+
+#[test]
+fn idle_drain_replacement_still_requires_authenticated_native_identity() {
+    let transport = BootstrapTestTransport::with_connect_budget(
+        [
+            BootstrapConnectOutcome::HelloIdleDraining,
+            BootstrapConnectOutcome::NoOwner,
+            BootstrapConnectOutcome::HelloWrongIdentity,
+            BootstrapConnectOutcome::Connected,
+        ],
+        BootstrapConnectOutcome::Connected,
+        Duration::from_millis(10),
+        Duration::from_millis(20),
+    );
+    let client = test_client(transport.clone());
+    let error = match client.connect(EmbeddingConnectIntent::Activate, true) {
+        Ok(_) => panic!("an unverified replacement peer cannot be admitted"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("embedding_server_peer_identity_mismatch"),
+        "unexpected identity error: {error:#}"
+    );
+    assert_eq!(
+        transport.connect_count.load(Ordering::Acquire),
+        3,
+        "hard identity refusal must not reconnect to a later good peer"
+    );
+    assert_eq!(transport.spawn_count.load(Ordering::Acquire), 1);
 }

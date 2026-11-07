@@ -29,7 +29,7 @@ pub(in crate::app) fn run_trail(cmd: TrailCommand) -> Result<()> {
 
     let file_filter = cmd.target.file_filter();
     let operation = if cmd.target.query.is_some() {
-        "graph_assisted"
+        "resolution"
     } else {
         "graph"
     };

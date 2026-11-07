@@ -11,7 +11,7 @@ pub(crate) use diagnostics::{
 pub(crate) use discovery::NativeSessionV3;
 #[cfg(feature = "proof-qualification-support")]
 pub(crate) use discovery::discovery_contract_v3;
-pub(crate) use profile::McpRevisionV3;
+pub(crate) use profile::{McpResultDisplay, McpRevisionV3};
 pub(crate) use transport::{
     FrameResponseV3, build_proof_tool_result_v3, build_tool_result_v3, jsonrpc_internal_error_v3,
     jsonrpc_invalid_params_v3, process_jsonrpc_frame_v3, revision_native_tool_result_unchecked_v3,

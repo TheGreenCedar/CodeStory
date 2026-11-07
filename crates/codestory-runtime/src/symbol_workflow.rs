@@ -176,6 +176,7 @@ impl AppController {
                         kind: AffectedChangeKindDto::Unknown,
                         status: "symbol_file".to_string(),
                         previous_path: None,
+                        scope: None,
                     }]),
                     depth: Some(depth),
                     filter: None,

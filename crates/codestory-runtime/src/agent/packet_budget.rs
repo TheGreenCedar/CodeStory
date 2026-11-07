@@ -341,16 +341,42 @@ fn packet_optional_diagnostics_bytes(
     packet: &AgentPacketDto,
     representation_len: &impl Fn(&AgentPacketDto) -> usize,
 ) -> usize {
-    let full = representation_len(packet);
     let mut without_optional = packet.clone();
-    strip_optional_packet_diagnostics(&mut without_optional);
+    if !strip_optional_packet_diagnostics(&mut without_optional) {
+        // Identical inputs have identical adapter representations, even when
+        // the representation is non-additive. Do not measure a no-op twice.
+        return 0;
+    }
+    let full = representation_len(packet);
     full.saturating_sub(representation_len(&without_optional))
 }
 
-fn strip_optional_packet_diagnostics(packet: &mut AgentPacketDto) {
-    let _ = trim_packet_verbose_plan_lists(packet);
-    let _ = trim_packet_retrieval_trace_summary(packet);
-    let _ = trim_packet_answer_retrieval_diagnostics(packet);
+fn strip_optional_packet_diagnostics(packet: &mut AgentPacketDto) -> bool {
+    // Existing trimmer receipts are not a complete byte-level no-op proof:
+    // steps are cleared unconditionally, and -0.0 normalizes to +0.0 even
+    // when the stage trimmer reports no other verbose fields. Observe those
+    // mutations here without changing the trimmers' omission policy.
+    let has_signed_zero = |shadow: Option<&RetrievalShadowDto>| {
+        shadow.is_some_and(|shadow| {
+            shadow
+                .stage_timings
+                .iter()
+                .any(|stage| stage.marginal_gain == 0.0 && stage.marginal_gain.is_sign_negative())
+        })
+    };
+    let mut changed = !packet.answer.retrieval_trace.steps.is_empty()
+        || has_signed_zero(packet.answer.retrieval_trace.retrieval_shadow.as_ref())
+        || has_signed_zero(
+            packet
+                .retrieval_trace_summary
+                .retrieval_trace
+                .retrieval_shadow
+                .as_ref(),
+        );
+    changed |= !trim_packet_verbose_plan_lists(packet).is_empty();
+    changed |= trim_packet_retrieval_trace_summary(packet);
+    changed |= trim_packet_answer_retrieval_diagnostics(packet);
+    changed
 }
 
 fn minimize_packet_for_hard_budget(packet: &mut AgentPacketDto) -> bool {
@@ -411,6 +437,9 @@ fn packet_optional_graph_bytes(
     packet: &AgentPacketDto,
     representation_len: &impl Fn(&AgentPacketDto) -> usize,
 ) -> usize {
+    if packet.answer.graphs.is_empty() {
+        return 0;
+    }
     let full = representation_len(packet);
     let mut proof_only = packet.clone();
     retain_required_graph_proof_only(&mut proof_only.answer, &HashSet::new());
@@ -1141,6 +1170,213 @@ pub(super) mod tests {
             retrieval_trace_summary,
             answer_sufficiency: Default::default(),
         }
+    }
+
+    fn measurement_fixture(case: usize) -> AgentPacketDto {
+        use codestory_contracts::api::{GraphArtifactDto, RetrievalAnnotationDto};
+        let mut packet = test_packet("Unicode λ\nquoted \"evidence\" \\ path", 16 * 1024);
+        super::strip_optional_packet_diagnostics(&mut packet);
+        let shadow = |gain: f32| {
+            serde_json::from_value(serde_json::json!({
+                "retrieval_mode":"full", "retrieval_total_ms":1,
+                "stage_timings":[{"stage":"lexical", "elapsed_ms":0,
+                    "completion_status":"completed", "marginal_gain":gain}]
+            }))
+            .unwrap()
+        };
+        match case {
+            0 => {}
+            1 => {
+                packet.plan.trace.push("diagnostic λ \\\"".repeat(12));
+                packet.answer.graphs.push(GraphArtifactDto::Mermaid {
+                    id: "optional".into(),
+                    title: "Unicode λ".into(),
+                    diagram: "flowchart LR\n A-->B".into(),
+                    mermaid_syntax: "flowchart LR\n A-->B".into(),
+                });
+            }
+            2 => packet.answer.retrieval_trace.retrieval_shadow = Some(shadow(-0.0)),
+            3 => {
+                packet
+                    .retrieval_trace_summary
+                    .retrieval_trace
+                    .retrieval_shadow = Some(shadow(-0.0))
+            }
+            4 => {
+                packet
+                    .answer
+                    .retrieval_trace
+                    .annotations
+                    .push(RetrievalAnnotationDto::gap("missing λ \\\""));
+                packet.answer.retrieval_trace.steps.push(
+                    codestory_contracts::api::AgentRetrievalStepDto {
+                        kind: codestory_contracts::api::AgentRetrievalStepKindDto::SourceRead,
+                        status: codestory_contracts::api::AgentRetrievalStepStatusDto::Ok,
+                        duration_ms: 1,
+                        input: Vec::new(),
+                        output: Vec::new(),
+                        message: Some("source λ".into()),
+                    },
+                );
+            }
+            5 => {
+                packet.answer.retrieval_trace.retrieval_shadow = Some(shadow(0.0));
+                packet
+                    .retrieval_trace_summary
+                    .retrieval_trace
+                    .retrieval_shadow = Some(shadow(0.0));
+            }
+            _ => unreachable!(),
+        }
+        packet
+    }
+
+    fn adapter_measurement(packet: &AgentPacketDto, wrapped: bool) -> usize {
+        if !wrapped {
+            return serde_json::to_vec(packet).unwrap().len();
+        }
+        // This envelope is deliberately non-additive and observes float bits.
+        let bits = [
+            &packet.answer.retrieval_trace,
+            &packet.retrieval_trace_summary.retrieval_trace,
+        ]
+        .into_iter()
+        .filter_map(|trace| trace.retrieval_shadow.as_ref())
+        .flat_map(|shadow| {
+            shadow
+                .stage_timings
+                .iter()
+                .map(|stage| stage.marginal_gain.to_bits())
+        })
+        .collect::<Vec<_>>();
+        serde_json::to_vec(&serde_json::json!({
+            "wire":serde_json::to_string(packet).unwrap(), "bits":bits,
+            "shape":if packet.answer.graphs.is_empty() { "empty graph envelope" } else { "g" }
+        }))
+        .unwrap()
+        .len()
+    }
+
+    #[test]
+    fn unchanged_optional_sections_do_not_remeasure_the_packet() {
+        use std::cell::Cell;
+        for case in [0, 5] {
+            let packet = measurement_fixture(case);
+            let calls = Cell::new(0);
+            let measure = |packet: &AgentPacketDto| {
+                calls.set(calls.get() + 1);
+                adapter_measurement(packet, true)
+            };
+            for _ in 0..16 {
+                assert_eq!(super::packet_optional_graph_bytes(&packet, &measure), 0);
+                assert_eq!(
+                    super::packet_optional_diagnostics_bytes(&packet, &measure),
+                    0
+                );
+            }
+            assert_eq!(
+                calls.get(),
+                0,
+                "case {case}: absent optional content must not serialize or recompile the full evidence packet"
+            );
+        }
+    }
+
+    #[test]
+    fn optional_measurements_match_the_original_exact_adapter_difference() {
+        for case in 0..6 {
+            for wrapped in [false, true] {
+                let packet = measurement_fixture(case);
+                let before = serde_json::to_vec(&packet).unwrap();
+                let measure = |packet: &AgentPacketDto| adapter_measurement(packet, wrapped);
+                let full = measure(&packet);
+                let mut stripped = packet.clone();
+                let _ = super::trim_packet_verbose_plan_lists(&mut stripped);
+                let _ = super::trim_packet_retrieval_trace_summary(&mut stripped);
+                let _ = super::trim_packet_answer_retrieval_diagnostics(&mut stripped);
+                assert_eq!(
+                    super::packet_optional_diagnostics_bytes(&packet, &measure),
+                    full.saturating_sub(measure(&stripped)),
+                    "case {case}/wrapped {wrapped}"
+                );
+                let mut proof_only = packet.clone();
+                super::retain_required_graph_proof_only(
+                    &mut proof_only.answer,
+                    &Default::default(),
+                );
+                assert_eq!(
+                    super::packet_optional_graph_bytes(&packet, &measure),
+                    full.saturating_sub(measure(&proof_only))
+                );
+                assert_eq!(
+                    serde_json::to_vec(&packet).unwrap(),
+                    before,
+                    "measurement never mutates evidence"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cap_results_preserve_original_packet_bytes_and_errors() {
+        use sha2::{Digest, Sha256};
+        let mut digests = Vec::new();
+        for case in 0..6 {
+            for wrapped in [false, true] {
+                for cap in [1, 2048, 16 * 1024] {
+                    let mut packet = measurement_fixture(case);
+                    packet.budget.limits.max_output_bytes = cap;
+                    let result = super::enforce_packet_output_budget_for_representation(
+                        std::path::Path::new("/repo"),
+                        &mut packet,
+                        |packet| adapter_measurement(packet, wrapped),
+                    );
+                    let error = result.err().map(|error| (error.code, error.message));
+                    let bytes = serde_json::to_vec(&(packet, error)).unwrap();
+                    digests.push(format!("{:x}", Sha256::digest(bytes)));
+                }
+            }
+        }
+        // These are captured from the unmodified owner before the no-op repair.
+        let expected: &[&str] = &[
+            "ea7da037377bcdf14ebb7367beb2e5de3d9cfee27379b0bf7df5404109f7b733",
+            "9558cc1f64ea4c26d9a57e37572f36d3ec1a26f5cd4e7f0090e69e2ac386c1d1",
+            "c3588a0f07359ac210ea83ef9fcea50c12f461ccb88a5e445208601d40cba627",
+            "4543eeb0232349f4f42d455048246192bc329482e742d79d36cd03c06d2a2ad6",
+            "7cd9b04ad1c839b495a34b57756000a5c61ef29595f4acf27fd621ca36aeb9b5",
+            "e87b46145378289607aacc60bf69906a0132a9921d9f47c14d7a2e3e337e0def",
+            "8e7b0f6fd348663a12402021f7e55ed997c6f254f6fe159119ee71fc015d4ddd",
+            "d167f3884d18258c188f4be3bed319eeb8ce35013405c3971b8b69074b2cb6f3",
+            "878caf46a6b07e4d93634c905b2d2175da7ceceee70c9df57fb8e94c7225eb0f",
+            "7579d85e9304bb5d92f617e7531acfc463b3f5c93a33aacca6fbeb6ae64de70d",
+            "75459da1aaa374914fb232a5d5b677adac4f5388018160cbc3c021a7ddda6fb7",
+            "5bed5032580c734cae2d0c099fe5d22212e39a358f1207c73f7f3812111632a1",
+            "eabb93a328127d339de28a8cc8e06d0ebf96ca6cacfe60de903dc2dfb5e576c9",
+            "073d48b7588c023e61a35e9982ecba002147e192166ed1918478b17cbdff0da1",
+            "c5a271c631c623b94cd18dac80a21c7cd0e95dc641564ec706240a409ca2ff11",
+            "c527ee0d907e8a3f1ede656e539edd2e3008bfe9caed981331170b8063293862",
+            "b76ffe674b2f761633b4a1a1f02e6ab364d237077b0eb0820a4b01403e66ae22",
+            "62eda01be255b2ced288e2a392be5ca378d8c364d93ae6d9451b778adeca580b",
+            "ea7da037377bcdf14ebb7367beb2e5de3d9cfee27379b0bf7df5404109f7b733",
+            "9558cc1f64ea4c26d9a57e37572f36d3ec1a26f5cd4e7f0090e69e2ac386c1d1",
+            "c3588a0f07359ac210ea83ef9fcea50c12f461ccb88a5e445208601d40cba627",
+            "4543eeb0232349f4f42d455048246192bc329482e742d79d36cd03c06d2a2ad6",
+            "7cd9b04ad1c839b495a34b57756000a5c61ef29595f4acf27fd621ca36aeb9b5",
+            "e87b46145378289607aacc60bf69906a0132a9921d9f47c14d7a2e3e337e0def",
+            "d351eaa690139ef3e3f0634a7ccfc832362ec24f61c096ba284bbecc5adaf1c6",
+            "cff4d9f7bef6092db9da0b4b714d79cfadde5dfb212c360bfdede4afe7a09bcb",
+            "872c45c5e5822895daa8b515f14f53bfcf6979997c0a9b36698b453ad3fbd324",
+            "21b681cb2caf78c0e2ae49d03c17d1cde90e1e635625e30d4d54f7df925e2f1f",
+            "638eee60028a068c356fd13ed7efb9af96894227d00f3e7187058a8407013abf",
+            "1162c01d0e96896a426482bb385d60cd4152ac53c1aedcd396ebd66cced7839a",
+            "eabb93a328127d339de28a8cc8e06d0ebf96ca6cacfe60de903dc2dfb5e576c9",
+            "1df7891b954c7f1903066bd5693e379c05e9b0824606314a90e7bfd08d5f7e4c",
+            "dd59906855899e0720d44b361d89a22e74857a5ca06d71b5cf38221f3844a268",
+            "c527ee0d907e8a3f1ede656e539edd2e3008bfe9caed981331170b8063293862",
+            "b76ffe674b2f761633b4a1a1f02e6ab364d237077b0eb0820a4b01403e66ae22",
+            "5c38e2df3b434feab321b41fca411455629efe9b64000921125b771ce68320a4",
+        ];
+        assert_eq!(digests, expected);
     }
 
     #[test]

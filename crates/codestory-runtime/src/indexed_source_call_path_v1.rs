@@ -27,7 +27,9 @@ use crate::call_path_kernel::{
 #[cfg(test)]
 use crate::call_path_kernel::{RawCallEdgeAdmission, admit_raw_call_edge};
 use codestory_contracts::api::ApiError;
-use codestory_contracts::graph::{Node, NodeId, NodeKind, RUST_ORDINAL_CANONICAL_ID_PREFIX};
+#[cfg(test)]
+use codestory_contracts::graph::RUST_ORDINAL_CANONICAL_ID_PREFIX;
+use codestory_contracts::graph::{Node, NodeId, NodeKind, source_ordinal_canonical_id_parts};
 use codestory_contracts::proof_resolution::{CallResolutionFact, ProofResolutionStatus};
 use codestory_indexer::current_proof_resolution_adapter_roster;
 #[cfg(test)]
@@ -1530,11 +1532,7 @@ impl CanonicalSelectorIndex {
         if self.unavailable {
             return Err(());
         }
-        let (epoch, canonical_path) = canonical_id
-            .strip_prefix(RUST_ORDINAL_CANONICAL_ID_PREFIX)
-            .map_or(("", canonical_id), |path| {
-                (RUST_ORDINAL_CANONICAL_ID_PREFIX, path)
-            });
+        let (epoch, canonical_path) = source_ordinal_canonical_id_parts(canonical_id);
         let Some((relative_prefix, stored_prefixes)) = self
             .stored_prefixes_by_relative
             .range(..=canonical_path.to_owned())
@@ -1701,9 +1699,7 @@ fn canonical_id_authenticates_selected_files(
     node_ids: &[NodeId],
     identities: &mut OperationPathIdentityResolver,
 ) -> bool {
-    let canonical_id = canonical_id
-        .strip_prefix(RUST_ORDINAL_CANONICAL_ID_PREFIX)
-        .unwrap_or(canonical_id);
+    let (_, canonical_id) = source_ordinal_canonical_id_parts(canonical_id);
     if !canonical_id.contains('#') {
         return true;
     }
@@ -5851,5 +5847,249 @@ mod tests {
             vec![FactBuildGap::RecursiveCallNotRepresentable { step_index: 0 }]
         );
         assert!(built.facts.is_empty());
+    }
+
+    #[test]
+    fn object_property_callable_canonical_selector_roundtrip_authenticates_source_file() {
+        let source = "function target() {}\nconst api = {\n  request: function () {\n    target();\n  },\n};\nfunction run() { api.request(); }\n";
+        let fixture = source_built_fixture_with_extension("js", source);
+        let property = fixture
+            .store
+            .get_nodes()
+            .unwrap()
+            .into_iter()
+            .find(|node| {
+                matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                    && node.start_line == Some(3)
+                    && node.start_col == Some(12)
+            })
+            .expect("actual indexer must retain the property callable");
+        let absolute = canonical_id(&property).to_owned();
+        let relative =
+            absolute.replace(fixture.source_path.to_string_lossy().as_ref(), "src/lib.js");
+        assert_ne!(
+            relative, absolute,
+            "roundtrip must exercise path reconstruction"
+        );
+        let files = fixture.store.get_files().unwrap();
+        let index = CanonicalSelectorIndex::prepare(
+            &fixture.root,
+            &files,
+            &mut OperationPathIdentityResolver::native(),
+        );
+        let context = SelectorContext {
+            store: &fixture.store,
+            project_root: &fixture.root,
+            project_id: &fixture.project_id,
+            publication: &fixture.publication,
+            files: &files,
+            canonical_index: &index,
+        };
+        for selector in [&absolute, &relative] {
+            let resolved = resolve_canonical(
+                &context,
+                selector,
+                &mut OperationPathIdentityResolver::native(),
+            )
+            .unwrap();
+            assert!(
+                matches!(resolved, SelectorResolution::Resolved(node)
+                if node.pinned.node_id == property.id.0.to_string() && node.canonical_id == *selector),
+                "real source-bound property selector did not roundtrip"
+            );
+        }
+        let wrong_file = relative.replace("src/lib.js", "src/other.js");
+        assert!(
+            !matches!(
+                resolve_canonical(
+                    &context,
+                    &wrong_file,
+                    &mut OperationPathIdentityResolver::native()
+                )
+                .unwrap(),
+                SelectorResolution::Resolved(_)
+            ),
+            "a same-tail selector for a different file must not select this property"
+        );
+
+        let foreign = fixture.root.join("src/foreign.js");
+        fs::write(&foreign, source).unwrap();
+        fixture
+            .store
+            .get_connection()
+            .execute(
+                "UPDATE file SET path = ?1 WHERE id = ?2",
+                (
+                    foreign.to_string_lossy().into_owned(),
+                    property.file_node_id.unwrap().0,
+                ),
+            )
+            .unwrap();
+        let files = fixture.store.get_files().unwrap();
+        let index = CanonicalSelectorIndex::prepare(
+            &fixture.root,
+            &files,
+            &mut OperationPathIdentityResolver::native(),
+        );
+        let context = SelectorContext {
+            store: &fixture.store,
+            project_root: &fixture.root,
+            project_id: &fixture.project_id,
+            publication: &fixture.publication,
+            files: &files,
+            canonical_index: &index,
+        };
+        assert!(
+            matches!(
+                resolve_canonical(
+                    &context,
+                    &absolute,
+                    &mut OperationPathIdentityResolver::native()
+                )
+                .unwrap(),
+                SelectorResolution::Unavailable(UnavailableReason::SourceNotBoundToPublication)
+            ),
+            "identical bytes in another file cannot authenticate the old property's canonical path"
+        );
+    }
+
+    #[test]
+    fn script_ordinal_selector_preserves_epoch_and_rejects_legacy_or_wrong_file_keys() {
+        use codestory_contracts::graph::SCRIPT_ORDINAL_CANONICAL_ID_PREFIX;
+        let source = "function run() { helper(); }\nfunction helper() {}\n";
+        let fixture = source_built_fixture_with_extension("js", source);
+        let helper = fixture
+            .store
+            .get_nodes()
+            .unwrap()
+            .into_iter()
+            .find(|node| node.kind == NodeKind::FUNCTION && node.serialized_name == "helper")
+            .expect("ordinary helper declaration retained");
+        let absolute = canonical_id(&helper).to_owned();
+        assert!(
+            absolute.starts_with(SCRIPT_ORDINAL_CANONICAL_ID_PREFIX),
+            "ordinary script declaration must carry the migrated source identity"
+        );
+        let relative =
+            absolute.replace(fixture.source_path.to_string_lossy().as_ref(), "src/lib.js");
+        assert_ne!(relative, absolute);
+        let files = fixture.store.get_files().unwrap();
+        let index = CanonicalSelectorIndex::prepare(
+            &fixture.root,
+            &files,
+            &mut OperationPathIdentityResolver::native(),
+        );
+        let context = SelectorContext {
+            store: &fixture.store,
+            project_root: &fixture.root,
+            project_id: &fixture.project_id,
+            publication: &fixture.publication,
+            files: &files,
+            canonical_index: &index,
+        };
+        for selector in [&absolute, &relative] {
+            let resolved = resolve_canonical(
+                &context,
+                selector,
+                &mut OperationPathIdentityResolver::native(),
+            )
+            .unwrap();
+            assert!(
+                matches!(resolved, SelectorResolution::Resolved(node)
+                if node.pinned.node_id == helper.id.0.to_string() && node.canonical_id == *selector),
+                "known script epoch absolute/relative selector must roundtrip"
+            );
+        }
+        let legacy_absolute = absolute
+            .strip_prefix(SCRIPT_ORDINAL_CANONICAL_ID_PREFIX)
+            .unwrap();
+        let legacy_relative = relative
+            .strip_prefix(SCRIPT_ORDINAL_CANONICAL_ID_PREFIX)
+            .unwrap();
+        let wrong_file = relative.replace("src/lib.js", "src/other.js");
+        for selector in [legacy_absolute, legacy_relative, wrong_file.as_str()] {
+            assert!(
+                !matches!(
+                    resolve_canonical(
+                        &context,
+                        selector,
+                        &mut OperationPathIdentityResolver::native()
+                    )
+                    .unwrap(),
+                    SelectorResolution::Resolved(_)
+                ),
+                "legacy or wrong-file key must not upgrade to the new helper identity: {selector}"
+            );
+        }
+        let foreign = fixture.root.join("src/foreign.js");
+        fs::write(&foreign, source).unwrap();
+        fixture
+            .store
+            .get_connection()
+            .execute(
+                "UPDATE file SET path = ?1 WHERE id = ?2",
+                (
+                    foreign.to_string_lossy().into_owned(),
+                    helper.file_node_id.unwrap().0,
+                ),
+            )
+            .unwrap();
+        let files = fixture.store.get_files().unwrap();
+        let index = CanonicalSelectorIndex::prepare(
+            &fixture.root,
+            &files,
+            &mut OperationPathIdentityResolver::native(),
+        );
+        let context = SelectorContext {
+            store: &fixture.store,
+            project_root: &fixture.root,
+            project_id: &fixture.project_id,
+            publication: &fixture.publication,
+            files: &files,
+            canonical_index: &index,
+        };
+        assert!(
+            matches!(
+                resolve_canonical(
+                    &context,
+                    &absolute,
+                    &mut OperationPathIdentityResolver::native()
+                )
+                .unwrap(),
+                SelectorResolution::Unavailable(UnavailableReason::SourceNotBoundToPublication)
+            ),
+            "identical bytes in a different file cannot authenticate the migrated helper key"
+        );
+    }
+
+    #[test]
+    fn object_property_callable_declaration_does_not_expand_exact_object_dispatch() {
+        let fixture = source_built_fixture_with_extension(
+            "js",
+            "function target() {}\nconst api = {\n  request: function () {\n    target();\n  },\n};\nfunction run() { api.request(); }\n",
+        );
+        let calls = fixture
+            .store
+            .get_edges()
+            .unwrap()
+            .into_iter()
+            .filter(|edge| edge.kind == EdgeKind::CALL && edge.line == Some(7))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            calls.len(),
+            1,
+            "the ordinary object-member call must actually be represented"
+        );
+        assert_eq!(
+            calls[0].resolved_target, None,
+            "new property declaration is not object-dispatch authority"
+        );
+        let facts = fixture.store.get_proof_resolution_facts().unwrap();
+        assert!(
+            !facts
+                .iter()
+                .any(|fact| fact.callsite.line == 7 && fact.status == ProofResolutionStatus::Exact),
+            "navigation-only property extraction must not mint Exact object-dispatch facts"
+        );
     }
 }

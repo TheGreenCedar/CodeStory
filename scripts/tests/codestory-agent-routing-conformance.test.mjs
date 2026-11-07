@@ -2163,7 +2163,7 @@ test("static Cursor Claude Code and Copilot surfaces bind one package launcher a
 
 });
 
-test("static parity rejects substituted bytes invalid or no-op hooks and metadata drift", async () => {
+test("static parity rejects substituted bytes invalid hooks automatic shared hooks and metadata drift", async () => {
   const root = mkdtempSync(join(tmpdir(), "codestory-routing-static-"));
   cpSync(pluginRoot, root, { recursive: true });
   try {
@@ -2184,6 +2184,15 @@ test("static parity rejects substituted bytes invalid or no-op hooks and metadat
     await assert.rejects(validateStaticHostParity(root, noOpHook), /hook command is not the canonical launcher/u);
 
     cpSync(join(pluginRoot, "hooks", "copilot-hooks.json"), join(root, "hooks", "copilot-hooks.json"));
+    const sharedHookPath = join(root, "hooks", "claude-codex-hooks.json");
+    for (const event of ["SessionStart", "UserPromptSubmit"]) {
+      writeFileSync(sharedHookPath, JSON.stringify({ hooks: { [event]: [] } }));
+      await assert.rejects(
+        validateStaticHostParity(root, staticIdentityFor(root)),
+        /claude_code hook registrations/u,
+      );
+    }
+    cpSync(join(pluginRoot, "hooks", "claude-codex-hooks.json"), sharedHookPath);
     const copilotMetadataPath = join(root, ".github", "plugin", "plugin.json");
     const metadata = JSON.parse(readFileSync(copilotMetadataPath, "utf8"));
     metadata.hooks = "hooks/other.json";

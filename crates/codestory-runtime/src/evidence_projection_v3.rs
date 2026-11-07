@@ -861,6 +861,14 @@ pub fn project_search_v3(
         was_bounded,
     } = search_evidence_selection(results);
     let mut gaps = Vec::new();
+    if results.public_exports.incomplete {
+        gaps.push(gap_row("search-public-export-incomplete", GapKindV3Dto::EvidenceMissing,
+            Some("Public export navigation is incomplete, unavailable or ambiguous; additional bindings may exist."))?);
+    }
+    if results.public_exports.bounded {
+        gaps.push(gap_row("search-public-export-bounded", GapKindV3Dto::OutputBudgetExceeded,
+            Some("Additional public export bindings or their complete provenance exceeded the navigation bound."))?);
+    }
     if symbolic
         && results.repo_text_mode == codestory_contracts::api::SearchRepoTextMode::Off
         && !results.repo_text_enabled
@@ -976,7 +984,16 @@ fn search_evidence_selection(results: &SearchResultsDto) -> SearchEvidenceSelect
             was_bounded = true;
             continue;
         }
-        rows.push(search_evidence_row(rows.len(), hit).expect("search hit has a path"));
+        let mut row = search_evidence_row(rows.len(), hit).expect("search hit has a path");
+        if let Some(binding) = results
+            .public_exports
+            .matches
+            .iter()
+            .find(|binding| binding.node_id == hit.node_id)
+        {
+            row.display_name = Some(symbol_id_text(&binding.presentation));
+        }
+        rows.push(row);
     }
     SearchEvidenceSelectionV3 {
         rows,
@@ -2520,6 +2537,119 @@ mod tests {
             hybrid_weights: None,
             hybrid_limits: None,
         }
+    }
+
+    #[test]
+    fn core_search_keeps_qualified_callable_definitions_within_small_limits() {
+        let (project, _state, _process_cache, controller, service) = indexed_search_fixture();
+        fs::write(
+            project.path().join("src/storage.go"),
+            "package storage\ntype Warehouse struct{}\nfunc (w *Warehouse) pack() {}\nfunc pack() {}\nfunc relay() { external.pack() }\n",
+        )
+        .unwrap();
+        fs::write(
+            project.path().join("src/container.py"),
+            "class Bucket:\n    def pack(self):\n        return 1\n    def relay(self):\n        return external.pack()\n",
+        )
+        .unwrap();
+        for index in 0..12 {
+            fs::write(
+                project.path().join(format!("src/labels_{index}.json")),
+                "{\"pack\": \"parcel\"}\n",
+            )
+            .unwrap();
+        }
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("index methods and independent same-name structural keys");
+        service
+            .run_observational_with_cancel("exact_search", Arc::new(AtomicBool::new(false)), || {
+                let mut expected = Vec::new();
+                for name in ["Warehouse.pack", "Bucket.pack"] {
+                    let specific = controller.search_results(core_search_request(name))?;
+                    let definition = specific
+                        .hits
+                        .iter()
+                        .find(|hit| hit.display_name == name)
+                        .expect("qualified query finds the actual indexed method");
+                    assert_eq!(specific.hits[0].node_id, definition.node_id);
+                    expected.push(definition.clone());
+                }
+                let mut request = core_search_request("pack");
+                request.limit_per_source = 8;
+                let results = controller.search_results(request)?;
+                assert_eq!(results.hits.len(), 8, "public result cap is unchanged");
+                assert_eq!(results.hits[0].display_name, "pack");
+                assert_eq!(
+                    results.hits[0].kind,
+                    codestory_contracts::api::NodeKind::FUNCTION
+                );
+                let mut all_request = core_search_request("pack");
+                all_request.limit_per_source = 50;
+                let all = controller.search_results(all_request)?;
+                assert!(all.hits.len() > 8 && all.hits.len() <= 50);
+                assert_eq!(
+                    results
+                        .hits
+                        .iter()
+                        .map(|hit| &hit.node_id)
+                        .collect::<Vec<_>>(),
+                    all.hits
+                        .iter()
+                        .take(8)
+                        .map(|hit| &hit.node_id)
+                        .collect::<Vec<_>>()
+                );
+                let projected = project_search_v3(&service, "test", &results)?;
+                let json = serde_json::to_value(projected).unwrap();
+                let rows = json["evidence"].as_array().unwrap();
+                assert_eq!(rows.len(), 8);
+                for definition in &expected {
+                    let row = rows
+                        .iter()
+                        .find(|row| row["symbol_id"].as_str() == Some(&definition.node_id.0))
+                        .expect("qualified implementation survives incidental whole-name hits");
+                    assert_eq!(row["display_name"], definition.display_name);
+                    assert_eq!(row["path"].as_str(), definition.file_path.as_deref());
+                    assert_eq!(row["start_line"].as_u64(), definition.line.map(u64::from));
+                    assert!(row["excerpt"].as_str().unwrap().contains("pack("));
+                }
+                let nodes = controller
+                    .open_storage_read_only()
+                    .unwrap()
+                    .get_nodes()
+                    .unwrap();
+                let unknowns = nodes
+                    .iter()
+                    .filter(|node| {
+                        node.kind == codestory_contracts::graph::NodeKind::UNKNOWN
+                            && node.serialized_name.contains("pack")
+                    })
+                    .collect::<Vec<_>>();
+                assert!(
+                    !unknowns.is_empty(),
+                    "unresolved receiver control produces UNKNOWN nodes"
+                );
+                for unknown in unknowns {
+                    if let Some(position) = all
+                        .hits
+                        .iter()
+                        .position(|hit| hit.node_id.0 == unknown.id.0.to_string())
+                    {
+                        for definition in &expected {
+                            assert!(
+                                all.hits
+                                    .iter()
+                                    .position(|hit| hit.node_id == definition.node_id)
+                                    .unwrap()
+                                    < position
+                            );
+                        }
+                    }
+                }
+                Ok(())
+            })
+            .expect("core ranking and modern projection retain canonical definitions");
     }
 
     #[test]
@@ -4537,7 +4667,8 @@ mod tests {
         use codestory_contracts::graph::{Node, NodeId as CoreNodeId, NodeKind};
         use codestory_retrieval::{SidecarProfile, SidecarRuntimeConfig, test_support};
         use codestory_store::{
-            FileInfo, FileRole, IndexPublicationMode, IndexPublicationRecord, Store,
+            FileContentHash, FileExtractionIdentity, FileInfo, FileRole, IndexPublicationMode,
+            IndexPublicationRecord, ProjectionBatch, Store,
         };
         use sha2::{Digest, Sha256};
 
@@ -4570,34 +4701,54 @@ mod tests {
                 line_count: 3,
                 file_role: FileRole::Source,
             };
-            store.insert_file(&file).expect("file");
+            let content_hash = format!("{:x}", Sha256::digest(source.as_bytes()));
             store
-                .update_file_metadata(
-                    &file,
-                    Some(&format!("{:x}", Sha256::digest(source.as_bytes()))),
-                )
-                .expect("source hash");
-            store
-                .insert_nodes_batch(&[
-                    Node {
-                        id: CoreNodeId(10),
-                        kind: NodeKind::FILE,
-                        serialized_name: source_path.to_string_lossy().into_owned(),
-                        file_node_id: Some(CoreNodeId(10)),
-                        start_line: Some(1),
-                        ..Default::default()
-                    },
-                    Node {
-                        id: CoreNodeId(20),
-                        kind: NodeKind::FUNCTION,
-                        serialized_name: "focused_source_anchor".into(),
-                        file_node_id: Some(CoreNodeId(10)),
-                        start_line: Some(1),
-                        end_line: Some(3),
-                        ..Default::default()
-                    },
-                ])
-                .expect("nodes");
+                .projections()
+                .flush_projection_batch(ProjectionBatch {
+                    files: std::slice::from_ref(&file),
+                    file_content_hashes: &[FileContentHash {
+                        file_id: file.id,
+                        content_hash: content_hash.clone(),
+                    }],
+                    file_extraction_identities: &[FileExtractionIdentity {
+                        file_id: file.id,
+                        language: file.language.clone(),
+                        source_content_hash: content_hash,
+                        extraction_revision: codestory_indexer::current_file_extraction_revision(
+                            &file.language,
+                        )
+                        .expect("current JavaScript extraction revision")
+                        .into(),
+                    }],
+                    nodes: &[
+                        Node {
+                            id: CoreNodeId(10),
+                            kind: NodeKind::FILE,
+                            serialized_name: source_path.to_string_lossy().into_owned(),
+                            file_node_id: Some(CoreNodeId(10)),
+                            start_line: Some(1),
+                            ..Default::default()
+                        },
+                        Node {
+                            id: CoreNodeId(20),
+                            kind: NodeKind::FUNCTION,
+                            serialized_name: "focused_source_anchor".into(),
+                            file_node_id: Some(CoreNodeId(10)),
+                            start_line: Some(1),
+                            end_line: Some(3),
+                            ..Default::default()
+                        },
+                    ],
+                    structural_text_units: &[],
+                    structural_text_projections: &[],
+                    structural_text_cache_writes: &[],
+                    edges: &[],
+                    occurrences: &[],
+                    component_access: &[],
+                    callable_projection_states: &[],
+                    file_errors: &[],
+                })
+                .expect("current source projection");
             let publication = IndexPublicationRecord {
                 generation: 1,
                 generation_id: "11111111-1111-4111-8111-111111111111".into(),

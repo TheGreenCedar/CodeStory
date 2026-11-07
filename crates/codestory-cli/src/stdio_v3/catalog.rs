@@ -105,12 +105,17 @@ fn project_tool_v3(revision: McpRevisionV3, source: &Value) -> Value {
         McpRevisionV3::March2025 => {
             projected.insert("annotations".to_string(), annotations_v3(activates));
         }
-        McpRevisionV3::June2025 | McpRevisionV3::November2025 => {
+        McpRevisionV3::June2025
+        | McpRevisionV3::November2025
+        | McpRevisionV3::June2025JsonText
+        | McpRevisionV3::November2025JsonText => {
             projected.insert("title".to_string(), json!(title_v3(name)));
-            projected.insert(
-                "outputSchema".to_string(),
-                output_schema_for_tool_v3(name, source, activates),
-            );
+            if !revision.json_text_only() {
+                projected.insert(
+                    "outputSchema".to_string(),
+                    output_schema_for_tool_v3(name, source, activates),
+                );
+            }
             projected.insert("annotations".to_string(), annotations_v3(activates));
             projected.insert(
                 "_meta".to_string(),
@@ -640,7 +645,8 @@ mod tests {
             for required in ["packet", "context", "search"] {
                 assert!(names.contains(required), "missing evidence tool {required}");
             }
-            assert_eq!(tools.len(), 20);
+            assert!(names.contains("source_context_hook"));
+            assert_eq!(tools.len(), 21);
         }
     }
 
@@ -650,7 +656,7 @@ mod tests {
             let tools = tools_for_surface_v3(*revision, super::super::V3SurfaceSet::WithProof);
             assert_eq!(
                 tools.len(),
-                21,
+                22,
                 "{revision:?} should include the dark proof tool"
             );
             let expected = revision

@@ -253,6 +253,7 @@ fn lexical_hit_to_candidate(hit: LexicalHit) -> Result<super::CandidateHit> {
         hit.score,
         CandidateSource::Lexical,
     );
+    candidate.whole_file_length_evidence = hit.whole_file_length_evidence;
     candidate.node_id = hit.node_id;
     // Only a located symbol or a real source-file row owns a source
     // reservation. Generated summaries remain navigation evidence.
@@ -279,6 +280,8 @@ mod tests {
     fn source_reservation_requires_source_owning_lexical_metadata() {
         let convert = |source, node_id: Option<&str>, start_line| {
             lexical_hit_to_candidate(LexicalHit {
+                whole_file_length_evidence: None,
+                raw_decoded_bytes: None,
                 call_neighborhood: None,
                 path: "src/service.rs".into(),
                 source,

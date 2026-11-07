@@ -51,6 +51,12 @@ pub(in crate::per_user_embedding) struct ServerRequestRegistration<'a> {
     pub(in crate::per_user_embedding) cancellation_auth: Option<ServerCancellationAuth>,
 }
 
+#[derive(Default)]
+pub(in crate::per_user_embedding) struct ServerAdmissionState {
+    handoff_responses: usize,
+    retirement_committed: bool,
+}
+
 pub(in crate::per_user_embedding) struct PerUserEmbeddingServerState {
     pub(in crate::per_user_embedding) clock: Arc<dyn AwakeMonotonicClock>,
     pub(in crate::per_user_embedding) engine_cache_root: PathBuf,
@@ -61,7 +67,7 @@ pub(in crate::per_user_embedding) struct PerUserEmbeddingServerState {
     pub(in crate::per_user_embedding) authority: EmbeddingServerAuthoritySnapshot,
     pub(in crate::per_user_embedding) connections: AtomicUsize,
     pub(in crate::per_user_embedding) pre_request_connections: AtomicUsize,
-    pub(in crate::per_user_embedding) admission_gate: Mutex<()>,
+    pub(in crate::per_user_embedding) admission_gate: Mutex<ServerAdmissionState>,
     pub(in crate::per_user_embedding) request_admission: Arc<ServerRequestAdmission>,
     pub(in crate::per_user_embedding) active: Mutex<BTreeMap<String, ActiveServerRequest>>,
     pub(in crate::per_user_embedding) cancellations: Mutex<BTreeMap<String, ServerCancellation>>,
@@ -407,31 +413,81 @@ impl PerUserEmbeddingServerState {
         })
     }
 
+    // Called only while admission_gate is held. Do not publish draining until
+    // both server and native admission agree: busy checks must never expose a
+    // transient true flag to the independent owner loop.
+    fn idle_drain_ready(&self) -> bool {
+        if !self.true_idle() {
+            return false;
+        }
+        if !self.draining.load(Ordering::Acquire)
+            && let Some(engine) = self.initialized_engine()
+            && !engine.begin_draining_if_idle()
+        {
+            return false;
+        }
+        true
+    }
+
     pub(in crate::per_user_embedding) fn begin_draining_if_idle(&self) -> bool {
-        // Same reasoning as `true_idle`: a poisoned admission gate must not be
-        // the reason a server that cannot serve refuses to drain.
         let _admission = self
             .admission_gate
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if self
-            .draining
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return self.true_idle();
-        }
-        if !self.true_idle() {
-            self.draining.store(false, Ordering::Release);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.idle_drain_ready() {
             return false;
         }
-        if let Some(engine) = self.initialized_engine()
-            && !engine.begin_draining_if_idle()
-        {
-            self.draining.store(false, Ordering::Release);
-            return false;
-        }
+        self.draining.store(true, Ordering::Release);
         self.bump_event();
+        true
+    }
+
+    /// Only authenticated incompatible activation reaches this boundary. The
+    /// reservation and committed drain become visible under one admission lock.
+    /// Busy replies also retain a reservation in case another caller drains the
+    /// owner while their correlated rejection is being delivered.
+    pub(in crate::per_user_embedding) fn begin_authenticated_handoff(
+        self: &Arc<Self>,
+    ) -> Result<(bool, ServerHandoffResponseGuard)> {
+        let mut admission = self
+            .admission_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if admission.retirement_committed || self.stopped.load(Ordering::Acquire) {
+            bail!("embedding_server_draining");
+        }
+        let idle = self.idle_drain_ready();
+        admission.handoff_responses += 1;
+        if idle {
+            self.draining.store(true, Ordering::Release);
+            self.bump_event();
+        }
+        drop(admission);
+        Ok((
+            idle,
+            ServerHandoffResponseGuard {
+                state: Arc::clone(self),
+            },
+        ))
+    }
+
+    /// Seal against late reservations before releasing the owner. Fatal/abort
+    /// teardown keeps its fail-stop behavior; it does not promise delivery.
+    pub(in crate::per_user_embedding) fn commit_retirement_when_ready(&self, abort: bool) -> bool {
+        let mut admission = self
+            .admission_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if admission.retirement_committed {
+            return true;
+        }
+        if !abort && (!self.draining.load(Ordering::Acquire) || admission.handoff_responses != 0) {
+            return false;
+        }
+        if abort {
+            self.draining.store(true, Ordering::Release);
+        }
+        admission.retirement_committed = true;
         true
     }
 
@@ -598,6 +654,23 @@ impl ServerRequestGuard {
         if let Some(key) = self.key.as_deref() {
             self.state.update_request_phase(key, phase);
         }
+    }
+}
+
+pub(in crate::per_user_embedding) struct ServerHandoffResponseGuard {
+    state: Arc<PerUserEmbeddingServerState>,
+}
+
+impl Drop for ServerHandoffResponseGuard {
+    fn drop(&mut self) {
+        let mut admission = self
+            .state
+            .admission_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        admission.handoff_responses -= 1;
+        drop(admission);
+        self.state.bump_event();
     }
 }
 

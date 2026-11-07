@@ -76,6 +76,7 @@ The plugin launcher and installed hosts set these. Setting them by hand misrepor
 | --- | --- | --- | --- |
 | `CODESTORY_CLI` | path | `crates/codestory-cli/src/runtime.rs` | Executable an installed host launches instead of the provisioned CLI. |
 | `CODESTORY_LATEST_RELEASE_VERSION` | text | `crates/codestory-cli/src/stdio_transport.rs` | Latest published version supplied by the host instead of a live release probe. |
+| `CODESTORY_MCP_RESULT_DISPLAY` | enum | `crates/codestory-cli/src/config.rs` | Process-start MCP display selection; exact `codex-json-text-v1` selects JSON text, and other values keep mirrored results. |
 | `CODESTORY_PLUGIN_ACTIVE_PROJECT_TTL_MS` | integer | `crates/codestory-cli/src/stdio_transport.rs` | Milliseconds a host-recorded active project stays routable. |
 | `CODESTORY_PLUGIN_ACTIVE_STATE_PATH` | path | `crates/codestory-cli/src/stdio_transport.rs` | File where the host records the active project for stdio routing. |
 | `CODESTORY_PLUGIN_CACHE_VERSION` | text | `crates/codestory-cli/src/stdio_transport.rs` | Plugin cache layout version reported with provisioning status. |
@@ -99,6 +100,12 @@ The plugin launcher and installed hosts set these. Setting them by hand misrepor
 | `CODESTORY_PLUGIN_ROOT` | path | `crates/codestory-cli/src/stdio_transport.rs` | Installed plugin root the host launched. |
 | `CODESTORY_PLUGIN_RUNTIME_CWD` | path | `crates/codestory-cli/src/stdio_transport.rs` | Working directory the runtime binary should adopt. |
 | `CODESTORY_PLUGIN_VERSION` | text | `crates/codestory-cli/src/stdio_transport.rs` | Version of the installed plugin package. |
+| `CODESTORY_SOURCE_CONTEXT_BOUND_RG` | path | `crates/codestory-cli/src/app/source_context/transport.rs` | Absolute original rg executable bound after shell startup and verified before invocation. |
+| `CODESTORY_SOURCE_CONTEXT_CLI` | path | `crates/codestory-cli/src/app/source_context/transport.rs` | Exact CLI executable supplied to the installed source-context rg shim. |
+| `CODESTORY_SOURCE_CONTEXT_FD` | integer | `crates/codestory-cli/src/app/source_context/transport.rs` | Inherited private observation-pipe writer descriptor, checked against its native pipe identity. |
+| `CODESTORY_SOURCE_CONTEXT_ORIGINAL_PATH` | text | `crates/codestory-cli/src/app/source_context/transport.rs` | Original PATH list restored when invoking the bound rg executable. |
+| `CODESTORY_SOURCE_CONTEXT_PIPE_ID` | text | `crates/codestory-cli/src/app/source_context/transport.rs` | Expected native identity and access mode of the private observation-pipe writer. |
+| `CODESTORY_SOURCE_CONTEXT_READY` | boolean | `crates/codestory-cli/src/app/source_context/transport.rs` | Setup-success sentinel used before the capture prelude prepends its rg shim to PATH. |
 
 ### Diagnostic environment variables
 

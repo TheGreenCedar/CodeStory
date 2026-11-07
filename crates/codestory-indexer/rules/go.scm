@@ -51,6 +51,23 @@
   attr (@name.node) end_col = (end-column @def)
 }
 
+((type_spec
+  type: (struct_type
+    (field_declaration_list
+      (field_declaration
+        name: (field_identifier) @name))))
+ (#not-eq? @name "_"))
+{
+  node @name.node
+  attr (@name.node) kind = "FIELD"
+  attr (@name.node) canonical_role = "definition"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @name)
+  attr (@name.node) start_col = (start-column @name)
+  attr (@name.node) end_row = (end-row @name)
+  attr (@name.node) end_col = (end-column @name)
+}
+
 (package_clause
   (package_identifier) @name) @def
 {
@@ -61,6 +78,39 @@
   attr (@name.node) start_col = (start-column @def)
   attr (@name.node) end_row = (end-row @def)
   attr (@name.node) end_col = (end-column @def)
+}
+
+((source_file
+  (var_declaration
+    (var_spec
+      name: (identifier) @name)))
+ (#not-eq? @name "_"))
+{
+  node @name.node
+  attr (@name.node) kind = "GLOBAL_VARIABLE"
+  attr (@name.node) canonical_role = "definition"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @name)
+  attr (@name.node) start_col = (start-column @name)
+  attr (@name.node) end_row = (end-row @name)
+  attr (@name.node) end_col = (end-column @name)
+}
+
+((source_file
+  (var_declaration
+    (var_spec_list
+      (var_spec
+        name: (identifier) @name))))
+ (#not-eq? @name "_"))
+{
+  node @name.node
+  attr (@name.node) kind = "GLOBAL_VARIABLE"
+  attr (@name.node) canonical_role = "definition"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @name)
+  attr (@name.node) start_col = (start-column @name)
+  attr (@name.node) end_row = (end-row @name)
+  attr (@name.node) end_col = (end-column @name)
 }
 
 ;; Calls (global fallback identifier)

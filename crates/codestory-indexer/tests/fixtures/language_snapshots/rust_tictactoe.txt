@@ -1,4 +1,4 @@
-node ENUM name=Token qn=Token canonical=game.rs:Token line=7 col=6 end=7:11 file=FILE:game.rs@1
+node ENUM name=Token qn=Token canonical=game.rs:Token line=6 col=1 end=11:2 file=FILE:game.rs@1
 node ENUM_CONSTANT name=Token::TOKEN_NONE qn=Token::TOKEN_NONE canonical=rust-ordinal-v2:game.rs:Token::TOKEN_NONE#0 line=8 col=5 end=8:15 file=FILE:game.rs@1
 node ENUM_CONSTANT name=Token::TOKEN_PLAYER_A qn=Token::TOKEN_PLAYER_A canonical=rust-ordinal-v2:game.rs:Token::TOKEN_PLAYER_A#0 line=9 col=5 end=9:19 file=FILE:game.rs@1
 node ENUM_CONSTANT name=Token::TOKEN_PLAYER_B qn=Token::TOKEN_PLAYER_B canonical=rust-ordinal-v2:game.rs:Token::TOKEN_PLAYER_B#0 line=10 col=5 end=10:19 file=FILE:game.rs@1
@@ -58,13 +58,13 @@ node METHOD name=TicTacToe::run qn=TicTacToe::run canonical=rust-ordinal-v2:game
 node METHOD name=TicTacToe::start qn=TicTacToe::start canonical=rust-ordinal-v2:game.rs:TicTacToe::start#0 line=348 col=5 end=355:6 file=FILE:game.rs@1
 node MODULE name=Write qn=Write canonical=rust-ordinal-v2:game.rs:Write#0 line=1 col=21 end=1:26 file=FILE:game.rs@1
 node MODULE name=std::fmt qn=std::fmt canonical=rust-ordinal-v2:game.rs:std::fmt#0 line=2 col=5 end=2:13 file=FILE:game.rs@1
-node STRUCT name=ArtificialPlayer qn=ArtificialPlayer canonical=game.rs:ArtificialPlayer line=262 col=8 end=262:24 file=FILE:game.rs@1
-node STRUCT name=Field qn=Field canonical=game.rs:Field line=38 col=8 end=38:13 file=FILE:game.rs@1
-node STRUCT name=GameObject qn=GameObject canonical=game.rs:GameObject line=4 col=8 end=4:18 file=FILE:game.rs@1
-node STRUCT name=HumanPlayer qn=HumanPlayer canonical=game.rs:HumanPlayer line=203 col=8 end=203:19 file=FILE:game.rs@1
-node STRUCT name=Move qn=Move canonical=game.rs:Move line=14 col=8 end=14:12 file=FILE:game.rs@1
-node STRUCT name=Node qn=Node canonical=game.rs:Node line=256 col=8 end=256:12 file=FILE:game.rs@1
-node STRUCT name=TicTacToe qn=TicTacToe canonical=game.rs:TicTacToe line=335 col=8 end=335:17 file=FILE:game.rs@1
+node STRUCT name=ArtificialPlayer qn=ArtificialPlayer canonical=game.rs:ArtificialPlayer line=261 col=1 end=265:2 file=FILE:game.rs@1
+node STRUCT name=Field qn=Field canonical=game.rs:Field line=37 col=1 end=41:2 file=FILE:game.rs@1
+node STRUCT name=GameObject qn=GameObject canonical=game.rs:GameObject line=4 col=1 end=4:19 file=FILE:game.rs@1
+node STRUCT name=HumanPlayer qn=HumanPlayer canonical=game.rs:HumanPlayer line=202 col=1 end=206:2 file=FILE:game.rs@1
+node STRUCT name=Move qn=Move canonical=game.rs:Move line=13 col=1 end=17:2 file=FILE:game.rs@1
+node STRUCT name=Node qn=Node canonical=game.rs:Node line=255 col=1 end=259:2 file=FILE:game.rs@1
+node STRUCT name=TicTacToe qn=TicTacToe canonical=game.rs:TicTacToe line=335 col=1 end=338:2 file=FILE:game.rs@1
 node UNKNOWN name=ArtificialPlayer::evaluate qn=ArtificialPlayer::evaluate canonical=rust-ordinal-v2:game.rs:ArtificialPlayer::evaluate#1 line=301 col=43 end=301:51 file=FILE:game.rs@1
 node UNKNOWN name=ArtificialPlayer::min_max qn=ArtificialPlayer::min_max canonical=rust-ordinal-v2:game.rs:ArtificialPlayer::min_max#1 line=303 col=38 end=303:45 file=FILE:game.rs@1
 node UNKNOWN name=ArtificialPlayer::min_max qn=ArtificialPlayer::min_max canonical=rust-ordinal-v2:game.rs:ArtificialPlayer::min_max#2 line=330 col=25 end=330:32 file=FILE:game.rs@1
@@ -257,48 +257,48 @@ edge CALL src=METHOD:TicTacToe::start@348 dst=UNKNOWN:new@353 resolved_src=- res
 edge CALL src=METHOD:TicTacToe::start@348 dst=UNKNOWN:string_out@350 resolved_src=- resolved_dst=- line=350 confidence=- certainty=- callsite=h0:350:1:h85 candidates=[]
 edge IMPORT src=MODULE:Write@1 dst=MODULE:Write@1 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 edge IMPORT src=MODULE:std::fmt@2 dst=MODULE:std::fmt@2 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge INHERITANCE src=STRUCT:ArtificialPlayer@262 dst=INTERFACE:Player@196 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge INHERITANCE src=STRUCT:HumanPlayer@203 dst=INTERFACE:Player@196 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=ENUM:Token@7 dst=ENUM_CONSTANT:Token::TOKEN_NONE@8 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=ENUM:Token@7 dst=ENUM_CONSTANT:Token::TOKEN_PLAYER_A@9 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=ENUM:Token@7 dst=ENUM_CONSTANT:Token::TOKEN_PLAYER_B@10 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge INHERITANCE src=STRUCT:ArtificialPlayer@261 dst=INTERFACE:Player@196 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge INHERITANCE src=STRUCT:HumanPlayer@202 dst=INTERFACE:Player@196 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=ENUM:Token@6 dst=ENUM_CONSTANT:Token::TOKEN_NONE@8 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=ENUM:Token@6 dst=ENUM_CONSTANT:Token::TOKEN_PLAYER_A@9 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=ENUM:Token@6 dst=ENUM_CONSTANT:Token::TOKEN_PLAYER_B@10 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 edge MEMBER src=INTERFACE:Player@196 dst=FUNCTION:Player::name@199 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 edge MEMBER src=INTERFACE:Player@196 dst=FUNCTION:Player::token@198 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 edge MEMBER src=INTERFACE:Player@196 dst=FUNCTION:Player::turn@197 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:ArtificialPlayer@262 dst=FIELD:ArtificialPlayer::name@264 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:ArtificialPlayer@262 dst=FIELD:ArtificialPlayer::token@263 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:ArtificialPlayer@262 dst=METHOD:ArtificialPlayer::evaluate@275 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:ArtificialPlayer@262 dst=METHOD:ArtificialPlayer::min_max@287 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:ArtificialPlayer@262 dst=METHOD:ArtificialPlayer::name@324 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:ArtificialPlayer@262 dst=METHOD:ArtificialPlayer::new@268 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:ArtificialPlayer@262 dst=METHOD:ArtificialPlayer::token@320 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:ArtificialPlayer@262 dst=METHOD:ArtificialPlayer::turn@328 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:Field@38 dst=FIELD:Field::grid@39 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:Field@38 dst=FIELD:Field::left@40 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:Field@38 dst=METHOD:Field::clear@78 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:Field@38 dst=METHOD:Field::clear_move@165 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:Field@38 dst=METHOD:Field::clone_field@67 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:Field@38 dst=METHOD:Field::in_range@135 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:Field@38 dst=METHOD:Field::is_empty@139 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:Field@38 dst=METHOD:Field::is_full@143 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:Field@38 dst=METHOD:Field::make_move@147 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:Field@38 dst=METHOD:Field::new@44 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:Field@38 dst=METHOD:Field::opponent@57 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:Field@38 dst=METHOD:Field::same_in_row@111 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:Field@38 dst=METHOD:Field::show@87 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:HumanPlayer@203 dst=FIELD:HumanPlayer::name@205 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:HumanPlayer@203 dst=FIELD:HumanPlayer::token@204 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:HumanPlayer@203 dst=METHOD:HumanPlayer::check@220 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:HumanPlayer@203 dst=METHOD:HumanPlayer::input@216 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:HumanPlayer@203 dst=METHOD:HumanPlayer::name@238 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:HumanPlayer@203 dst=METHOD:HumanPlayer::new@209 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:HumanPlayer@203 dst=METHOD:HumanPlayer::token@234 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:HumanPlayer@203 dst=METHOD:HumanPlayer::turn@242 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:Move@14 dst=FIELD:Move::col@16 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:Move@14 dst=FIELD:Move::row@15 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:Move@14 dst=METHOD:Move::new@20 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:Node@256 dst=FIELD:Node::mv@257 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=STRUCT:Node@256 dst=FIELD:Node::value@258 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:ArtificialPlayer@261 dst=FIELD:ArtificialPlayer::name@264 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:ArtificialPlayer@261 dst=FIELD:ArtificialPlayer::token@263 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:ArtificialPlayer@261 dst=METHOD:ArtificialPlayer::evaluate@275 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:ArtificialPlayer@261 dst=METHOD:ArtificialPlayer::min_max@287 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:ArtificialPlayer@261 dst=METHOD:ArtificialPlayer::name@324 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:ArtificialPlayer@261 dst=METHOD:ArtificialPlayer::new@268 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:ArtificialPlayer@261 dst=METHOD:ArtificialPlayer::token@320 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:ArtificialPlayer@261 dst=METHOD:ArtificialPlayer::turn@328 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Field@37 dst=FIELD:Field::grid@39 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Field@37 dst=FIELD:Field::left@40 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Field@37 dst=METHOD:Field::clear@78 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Field@37 dst=METHOD:Field::clear_move@165 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Field@37 dst=METHOD:Field::clone_field@67 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Field@37 dst=METHOD:Field::in_range@135 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Field@37 dst=METHOD:Field::is_empty@139 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Field@37 dst=METHOD:Field::is_full@143 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Field@37 dst=METHOD:Field::make_move@147 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Field@37 dst=METHOD:Field::new@44 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Field@37 dst=METHOD:Field::opponent@57 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Field@37 dst=METHOD:Field::same_in_row@111 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Field@37 dst=METHOD:Field::show@87 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:HumanPlayer@202 dst=FIELD:HumanPlayer::name@205 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:HumanPlayer@202 dst=FIELD:HumanPlayer::token@204 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:HumanPlayer@202 dst=METHOD:HumanPlayer::check@220 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:HumanPlayer@202 dst=METHOD:HumanPlayer::input@216 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:HumanPlayer@202 dst=METHOD:HumanPlayer::name@238 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:HumanPlayer@202 dst=METHOD:HumanPlayer::new@209 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:HumanPlayer@202 dst=METHOD:HumanPlayer::token@234 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:HumanPlayer@202 dst=METHOD:HumanPlayer::turn@242 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Move@13 dst=FIELD:Move::col@16 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Move@13 dst=FIELD:Move::row@15 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Move@13 dst=METHOD:Move::new@20 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Node@255 dst=FIELD:Node::mv@257 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=STRUCT:Node@255 dst=FIELD:Node::value@258 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 edge MEMBER src=STRUCT:TicTacToe@335 dst=FIELD:TicTacToe::field@336 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 edge MEMBER src=STRUCT:TicTacToe@335 dst=FIELD:TicTacToe::players@337 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 edge MEMBER src=STRUCT:TicTacToe@335 dst=METHOD:TicTacToe::_reset@381 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
@@ -307,7 +307,7 @@ edge MEMBER src=STRUCT:TicTacToe@335 dst=METHOD:TicTacToe::new@341 resolved_src=
 edge MEMBER src=STRUCT:TicTacToe@335 dst=METHOD:TicTacToe::run@357 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 edge MEMBER src=STRUCT:TicTacToe@335 dst=METHOD:TicTacToe::start@348 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 file path=game.rs language=rust lines=404 complete=true role=Source
-occurrence element=ENUM:Token@7 kind=DECLARATION span=7:6-7:11
+occurrence element=ENUM:Token@6 kind=DECLARATION span=7:6-7:11
 occurrence element=ENUM_CONSTANT:Token::TOKEN_NONE@8 kind=DECLARATION span=8:5-8:15
 occurrence element=ENUM_CONSTANT:Token::TOKEN_PLAYER_A@9 kind=DECLARATION span=9:5-9:19
 occurrence element=ENUM_CONSTANT:Token::TOKEN_PLAYER_B@10 kind=DECLARATION span=10:5-10:19
@@ -335,8 +335,8 @@ occurrence element=FUNCTION:probe_check_winner@188 kind=DEFINITION span=188:1-19
 occurrence element=FUNCTION:probe_is_draw@192 kind=DEFINITION span=192:1-194:2
 occurrence element=FUNCTION:string_out@33 kind=DEFINITION span=33:1-35:2
 occurrence element=INTERFACE:Player@196 kind=DECLARATION span=196:7-196:13
-occurrence element=INTERFACE:Player@196 kind=DEFINITION span=233:6-233:12
-occurrence element=INTERFACE:Player@196 kind=DEFINITION span=319:6-319:12
+occurrence element=INTERFACE:Player@196 kind=REFERENCE span=233:6-233:12
+occurrence element=INTERFACE:Player@196 kind=REFERENCE span=319:6-319:12
 occurrence element=METHOD:ArtificialPlayer::evaluate@275 kind=DEFINITION span=275:5-285:6
 occurrence element=METHOD:ArtificialPlayer::min_max@287 kind=DEFINITION span=287:5-316:6
 occurrence element=METHOD:ArtificialPlayer::name@324 kind=DEFINITION span=324:5-326:6
@@ -366,107 +366,107 @@ occurrence element=METHOD:TicTacToe::_select_player@386 kind=DEFINITION span=386
 occurrence element=METHOD:TicTacToe::new@341 kind=DEFINITION span=341:5-346:6
 occurrence element=METHOD:TicTacToe::run@357 kind=DEFINITION span=357:5-379:6
 occurrence element=METHOD:TicTacToe::start@348 kind=DEFINITION span=348:5-355:6
-occurrence element=MODULE:Write@1 kind=DEFINITION span=1:21-1:26
-occurrence element=MODULE:std::fmt@2 kind=DEFINITION span=2:5-2:13
-occurrence element=STRUCT:ArtificialPlayer@262 kind=DECLARATION span=262:8-262:24
-occurrence element=STRUCT:ArtificialPlayer@262 kind=DEFINITION span=267:6-267:22
-occurrence element=STRUCT:ArtificialPlayer@262 kind=DEFINITION span=319:17-319:33
-occurrence element=STRUCT:Field@38 kind=DECLARATION span=38:8-38:13
-occurrence element=STRUCT:Field@38 kind=DEFINITION span=43:6-43:11
+occurrence element=MODULE:Write@1 kind=REFERENCE span=1:21-1:26
+occurrence element=MODULE:std::fmt@2 kind=REFERENCE span=2:5-2:13
+occurrence element=STRUCT:ArtificialPlayer@261 kind=DECLARATION span=262:8-262:24
+occurrence element=STRUCT:ArtificialPlayer@261 kind=DEFINITION span=267:6-267:22
+occurrence element=STRUCT:ArtificialPlayer@261 kind=DEFINITION span=319:17-319:33
+occurrence element=STRUCT:Field@37 kind=DECLARATION span=38:8-38:13
+occurrence element=STRUCT:Field@37 kind=DEFINITION span=43:6-43:11
 occurrence element=STRUCT:GameObject@4 kind=DECLARATION span=4:8-4:18
-occurrence element=STRUCT:HumanPlayer@203 kind=DECLARATION span=203:8-203:19
-occurrence element=STRUCT:HumanPlayer@203 kind=DEFINITION span=208:6-208:17
-occurrence element=STRUCT:HumanPlayer@203 kind=DEFINITION span=233:17-233:28
-occurrence element=STRUCT:Move@14 kind=DECLARATION span=14:8-14:12
-occurrence element=STRUCT:Move@14 kind=DEFINITION span=19:6-19:10
-occurrence element=STRUCT:Node@256 kind=DECLARATION span=256:8-256:12
+occurrence element=STRUCT:HumanPlayer@202 kind=DECLARATION span=203:8-203:19
+occurrence element=STRUCT:HumanPlayer@202 kind=DEFINITION span=208:6-208:17
+occurrence element=STRUCT:HumanPlayer@202 kind=DEFINITION span=233:17-233:28
+occurrence element=STRUCT:Move@13 kind=DECLARATION span=14:8-14:12
+occurrence element=STRUCT:Move@13 kind=DEFINITION span=19:6-19:10
+occurrence element=STRUCT:Node@255 kind=DECLARATION span=256:8-256:12
 occurrence element=STRUCT:TicTacToe@335 kind=DECLARATION span=335:8-335:17
 occurrence element=STRUCT:TicTacToe@335 kind=DEFINITION span=340:6-340:15
-occurrence element=UNKNOWN:ArtificialPlayer::evaluate@301 kind=DEFINITION span=301:43-301:51
-occurrence element=UNKNOWN:ArtificialPlayer::min_max@303 kind=DEFINITION span=303:38-303:45
-occurrence element=UNKNOWN:ArtificialPlayer::min_max@330 kind=DEFINITION span=330:25-330:32
-occurrence element=UNKNOWN:Field::clear@382 kind=DEFINITION span=382:20-382:25
-occurrence element=UNKNOWN:Field::clear_move@306 kind=DEFINITION span=306:23-306:33
-occurrence element=UNKNOWN:Field::clone_field@329 kind=DEFINITION span=329:36-329:47
-occurrence element=UNKNOWN:Field::in_range@148 kind=DEFINITION span=148:18-148:26
-occurrence element=UNKNOWN:Field::in_range@166 kind=DEFINITION span=166:18-166:26
-occurrence element=UNKNOWN:Field::in_range@221 kind=DEFINITION span=221:19-221:27
-occurrence element=UNKNOWN:Field::is_empty@151 kind=DEFINITION span=151:18-151:26
-occurrence element=UNKNOWN:Field::is_empty@169 kind=DEFINITION span=169:17-169:25
-occurrence element=UNKNOWN:Field::is_empty@225 kind=DEFINITION span=225:19-225:27
-occurrence element=UNKNOWN:Field::is_empty@296 kind=DEFINITION span=296:27-296:35
-occurrence element=UNKNOWN:Field::is_full@157 kind=DEFINITION span=157:17-157:24
-occurrence element=UNKNOWN:Field::is_full@185 kind=DEFINITION span=185:11-185:18
-occurrence element=UNKNOWN:Field::is_full@302 kind=DEFINITION span=302:46-302:53
-occurrence element=UNKNOWN:Field::make_move@300 kind=DEFINITION span=300:23-300:32
-occurrence element=UNKNOWN:Field::make_move@365 kind=DEFINITION span=365:24-365:33
-occurrence element=UNKNOWN:Field::opponent@278 kind=DEFINITION span=278:43-278:51
-occurrence element=UNKNOWN:Field::opponent@303 kind=DEFINITION span=303:59-303:67
-occurrence element=UNKNOWN:Field::same_in_row@162 kind=DEFINITION span=162:14-162:25
-occurrence element=UNKNOWN:Field::same_in_row@181 kind=DEFINITION span=181:11-181:22
-occurrence element=UNKNOWN:Field::same_in_row@276 kind=DEFINITION span=276:18-276:29
-occurrence element=UNKNOWN:Field::same_in_row@278 kind=DEFINITION span=278:25-278:36
-occurrence element=UNKNOWN:Field::same_in_row@280 kind=DEFINITION span=280:25-280:36
-occurrence element=UNKNOWN:Field::show@358 kind=DEFINITION span=358:20-358:24
-occurrence element=UNKNOWN:HumanPlayer::check@247 kind=DEFINITION span=247:18-247:23
-occurrence element=UNKNOWN:HumanPlayer::check@248 kind=DEFINITION span=248:21-248:26
-occurrence element=UNKNOWN:HumanPlayer::input@246 kind=DEFINITION span=246:27-246:32
-occurrence element=UNKNOWN:HumanPlayer::name@243 kind=DEFINITION span=243:25-243:29
-occurrence element=UNKNOWN:Some@352 kind=DEFINITION span=352:27-352:31
-occurrence element=UNKNOWN:Some@353 kind=DEFINITION span=353:27-353:31
-occurrence element=UNKNOWN:TicTacToe::_reset@349 kind=DEFINITION span=349:14-349:20
-occurrence element=UNKNOWN:TicTacToe::run@402 kind=DEFINITION span=402:19-402:22
-occurrence element=UNKNOWN:TicTacToe::start@401 kind=DEFINITION span=401:21-401:26
-occurrence element=UNKNOWN:_select_player@352 kind=DEFINITION span=352:47-352:61
-occurrence element=UNKNOWN:_select_player@353 kind=DEFINITION span=353:47-353:61
-occurrence element=UNKNOWN:as_ref@362 kind=DEFINITION span=362:18-362:24
-occurrence element=UNKNOWN:check_winner@189 kind=DEFINITION span=189:5-189:17
-occurrence element=UNKNOWN:check_winner@366 kind=DEFINITION span=366:13-366:25
-occurrence element=UNKNOWN:check_winner@368 kind=DEFINITION span=368:16-368:28
-occurrence element=UNKNOWN:expect@363 kind=DEFINITION span=363:18-363:24
-occurrence element=UNKNOWN:is_draw@193 kind=DEFINITION span=193:5-193:12
-occurrence element=UNKNOWN:is_draw@367 kind=DEFINITION span=367:13-367:20
-occurrence element=UNKNOWN:is_draw@373 kind=DEFINITION span=373:16-373:23
-occurrence element=UNKNOWN:is_some@354 kind=DEFINITION span=354:54-354:61
-occurrence element=UNKNOWN:name@369 kind=DEFINITION span=369:35-369:39
-occurrence element=UNKNOWN:new@217 kind=DEFINITION span=217:15-217:18
-occurrence element=UNKNOWN:new@289 kind=DEFINITION span=289:23-289:26
-occurrence element=UNKNOWN:new@295 kind=DEFINITION span=295:32-295:35
-occurrence element=UNKNOWN:new@343 kind=DEFINITION span=343:27-343:30
-occurrence element=UNKNOWN:new@352 kind=DEFINITION span=352:37-352:40
-occurrence element=UNKNOWN:new@353 kind=DEFINITION span=353:37-353:40
-occurrence element=UNKNOWN:new@392 kind=DEFINITION span=392:35-392:38
-occurrence element=UNKNOWN:new@394 kind=DEFINITION span=394:40-394:43
-occurrence element=UNKNOWN:new@400 kind=DEFINITION span=400:36-400:39
-occurrence element=UNKNOWN:new@68 kind=DEFINITION span=68:31-68:34
-occurrence element=UNKNOWN:number_in@217 kind=DEFINITION span=217:45-217:54
-occurrence element=UNKNOWN:number_in@390 kind=DEFINITION span=390:25-390:34
-occurrence element=UNKNOWN:number_out@90 kind=DEFINITION span=90:13-90:23
-occurrence element=UNKNOWN:string_out@101 kind=DEFINITION span=101:21-101:31
-occurrence element=UNKNOWN:string_out@105 kind=DEFINITION span=105:17-105:27
-occurrence element=UNKNOWN:string_out@108 kind=DEFINITION span=108:9-108:19
-occurrence element=UNKNOWN:string_out@222 kind=DEFINITION span=222:13-222:23
-occurrence element=UNKNOWN:string_out@226 kind=DEFINITION span=226:13-226:23
-occurrence element=UNKNOWN:string_out@243 kind=DEFINITION span=243:9-243:19
-occurrence element=UNKNOWN:string_out@244 kind=DEFINITION span=244:9-244:19
-occurrence element=UNKNOWN:string_out@350 kind=DEFINITION span=350:9-350:19
-occurrence element=UNKNOWN:string_out@369 kind=DEFINITION span=369:17-369:27
-occurrence element=UNKNOWN:string_out@370 kind=DEFINITION span=370:17-370:27
-occurrence element=UNKNOWN:string_out@374 kind=DEFINITION span=374:17-374:27
-occurrence element=UNKNOWN:string_out@387 kind=DEFINITION span=387:9-387:19
-occurrence element=UNKNOWN:string_out@388 kind=DEFINITION span=388:9-388:19
-occurrence element=UNKNOWN:string_out@389 kind=DEFINITION span=389:9-389:19
-occurrence element=UNKNOWN:string_out@88 kind=DEFINITION span=88:9-88:19
-occurrence element=UNKNOWN:string_out@91 kind=DEFINITION span=91:13-91:23
-occurrence element=UNKNOWN:string_out@94 kind=DEFINITION span=94:21-94:31
-occurrence element=UNKNOWN:string_out@96 kind=DEFINITION span=96:21-96:31
-occurrence element=UNKNOWN:string_out@98 kind=DEFINITION span=98:21-98:31
-occurrence element=UNKNOWN:to_string@212 kind=DEFINITION span=212:24-212:33
-occurrence element=UNKNOWN:to_string@271 kind=DEFINITION span=271:24-271:33
-occurrence element=UNKNOWN:token@365 kind=DEFINITION span=365:51-365:56
-occurrence element=UNKNOWN:token@366 kind=DEFINITION span=366:46-366:51
-occurrence element=UNKNOWN:token@368 kind=DEFINITION span=368:49-368:54
-occurrence element=UNKNOWN:turn@364 kind=DEFINITION span=364:35-364:39
+occurrence element=UNKNOWN:ArtificialPlayer::evaluate@301 kind=REFERENCE span=301:43-301:51
+occurrence element=UNKNOWN:ArtificialPlayer::min_max@303 kind=REFERENCE span=303:38-303:45
+occurrence element=UNKNOWN:ArtificialPlayer::min_max@330 kind=REFERENCE span=330:25-330:32
+occurrence element=UNKNOWN:Field::clear@382 kind=REFERENCE span=382:20-382:25
+occurrence element=UNKNOWN:Field::clear_move@306 kind=REFERENCE span=306:23-306:33
+occurrence element=UNKNOWN:Field::clone_field@329 kind=REFERENCE span=329:36-329:47
+occurrence element=UNKNOWN:Field::in_range@148 kind=REFERENCE span=148:18-148:26
+occurrence element=UNKNOWN:Field::in_range@166 kind=REFERENCE span=166:18-166:26
+occurrence element=UNKNOWN:Field::in_range@221 kind=REFERENCE span=221:19-221:27
+occurrence element=UNKNOWN:Field::is_empty@151 kind=REFERENCE span=151:18-151:26
+occurrence element=UNKNOWN:Field::is_empty@169 kind=REFERENCE span=169:17-169:25
+occurrence element=UNKNOWN:Field::is_empty@225 kind=REFERENCE span=225:19-225:27
+occurrence element=UNKNOWN:Field::is_empty@296 kind=REFERENCE span=296:27-296:35
+occurrence element=UNKNOWN:Field::is_full@157 kind=REFERENCE span=157:17-157:24
+occurrence element=UNKNOWN:Field::is_full@185 kind=REFERENCE span=185:11-185:18
+occurrence element=UNKNOWN:Field::is_full@302 kind=REFERENCE span=302:46-302:53
+occurrence element=UNKNOWN:Field::make_move@300 kind=REFERENCE span=300:23-300:32
+occurrence element=UNKNOWN:Field::make_move@365 kind=REFERENCE span=365:24-365:33
+occurrence element=UNKNOWN:Field::opponent@278 kind=REFERENCE span=278:43-278:51
+occurrence element=UNKNOWN:Field::opponent@303 kind=REFERENCE span=303:59-303:67
+occurrence element=UNKNOWN:Field::same_in_row@162 kind=REFERENCE span=162:14-162:25
+occurrence element=UNKNOWN:Field::same_in_row@181 kind=REFERENCE span=181:11-181:22
+occurrence element=UNKNOWN:Field::same_in_row@276 kind=REFERENCE span=276:18-276:29
+occurrence element=UNKNOWN:Field::same_in_row@278 kind=REFERENCE span=278:25-278:36
+occurrence element=UNKNOWN:Field::same_in_row@280 kind=REFERENCE span=280:25-280:36
+occurrence element=UNKNOWN:Field::show@358 kind=REFERENCE span=358:20-358:24
+occurrence element=UNKNOWN:HumanPlayer::check@247 kind=REFERENCE span=247:18-247:23
+occurrence element=UNKNOWN:HumanPlayer::check@248 kind=REFERENCE span=248:21-248:26
+occurrence element=UNKNOWN:HumanPlayer::input@246 kind=REFERENCE span=246:27-246:32
+occurrence element=UNKNOWN:HumanPlayer::name@243 kind=REFERENCE span=243:25-243:29
+occurrence element=UNKNOWN:Some@352 kind=REFERENCE span=352:27-352:31
+occurrence element=UNKNOWN:Some@353 kind=REFERENCE span=353:27-353:31
+occurrence element=UNKNOWN:TicTacToe::_reset@349 kind=REFERENCE span=349:14-349:20
+occurrence element=UNKNOWN:TicTacToe::run@402 kind=REFERENCE span=402:19-402:22
+occurrence element=UNKNOWN:TicTacToe::start@401 kind=REFERENCE span=401:21-401:26
+occurrence element=UNKNOWN:_select_player@352 kind=REFERENCE span=352:47-352:61
+occurrence element=UNKNOWN:_select_player@353 kind=REFERENCE span=353:47-353:61
+occurrence element=UNKNOWN:as_ref@362 kind=REFERENCE span=362:18-362:24
+occurrence element=UNKNOWN:check_winner@189 kind=REFERENCE span=189:5-189:17
+occurrence element=UNKNOWN:check_winner@366 kind=REFERENCE span=366:13-366:25
+occurrence element=UNKNOWN:check_winner@368 kind=REFERENCE span=368:16-368:28
+occurrence element=UNKNOWN:expect@363 kind=REFERENCE span=363:18-363:24
+occurrence element=UNKNOWN:is_draw@193 kind=REFERENCE span=193:5-193:12
+occurrence element=UNKNOWN:is_draw@367 kind=REFERENCE span=367:13-367:20
+occurrence element=UNKNOWN:is_draw@373 kind=REFERENCE span=373:16-373:23
+occurrence element=UNKNOWN:is_some@354 kind=REFERENCE span=354:54-354:61
+occurrence element=UNKNOWN:name@369 kind=REFERENCE span=369:35-369:39
+occurrence element=UNKNOWN:new@217 kind=REFERENCE span=217:15-217:18
+occurrence element=UNKNOWN:new@289 kind=REFERENCE span=289:23-289:26
+occurrence element=UNKNOWN:new@295 kind=REFERENCE span=295:32-295:35
+occurrence element=UNKNOWN:new@343 kind=REFERENCE span=343:27-343:30
+occurrence element=UNKNOWN:new@352 kind=REFERENCE span=352:37-352:40
+occurrence element=UNKNOWN:new@353 kind=REFERENCE span=353:37-353:40
+occurrence element=UNKNOWN:new@392 kind=REFERENCE span=392:35-392:38
+occurrence element=UNKNOWN:new@394 kind=REFERENCE span=394:40-394:43
+occurrence element=UNKNOWN:new@400 kind=REFERENCE span=400:36-400:39
+occurrence element=UNKNOWN:new@68 kind=REFERENCE span=68:31-68:34
+occurrence element=UNKNOWN:number_in@217 kind=REFERENCE span=217:45-217:54
+occurrence element=UNKNOWN:number_in@390 kind=REFERENCE span=390:25-390:34
+occurrence element=UNKNOWN:number_out@90 kind=REFERENCE span=90:13-90:23
+occurrence element=UNKNOWN:string_out@101 kind=REFERENCE span=101:21-101:31
+occurrence element=UNKNOWN:string_out@105 kind=REFERENCE span=105:17-105:27
+occurrence element=UNKNOWN:string_out@108 kind=REFERENCE span=108:9-108:19
+occurrence element=UNKNOWN:string_out@222 kind=REFERENCE span=222:13-222:23
+occurrence element=UNKNOWN:string_out@226 kind=REFERENCE span=226:13-226:23
+occurrence element=UNKNOWN:string_out@243 kind=REFERENCE span=243:9-243:19
+occurrence element=UNKNOWN:string_out@244 kind=REFERENCE span=244:9-244:19
+occurrence element=UNKNOWN:string_out@350 kind=REFERENCE span=350:9-350:19
+occurrence element=UNKNOWN:string_out@369 kind=REFERENCE span=369:17-369:27
+occurrence element=UNKNOWN:string_out@370 kind=REFERENCE span=370:17-370:27
+occurrence element=UNKNOWN:string_out@374 kind=REFERENCE span=374:17-374:27
+occurrence element=UNKNOWN:string_out@387 kind=REFERENCE span=387:9-387:19
+occurrence element=UNKNOWN:string_out@388 kind=REFERENCE span=388:9-388:19
+occurrence element=UNKNOWN:string_out@389 kind=REFERENCE span=389:9-389:19
+occurrence element=UNKNOWN:string_out@88 kind=REFERENCE span=88:9-88:19
+occurrence element=UNKNOWN:string_out@91 kind=REFERENCE span=91:13-91:23
+occurrence element=UNKNOWN:string_out@94 kind=REFERENCE span=94:21-94:31
+occurrence element=UNKNOWN:string_out@96 kind=REFERENCE span=96:21-96:31
+occurrence element=UNKNOWN:string_out@98 kind=REFERENCE span=98:21-98:31
+occurrence element=UNKNOWN:to_string@212 kind=REFERENCE span=212:24-212:33
+occurrence element=UNKNOWN:to_string@271 kind=REFERENCE span=271:24-271:33
+occurrence element=UNKNOWN:token@365 kind=REFERENCE span=365:51-365:56
+occurrence element=UNKNOWN:token@366 kind=REFERENCE span=366:46-366:51
+occurrence element=UNKNOWN:token@368 kind=REFERENCE span=368:49-368:54
+occurrence element=UNKNOWN:turn@364 kind=REFERENCE span=364:35-364:39
 occurrence element=VARIABLE:child@303 kind=DEFINITION span=303:25-303:30
 occurrence element=VARIABLE:clone@68 kind=DEFINITION span=68:17-68:22
 occurrence element=VARIABLE:count@113 kind=DEFINITION span=113:17-113:22
@@ -550,41 +550,41 @@ impl_anchor node=<missing:4352078440727259340>
 callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "13:Player::name", node_id: NodeId(7901299584274057942), signature_hash: 2337928819342862641, normalized_signature: Some("outline:-1793518511152586733"), body_hash: 1844935322489418739, start_line: 199, end_line: 199 }
 callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "13:Player::token", node_id: NodeId(8943915237020985200), signature_hash: -4748688299950841463, normalized_signature: Some("outline:-1793518511152586733"), body_hash: 961989463784140794, start_line: 198, end_line: 198 }
 callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "13:Player::turn", node_id: NodeId(-4338412032649325826), signature_hash: -5978591076735847679, normalized_signature: Some("outline:-1793518511152586733"), body_hash: -4823905825912693835, start_line: 197, end_line: 197 }
-callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "13:check_winner", node_id: NodeId(552384309707348182), signature_hash: -2648810083447582743, normalized_signature: Some("shape:-7129004063419836121"), body_hash: 3433530962717890, start_line: 180, end_line: 182 }
-callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "13:is_draw", node_id: NodeId(-4301496939497734015), signature_hash: -2481105112044182130, normalized_signature: Some("shape:2949831031533748344"), body_hash: -204319749395503244, start_line: 184, end_line: 186 }
-callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "13:main", node_id: NodeId(7512572422624160473), signature_hash: -4671339478033693080, normalized_signature: Some("shape:1876517476969229155"), body_hash: 8914143658137206075, start_line: 399, end_line: 404 }
+callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "13:check_winner", node_id: NodeId(552384309707348182), signature_hash: -2648810083447582743, normalized_signature: Some("shape:4399213069393735554"), body_hash: 4701990786528152595, start_line: 180, end_line: 182 }
+callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "13:is_draw", node_id: NodeId(-4301496939497734015), signature_hash: -2481105112044182130, normalized_signature: Some("shape:-591572711720333227"), body_hash: 8395973758014456677, start_line: 184, end_line: 186 }
+callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "13:main", node_id: NodeId(7512572422624160473), signature_hash: -4671339478033693080, normalized_signature: Some("shape:7763614179887365628"), body_hash: 1948458460298180548, start_line: 399, end_line: 404 }
 callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "13:number_in", node_id: NodeId(-889522379597435097), signature_hash: 8955686532900880052, normalized_signature: Some("outline:-1795207361013140379"), body_hash: 5121502180887966040, start_line: 25, end_line: 27 }
 callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "13:number_out", node_id: NodeId(1560465262411347338), signature_hash: 2127726226258782589, normalized_signature: Some("outline:-1795207361013140379"), body_hash: -6144471250428660743, start_line: 29, end_line: 31 }
-callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "13:probe_check_winner", node_id: NodeId(-7278773163460896139), signature_hash: 8230045360579097032, normalized_signature: Some("shape:5480245894750971792"), body_hash: -3198634867844341834, start_line: 188, end_line: 190 }
-callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "13:probe_is_draw", node_id: NodeId(1917670857885809240), signature_hash: 2557602451772864317, normalized_signature: Some("shape:-709551429523421445"), body_hash: -6996798516919462402, start_line: 192, end_line: 194 }
+callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "13:probe_check_winner", node_id: NodeId(-7278773163460896139), signature_hash: 8230045360579097032, normalized_signature: Some("shape:-5680924907813578773"), body_hash: 4140563474265138353, start_line: 188, end_line: 190 }
+callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "13:probe_is_draw", node_id: NodeId(1917670857885809240), signature_hash: 2557602451772864317, normalized_signature: Some("shape:6552379593094730692"), body_hash: 5354899196448378909, start_line: 192, end_line: 194 }
 callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "13:string_out", node_id: NodeId(566749007844512478), signature_hash: -3564980872777874655, normalized_signature: Some("outline:-1795207361013140379"), body_hash: 621262170870597072, start_line: 33, end_line: 35 }
-callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:ArtificialPlayer::evaluate", node_id: NodeId(3348270452980155110), signature_hash: -5188857207918338924, normalized_signature: Some("shape:5114687643064552744"), body_hash: 3335343505775856497, start_line: 275, end_line: 285 }
-callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:ArtificialPlayer::min_max", node_id: NodeId(9058720084582004924), signature_hash: 7605178372967938102, normalized_signature: Some("shape:6268216495467564730"), body_hash: 2466322894089256852, start_line: 287, end_line: 316 }
+callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:ArtificialPlayer::evaluate", node_id: NodeId(3348270452980155110), signature_hash: -5188857207918338924, normalized_signature: Some("shape:4306130879505526532"), body_hash: -3085063620632195799, start_line: 275, end_line: 285 }
+callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:ArtificialPlayer::min_max", node_id: NodeId(9058720084582004924), signature_hash: 7605178372967938102, normalized_signature: Some("shape:-7413346110899146865"), body_hash: -6155485183438964431, start_line: 287, end_line: 316 }
 callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:ArtificialPlayer::name", node_id: NodeId(5303001089493879625), signature_hash: -7414647915502216140, normalized_signature: Some("outline:-5084961018881034800"), body_hash: -3341830858772065725, start_line: 324, end_line: 326 }
-callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:ArtificialPlayer::new", node_id: NodeId(8853188369260832619), signature_hash: -5878799092325564173, normalized_signature: Some("shape:5581608322346679825"), body_hash: 6865767961361618166, start_line: 268, end_line: 273 }
+callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:ArtificialPlayer::new", node_id: NodeId(8853188369260832619), signature_hash: -5878799092325564173, normalized_signature: Some("shape:-2413734678444879280"), body_hash: 255129175290985311, start_line: 268, end_line: 273 }
 callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:ArtificialPlayer::token", node_id: NodeId(9041233229050624739), signature_hash: 2153484575081840382, normalized_signature: Some("outline:-5084961018881034800"), body_hash: 33078970287095056, start_line: 320, end_line: 322 }
-callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:ArtificialPlayer::turn", node_id: NodeId(-7326319691328235074), signature_hash: -3114194858964325968, normalized_signature: Some("shape:-7979972353853532374"), body_hash: 2770811079965943934, start_line: 328, end_line: 332 }
+callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:ArtificialPlayer::turn", node_id: NodeId(-7326319691328235074), signature_hash: -3114194858964325968, normalized_signature: Some("shape:-4567910452707245902"), body_hash: 428274268356232194, start_line: 328, end_line: 332 }
 callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:Field::clear", node_id: NodeId(-3065501169479058799), signature_hash: 7003150246128009501, normalized_signature: Some("outline:-5090027568462884963"), body_hash: 8556493748509451354, start_line: 78, end_line: 85 }
-callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:Field::clear_move", node_id: NodeId(-3818718458948233907), signature_hash: -4848805601082154519, normalized_signature: Some("shape:3542168176591889684"), body_hash: 486788886363282313, start_line: 165, end_line: 177 }
-callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:Field::clone_field", node_id: NodeId(-2221843448000671838), signature_hash: 5899542232925152804, normalized_signature: Some("shape:4697039134606256577"), body_hash: 402033742427928134, start_line: 67, end_line: 76 }
+callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:Field::clear_move", node_id: NodeId(-3818718458948233907), signature_hash: -4848805601082154519, normalized_signature: Some("shape:1430922020162331432"), body_hash: -9110011676573296015, start_line: 165, end_line: 177 }
+callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:Field::clone_field", node_id: NodeId(-2221843448000671838), signature_hash: 5899542232925152804, normalized_signature: Some("shape:8556278653811935464"), body_hash: -712645950843612277, start_line: 67, end_line: 76 }
 callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:Field::in_range", node_id: NodeId(-5418679528572055157), signature_hash: -7764955932420943677, normalized_signature: Some("outline:-5084961018881034800"), body_hash: -8334207092775125512, start_line: 135, end_line: 137 }
 callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:Field::is_empty", node_id: NodeId(4808671713050437080), signature_hash: -6591906591181576130, normalized_signature: Some("outline:-5084961018881034800"), body_hash: 4189524677612178998, start_line: 139, end_line: 141 }
 callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:Field::is_full", node_id: NodeId(-7863043902394988004), signature_hash: 2498900074852421266, normalized_signature: Some("outline:-5084961018881034800"), body_hash: -7361665011561784065, start_line: 143, end_line: 145 }
-callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:Field::make_move", node_id: NodeId(687915286835036342), signature_hash: 2423875957513444308, normalized_signature: Some("shape:5345821033080210375"), body_hash: -7591882334883238302, start_line: 147, end_line: 163 }
+callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:Field::make_move", node_id: NodeId(687915286835036342), signature_hash: 2423875957513444308, normalized_signature: Some("shape:-8026468773118164731"), body_hash: 2923497782043251776, start_line: 147, end_line: 163 }
 callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:Field::new", node_id: NodeId(-5903412874155702390), signature_hash: -1462970298763405824, normalized_signature: Some("shape:6786820465994381911"), body_hash: -7744045501203871347, start_line: 44, end_line: 55 }
 callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:Field::opponent", node_id: NodeId(-2202261576790351321), signature_hash: -2831962648295621309, normalized_signature: Some("outline:-5075390869670978506"), body_hash: -6523077473259132647, start_line: 57, end_line: 65 }
 callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:Field::same_in_row", node_id: NodeId(6764445873231418563), signature_hash: -6723821694891250577, normalized_signature: Some("shape:5152550848761365939"), body_hash: -542365719150442535, start_line: 111, end_line: 133 }
-callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:Field::show", node_id: NodeId(-6831380503904243329), signature_hash: -6391801535924379689, normalized_signature: Some("shape:4496742922356123121"), body_hash: 2957385637433397222, start_line: 87, end_line: 109 }
-callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:HumanPlayer::check", node_id: NodeId(-7874145900157051492), signature_hash: 7885896921611914790, normalized_signature: Some("shape:5345907160524726973"), body_hash: -8211269879893480248, start_line: 220, end_line: 230 }
-callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:HumanPlayer::input", node_id: NodeId(-2465283449941835888), signature_hash: 6374814526327337170, normalized_signature: Some("shape:8772409281539735927"), body_hash: 7720866745402809419, start_line: 216, end_line: 218 }
+callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:Field::show", node_id: NodeId(-6831380503904243329), signature_hash: -6391801535924379689, normalized_signature: Some("shape:-7417200648963289114"), body_hash: -9207027482718059255, start_line: 87, end_line: 109 }
+callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:HumanPlayer::check", node_id: NodeId(-7874145900157051492), signature_hash: 7885896921611914790, normalized_signature: Some("shape:-5665191803089992735"), body_hash: -2575063758125028380, start_line: 220, end_line: 230 }
+callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:HumanPlayer::input", node_id: NodeId(-2465283449941835888), signature_hash: 6374814526327337170, normalized_signature: Some("shape:8720786024831241503"), body_hash: -7857349047553639565, start_line: 216, end_line: 218 }
 callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:HumanPlayer::name", node_id: NodeId(5971052831762799074), signature_hash: 532226190429775869, normalized_signature: Some("outline:-5084961018881034800"), body_hash: -1698579568374390586, start_line: 238, end_line: 240 }
-callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:HumanPlayer::new", node_id: NodeId(-7168634858143928854), signature_hash: -1351912717055827284, normalized_signature: Some("shape:-6115193852671514201"), body_hash: 8569767090553737384, start_line: 209, end_line: 214 }
+callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:HumanPlayer::new", node_id: NodeId(-7168634858143928854), signature_hash: -1351912717055827284, normalized_signature: Some("shape:3958616997287657294"), body_hash: 2468939281933072261, start_line: 209, end_line: 214 }
 callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:HumanPlayer::token", node_id: NodeId(-142243684850131794), signature_hash: -4145182955680989547, normalized_signature: Some("outline:-5084961018881034800"), body_hash: -4339654573073317462, start_line: 234, end_line: 236 }
-callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:HumanPlayer::turn", node_id: NodeId(1648675718484484537), signature_hash: 6721508572757190989, normalized_signature: Some("shape:187895462604419839"), body_hash: 3176727249730058382, start_line: 242, end_line: 252 }
+callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:HumanPlayer::turn", node_id: NodeId(1648675718484484537), signature_hash: 6721508572757190989, normalized_signature: Some("shape:-51467337123357599"), body_hash: -8842374625490444756, start_line: 242, end_line: 252 }
 callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:Move::new", node_id: NodeId(-7728989887154923069), signature_hash: 8604151747431733291, normalized_signature: Some("outline:-5084961018881034800"), body_hash: -7074340804169045614, start_line: 20, end_line: 22 }
-callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:TicTacToe::_reset", node_id: NodeId(-3980815892144796566), signature_hash: 7763690723086356648, normalized_signature: Some("shape:9046948035930873806"), body_hash: -7748071413826360173, start_line: 381, end_line: 384 }
-callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:TicTacToe::_select_player", node_id: NodeId(9216475580748015129), signature_hash: 1002606463558740773, normalized_signature: Some("shape:8606361645075781382"), body_hash: 6706707704226497132, start_line: 386, end_line: 396 }
-callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:TicTacToe::new", node_id: NodeId(663189887621929898), signature_hash: -8233056051072368200, normalized_signature: Some("shape:7905044180300596008"), body_hash: -5542192695430268642, start_line: 341, end_line: 346 }
-callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:TicTacToe::run", node_id: NodeId(-7812265955690242023), signature_hash: 4486076148756622909, normalized_signature: Some("shape:2764441206706276505"), body_hash: -6968175899919452128, start_line: 357, end_line: 379 }
-callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:TicTacToe::start", node_id: NodeId(6626495345195486132), signature_hash: 3488513926873607814, normalized_signature: Some("shape:-4773583540460124298"), body_hash: -6326685641576319990, start_line: 348, end_line: 355 }
-callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "__file_structural__", node_id: NodeId(2795638767924858044), signature_hash: -199817786350465965, normalized_signature: None, body_hash: 6785362201555541187, start_line: 1, end_line: 404 }
+callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:TicTacToe::_reset", node_id: NodeId(-3980815892144796566), signature_hash: 7763690723086356648, normalized_signature: Some("shape:4608781845955663615"), body_hash: 8453157415796933794, start_line: 381, end_line: 384 }
+callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:TicTacToe::_select_player", node_id: NodeId(9216475580748015129), signature_hash: 1002606463558740773, normalized_signature: Some("shape:3314571300111386730"), body_hash: -2606884818026577360, start_line: 386, end_line: 396 }
+callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:TicTacToe::new", node_id: NodeId(663189887621929898), signature_hash: -8233056051072368200, normalized_signature: Some("shape:3386550371661211741"), body_hash: 2659676076069648927, start_line: 341, end_line: 346 }
+callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:TicTacToe::run", node_id: NodeId(-7812265955690242023), signature_hash: 4486076148756622909, normalized_signature: Some("shape:-5929378097668513739"), body_hash: -2620780493666009312, start_line: 357, end_line: 379 }
+callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:TicTacToe::start", node_id: NodeId(6626495345195486132), signature_hash: 3488513926873607814, normalized_signature: Some("shape:-1408259571890096837"), body_hash: -3103414129199473121, start_line: 348, end_line: 355 }
+callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "__file_structural__", node_id: NodeId(2795638767924858044), signature_hash: 3381886049027414599, normalized_signature: None, body_hash: -3095778783866673535, start_line: 1, end_line: 404 }

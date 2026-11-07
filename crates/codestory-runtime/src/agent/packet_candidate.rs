@@ -9,8 +9,9 @@ use codestory_contracts::api::{
 use codestory_contracts::compilation::PACKET_RETRIEVAL_SCORE_VERSION_V1;
 use codestory_contracts::compilation::{
     INTERIM_MAX_ADMITTED_CANDIDATES, INTERIM_MAX_ADMITTED_SOURCE_BYTES,
-    INTERIM_SOURCE_CONTINUATION_UPPER_BOUND, PacketAdmissionGapKindV1, PacketAdmissionGapV1,
-    PacketAdmissionOriginV1, PacketAdmissionReceiptV1, PacketCandidateDescriptorV1,
+    INTERIM_SOURCE_CONTINUATION_UPPER_BOUND, INTERIM_SOURCE_ROW_UPPER_BOUND,
+    PacketAdmissionGapKindV1, PacketAdmissionGapV1, PacketAdmissionOriginV1,
+    PacketAdmissionReceiptV1, PacketCandidateDescriptorV1,
 };
 use codestory_contracts::graph::NodeId as CoreNodeId;
 use codestory_retrieval::LexicalAdmissionPolicy;
@@ -19,7 +20,6 @@ use sha2::{Digest, Sha256};
 #[cfg(any(test, feature = "benchmark-support"))]
 use std::cell::Cell;
 use std::cell::RefCell;
-#[cfg(any(test, feature = "benchmark-support"))]
 use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
@@ -36,6 +36,13 @@ pub(crate) enum PacketGraphDirection {
     Incoming,
 }
 
+/// Core-bound original focus for an automatic genuine FILE admission.
+#[derive(Debug, Clone)]
+pub(crate) struct AutomaticFileContext {
+    pub(crate) ranges: Vec<codestory_contracts::compilation::PacketSourceRangeV1>,
+    pub(crate) matched: bool,
+}
+
 /// Thread-scoped Horizon A admission counters for one packet operation.
 ///
 /// Formula hydration, trail-scan ledgers, and promotion need-sets no longer
@@ -45,6 +52,10 @@ pub(crate) enum PacketGraphDirection {
 pub(crate) struct PacketProofSession {
     pub(crate) issued_source_record:
         RefCell<Option<super::packet_served_sources::ServedSourceRecord>>,
+    /// Selected final parent offers, verified against real complete FILE extents.
+    /// These are unread-file intents, never fabricated served-source witnesses.
+    pub(crate) offered_whole_files:
+        RefCell<HashMap<String, codestory_contracts::compilation::PacketSourceRangeV1>>,
     /// Packet-scoped count of candidates selected for source/graph hydration.
     /// Horizon A admits at most [`INTERIM_MAX_ADMITTED_CANDIDATES`] across the
     /// whole packet before hydration, not per subquery.
@@ -56,8 +67,20 @@ pub(crate) struct PacketProofSession {
     gaps: RefCell<Vec<PacketAdmissionGapV1>>,
     retrieval_admission_sealed: RefCell<bool>,
     descriptor_results: RefCell<Vec<RetainedPacketDescriptorResult>>,
+    whole_file_length_candidates: RefCell<
+        HashMap<
+            String,
+            (
+                RetrievalPublicationIdentity,
+                codestory_retrieval::CandidateHit,
+            ),
+        >,
+    >,
+    early_whole_file_refusals: RefCell<BTreeMap<String, (String, usize)>>,
     admitted_call_annotations:
         RefCell<HashMap<String, codestory_contracts::compilation::PacketPublishedCallsV1>>,
+    pub(crate) automatic_file_context: RefCell<HashMap<String, AutomaticFileContext>>,
+    pub(crate) automatic_file_matches: RefCell<HashMap<String, String>>,
     include_dense_semantic: bool,
     replay_ranked_descriptors: RefCell<Option<Vec<PacketCandidateDescriptorV1>>>,
     #[cfg(any(test, feature = "benchmark-support"))]
@@ -228,13 +251,18 @@ impl PacketProofSession {
         Self {
             hydrated_admissions: RefCell::new(0),
             issued_source_record: RefCell::new(None),
+            offered_whole_files: RefCell::new(HashMap::new()),
             admitted_source_bytes: RefCell::new(0),
             admitted_identities: RefCell::new(HashMap::new()),
             receipts: RefCell::new(Vec::new()),
             gaps: RefCell::new(Vec::new()),
             retrieval_admission_sealed: RefCell::new(false),
             descriptor_results: RefCell::new(Vec::new()),
+            whole_file_length_candidates: RefCell::new(HashMap::new()),
+            early_whole_file_refusals: RefCell::new(BTreeMap::new()),
             admitted_call_annotations: RefCell::new(HashMap::new()),
+            automatic_file_context: RefCell::new(HashMap::new()),
+            automatic_file_matches: RefCell::new(HashMap::new()),
             include_dense_semantic: true,
             replay_ranked_descriptors: RefCell::new(None),
             #[cfg(any(test, feature = "benchmark-support"))]
@@ -404,6 +432,24 @@ impl PacketProofSession {
         }) {
             return Err("descriptor result was retained twice for one packet query");
         }
+        let mut lengths = self.whole_file_length_candidates.borrow_mut();
+        for candidate in &result.hits {
+            let Some(identity) = candidate.packet_stable_identity() else {
+                continue;
+            };
+            match lengths.entry(identity) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert((publication.clone(), candidate.clone()));
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let (previous_publication, previous) = entry.get_mut();
+                    if previous_publication != publication {
+                        return Err("whole-file length publication changed within packet");
+                    }
+                    previous.merge_whole_file_length_evidence(candidate);
+                }
+            }
+        }
         retained.push(RetainedPacketDescriptorResult {
             lexical_policy: expected_policy,
             query: result.query.clone(),
@@ -508,6 +554,54 @@ impl PacketProofSession {
         )
     }
 
+    pub(crate) fn apply_admitted_file_representation(
+        &self,
+        descriptor: &mut PacketCandidateDescriptorV1,
+    ) {
+        if descriptor.exact_selector_ordinal.is_some() {
+            return;
+        }
+        let matches = self.automatic_file_matches.borrow();
+        let Some(file) = matches.get(&descriptor.stable_identity) else {
+            return;
+        };
+        let admitted = self.admitted_identities.borrow();
+        let Some(bytes) = admitted.get(file) else {
+            return;
+        };
+        descriptor.stable_identity = file.clone();
+        descriptor.symbol = None;
+        descriptor.source_bytes_upper_bound = u32::try_from(*bytes).ok();
+        descriptor.published_calls = None;
+        descriptor.published_calls_conflicted = false;
+    }
+
+    pub(crate) fn descriptor_known_whole_file_overflow(
+        &self,
+        descriptor: &PacketCandidateDescriptorV1,
+    ) -> bool {
+        let Some(cap) = descriptor.source_bytes_upper_bound else {
+            return false;
+        };
+        descriptor.exact_selector_ordinal.is_none()
+            && descriptor.symbol.is_none()
+            && self
+                .whole_file_length_candidates
+                .borrow()
+                .get(&descriptor.stable_identity)
+                .is_some_and(|(publication, candidate)| {
+                    candidate.file_path == descriptor.path
+                        && candidate
+                            .whole_file_decoded_bytes(
+                                &publication.sidecar_generation,
+                                &publication.sidecar_input_hash,
+                            )
+                            .is_some_and(|bytes| {
+                                bytes > (cap as usize).min(INTERIM_SOURCE_ROW_UPPER_BOUND) as u64
+                            })
+                })
+    }
+
     pub(crate) fn admit_descriptor(
         &self,
         descriptor: &PacketCandidateDescriptorV1,
@@ -523,6 +617,22 @@ impl PacketProofSession {
             .contains_key(&descriptor.stable_identity)
         {
             return PacketAdmissionDecision::AlreadyAdmitted;
+        }
+        if descriptor.exact_selector_ordinal.is_none()
+            && descriptor.symbol.is_none()
+            && self
+                .early_whole_file_refusals
+                .borrow()
+                .get(&descriptor.stable_identity)
+                .is_some_and(|(path, cap)| {
+                    path == &descriptor.path
+                        && descriptor
+                            .source_bytes_upper_bound
+                            .map(|bytes| (bytes as usize).min(INTERIM_SOURCE_ROW_UPPER_BOUND))
+                            == Some(*cap)
+                })
+        {
+            return PacketAdmissionDecision::SourceBudgetExceeded;
         }
         if *self.retrieval_admission_sealed.borrow() {
             self.record_gap(
@@ -540,6 +650,33 @@ impl PacketProofSession {
             );
             return PacketAdmissionDecision::SourceBudgetExceeded;
         };
+        if descriptor.exact_selector_ordinal.is_none()
+            && let Some((publication, candidate)) = self
+                .whole_file_length_candidates
+                .borrow()
+                .get(&descriptor.stable_identity)
+            && candidate.file_path == descriptor.path
+            && descriptor.symbol.is_none()
+            && let Some(decoded_bytes) = candidate.whole_file_decoded_bytes(
+                &publication.sidecar_generation,
+                &publication.sidecar_input_hash,
+            )
+            && decoded_bytes > (source_bytes as usize).min(INTERIM_SOURCE_ROW_UPPER_BOUND) as u64
+        {
+            self.early_whole_file_refusals.borrow_mut().insert(
+                descriptor.stable_identity.clone(),
+                (
+                    candidate.file_path.clone(),
+                    (source_bytes as usize).min(INTERIM_SOURCE_ROW_UPPER_BOUND),
+                ),
+            );
+            self.record_gap(
+                PacketAdmissionGapKindV1::SourceBudgetExceeded,
+                Some(descriptor.stable_identity.clone()),
+                None,
+            );
+            return PacketAdmissionDecision::SourceBudgetExceeded;
+        }
         self.admit_with_receipt(
             &descriptor.stable_identity,
             source_bytes as usize,
@@ -547,6 +684,40 @@ impl PacketProofSession {
             &descriptor.retrieval_score.version,
             descriptor.exact_selector_ordinal,
         )
+    }
+
+    pub(crate) fn is_metadata_excluded_candidate(
+        &self,
+        candidate: &codestory_retrieval::CandidateHit,
+    ) -> bool {
+        if !self.retrieval_admission_is_sealed()
+            || candidate.source != codestory_retrieval::CandidateSource::Lexical
+            || candidate.node_id.is_some()
+            || candidate.symbol_name.is_some()
+            || candidate.qualified_name.is_some()
+            || candidate.start_line.is_some()
+            || candidate.target.is_some()
+            || candidate.source_excerpt.is_some()
+        {
+            return false;
+        }
+        let Some(identity) = candidate.packet_stable_identity() else {
+            return false;
+        };
+        self.early_whole_file_refusals
+            .borrow()
+            .get(&identity)
+            .is_some_and(|(path, cap)| {
+                path == &candidate.file_path
+                    && candidate
+                        .source_bytes_upper_bound
+                        .map(|bytes| (bytes as usize).min(INTERIM_SOURCE_ROW_UPPER_BOUND))
+                        == Some(*cap)
+            })
+    }
+
+    pub(crate) fn early_whole_file_refusals(&self) -> BTreeMap<String, (String, usize)> {
+        self.early_whole_file_refusals.borrow().clone()
     }
 
     pub(crate) fn retrieval_admission_is_sealed(&self) -> bool {
@@ -749,6 +920,42 @@ impl PacketProofSession {
                     break;
                 }
             }
+        }
+    }
+
+    /// Fresh retrieval keeps every admission's initial charge, then completes
+    /// known authenticated pages in sealed order within the same source budget.
+    pub(crate) fn reserve_source_pages_in_admission_order(&self, demands: &HashMap<String, usize>) {
+        if !self.retrieval_admission_is_sealed() || self.issued_source_record.borrow().is_some() {
+            return;
+        }
+        let mut receipts = self.receipts.borrow_mut();
+        if receipts
+            .iter()
+            .any(|receipt| receipt.origin != PacketAdmissionOriginV1::Retrieval)
+        {
+            return;
+        }
+        let mut identities = self.admitted_identities.borrow_mut();
+        let mut used = self.admitted_source_bytes.borrow_mut();
+        for receipt in receipts.iter_mut() {
+            let Some(demand) = demands.get(&receipt.stable_identity) else {
+                // Complete FILE reservations and unknown source demands retain
+                // their original charge. No unverified tail earns a top-up.
+                continue;
+            };
+            let current = receipt.reserved_source_bytes as usize;
+            let extra = (*demand)
+                .min(INTERIM_SOURCE_CONTINUATION_UPPER_BOUND)
+                .saturating_sub(current)
+                .min(INTERIM_MAX_ADMITTED_SOURCE_BYTES.saturating_sub(*used));
+            let Some(reserved) = identities.get_mut(&receipt.stable_identity) else {
+                continue;
+            };
+            debug_assert_eq!(*reserved, current);
+            *reserved += extra;
+            *used += extra;
+            receipt.reserved_source_bytes += extra as u32;
         }
     }
 
@@ -1536,6 +1743,102 @@ mod tests {
             after,
             "a smaller observation cannot refund a charge"
         );
+
+        for consume in [false, true] {
+            let session = PacketProofSession::new();
+            for id in 0..16 {
+                let bytes = if id == 2 { 2400 } else { 512 };
+                assert_eq!(
+                    session.admit(&format!("node:{id}"), bytes),
+                    PacketAdmissionDecision::Admitted
+                );
+            }
+            let charged_before = 16_384 - session.remaining_source_bytes();
+            if consume {
+                session.consume_unresolved_reservation("node:4");
+                assert_eq!(16_384 - session.remaining_source_bytes(), charged_before);
+                assert!(
+                    !session
+                        .receipts()
+                        .iter()
+                        .any(|row| row.stable_identity == "node:4")
+                );
+            }
+            assert_eq!(session.remaining_hydration_slots(), 0);
+            assert_eq!(
+                session.admit("node:extra", 512),
+                PacketAdmissionDecision::CountBudgetExceeded
+            );
+            session.seal_retrieval_admission();
+            let before = session.receipts();
+            let mut demands = (3..16)
+                .map(|id| (format!("node:{id}"), 4096))
+                .collect::<HashMap<_, _>>();
+            demands.insert("node:1".into(), 600);
+            demands.insert("node:3".into(), 9000);
+            // node:0 is unknown before the known small unit. node:2 carries
+            // the runtime's complete-FILE reservation and no node demand.
+            session.reserve_source_pages_in_admission_order(&demands);
+            let after = session.receipts();
+            let charge = |id: &str| {
+                after
+                    .iter()
+                    .find(|row| row.stable_identity == id)
+                    .unwrap()
+                    .reserved_source_bytes
+            };
+            assert_eq!(
+                charge("node:0"),
+                512,
+                "unknown demand must not consume known-unit capacity"
+            );
+            assert_eq!(
+                charge("node:1"),
+                600,
+                "known small demand gets its exact top-up"
+            );
+            assert_eq!(
+                charge("node:2"),
+                2400,
+                "complete FILE charge stays unchanged"
+            );
+            assert_eq!(charge("node:3"), 4096, "large demand remains page-capped");
+            assert_eq!(after.len(), 16 - usize::from(consume));
+            assert!(
+                after
+                    .iter()
+                    .all(|row| (512..=4096).contains(&row.reserved_source_bytes))
+            );
+            assert!(before.iter().all(|old| {
+                after.iter().any(|new| {
+                    new.stable_identity == old.stable_identity
+                        && new.reserved_source_bytes >= old.reserved_source_bytes
+                })
+            }));
+            let visible = after
+                .iter()
+                .map(|row| row.reserved_source_bytes as usize)
+                .sum::<usize>();
+            let consumed = if consume { 512 } else { 0 };
+            assert_eq!(
+                visible + consumed,
+                16_384 - session.remaining_source_bytes()
+            );
+            assert_eq!(
+                visible + consumed,
+                16_384,
+                "global charge includes the consumed reservation"
+            );
+            session.reserve_source_pages_in_admission_order(&demands);
+            assert_eq!(session.receipts(), after, "repeated allocation is stable");
+            demands.insert("node:1".into(), 1);
+            session.reserve_source_pages_in_admission_order(&demands);
+            assert_eq!(
+                session.receipts(),
+                after,
+                "smaller demands cannot refund prior charges"
+            );
+        }
     }
 
     #[test]

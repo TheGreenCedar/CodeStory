@@ -202,3 +202,67 @@ fn path_window_rejects_known_nonregular_path_before_invoking_the_opener() {
     .unwrap();
     assert!(opened.metadata().unwrap().is_file());
 }
+
+#[test]
+fn bom_utf16_source_windows_share_decoded_utf8_coordinates_and_byte_caps() {
+    let source = "one\r\nβ🦀\r\nlast";
+    for little in [true, false] {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("commands.ps1");
+        let mut bytes = if little {
+            vec![0xff, 0xfe]
+        } else {
+            vec![0xfe, 0xff]
+        };
+        for unit in source.encode_utf16() {
+            bytes.extend(if little {
+                unit.to_le_bytes()
+            } else {
+                unit.to_be_bytes()
+            });
+        }
+        std::fs::write(&path, bytes).unwrap();
+        let snippet =
+            bounded_markdown_snippet_from_path(&path, 2, 0, 1024, DIRECT_SNIPPET_TRUNCATION_SUFFIX)
+                .unwrap();
+        assert!(snippet.markdown.contains("β🦀"));
+        assert!(!snippet.markdown.contains('\u{fffd}'));
+        let reader = codestory_contracts::source_text::source_text_reader(
+            std::fs::File::open(&path).unwrap(),
+            &path,
+        )
+        .unwrap();
+        let windows = crate::snippets::read_path_source_windows(
+            std::io::BufReader::with_capacity(1, reader),
+            &[(2, 3)],
+            1024,
+        )
+        .unwrap();
+        let delivered = windows[0].render("commands.ps1".into(), 2, 3, 1024);
+        assert_eq!(delivered.delivered_start_line, Some(2));
+        assert_eq!(delivered.delivered_end_line, Some(3));
+        assert_eq!(delivered.source_total_lines, Some(3));
+        assert!(delivered.snippet.contains("β🦀\r\n"));
+        {
+            use sha2::{Digest, Sha256};
+            assert_eq!(
+                delivered.source_range_sha256,
+                Some(format!("{:x}", Sha256::digest("β🦀\r\nlast".as_bytes())))
+            );
+        }
+        let reader = codestory_contracts::source_text::source_text_reader(
+            std::fs::File::open(&path).unwrap(),
+            &path,
+        )
+        .unwrap();
+        let capped = crate::snippets::read_path_source_windows(
+            std::io::BufReader::new(reader),
+            &[(2, 3)],
+            17,
+        )
+        .unwrap();
+        let capped = capped[0].render("commands.ps1".into(), 2, 3, 17);
+        assert!(capped.delivered_end_line.is_none());
+        assert!(!capped.complete);
+    }
+}

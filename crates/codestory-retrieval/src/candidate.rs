@@ -86,6 +86,46 @@ pub enum CandidateLane {
     Graph,
 }
 
+/// In-memory authority from a sealed whole-file lexical publication. JSON cannot mint it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WholeFileLengthEvidence {
+    fact: Option<WholeFileLengthFact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WholeFileLengthFact {
+    path: String,
+    document_key: String,
+    generation: String,
+    input_hash: String,
+    owner: String,
+    decoded_bytes: u64,
+    seals: std::sync::Arc<Vec<codestory_contracts::validation_receipts::ArtifactSeal>>,
+}
+
+impl WholeFileLengthEvidence {
+    pub(crate) fn sealed(
+        path: String,
+        generation: &str,
+        input_hash: &str,
+        owner: String,
+        decoded_bytes: u64,
+        seals: std::sync::Arc<Vec<codestory_contracts::validation_receipts::ArtifactSeal>>,
+    ) -> Self {
+        Self {
+            fact: Some(WholeFileLengthFact {
+                document_key: format!("source\0{path}"),
+                path,
+                generation: generation.into(),
+                input_hash: input_hash.into(),
+                owner,
+                decoded_bytes,
+                seals,
+            }),
+        }
+    }
+}
+
 /// Unified retrieval candidate from any sidecar lane.
 ///
 /// Candidates are navigation evidence until the runtime resolves them back to indexed symbols.
@@ -111,6 +151,8 @@ pub struct CandidateHit {
     /// speculative fallback by opening core state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_bytes_upper_bound: Option<u32>,
+    #[serde(skip)]
+    pub whole_file_length_evidence: Option<WholeFileLengthEvidence>,
     pub score: f32,
     #[serde(default, skip_serializing)]
     pub lane_scores: CandidateLaneScores,
@@ -173,6 +215,59 @@ pub fn fused_candidate_identity_matches(left: &CandidateHit, right: &CandidateHi
 }
 
 impl CandidateHit {
+    fn is_whole_file_length_candidate(&self) -> bool {
+        self.node_id.is_none()
+            && self.symbol_name.is_none()
+            && self.qualified_name.is_none()
+            && self.start_line.is_none()
+            && self.target.is_none()
+            && self.source_excerpt.is_none()
+    }
+
+    /// Merge authority separately from scores. Conflict remains sticky across later duplicates.
+    pub fn merge_whole_file_length_evidence(&mut self, incoming: &Self) {
+        let compatible = self.is_whole_file_length_candidate()
+            && incoming.is_whole_file_length_candidate()
+            && self.file_path == incoming.file_path;
+        match (
+            &self.whole_file_length_evidence,
+            &incoming.whole_file_length_evidence,
+        ) {
+            (None, None) => {}
+            _ if !compatible => {
+                self.whole_file_length_evidence = Some(WholeFileLengthEvidence { fact: None })
+            }
+            (None, Some(evidence)) => self.whole_file_length_evidence = Some(evidence.clone()),
+            (Some(left), Some(right)) if left != right => {
+                self.whole_file_length_evidence = Some(WholeFileLengthEvidence { fact: None });
+            }
+            _ => {}
+        }
+    }
+
+    /// Exact published UTF-8 bytes, only while the native artifact observations still match.
+    pub fn whole_file_decoded_bytes(&self, generation: &str, input_hash: &str) -> Option<u64> {
+        if !self.is_whole_file_length_candidate() {
+            return None;
+        }
+        let fact = self.whole_file_length_evidence.as_ref()?.fact.as_ref()?;
+        if fact.path != self.file_path
+            || fact.document_key != format!("source\0{}", self.file_path)
+            || fact.generation != generation
+            || fact.input_hash != input_hash
+        {
+            return None;
+        }
+        let paths = fact
+            .seals
+            .iter()
+            .map(|seal| seal.path().to_path_buf())
+            .collect::<Vec<_>>();
+        let observed =
+            codestory_contracts::validation_receipts::ArtifactSeal::observe_all(&paths).ok()?;
+        (observed == *fact.seals).then_some(fact.decoded_bytes)
+    }
+
     /// Stable descriptor identity available without opening core state.
     pub fn packet_stable_identity(&self) -> Option<String> {
         match self.node_id.as_deref() {
@@ -247,6 +342,7 @@ impl CandidateHit {
             target: None,
             source_excerpt: None,
             source_bytes_upper_bound: None,
+            whole_file_length_evidence: None,
             score,
             lane_scores: CandidateLaneScores {
                 lexical: Some(CandidateLaneEvidence {
@@ -282,6 +378,7 @@ impl CandidateHit {
             target: None,
             source_excerpt: None,
             source_bytes_upper_bound: None,
+            whole_file_length_evidence: None,
             score,
             lane_scores: CandidateLaneScores::default(),
             source,

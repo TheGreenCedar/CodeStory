@@ -170,6 +170,7 @@ pub(in crate::app) fn parse_git_name_status_records_z(
             kind,
             status: status.to_string(),
             previous_path,
+            scope: None,
         });
     }
     Ok(records)
@@ -222,6 +223,7 @@ pub(super) fn parse_git_name_status_record(line: &str) -> Result<AffectedChangeR
         kind,
         status: status.to_string(),
         previous_path,
+        scope: None,
     })
 }
 
@@ -235,6 +237,7 @@ pub(in crate::app) fn affected_path_record(
         kind,
         status: status.to_string(),
         previous_path: None,
+        scope: None,
     }
 }
 
@@ -262,5 +265,6 @@ pub(super) fn dedupe_affected_change_records(records: &mut Vec<AffectedChangeRec
         left.path == right.path
             && left.previous_path == right.previous_path
             && left.status == right.status
+            && left.scope == right.scope
     });
 }

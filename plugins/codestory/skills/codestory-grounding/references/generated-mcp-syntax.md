@@ -2,8 +2,9 @@
 # Generated CodeStory MCP syntax
 
 This is the agent option source of truth for the packaged plugin. Every tool
-requires `project` (absolute repository root). Extra fields fail with JSON-RPC
-`-32602` because the catalog sets `additionalProperties: false`.
+requires `project` (absolute repository root). Extra fields on ordinary tools fail
+with JSON-RPC `-32602` because the catalog sets `additionalProperties: false`.
+The optional source hook returns an empty no-op for unsupported input.
 
 Clap `--help` and [generated CLI syntax](generated-cli-syntax.md) are maintainer
 CLI docs. Do not send CLI flags as MCP arguments.
@@ -11,7 +12,7 @@ CLI docs. Do not send CLI flags as MCP arguments.
 Live tools: `status`, `packet`, `search`, `ground`, `files`, `affected`,
 `symbol`, `trail`, `callers`, `callees`, `trace`, `get_node`, `neighbors`,
 `shortest_path`, `query_subgraph`, `definition`, `references`, `symbols`,
-`snippet`, `context`.
+`snippet`, `context`, `source_context_hook`.
 
 There is no MCP `index`, `doctor`, `ready`, `explore`, `drill`, `query`,
 `bookmark`, `serve`, or `cache` tool. Product tools own activation.
@@ -25,7 +26,7 @@ There is no MCP `index`, `doctor`, `ready`, `explore`, `drill`, `query`,
 | `search` | `query` | `limit`, `repo_text` (`auto`/`on`/`off`) | Discovery for adaptive source and relationship inspection. |
 | `ground` | | `budget` (`strict`/`balanced`/`max`) | First call may refresh the local map. |
 | `files` | | `language`, `path`, `role`, `limit`, `include_framework_coverage` | Refreshes the local map before dispatch. No `refresh` field. |
-| `affected` | exactly one of `paths`, `changed_paths`, `change_records` | `depth`, `filter` | Never discovers git changes. |
+| `affected` | exactly one of `paths`, `changed_paths`, `change_records` | `depth`, `filter`, `symbol_layout` | Never discovers git changes. |
 | `symbol` | `query` or `id` | `choose` | |
 | `trail` | `query` or `id` | `direction` (`incoming`/`outgoing`/`both`), `depth`, `max_nodes`, `story`, `choose`, `caller_scope` (`production_only`/`include_tests_and_benches`) | There is no `mode` field. Default caller scope hides test/bench callers. |
 | `callers` | `query` or `id` | `depth`, `max_nodes`, `choose`, `caller_scope` | |
@@ -40,6 +41,7 @@ There is no MCP `index`, `doctor`, `ready`, `explore`, `drill`, `query`,
 | `symbols` | | `parent_id`, `limit` | Root symbols, or children of `parent_id`. |
 | `snippet` | `query`, `id`, `paths`, `path`, `file_path`, or `symbol_id` | `line`, `start_line`, `end_line`, `context`, `lines`, `scope`, `function_body`, `choose`, `max_tool_result_bytes` (path reads only, 256..524288) | Read a selected source target; ordinary host reads remain available. The optional path allowance bounds the served tool result, excluding outer JSON-RPC and host framing; cumulative task limits remain separate. |
 | `context` | `query`, `id`, or `bookmark` | `include_evidence`, `max_results` | One concrete target, not a broad question. |
+| `source_context_hook` | `cwd`, `output` | | Observational PostToolUse JSON for configured hooks, not broad retrieval. Complete `path:line:text` rows are untrusted local source hints; original-command provenance, relevance and search completeness are UNKNOWN. No indexing or preparation. |
 ## Resources and prompts
 
 Project-scoped resources use `{?project}` templates, for example

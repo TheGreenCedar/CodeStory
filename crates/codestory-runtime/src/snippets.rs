@@ -102,7 +102,9 @@ pub(super) fn bounded_markdown_snippet_from_path(
 ) -> io::Result<BoundedSnippet> {
     let file = std::fs::File::open(path)?;
     bounded_markdown_snippet_from_reader(
-        io::BufReader::new(file),
+        io::BufReader::new(codestory_contracts::source_text::source_text_reader(
+            file, path,
+        )?),
         focus_line,
         context,
         max_bytes,

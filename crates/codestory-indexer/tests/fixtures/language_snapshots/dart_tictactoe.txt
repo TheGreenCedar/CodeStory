@@ -53,8 +53,8 @@ file path=game.dart language=dart lines=73 complete=true role=Source
 occurrence element=CLASS:ArtificialPlayer@46 kind=DEFINITION span=46:1-58:2
 occurrence element=CLASS:Field@19 kind=DEFINITION span=19:1-34:2
 occurrence element=CLASS:GameObject@15 kind=DEFINITION span=15:1-17:2
-occurrence element=CLASS:GameObject@15 kind=DEFINITION span=19:21-19:31
-occurrence element=CLASS:GameObject@15 kind=DEFINITION span=60:25-60:35
+occurrence element=CLASS:GameObject@15 kind=REFERENCE span=19:21-19:31
+occurrence element=CLASS:GameObject@15 kind=REFERENCE span=60:25-60:35
 occurrence element=CLASS:HumanPlayer@40 kind=DEFINITION span=40:1-44:2
 occurrence element=CLASS:TicTacToe@60 kind=DEFINITION span=60:1-68:2
 occurrence element=FUNCTION:main@70 kind=DEFINITION span=70:1-70:12
@@ -62,8 +62,8 @@ occurrence element=FUNCTION:numberIn@3 kind=DEFINITION span=3:1-3:15
 occurrence element=FUNCTION:numberOut@7 kind=DEFINITION span=7:1-7:24
 occurrence element=FUNCTION:stringOut@11 kind=DEFINITION span=11:1-11:29
 occurrence element=INTERFACE:Player@36 kind=DEFINITION span=36:1-38:2
-occurrence element=INTERFACE:Player@36 kind=DEFINITION span=40:30-40:36
-occurrence element=INTERFACE:Player@36 kind=DEFINITION span=46:35-46:41
+occurrence element=INTERFACE:Player@36 kind=REFERENCE span=40:30-40:36
+occurrence element=INTERFACE:Player@36 kind=REFERENCE span=46:35-46:41
 occurrence element=METHOD:ArtificialPlayer.minMax@47 kind=DEFINITION span=47:3-47:48
 occurrence element=METHOD:ArtificialPlayer.turn@54 kind=DEFINITION span=54:3-54:36
 occurrence element=METHOD:Field.makeMove@26 kind=DEFINITION span=26:3-26:45
@@ -72,19 +72,19 @@ occurrence element=METHOD:GameObject.announce@16 kind=DEFINITION span=16:3-16:18
 occurrence element=METHOD:HumanPlayer.turn@41 kind=DEFINITION span=41:3-41:36
 occurrence element=METHOD:Player.turn@37 kind=DEFINITION span=37:3-37:37
 occurrence element=METHOD:TicTacToe.run@63 kind=DEFINITION span=63:3-63:13
-occurrence element=MODULE:'dart:math'@1 kind=DEFINITION span=1:8-1:19
-occurrence element=UNKNOWN:Field@61 kind=DEFINITION span=61:17-61:22
-occurrence element=UNKNOWN:Random@66 kind=DEFINITION span=66:5-66:11
-occurrence element=UNKNOWN:TicTacToe@71 kind=DEFINITION span=71:16-71:25
-occurrence element=UNKNOWN:makeMove@42 kind=DEFINITION span=42:18-42:26
-occurrence element=UNKNOWN:minMax@51 kind=DEFINITION span=51:12-51:18
-occurrence element=UNKNOWN:minMax@55 kind=DEFINITION span=55:5-55:11
-occurrence element=UNKNOWN:numberIn@64 kind=DEFINITION span=64:5-64:13
-occurrence element=UNKNOWN:print@12 kind=DEFINITION span=12:3-12:8
-occurrence element=UNKNOWN:print@8 kind=DEFINITION span=8:3-8:8
-occurrence element=UNKNOWN:run@72 kind=DEFINITION span=72:8-72:11
-occurrence element=UNKNOWN:sameInRow@31 kind=DEFINITION span=31:5-31:14
-occurrence element=UNKNOWN:stringOut@65 kind=DEFINITION span=65:5-65:14
+occurrence element=MODULE:'dart:math'@1 kind=REFERENCE span=1:8-1:19
+occurrence element=UNKNOWN:Field@61 kind=REFERENCE span=61:17-61:22
+occurrence element=UNKNOWN:Random@66 kind=REFERENCE span=66:5-66:11
+occurrence element=UNKNOWN:TicTacToe@71 kind=REFERENCE span=71:16-71:25
+occurrence element=UNKNOWN:makeMove@42 kind=REFERENCE span=42:18-42:26
+occurrence element=UNKNOWN:minMax@51 kind=REFERENCE span=51:12-51:18
+occurrence element=UNKNOWN:minMax@55 kind=REFERENCE span=55:5-55:11
+occurrence element=UNKNOWN:numberIn@64 kind=REFERENCE span=64:5-64:13
+occurrence element=UNKNOWN:print@12 kind=REFERENCE span=12:3-12:8
+occurrence element=UNKNOWN:print@8 kind=REFERENCE span=8:3-8:8
+occurrence element=UNKNOWN:run@72 kind=REFERENCE span=72:8-72:11
+occurrence element=UNKNOWN:sameInRow@31 kind=REFERENCE span=31:5-31:14
+occurrence element=UNKNOWN:stringOut@65 kind=REFERENCE span=65:5-65:14
 access node=METHOD:ArtificialPlayer.minMax@47 kind=Public
 access node=METHOD:ArtificialPlayer.turn@54 kind=Public
 access node=METHOD:Field.makeMove@26 kind=Public
@@ -105,4 +105,4 @@ callable_state CallableProjectionState { file_id: 8885278408206200492, symbol_ke
 callable_state CallableProjectionState { file_id: 8885278408206200492, symbol_key: "14:HumanPlayer.turn", node_id: NodeId(-1216559423763927890), signature_hash: -1551097434895889655, normalized_signature: Some("shape:7164779443168732580"), body_hash: 1703219438516552849, start_line: 41, end_line: 41 }
 callable_state CallableProjectionState { file_id: 8885278408206200492, symbol_key: "14:Player.turn", node_id: NodeId(3983705973672247437), signature_hash: -1091959065548758310, normalized_signature: Some("outline:-5083272169020481154"), body_hash: -1041864639719970143, start_line: 37, end_line: 37 }
 callable_state CallableProjectionState { file_id: 8885278408206200492, symbol_key: "14:TicTacToe.run", node_id: NodeId(1973322840329670188), signature_hash: 5136661510898306809, normalized_signature: Some("shape:255436906924033835"), body_hash: -3295100025934209292, start_line: 63, end_line: 63 }
-callable_state CallableProjectionState { file_id: 8885278408206200492, symbol_key: "__file_structural__", node_id: NodeId(8885278408206200492), signature_hash: 5848371559775392870, normalized_signature: None, body_hash: 1113860019240585771, start_line: 1, end_line: 73 }
+callable_state CallableProjectionState { file_id: 8885278408206200492, symbol_key: "__file_structural__", node_id: NodeId(8885278408206200492), signature_hash: 4160010641269991893, normalized_signature: None, body_hash: -2049240425095728612, start_line: 1, end_line: 73 }

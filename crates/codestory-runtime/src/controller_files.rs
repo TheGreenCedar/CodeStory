@@ -277,7 +277,13 @@ impl AppController {
         let file = open_regular_source_file_with(&candidate, |path| std::fs::File::open(path))
             .map_err(|error| ApiError::new("source_unavailable", error.to_string()))?;
         let windows = crate::snippets::read_path_source_windows(
-            std::io::BufReader::new(file),
+            std::io::BufReader::new(
+                codestory_contracts::source_text::source_text_reader(
+                    file,
+                    std::path::Path::new(path),
+                )
+                .map_err(|error| ApiError::new("source_unavailable", error.to_string()))?,
+            ),
             requests,
             maximum_bytes,
         )

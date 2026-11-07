@@ -419,7 +419,7 @@ fn run_http_target_operation<T>(
 
 fn http_target_public_operation(selection: &args::TargetSelection) -> &'static str {
     match selection {
-        args::TargetSelection::Query { .. } => "graph_assisted",
+        args::TargetSelection::Query { .. } => "resolution",
         args::TargetSelection::Id(_) => "graph",
     }
 }
@@ -722,13 +722,13 @@ mod tests {
     use std::thread;
 
     #[test]
-    fn query_resolved_graph_routes_use_the_complete_retrieval_operation() {
+    fn query_resolved_graph_routes_use_fresh_core_resolution() {
         assert_eq!(
             http_target_public_operation(&args::TargetSelection::Query {
                 query: "AppController".to_string(),
                 choose: None,
             }),
-            "graph_assisted"
+            "resolution"
         );
         assert_eq!(
             http_target_public_operation(&args::TargetSelection::Id(NodeId("node-1".to_string()))),

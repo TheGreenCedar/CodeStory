@@ -18,8 +18,9 @@ adapter syntax, SQLite mechanics, parsers, or model execution.
 - one packet-probe normalization and resolution path for exact paths, stable
   symbol IDs, qualified symbols, file-scoped symbols, free queries, and
   generation-bound continuations;
-- one descriptor-only admission pass across the unchanged question and all
-  typed free queries before candidate source or graph hydration;
+- one bounded admission pass across the unchanged question and all typed free
+  queries, with same-publication Core and lexical metadata association before
+  candidate source or relationship hydration;
 - assembly of `PacketCompilationInputV1` and projection of the pure compiler's
   bounded evidence product;
 - managed retrieval preparation and user-facing gap mapping;
@@ -37,19 +38,26 @@ adapter syntax, SQLite mechanics, parsers, or model execution.
 
 ## Publication contract
 
-A complete core publication may retain verified malformed UTF-8 source with a
-`malformed` coverage gap. It retains the file identity and content digest, not
-structural units, symbol documents, or proof facts. Both full and incremental
-refresh reverify those bytes before publication. A transition from valid to
-malformed removes the old projection; unchanged malformed source does not
-trigger a retry. Unreadable source, incomplete discovery, source drift, and
-collector failures still prevent publication.
+A complete core publication may retain fully read structural source rejected by
+strict decoding or format validation with an explicit `binary` or `malformed`
+coverage gap. It retains only verified raw file identity and content digest, not
+structural units, symbol documents, proof facts, or exact indexed text for opaque
+bytes. Both full and incremental refresh reverify those bytes before publication,
+including same-mtime changes. Valid-to-rejected transitions remove the old
+projection; unchanged verified rejections do not trigger retries. This changes
+whole-project availability, not accepted encodings or complete file coverage.
+Unreadable, oversized, drifting or incompletely discovered input, missing raw
+identity, and collector failures remain blocking unless an existing verified
+source-policy exclusion contract applies.
 
 Runtime publishes the core index through store, then asks retrieval to finalize
-immutable lexical/vector/SCIP state when a broad operation needs it. On reads it
-requires query hits and candidate resolution to share one
-`RetrievalPublicationIdentity`, holds the core read and generation leases, and
-revalidates before returning. Publication drift permits one bounded retry.
+immutable lexical/vector/SCIP state when a broad operation needs it. Broad reads
+require query hits and candidate resolution to share one
+`RetrievalPublicationIdentity`, hold the core read and generation leases, and
+revalidate before returning. Indexed-name navigation instead resolves from a
+fresh complete Core publication without attaching search state or pinning
+retrieval; stale or incomplete Core cannot admit it. Publication drift permits
+one bounded retry.
 
 Cache rehydrate selects its source's physical core generation after taking the
 source writer guard. Schema, file count, freshness, space accounting, and the
@@ -105,6 +113,16 @@ lookup remain a separate bounded-streaming concern. Index telemetry exposes
 selected symbols, retained context files and path bytes, and lookup entries so
 that boundary stays visible.
 
+Fresh Rust struct and enum compact documents use a private input view from one
+precise, same-file declaration occurrence contained in the displayed extent.
+Occurrence reads are batched within the existing semantic window or flow-seed
+page; stored-document republish does not perform this lookup. Missing, ambiguous
+or invalid anchors retain the displayed input. Public and dense locations and
+attached comments keep the full declaration envelope. Callables, enum variants
+and other languages keep their existing document inputs. The Rust extraction
+revision invalidates affected file documents before fresh materialization;
+the global document and embedding versions remain unchanged.
+
 Projection-only republish is a writer, never an activation or observational
 repair path. Runtime accepts only current stored document contracts, rebuilds
 graph-derived context and dense selection, and delegates atomic old-or-new core
@@ -122,6 +140,34 @@ body-less declarations remain line-context fallbacks; the scanner never borrows
 a later callable's body. A multiline result prefix ending in `interface` or
 `struct` before its opening brace remains unsupported and falls back explicitly.
 The existing scan/byte caps and other languages' ambiguity guards still apply.
+
+Broad packet requests may replace automatic callable fragments with a genuine
+small-file view. Runtime associates the match with its canonical Core file and
+sealed lexical size metadata from the same pinned publication. This selection
+step uses metadata only; source opens remain subject to admission and inspection
+limits. Missing or conflicting metadata retains ordinary fragments. Hydration
+still verifies native identity, source hash, line bounds and the rendered extent.
+
+Coalescing automatic matches can leave capacity for one pass over their
+published direct targets. This context carries no borrowed query score or
+inferred call certainty. Exact selector identities and requested scope remain
+unchanged. If a complete FILE view cannot fit the final response, authenticated
+focused ranges under that same admitted FILE can retain the matched source.
+A fresh implicit request may omit an automatic source unit through bounded
+selection, with its omission and continuation reported explicitly. Every FILE
+source unit that is returned must retain all of its authenticated matched ranges.
+Exact requests and previously issued source retain their existing protection.
+A later request can revalidate a recorded FILE range through its issued witness;
+this does not grant fresh FILE-range authority. These views establish neither
+answer sufficiency nor callable-body completeness.
+
+Continuation records also authenticate the options in the final response. A
+selected whole-file option can authorize an unread file's complete indexed
+extent from the same pinned publication. Runtime verifies the caller, question
+and recorded option before hydration. Older records retain their earlier
+source-witness authority. Paged continuations retain the original requested
+scope and source hash, and must deliver the requested next line when capacity
+permits.
 
 ## Extension rules
 

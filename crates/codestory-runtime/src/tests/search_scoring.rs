@@ -131,6 +131,289 @@ fn build_search_hit_prefers_declaration_coordinates_and_filters_unknown_nodes() 
 }
 
 #[test]
+fn unknown_nodes_do_not_spend_matcher_budget() {
+    let _env = hybrid_test_env();
+    let temp = tempdir().expect("matcher budget fixture");
+    let root = temp.path().join("project");
+    fs::create_dir_all(&root).expect("source root");
+    let source_paths = [root.join("one.rs"), root.join("two.rs")];
+    let mut source = "pub fn invokeTarget() {}\n".to_string();
+    for index in 0..201 {
+        source.push_str(&format!("pub fn boundedCandidate{index:03}() {{}}\n"));
+    }
+    fs::write(&source_paths[0], &source).expect("first source");
+    fs::write(&source_paths[1], "pub fn invokeTarget() {}\n").expect("second source");
+
+    let mut nodes = source_paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| Node {
+            id: CoreNodeId(100_000 + index as i64),
+            kind: NodeKind::FILE,
+            serialized_name: path.to_string_lossy().into_owned(),
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+    for (start, name) in [(-353, "invokeTarget"), (1_000, "phantomTarget")] {
+        nodes.extend((0..353).map(|offset| Node {
+            id: CoreNodeId(start + offset),
+            kind: NodeKind::UNKNOWN,
+            serialized_name: name.to_string(),
+            file_node_id: Some(CoreNodeId(100_000)),
+            start_line: Some(1),
+            ..Default::default()
+        }));
+    }
+    for index in 0..2 {
+        nodes.push(Node {
+            id: CoreNodeId(5_000 + index),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "invokeTarget".to_string(),
+            file_node_id: Some(CoreNodeId(100_000 + index)),
+            start_line: Some(1),
+            ..Default::default()
+        });
+    }
+    nodes.extend((0..201).map(|index| Node {
+        id: CoreNodeId(10_000 + index),
+        kind: NodeKind::FUNCTION,
+        serialized_name: format!("boundedCandidate{index:03}"),
+        file_node_id: Some(CoreNodeId(100_000)),
+        start_line: Some(index as u32 + 2),
+        ..Default::default()
+    }));
+    let raw_count = nodes.len();
+    let storage_path = root.join("codestory.db");
+    let mut storage = Storage::open(&storage_path).expect("open fixture core");
+    storage.insert_nodes_batch(&nodes).expect("canonical nodes");
+    storage
+        .insert_files_batch(
+            &source_paths
+                .iter()
+                .enumerate()
+                .map(|(index, path)| codestory_store::FileInfo {
+                    id: 100_000 + index as i64,
+                    path: path.clone(),
+                    language: "rust".to_string(),
+                    modification_time: 0,
+                    indexed: true,
+                    complete: true,
+                    line_count: if index == 0 { 202 } else { 1 },
+                    file_role: codestory_store::FileRole::Source,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .expect("canonical file identities");
+    let resident = build_persisted_search_state_from_canonical_symbols(
+        &mut storage,
+        &temp.path().join("search-generation"),
+        false,
+        &test_sidecar_runtime_from_env(),
+        None,
+    )
+    .expect("build resident matcher from the production canonical stream");
+    assert_eq!(
+        resident.search_stats.search_symbol_stream_rows as usize,
+        raw_count
+    );
+    assert_eq!(
+        resident.search_stats.search_symbol_index_docs_written as usize,
+        raw_count
+    );
+    assert_eq!(resident.node_names.len(), raw_count);
+    assert_eq!(resident.engine.full_text_doc_count(), raw_count);
+    assert_eq!(resident.engine.tantivy_doc_count(), raw_count);
+    assert_eq!(
+        storage.get_canonical_search_symbol_count().unwrap() as usize,
+        raw_count
+    );
+    assert_eq!(storage.get_search_symbol_projection_count().unwrap(), 0);
+    assert_eq!(
+        storage.get_node(CoreNodeId(-353)).unwrap().unwrap().kind,
+        NodeKind::UNKNOWN
+    );
+    drop(storage);
+
+    let controller = AppController::new_with_owned_cache_root(&temp.path().join("process-cache"));
+    controller
+        .open_project_with_storage_path(root, storage_path)
+        .expect("open core-only query surface");
+    let mut failures = Vec::new();
+    for (query, expected) in [
+        ("invokeTarget", vec![5_000, 5_001]),
+        ("invoketarget", vec![5_000, 5_001]),
+        ("invoke", vec![5_000, 5_001]),
+        ("phantomTarget", Vec::new()),
+        ("__absent_symbol__", Vec::new()),
+    ] {
+        let mut core_ids = controller
+            .resolve_core_symbol_candidates(query, 50)
+            .expect("core lookup")
+            .into_iter()
+            .map(|hit| hit.node_id.0.parse::<i64>().unwrap())
+            .collect::<Vec<_>>();
+        let mut resident_ids = resident
+            .engine
+            .search_symbol_with_scores(query)
+            .into_iter()
+            .map(|(id, _)| id.0)
+            .collect::<Vec<_>>();
+        core_ids.sort_unstable();
+        resident_ids.sort_unstable();
+        if core_ids != expected || resident_ids != expected {
+            failures.push(format!(
+                "{query}: core={core_ids:?}, resident_count={}, resident_first={:?}, expected={expected:?}",
+                resident_ids.len(),
+                &resident_ids[..resident_ids.len().min(3)]
+            ));
+        }
+    }
+    assert_eq!(
+        resident
+            .engine
+            .search_symbol_with_scores("boundedCandidate")
+            .len(),
+        200
+    );
+    assert_eq!(
+        controller
+            .resolve_core_symbol_candidates("boundedCandidate", 50)
+            .unwrap()
+            .len(),
+        50
+    );
+    assert!(
+        failures.is_empty(),
+        "UNKNOWN nodes must not spend the eligible matcher window: {failures:#?}"
+    );
+
+    // Leave Tantivy empty so expanded search cannot recover a declaration
+    // through its separate full-text fallback and mask a broken symbol lane.
+    let storage = controller
+        .open_storage_read_only()
+        .expect("read fixture core");
+    let mut symbolic_engine = SearchEngine::new(None).expect("symbol-only engine");
+    crate::load_canonical_search_symbols(&storage, 128, None, |batch| {
+        symbolic_engine.extend_symbol_projection_with_eligibility(batch.into_iter().map(|entry| {
+            (
+                entry.node_id,
+                entry.display_name,
+                crate::search::engine::symbol_kind_is_searchable(entry.node_kind),
+            )
+        }));
+        Ok(())
+    })
+    .expect("load complete typed symbol projection");
+    assert!(
+        symbolic_engine
+            .search_full_text("invokeTarget")
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        symbolic_engine
+            .search_symbol_with_scores("resolve invokeTarget")
+            .is_empty(),
+        "compound query must require extracted-term lookup"
+    );
+    {
+        let mut state = controller.state.lock();
+        state.node_names = resident.node_names;
+        super::publish_search_engine(&mut state, symbolic_engine, None);
+    }
+    for (query, expected) in [
+        ("invokeTarget", vec![5_000, 5_001]),
+        ("invoke", vec![5_000, 5_001]),
+        ("resolve invokeTarget", vec![5_000, 5_001]),
+        ("phantomTarget", Vec::new()),
+        ("__absent_symbol__", Vec::new()),
+    ] {
+        let mut ids = controller
+            .expanded_symbol_hits(&storage, query)
+            .expect("expanded symbolic lookup")
+            .into_iter()
+            .map(|hit| hit.node_id.0.parse::<i64>().unwrap())
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, expected, "expanded query {query}");
+    }
+}
+
+#[test]
+fn unknown_symbol_eligibility_survives_generation_reuse_and_reopen() {
+    let _env = hybrid_test_env();
+    let temp = tempdir().expect("search lifecycle fixture");
+    let storage_path = temp.path().join("codestory.db");
+    let mut storage = Storage::open(&storage_path).expect("fixture core");
+    storage
+        .insert_nodes_batch(&[
+            Node {
+                id: CoreNodeId(1),
+                kind: NodeKind::UNKNOWN,
+                serialized_name: "sharedName".into(),
+                ..Default::default()
+            },
+            Node {
+                id: CoreNodeId(2),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "sharedName".into(),
+                ..Default::default()
+            },
+        ])
+        .expect("known declaration and raw reference");
+
+    // Exercise the legacy reader first, then the complete-generation builder,
+    // its reuse path, and the independent completed-generation reader.
+    let legacy = load_persisted_search_state(&mut storage, temp.path(), &storage_path)
+        .expect("legacy reader");
+    assert_eq!(
+        legacy.engine.search_symbol("sharedName"),
+        vec![CoreNodeId(2)]
+    );
+    assert_eq!(legacy.engine.tantivy_doc_count(), 2);
+    drop(legacy);
+    // The reader replaces its input handle with a read-only store. Reopen the
+    // writable fixture owner before setting up the publication lifecycle.
+    drop(storage);
+    let mut storage = Storage::open(&storage_path).expect("reopen writable fixture core");
+    storage
+        .put_index_publication(&test_index_publication(
+            1,
+            "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+        ))
+        .expect("complete core identity");
+    for (lane, expected_writes) in [("build", 2), ("reuse", 0)] {
+        let result = rebuild_search_state_from_storage(&mut storage, &storage_path, None, false)
+            .expect("build or reuse generation");
+        assert_eq!(
+            result.engine.search_symbol("sharedName"),
+            vec![CoreNodeId(2)],
+            "{lane}"
+        );
+        assert_eq!(result.node_names.len(), 2, "{lane} raw names");
+        assert_eq!(result.engine.tantivy_doc_count(), 2, "{lane} raw docs");
+        assert_eq!(result.search_stats.search_symbol_stream_rows, 2, "{lane}");
+        assert_eq!(
+            result.search_stats.search_symbol_index_docs_written, expected_writes,
+            "{lane}"
+        );
+    }
+    let reopened = load_persisted_search_state(&mut storage, temp.path(), &storage_path)
+        .expect("completed reader");
+    assert_eq!(
+        reopened.engine.search_symbol("sharedName"),
+        vec![CoreNodeId(2)]
+    );
+    assert_eq!(reopened.node_names.len(), 2);
+    assert_eq!(reopened.engine.tantivy_doc_count(), 2);
+    assert_eq!(storage.get_search_symbol_projection_count().unwrap(), 0);
+    assert_eq!(
+        storage.get_node(CoreNodeId(1)).unwrap().unwrap().kind,
+        NodeKind::UNKNOWN
+    );
+}
+
+#[test]
 fn build_search_hit_classifies_component_reports_without_forging_source() {
     use codestory_contracts::api::{PacketEvidenceResolutionDto, PacketEvidenceTierDto};
     let mut storage = Storage::new_in_memory().expect("storage");
@@ -917,6 +1200,24 @@ fn search_requires_full_sidecars_for_exact_type_queries() {
     assert!(!exact.indexed_symbol_hits.is_empty());
     assert!(exact.repo_text_hits.is_empty());
 
+    for query in [
+        "src/lib.rs".to_string(),
+        temp.path()
+            .join("src/lib.rs")
+            .to_string_lossy()
+            .into_owned(),
+    ] {
+        let candidates = controller
+            .resolve_indexed_symbol_candidates(&query, 10)
+            .expect("relative and absolute indexed FILE names remain resolvable");
+        assert!(
+            candidates
+                .iter()
+                .any(|hit| hit.node_id == NodeId("10".into())),
+            "{query}: {candidates:?}"
+        );
+    }
+
     let error = controller
         .search(SearchRequest {
             query: "AppController".to_string(),
@@ -1036,6 +1337,19 @@ fn dotted_owner_method_query_resolves_with_file_constraint() {
         "other owners must be excluded"
     );
 
+    let absolute_filter = parser_file.to_string_lossy();
+    let absolute = controller
+        .resolve_target(
+            TargetSelection::Query {
+                query: "OAuth2CodeParser.parseCode".into(),
+                choose: None,
+            },
+            Some(absolute_filter.as_ref()),
+        )
+        .expect("absolute file filter must preserve the indexed target");
+    assert!(matches!(absolute, TargetResolution::Resolved(target)
+        if target.selected.node_id == NodeId("11".into())));
+
     let fully_qualified = controller
         .resolve_target(
             TargetSelection::Query {
@@ -1154,13 +1468,17 @@ fn core_exact_search_is_invariant_to_absolute_project_root() {
             .expect("create source directory");
         fs::write(
             &source_path,
-            "export function renderFailurePanel() {}\nexport function resume() {}\n",
+            "export function renderFailurePanel() {}\nexport function resume() {}\nfunction collectMetrics() {}\napp.get('/health', collectMetrics);\n",
         )
         .expect("write source fixture");
-        let external_source = root
-            .parent()
-            .expect("workspace root")
-            .join("external-render-failure-panel.ts");
+        let external_root = root.with_file_name(format!(
+            "{}-external",
+            root.file_name()
+                .expect("project directory name")
+                .to_string_lossy()
+        ));
+        fs::create_dir_all(&external_root).expect("create outside prefix-neighbour directory");
+        let external_source = external_root.join("external-render-failure-panel.ts");
         fs::write(&external_source, "export const external = true\n")
             .expect("write external source fixture");
 
@@ -1190,7 +1508,7 @@ fn core_exact_search_is_invariant_to_absolute_project_root() {
                     id: CoreNodeId(10),
                     kind: NodeKind::FILE,
                     serialized_name: absolute_source.clone(),
-                    qualified_name: Some(absolute_source),
+                    qualified_name: Some(absolute_source.clone()),
                     file_node_id: Some(CoreNodeId(10)),
                     start_line: Some(1),
                     ..Default::default()
@@ -1217,9 +1535,50 @@ fn core_exact_search_is_invariant_to_absolute_project_root() {
                     id: CoreNodeId(13),
                     kind: NodeKind::FILE,
                     serialized_name: external_source.clone(),
-                    qualified_name: Some(external_source),
+                    qualified_name: Some(external_source.clone()),
                     file_node_id: Some(CoreNodeId(13)),
                     start_line: Some(1),
+                    ..Default::default()
+                },
+                // Match the indexer's file-MEMBER qualification shape: the
+                // absolute FILE name prefixes both ordinary and route labels.
+                Node {
+                    id: CoreNodeId(15),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "collectMetrics".to_string(),
+                    qualified_name: Some(format!("{absolute_source}.collectMetrics")),
+                    file_node_id: Some(CoreNodeId(10)),
+                    start_line: Some(3),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(16),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "GET /health (express route; confidence=heuristic)"
+                        .to_string(),
+                    qualified_name: Some(format!(
+                        "{absolute_source}.GET /health (express route; confidence=heuristic)"
+                    )),
+                    file_node_id: Some(CoreNodeId(10)),
+                    start_line: Some(4),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(17),
+                    kind: NodeKind::VARIABLE,
+                    serialized_name: "external".to_string(),
+                    qualified_name: Some(format!("{external_source}.external")),
+                    file_node_id: Some(CoreNodeId(13)),
+                    start_line: Some(1),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(19),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "collectMetrics".to_string(),
+                    qualified_name: Some("src/module-entry.ts.collectMetrics".to_string()),
+                    file_node_id: Some(CoreNodeId(10)),
+                    start_line: Some(3),
                     ..Default::default()
                 },
             ];
@@ -1229,9 +1588,18 @@ fn core_exact_search_is_invariant_to_absolute_project_root() {
                     id: CoreNodeId(14),
                     kind: NodeKind::FILE,
                     serialized_name: alias_source.clone(),
-                    qualified_name: Some(alias_source),
+                    qualified_name: Some(alias_source.clone()),
                     file_node_id: Some(CoreNodeId(14)),
                     start_line: Some(1),
+                    ..Default::default()
+                });
+                nodes.push(Node {
+                    id: CoreNodeId(18),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "collectMetrics".to_string(),
+                    qualified_name: Some(format!("{alias_source}.collectMetrics")),
+                    file_node_id: Some(CoreNodeId(14)),
+                    start_line: Some(3),
                     ..Default::default()
                 });
             }
@@ -1248,7 +1616,7 @@ fn core_exact_search_is_invariant_to_absolute_project_root() {
                     modification_time: 0,
                     indexed: true,
                     complete: true,
-                    line_count: 2,
+                    line_count: 4,
                     file_role: codestory_store::FileRole::Source,
                 })
                 .collect();
@@ -1322,8 +1690,8 @@ fn core_exact_search_is_invariant_to_absolute_project_root() {
         assert!(
             external_hits
                 .iter()
-                .all(|hit| hit.node_id != NodeId("13".to_string())),
-            "external absolute FILE identities must not participate in project search: {external_hits:#?}"
+                .all(|hit| !["13", "17"].contains(&hit.node_id.0.as_str())),
+            "outside identities must not match through a lexical project-root prefix: {external_hits:#?}"
         );
 
         let qualified_hits = search(&fixture.controller, "service::Session::resume");
@@ -1337,6 +1705,62 @@ fn core_exact_search_is_invariant_to_absolute_project_root() {
             Some("service::Session::resume"),
             "non-FILE qualified labels must remain untouched"
         );
+
+        for (query, id, label) in [
+            ("collectMetrics", "15", "collectMetrics"),
+            (
+                "health",
+                "16",
+                "GET /health (express route; confidence=heuristic)",
+            ),
+        ] {
+            let hits = search(&fixture.controller, query);
+            let hit = hits
+                .iter()
+                .find(|hit| hit.node_id == NodeId(id.to_string()))
+                .expect("a file-owned declaration must remain searchable by its own label");
+            assert_eq!(
+                hit.display_name,
+                format!("{}.{label}", fixture.source_path.to_string_lossy()),
+                "search admission must preserve the returned canonical display name"
+            );
+            let canonical_hits = search(&fixture.controller, &hit.display_name);
+            assert!(
+                canonical_hits.iter().any(|canonical| {
+                    canonical.node_id == hit.node_id && canonical.display_name == hit.display_name
+                }),
+                "returned absolute canonical labels must remain valid resolver queries: {canonical_hits:#?}"
+            );
+            let stored = Storage::open_read_only(&fixture.storage_path)
+                .expect("open stored core")
+                .get_node(CoreNodeId(id.parse().expect("fixture node ID")))
+                .expect("read stored file-owned node")
+                .expect("stored file-owned node");
+            assert_eq!(stored.serialized_name, label);
+            assert_eq!(
+                stored.qualified_name.as_deref(),
+                Some(hit.display_name.as_str())
+            );
+        }
+        let callable_hits = search(&fixture.controller, "collectMetrics");
+        for id in ["18", "19"] {
+            if id == "18" && !cfg!(unix) {
+                continue;
+            }
+            let hit = callable_hits
+                .iter()
+                .find(|hit| hit.node_id == NodeId(id.to_string()))
+                .expect("native aliases and relative qualified names must remain searchable");
+            let stored = Storage::open_read_only(&fixture.storage_path)
+                .expect("open stored core")
+                .get_node(CoreNodeId(id.parse().expect("fixture node ID")))
+                .expect("read stored callable")
+                .expect("stored callable");
+            assert_eq!(
+                stored.qualified_name.as_deref(),
+                Some(hit.display_name.as_str())
+            );
+        }
 
         let stored = Storage::open_read_only(&fixture.storage_path)
             .expect("open stored core")
@@ -1388,8 +1812,15 @@ fn core_exact_search_is_invariant_to_absolute_project_root() {
             .iter()
             .map(|hit| hit.node_id.clone())
             .collect::<Vec<_>>(),
-        "absolute checkout spelling must not add fuzzy FILE results to an exact-symbol query"
+        "absolute checkout spelling must not change admitted identities or their ranking for an exact-symbol query"
     );
+    for hits in [&matching_hits, &neutral_hits] {
+        assert!(
+            hits.iter()
+                .all(|hit| !["15", "16", "18", "19"].contains(&hit.node_id.0.as_str())),
+            "a checkout-prefix match must not admit unrelated file-owned callable or route labels: {hits:#?}"
+        );
+    }
 }
 
 #[test]

@@ -10,9 +10,13 @@ CLI flags. Every call requires `project` (absolute repository root).
 ## Target Resolution
 
 When using MCP `query`, the tool:
-1. Runs a hybrid search across the index
+1. Matches indexed symbol names from a fresh complete Core publication
 2. Ranks results by exact/terminal/structural match quality
 3. Selects the top-ranked hit, or errors if the top two are equally ranked (ambiguous)
+
+Name-selected symbol and graph navigation requires fresh complete Core, without
+preparing or attaching a search generation or claiming a retrieval publication.
+Ordinary search, packets and context retain their full-retrieval requirements.
 
 Use `id` when you already have a stable node id. Use `choose` to pick a
 1-based alternative from an ambiguity error. There is no MCP `file` field.

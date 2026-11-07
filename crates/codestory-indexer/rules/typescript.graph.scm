@@ -237,6 +237,22 @@
   attr (@name.node) end_col = (end-column @def)
 }
 
+;; Static object-property callables own their bodies without introducing a
+;; lexical function binding. Keep the value span for exact CALL attribution.
+(pair
+  key: (property_identifier) @name
+  value: [(function_expression) (arrow_function) (generator_function)] @def)
+{
+  node @def.node
+  attr (@def.node) kind = "METHOD"
+  attr (@def.node) name = (source-text @name)
+  attr (@def.node) script_property_callable = "pair"
+  attr (@def.node) start_row = (start-row @def)
+  attr (@def.node) start_col = (start-column @def)
+  attr (@def.node) end_row = (end-row @def)
+  attr (@def.node) end_col = (end-column @def)
+}
+
 ;; Receiver method assignment
 (assignment_expression
   left: (member_expression

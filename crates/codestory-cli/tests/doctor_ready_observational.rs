@@ -7,6 +7,60 @@ use std::path::{Path, PathBuf};
 use tempfile::tempdir;
 
 #[test]
+fn session_context_observes_only_existing_complete_core_and_selected_source() {
+    let fixture = tempdir().unwrap();
+    let project = fixture.path().join("project");
+    let process_cache = fixture.path().join("passive-cache");
+    fs::create_dir(&project).unwrap();
+    fs::write(project.join("lib.rs"), "pub fn local_entry() {}\n").unwrap();
+    let run = |args: &[&str]| {
+        test_support::cli_command()
+            .args(args)
+            .arg("--project")
+            .arg(&project)
+            .env("CODESTORY_STDIO_CACHE_ROOT", &process_cache)
+            .env("CODESTORY_CACHE_ROOT", &process_cache)
+            .output()
+            .unwrap()
+    };
+    let cold = run(&["internal-session-context"]);
+    assert!(cold.status.success());
+    let cold: Value = serde_json::from_slice(&cold.stdout).unwrap();
+    assert_eq!(cold["status"], "unavailable");
+    assert!(
+        !process_cache.exists(),
+        "passive cold observation created a cache"
+    );
+    let index = run(&["index", "--refresh", "full", "--format", "json"]);
+    assert!(
+        index.status.success(),
+        "{}",
+        String::from_utf8_lossy(&index.stderr)
+    );
+    let before = snapshot_tree(&process_cache);
+    let warm = run(&["internal-session-context"]);
+    assert!(warm.status.success());
+    let warm: Value = serde_json::from_slice(&warm.stdout).unwrap();
+    assert_eq!(warm["status"], "ready", "{warm}");
+    let context = warm["context"].as_str().unwrap();
+    assert!(context.contains("local_entry"));
+    assert!(context.contains("as of publication"));
+    assert!(context.len() <= 3584);
+    assert_eq!(snapshot_tree(&process_cache), before);
+    fs::write(project.join("lib.rs"), "pub fn other_entry() {}\n").unwrap();
+    let stale: Value = serde_json::from_slice(&run(&["internal-session-context"]).stdout).unwrap();
+    assert_eq!(stale["status"], "unavailable");
+    assert_eq!(snapshot_tree(&process_cache), before);
+    // Closed future schemas must not be migrated or rewritten by the hook.
+    let cache = process_cache.join(codestory_workspace::workspace_id_v3_for_root(&project));
+    test_support::set_active_core_schema_version(&cache, 999);
+    let future_before = snapshot_tree(&process_cache);
+    let future: Value = serde_json::from_slice(&run(&["internal-session-context"]).stdout).unwrap();
+    assert_eq!(future["status"], "unavailable");
+    assert_eq!(snapshot_tree(&process_cache), future_before);
+}
+
+#[test]
 fn doctor_does_not_create_an_absent_cache() {
     assert_absent_cache_is_observational("doctor");
 }

@@ -12,6 +12,7 @@ use super::{
     runtime_relative_path,
 };
 use crate::workspace_state::runtime_workspace_manifest;
+mod scopes;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
@@ -186,11 +187,13 @@ fn normalized_affected_input(
                     kind: AffectedChangeKindDto::Unknown,
                     status: "path".to_string(),
                     previous_path: None,
+                    scope: None,
                 })
                 .collect();
             Ok((changed_paths, change_records))
         }
         AffectedAnalysisInput::ChangeRecords(records) => {
+            codestory_contracts::api::validate_affected_scopes(records)?;
             let mut normalized_records = Vec::with_capacity(records.len());
             for record in records {
                 let path = record.path.trim();
@@ -225,6 +228,7 @@ fn normalized_affected_input(
                     kind: record.kind.clone(),
                     status: record.status.clone(),
                     previous_path,
+                    scope: record.scope.clone(),
                 });
             }
             Ok((
@@ -2029,6 +2033,7 @@ struct AffectedStoredState {
 }
 
 struct AffectedCompletionInput<'a> {
+    scoped_mode: bool,
     root: &'a Path,
     resolved_inputs: &'a [AffectedResolvedInput],
     matched_record_flags: &'a [bool],
@@ -2118,10 +2123,11 @@ fn complete_affected_analysis(input: AffectedCompletionInput<'_>) -> AffectedCom
             blind_spots.push(note);
         }
     } else {
-        notes.push(format!(
-            "matched {} indexed files by current path; dependency walk expanded files into contained symbols",
-            input.matched_file_count
-        ));
+        notes.push(if input.scoped_mode {
+            format!("matched {} indexed files; explicit changed ranges admit only verified owners, while unscoped records retain file expansion", input.matched_file_count)
+        } else {
+            format!("matched {} indexed files by current path; dependency walk expanded files into contained symbols", input.matched_file_count)
+        });
     }
     let graph_seeded_input_count = input
         .graph_seeded_record_flags
@@ -2132,9 +2138,11 @@ fn complete_affected_analysis(input: AffectedCompletionInput<'_>) -> AffectedCom
         .change_record_count
         .saturating_sub(graph_seeded_input_count);
     if graph_unseeded_input_count > 0 {
-        blind_spots.push(format!(
-            "{graph_unseeded_input_count} inputs had no indexed current or previous identity and were excluded from graph traversal"
-        ));
+        blind_spots.push(if input.scoped_mode {
+            format!("{graph_unseeded_input_count} inputs supplied no admitted changed owner or broad file seed; inspect scope resolutions and uncovered inputs")
+        } else {
+            format!("{graph_unseeded_input_count} inputs had no indexed current or previous identity and were excluded from graph traversal")
+        });
     }
     let previous_only_seed_count = input
         .graph_seeded_record_flags
@@ -2427,6 +2435,21 @@ impl AppController {
             freshness: freshness_observation,
             identity_matches,
         } = self.load_affected_state(&root, &change_records)?;
+        let graph = affected_graph_index(self, &root, &files, &nodes);
+        let scoped_mode = change_records.iter().any(|record| record.scope.is_some());
+        let scoped_admission = if scoped_mode {
+            Some(scopes::admit(
+                self,
+                &root,
+                &change_records,
+                &files,
+                &graph,
+                &storage,
+                &identity_matches,
+            )?)
+        } else {
+            None
+        };
         let AffectedClassifiedInputs {
             matched_files,
             unmatched_paths,
@@ -2450,13 +2473,26 @@ impl AppController {
             &freshness_observation,
             identity_matches,
         );
-        let graph = affected_graph_index(self, &root, &files, &nodes);
-
-        let seed_evidence = affected_graph_seeds(
-            &graph_seed_file_ids,
-            &previous_identity_seed_evidence,
-            &graph.node_ids_by_file,
-        );
+        let (seed_evidence, scope_resolutions, graph_seeded_record_flags, seeded_file_count) =
+            if let Some(admission) = scoped_admission {
+                (
+                    admission.seeds,
+                    admission.resolutions,
+                    admission.seeded_records,
+                    admission.seeded_files.len(),
+                )
+            } else {
+                (
+                    affected_graph_seeds(
+                        &graph_seed_file_ids,
+                        &previous_identity_seed_evidence,
+                        &graph.node_ids_by_file,
+                    ),
+                    Vec::new(),
+                    graph_seeded_record_flags,
+                    graph_seed_file_ids.len(),
+                )
+            };
         let AffectedReverseWalk {
             distances,
             evidence,
@@ -2489,11 +2525,12 @@ impl AppController {
         let AffectedCompletion {
             project,
             bounds,
-            completeness,
-            blind_spots,
+            mut completeness,
+            mut blind_spots,
             follow_ups,
             notes,
         } = complete_affected_analysis(AffectedCompletionInput {
+            scoped_mode,
             root: &root,
             resolved_inputs: &resolved_inputs,
             matched_record_flags: &current_matched_record_flags,
@@ -2506,7 +2543,7 @@ impl AppController {
             freshness_affects_claim: freshness_evidence_affects_requested_claim,
             uncovered_inputs: &uncovered_inputs,
             matched_file_count: current_matched_file_ids.len(),
-            graph_seed_file_count: graph_seed_file_ids.len(),
+            graph_seed_file_count: seeded_file_count,
             change_record_count: change_records.len(),
             matched_files: &matched_files,
             impacted_routes: &impacted_routes,
@@ -2521,6 +2558,25 @@ impl AppController {
             visited_node_count: distances.len(),
             visited_edge_count,
         });
+        let unresolved_scopes = scope_resolutions
+            .iter()
+            .filter(|resolution| {
+                resolution.status != codestory_contracts::api::AffectedScopeStatusDto::Resolved
+            })
+            .count();
+        if unresolved_scopes > 0 {
+            completeness.complete = false;
+            completeness.confidence = "bounded".to_string();
+            blind_spots.push(format!("{unresolved_scopes} changed ranges have partial or unresolved ownership; scope resolutions do not establish exhaustive impact"));
+        }
+        if scope_resolutions.iter().any(|resolution| {
+            resolution.status == codestory_contracts::api::AffectedScopeStatusDto::BudgetExceeded
+        }) {
+            completeness.truncated = true;
+            completeness.truncation_reasons.push(
+                "changed scope admission reached its source, owner or work bound".to_string(),
+            );
+        }
         Ok(AffectedAnalysisDto {
             project_root: project,
             changed_paths,
@@ -2538,6 +2594,7 @@ impl AppController {
             blind_spots,
             follow_ups,
             notes,
+            scope_resolutions,
         })
     }
 }

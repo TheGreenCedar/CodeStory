@@ -1628,6 +1628,201 @@ fn rust_same_file_ancestor_hashes_keep_distinct_roots_and_path_guards() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
+fn receipt_validation_seals_each_fact_once_for_live_and_source_rebind() {
+    use codestory_store::{bash_store_resolution_work, reset_bash_store_resolution_work};
+    let temp = tempfile::tempdir().unwrap();
+    let mut store = Store::new_in_memory().unwrap();
+    seed_exact_graph(&mut store);
+    let absent_source = temp.path().join("source.sh");
+    store
+        .get_connection()
+        .execute(
+            "UPDATE file SET path = ?1, language = 'bash' WHERE id = 1",
+            [absent_source.to_str().unwrap()],
+        )
+        .unwrap();
+    store
+        .get_connection()
+        .execute(
+            "UPDATE node SET serialized_name = ?1 WHERE id = 1",
+            [absent_source.to_str().unwrap()],
+        )
+        .unwrap();
+    let mut fact = exact_fact(EdgeId(7));
+    fact.provenance.language_adapter = "bash".into();
+    fact.provenance.language_adapter_version = "reference-v3".into();
+    let fact = seal_call_resolution_fact(fact).unwrap();
+    let mut input = projection(vec![fact.clone()]);
+    input.adapter_roster[0].language = "bash".into();
+    input.adapter_roster[0].adapter_version = "reference-v3".into();
+    input.funnel[0].language = "bash".into();
+    let previous = publication();
+    // Publication's graph validator is the independent single-seal-pass reference.
+    reset_bash_store_resolution_work();
+    let expected = store
+        .replace_proof_resolution_projection(&previous, &input)
+        .unwrap();
+    let one_pass = bash_store_resolution_work().sealing;
+    assert!(
+        one_pass > 0,
+        "reference must execute actual nested seal work"
+    );
+    reset_bash_store_resolution_work();
+    assert_eq!(
+        store
+            .validate_proof_resolution_publication(&previous)
+            .unwrap(),
+        expected
+    );
+    let live_work = bash_store_resolution_work();
+    // Decode counts one fact, one evidence and one dependency; receipt adds one.
+    assert_eq!(live_work.replay, 4);
+    assert!(
+        !absent_source.exists(),
+        "stored rebind must not require source bytes"
+    );
+    let next = IndexPublicationRecord {
+        generation: 2,
+        generation_id: "generation-2".into(),
+        run_id: "run-2".into(),
+        mode: IndexPublicationMode::Incremental,
+        published_at_epoch_ms: 456,
+    };
+    reset_bash_store_resolution_work();
+    let rebound = store
+        .rebind_proof_resolution_source_identities(&previous, &next, &[])
+        .unwrap()
+        .expect("complete source-absent stored rebind");
+    let rebind_work = bash_store_resolution_work();
+    let mut expected_rebound = expected;
+    expected_rebound.core_generation_id = next.generation_id.clone();
+    expected_rebound.core_run_id = next.run_id.clone();
+    expected_rebound.published_at_epoch_ms = next.published_at_epoch_ms;
+    assert_eq!(rebound, expected_rebound);
+    assert_eq!(store.get_proof_resolution_facts().unwrap(), vec![fact]);
+    assert_eq!(rebind_work.replay, 4);
+    eprintln!(
+        "PROOF_SEAL_WORK reference={one_pass} live={} rebind={}",
+        live_work.sealing, rebind_work.sealing
+    );
+    assert_eq!(
+        [live_work.sealing, rebind_work.sealing],
+        [one_pass, one_pass],
+        "each receipt caller must seal the same immutable facts only once"
+    );
+}
+
+#[test]
+fn both_receipt_callers_reject_corrupt_and_malformed_exact_seals() {
+    for rebind in [false, true] {
+        for mutation in ["evidence_digest", "missing_exact_target"] {
+            let mut store = Store::new_in_memory().unwrap();
+            seed_exact_graph(&mut store);
+            let previous = publication();
+            let receipt = store
+                .replace_proof_resolution_projection(
+                    &previous,
+                    &projection(vec![exact_fact(EdgeId(7))]),
+                )
+                .unwrap();
+            let sql = match mutation {
+                "evidence_digest" => "UPDATE proof_resolution_fact SET evidence_digest = ?1",
+                _ => "UPDATE proof_resolution_fact SET target_node_id = NULL WHERE ?1 IS NOT NULL",
+            };
+            if mutation == "missing_exact_target" {
+                // Corrupt persisted bytes past the schema fence, then restore it before validation.
+                store
+                    .get_connection()
+                    .pragma_update(None, "ignore_check_constraints", true)
+                    .unwrap();
+            }
+            store
+                .get_connection()
+                .execute(sql, ["0".repeat(64)])
+                .unwrap();
+            if mutation == "missing_exact_target" {
+                store
+                    .get_connection()
+                    .pragma_update(None, "ignore_check_constraints", false)
+                    .unwrap();
+                assert!(
+                    store
+                        .get_connection()
+                        .query_row(
+                            "SELECT target_node_id IS NULL FROM proof_resolution_fact",
+                            [],
+                            |row| row.get::<_, bool>(0)
+                        )
+                        .unwrap(),
+                    "malformed Exact must reach the native seal validator"
+                );
+            }
+            let next = IndexPublicationRecord {
+                generation: 2,
+                generation_id: "next".into(),
+                run_id: "next-run".into(),
+                mode: IndexPublicationMode::Incremental,
+                published_at_epoch_ms: 456,
+            };
+            let error = if rebind {
+                store
+                    .rebind_proof_resolution_source_identities(&previous, &next, &[])
+                    .unwrap_err()
+            } else {
+                store
+                    .validate_proof_resolution_publication(&previous)
+                    .unwrap_err()
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains(if mutation == "evidence_digest" {
+                        "evidence digest"
+                    } else {
+                        "Exact requires"
+                    }),
+                "rebind={rebind} mutation={mutation}: {error}"
+            );
+            assert_eq!(
+                store.get_proof_resolution_publication().unwrap(),
+                Some(receipt)
+            );
+        }
+    }
+}
+
+#[test]
+fn live_source_validation_rechecks_source_after_a_successful_receipt() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut store = Store::new_in_memory().unwrap();
+    let fact =
+        seed_authenticated_go_cross_file_graph(&mut store, temp.path(), "proof", "proof", false);
+    let publication = publication();
+    let receipt = store
+        .replace_proof_resolution_projection(&publication, &go_projection(fact))
+        .unwrap();
+    assert_eq!(
+        store
+            .validate_proof_resolution_publication(&publication)
+            .unwrap(),
+        receipt
+    );
+    fs::write(
+        temp.path().join("package/target.go"),
+        "package changed\nfunc callee() {}\n",
+    )
+    .unwrap();
+    store
+        .validate_proof_resolution_publication(&publication)
+        .expect_err("prior receipt must not hide current source drift");
+    assert_eq!(
+        store.get_proof_resolution_publication().unwrap(),
+        Some(receipt)
+    );
+}
+
+#[test]
 fn exact_projection_round_trips_with_matching_raw_call_and_deterministic_digest() {
     let temp = tempfile::tempdir().expect("tempdir");
     let path = temp.path().join("codestory.db");

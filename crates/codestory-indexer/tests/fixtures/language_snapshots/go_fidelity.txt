@@ -12,6 +12,9 @@ node STRUCT name=Event qn=Event canonical=<ROOT>/fidelity.go:Event line=21 col=1
 node STRUCT name=Notifier qn=Notifier canonical=<ROOT>/fidelity.go:Notifier line=5 col=1 end=7:2 file=FILE:<ROOT>/fidelity.go@1
 node STRUCT name=Repository qn=Repository canonical=<ROOT>/fidelity.go:Repository line=15 col=1 end=15:25 file=FILE:<ROOT>/fidelity.go@1
 node STRUCT name=Workflow qn=Workflow canonical=<ROOT>/fidelity.go:Workflow line=25 col=1 end=28:2 file=FILE:<ROOT>/fidelity.go@1
+node UNKNOWN name=Name qn=Name canonical=go-value:["<ROOT>/fidelity.go",12,20,{"owner":"Event","name":"Name","unresolved":false}] line=12 col=20 end=12:24 file=FILE:<ROOT>/fidelity.go@1
+node UNKNOWN name=Name qn=Name canonical=go-value:["<ROOT>/fidelity.go",18,20,{"owner":"Event","name":"Name","unresolved":false}] line=18 col=20 end=18:24 file=FILE:<ROOT>/fidelity.go@1
+node UNKNOWN name=Name qn=Name canonical=go-value:["<ROOT>/fidelity.go",33,17,{"owner":"Event","name":"Name","unresolved":false}] line=33 col=17 end=33:21 file=FILE:<ROOT>/fidelity.go@1
 node UNKNOWN name=Notify qn=Notify canonical=<ROOT>/fidelity.go:Notify#0 line=31 col=13 end=31:19 file=FILE:<ROOT>/fidelity.go@1
 node UNKNOWN name=Println qn=Println canonical=<ROOT>/fidelity.go:Println#0 line=12 col=6 end=12:13 file=FILE:<ROOT>/fidelity.go@1
 node UNKNOWN name=Println qn=Println canonical=<ROOT>/fidelity.go:Println#1 line=18 col=6 end=18:13 file=FILE:<ROOT>/fidelity.go@1
@@ -29,3 +32,6 @@ edge MEMBER src=STRUCT:ConsoleNotifier@9 dst=METHOD:ConsoleNotifier.Notify@11 re
 edge MEMBER src=STRUCT:Notifier@5 dst=METHOD:Notifier.Notify@6 resolved_src=- resolved_dst=- line=6 confidence=- certainty=Certain callsite=- candidates=[]
 edge MEMBER src=STRUCT:Repository@15 dst=METHOD:Repository.Save@17 resolved_src=- resolved_dst=- line=17 confidence=- certainty=Certain callsite=- candidates=[]
 edge MEMBER src=STRUCT:Workflow@25 dst=METHOD:Workflow.Run@30 resolved_src=- resolved_dst=- line=30 confidence=- certainty=Certain callsite=- candidates=[]
+edge USAGE src=METHOD:ConsoleNotifier.Notify@11 dst=UNKNOWN:Name@12 resolved_src=- resolved_dst=- line=12 confidence=- certainty=- callsite=- candidates=[]
+edge USAGE src=METHOD:Repository.Save@17 dst=UNKNOWN:Name@18 resolved_src=- resolved_dst=- line=18 confidence=- certainty=- callsite=- candidates=[]
+edge USAGE src=METHOD:Workflow.Run@30 dst=UNKNOWN:Name@33 resolved_src=- resolved_dst=- line=33 confidence=- certainty=- callsite=- candidates=[]

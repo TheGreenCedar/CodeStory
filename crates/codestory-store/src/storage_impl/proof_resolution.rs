@@ -24,8 +24,17 @@ struct StoredProofProvenanceKey {
     dependency_json: String,
 }
 
+#[cfg(test)]
+thread_local! {
+    // Counts actual key/JSON construction attempts, isolated from parallel tests.
+    static DEPENDENCY_CANONICAL_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PROVENANCE_KEY_CONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl StoredProofProvenanceKey {
     fn for_fact(fact: &CallResolutionFact) -> Result<Self, StorageError> {
+        #[cfg(test)]
+        PROVENANCE_KEY_CONSTRUCTIONS.with(|work| work.set(work.get() + 1));
         let dependency_json = serde_json::to_string(&fact.provenance.dependency_file_hashes)
             .map_err(|error| {
                 proof_error(format!("failed to serialize dependency hashes: {error}"))
@@ -245,6 +254,10 @@ fn parse_canonical_json<T>(value: &str, label: &str) -> Result<T, String>
 where
     T: serde::de::DeserializeOwned + serde::Serialize,
 {
+    #[cfg(test)]
+    if label == "dependency" {
+        DEPENDENCY_CANONICAL_DECODES.with(|work| work.set(work.get() + 1));
+    }
     let parsed: T = serde_json::from_str(value)
         .map_err(|error| format!("stored {label} JSON is invalid: {error}"))?;
     let canonical = serde_json::to_string(&parsed)
@@ -2859,6 +2872,7 @@ impl ProofResolutionValidationContext {
 
 fn parse_stored_proof_resolution_fact(
     row: &rusqlite::Row<'_>,
+    last_dependency: &mut Option<(String, Vec<DependencyFileHash>)>,
 ) -> Result<CallResolutionFact, StorageError> {
     let callee_form_text: String = row.get(10)?;
     let status_text: String = row.get(14)?;
@@ -2873,8 +2887,17 @@ fn parse_stored_proof_resolution_fact(
         .ok_or_else(|| proof_error("stored reason is outside the closed domain"))?;
     let evidence_chain: Vec<ResolutionEvidence> =
         parse_canonical_json(&evidence_json, "evidence").map_err(proof_error)?;
-    let dependency_file_hashes: Vec<DependencyFileHash> =
-        parse_canonical_json(&dependency_json, "dependency").map_err(proof_error)?;
+    let dependency_file_hashes = if let Some((_, dependencies)) = last_dependency
+        .as_ref()
+        .filter(|(raw, _)| raw == &dependency_json)
+    {
+        dependencies.clone()
+    } else {
+        let dependencies: Vec<DependencyFileHash> =
+            parse_canonical_json(&dependency_json, "dependency").map_err(proof_error)?;
+        *last_dependency = Some((dependency_json, dependencies.clone()));
+        dependencies
+    };
     let fact = CallResolutionFact {
         fact_id: row.get(0)?,
         edge_id: row.get::<_, Option<i64>>(1)?.map(EdgeId),
@@ -3075,8 +3098,9 @@ impl Storage {
             None => stmt.query([])?,
         };
         let mut facts = Vec::new();
+        let mut last_dependency = None;
         while let Some(row) = rows.next()? {
-            let fact = parse_stored_proof_resolution_fact(row)?;
+            let fact = parse_stored_proof_resolution_fact(row, &mut last_dependency)?;
             if edge_id.is_some() {
                 validate_fact_seal(&fact)?;
             }
@@ -3101,8 +3125,12 @@ impl Storage {
         )?;
         let mut rows = statement.query([])?;
         let mut facts = Vec::new();
+        let mut last_dependency = None;
         while let Some(row) = rows.next()? {
-            facts.push(parse_stored_proof_resolution_fact(row)?);
+            facts.push(parse_stored_proof_resolution_fact(
+                row,
+                &mut last_dependency,
+            )?);
         }
         Ok(facts)
     }
@@ -3115,6 +3143,7 @@ impl Storage {
             return Ok(Vec::new());
         }
         let mut facts = Vec::with_capacity(fact_ids.len());
+        let mut last_dependency = None;
         for chunk in fact_ids.chunks(400) {
             let placeholders = numbered_placeholders(1, chunk.len());
             let sql = format!(
@@ -3134,7 +3163,7 @@ impl Storage {
             let mut statement = self.conn.prepare(&sql)?;
             let mut rows = statement.query(params_from_iter(chunk.iter()))?;
             while let Some(row) = rows.next()? {
-                let fact = parse_stored_proof_resolution_fact(row)?;
+                let fact = parse_stored_proof_resolution_fact(row, &mut last_dependency)?;
                 validate_fact_seal(&fact)?;
                 facts.push(fact);
             }
@@ -4474,37 +4503,54 @@ impl Storage {
                 "funnel does not deterministically match the fact rows",
             ));
         }
-        let fact_digest =
-            publication_fact_id_integrity_digest_for_facts(&facts, &adapter_roster, &funnel)?;
-        let manifest = ProofResolutionPublication {
-            core_generation_id: publication.generation_id.clone(),
-            core_run_id: publication.run_id.clone(),
-            fact_schema_version: PROOF_RESOLUTION_FACT_SCHEMA_VERSION,
-            adapter_roster,
-            complete: true,
-            fact_count: facts.len() as u64,
-            fact_digest,
-            funnel,
-            published_at_epoch_ms: publication.published_at_epoch_ms,
-        };
-        let produced_validation =
-            proof_resolution_publication_validation(manifest.clone(), &facts)?;
+        let mut produced_validation = proof_resolution_publication_validation(
+            ProofResolutionPublication {
+                core_generation_id: publication.generation_id.clone(),
+                core_run_id: publication.run_id.clone(),
+                fact_schema_version: PROOF_RESOLUTION_FACT_SCHEMA_VERSION,
+                adapter_roster,
+                complete: true,
+                fact_count: facts.len() as u64,
+                fact_digest: String::new(),
+                funnel,
+                published_at_epoch_ms: publication.published_at_epoch_ms,
+            },
+            &facts,
+        )?;
+        // Finalize this local draft from its checked order before SQL, cache, or return.
+        produced_validation.manifest.fact_digest =
+            publication_fact_id_integrity_digest_for_sorted_ids(
+                &produced_validation.sorted_fact_ids,
+                &produced_validation.manifest.adapter_roster,
+                &produced_validation.manifest.funnel,
+            )?;
+        let manifest = produced_validation.manifest.clone();
         let adapter_roster_json = serde_json::to_string(&manifest.adapter_roster)
             .map_err(|error| proof_error(format!("failed to serialize adapter roster: {error}")))?;
         let funnel_json = serde_json::to_string(&manifest.funnel)
             .map_err(|error| proof_error(format!("failed to serialize funnel: {error}")))?;
-        let provenance_ids = facts
-            .iter()
-            .map(StoredProofProvenanceKey::for_fact)
-            .collect::<Result<BTreeSet<_>, _>>()?
+        // Keep one full key per group and compact associations for the fact rows.
+        let mut provenance_groups = BTreeMap::new();
+        let mut fact_provenance_groups = Vec::with_capacity(facts.len());
+        for fact in &facts {
+            let next_group = provenance_groups.len();
+            let group = *provenance_groups
+                .entry(StoredProofProvenanceKey::for_fact(fact)?)
+                .or_insert(next_group);
+            fact_provenance_groups.push(group);
+        }
+        let mut canonical_provenance_ids = vec![0_i64; provenance_groups.len()];
+        let provenance_rows = provenance_groups
             .into_iter()
             .enumerate()
-            .map(|(index, key)| {
-                i64::try_from(index + 1)
-                    .map(|provenance_id| (key, provenance_id))
-                    .map_err(|_| proof_error("proof provenance count exceeds SQLite integer"))
+            .map(|(index, (key, group))| {
+                let provenance_id = i64::try_from(index + 1)
+                    .map_err(|_| proof_error("proof provenance count exceeds SQLite integer"))?;
+                // Encounter order may differ from the canonical full-key order.
+                canonical_provenance_ids[group] = provenance_id;
+                Ok((key, provenance_id))
             })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
+            .collect::<Result<Vec<_>, StorageError>>()?;
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM proof_resolution_publication", [])?;
         tx.execute("DELETE FROM proof_resolution_fact", [])?;
@@ -4516,7 +4562,7 @@ impl Storage {
                     parser_fingerprint, dependency_json
                  ) VALUES (?1, ?2, ?3, ?4, ?5)",
             )?;
-            for (provenance, provenance_id) in &provenance_ids {
+            for (provenance, provenance_id) in &provenance_rows {
                 statement.execute(params![
                     provenance_id,
                     provenance.file_id,
@@ -4541,7 +4587,7 @@ impl Storage {
                     ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24
                  )",
             )?;
-            for fact in &facts {
+            for (fact, provenance_group) in facts.iter().zip(fact_provenance_groups) {
                 if fact.provenance.language_adapter == "bash" {
                     count_bash_store_resolution_work(
                         BashStoreResolutionPhase::Publication,
@@ -4555,9 +4601,8 @@ impl Storage {
                     serde_json::to_string(&fact.evidence_chain).map_err(|error| {
                         proof_error(format!("failed to serialize typed evidence: {error}"))
                     })?;
-                let provenance_key = StoredProofProvenanceKey::for_fact(fact)?;
-                let provenance_id = provenance_ids
-                    .get(&provenance_key)
+                let provenance_id = canonical_provenance_ids
+                    .get(provenance_group)
                     .ok_or_else(|| proof_error("proof fact lost its prepared provenance group"))?;
                 statement.execute(params![
                     fact.fact_id,
@@ -5100,11 +5145,11 @@ impl Storage {
                 "fact rows do not match their publication digest",
             ));
         }
+        // Both callers immediately authenticate each fact seal in graph validation.
         for fact in &facts {
             if fact.provenance.language_adapter == "bash" {
                 count_bash_store_resolution_work(BashStoreResolutionPhase::Replay, 1);
             }
-            validate_fact_seal(fact)?;
         }
         Ok((manifest, facts))
     }
@@ -5507,6 +5552,8 @@ fn publication_fact_id_integrity_digest_for_facts(
         .iter()
         .map(|fact| fact.fact_id.as_str())
         .collect::<Vec<_>>();
+    #[cfg(test)]
+    record_publication_sort(false, fact_ids.len());
     fact_ids.sort_unstable();
     let mut hasher = publication_fact_id_integrity_hasher(adapter_roster, funnel)?;
     hasher.update((fact_ids.len() as u64).to_be_bytes());
@@ -5535,20 +5582,26 @@ fn proof_resolution_publication_validation(
     manifest: ProofResolutionPublication,
     facts: &[CallResolutionFact],
 ) -> Result<ProofResolutionPublicationValidation, StorageError> {
-    let mut sorted_fact_ids = facts
-        .iter()
-        .map(|fact| fact.fact_id.clone())
-        .collect::<Vec<_>>();
-    sorted_fact_ids.sort_unstable();
-    if sorted_fact_ids.windows(2).any(|pair| pair[0] == pair[1])
-        || sorted_fact_ids.len() as u64 != manifest.fact_count
+    let mut sorted_facts = facts.iter().collect::<Vec<_>>();
+    #[cfg(test)]
+    record_publication_sort(false, sorted_facts.len());
+    sorted_facts.sort_unstable_by(|left, right| left.fact_id.cmp(&right.fact_id));
+    if sorted_facts
+        .windows(2)
+        .any(|pair| pair[0].fact_id == pair[1].fact_id)
+        || sorted_facts.len() as u64 != manifest.fact_count
     {
         return Err(proof_error(
             "proof validation contains duplicate or missing fact identities",
         ));
     }
+    let sorted_fact_ids = sorted_facts
+        .iter()
+        .map(|fact| fact.fact_id.clone())
+        .collect();
     let mut fact_ids_by_dependency_file = BTreeMap::<FileId, Vec<String>>::new();
-    for fact in facts {
+    // Each file receives a subsequence of globally unique, sorted fact IDs.
+    for fact in sorted_facts {
         let mut file_ids = fact
             .provenance
             .dependency_file_hashes
@@ -5562,10 +5615,6 @@ fn proof_resolution_publication_validation(
                 .or_default()
                 .push(fact.fact_id.clone());
         }
-    }
-    for fact_ids in fact_ids_by_dependency_file.values_mut() {
-        fact_ids.sort_unstable();
-        fact_ids.dedup();
     }
     Ok(ProofResolutionPublicationValidation {
         manifest,
@@ -5696,4 +5745,633 @@ fn recompute_funnel(facts: &[CallResolutionFact]) -> Vec<ProofResolutionFunnelRo
     }
     debug_assert!(linear_rows.is_empty());
     result
+}
+
+#[cfg(test)]
+thread_local! {
+    // Global sort calls/elements, followed by dependency-list sort calls/elements.
+    static PUBLICATION_SORT_WORK: std::cell::Cell<[usize; 4]> = const { std::cell::Cell::new([0; 4]) };
+}
+
+#[cfg(test)]
+fn record_publication_sort(dependency_list: bool, elements: usize) {
+    PUBLICATION_SORT_WORK.with(|work| {
+        let mut counts = work.get();
+        let slot = if dependency_list { 2 } else { 0 };
+        counts[slot] += 1;
+        counts[slot + 1] += elements;
+        work.set(counts);
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codestory_contracts::graph::{Node, NodeId, NodeKind};
+
+    fn fact(
+        id: &str,
+        file: i64,
+        start: u64,
+        dependencies: &[i64],
+        language: &str,
+    ) -> CallResolutionFact {
+        CallResolutionFact {
+            fact_id: id.into(),
+            edge_id: None,
+            raw_edge_target: None,
+            raw_callsite_identity: None,
+            callsite: ExactCallsite {
+                file_id: FileId(file),
+                source_sha256: "a".repeat(64),
+                start_byte: start,
+                end_byte_exclusive: start + 1,
+                line: 1,
+                column: 1,
+                callee_form: CalleeForm::Identifier,
+                raw_target: "unbound".into(),
+            },
+            caller: NodeId(file * 10 + 2),
+            target: None,
+            status: ProofResolutionStatus::MissingBinding,
+            reason: ProofResolutionReason::MissingBinding,
+            evidence_chain: vec![],
+            lookup_domain_complete: true,
+            provenance: ResolutionProvenance {
+                producer: INTERNAL_RESOLUTION_PRODUCER.into(),
+                fact_schema_version: PROOF_RESOLUTION_FACT_SCHEMA_VERSION,
+                algorithm: EXACT_CALL_RESOLUTION_ALGORITHM.into(),
+                language_adapter: language.into(),
+                language_adapter_version: "test-v1".into(),
+                parser_fingerprint: "1".repeat(64),
+                dependency_file_hashes: dependencies
+                    .iter()
+                    .map(|&id| DependencyFileHash {
+                        file_id: FileId(id),
+                        source_sha256: "a".repeat(64),
+                    })
+                    .collect(),
+                evidence_sha256: "e".repeat(64),
+            },
+        }
+    }
+
+    fn manifest(count: u64) -> ProofResolutionPublication {
+        ProofResolutionPublication {
+            core_generation_id: "generation".into(),
+            core_run_id: "run".into(),
+            fact_schema_version: PROOF_RESOLUTION_FACT_SCHEMA_VERSION,
+            adapter_roster: vec![ProofResolutionAdapter {
+                language: "rust".into(),
+                adapter_version: "test-v1".into(),
+            }],
+            complete: true,
+            fact_count: count,
+            fact_digest: "unchanged-digest".into(),
+            funnel: vec![],
+            published_at_epoch_ms: 123,
+        }
+    }
+
+    #[test]
+    fn publication_bookkeeping_preserves_exact_membership_and_rejects_bad_counts()
+    -> Result<(), StorageError> {
+        // Bookkeeping treats IDs as opaque; repeated dependencies here do not claim sealed-fact validity.
+        let a = fact("30", 1, 30, &[1, 2, 2], "rust");
+        let b = fact("10", 2, 10, &[1, 2, 3], "rust");
+        let c = fact("20", 3, 20, &[2, 3], "rust");
+        let expected_map = BTreeMap::from([
+            (FileId(1), vec!["10".into(), "30".into()]),
+            (FileId(2), vec!["10".into(), "20".into(), "30".into()]),
+            (FileId(3), vec!["10".into(), "20".into()]),
+        ]);
+        for facts in [
+            vec![a.clone(), b.clone(), c.clone()],
+            vec![c.clone(), a.clone(), b.clone()],
+        ] {
+            let output = proof_resolution_publication_validation(manifest(3), &facts)?;
+            assert_eq!(output.manifest, manifest(3));
+            assert_eq!(output.sorted_fact_ids, vec!["10", "20", "30"]);
+            assert_eq!(output.fact_ids_by_dependency_file, expected_map);
+        }
+        let empty = proof_resolution_publication_validation(manifest(0), &[])?;
+        assert_eq!(empty.manifest, manifest(0));
+        assert!(empty.sorted_fact_ids.is_empty() && empty.fact_ids_by_dependency_file.is_empty());
+        for (count, facts) in [(3, vec![a.clone(), b.clone()]), (2, vec![a.clone(), a])] {
+            let error =
+                proof_resolution_publication_validation(manifest(count), &facts).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("duplicate or missing fact identities"),
+                "{error}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn publication_writer_reuses_one_fact_id_order_without_changing_rows()
+    -> Result<(), StorageError> {
+        let mut store = Storage::new_in_memory()?;
+        for (id, language, extension) in [(1, "rust", "rs"), (5, "bash", "sh")] {
+            let file = FileInfo {
+                id,
+                path: format!("src/input{id}.{extension}").into(),
+                language: language.into(),
+                modification_time: 0,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: FileRole::Source,
+            };
+            store.insert_file(&file)?;
+            store.update_file_metadata(&file, Some(&"a".repeat(64)))?;
+            for node in [
+                Node {
+                    id: NodeId(id),
+                    kind: NodeKind::FILE,
+                    serialized_name: file.path.to_string_lossy().into_owned(),
+                    ..Default::default()
+                },
+                Node {
+                    id: NodeId(id * 10 + 2),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "caller".into(),
+                    file_node_id: Some(NodeId(id)),
+                    start_line: Some(1),
+                    end_line: Some(1),
+                    ..Default::default()
+                },
+            ] {
+                store.insert_node(&node)?;
+            }
+        }
+        let a = seal_call_resolution_fact(fact("", 1, 30, &[1], "rust"))?;
+        // Earlier insertion belongs to the lexically later provenance group.
+        let mut b = fact("", 1, 20, &[1], "rust");
+        b.provenance.parser_fingerprint = "2".repeat(64);
+        let b = seal_call_resolution_fact(b)?;
+        let c = seal_call_resolution_fact(fact("", 5, 50, &[5], "bash"))?;
+        let d = seal_call_resolution_fact(fact("", 5, 10, &[5], "bash"))?;
+        let row = |language: &str| ProofResolutionFunnelRow {
+            language: language.into(),
+            callee_form: Some(CalleeForm::Identifier),
+            evidence_kind: None,
+            counts: ProofResolutionFunnelCounts {
+                syntax_calls: 2,
+                adapter_supported: 2,
+                missing_binding: 2,
+                ..Default::default()
+            },
+        };
+        let roster = vec![
+            ProofResolutionAdapter {
+                language: "bash".into(),
+                adapter_version: "test-v1".into(),
+            },
+            ProofResolutionAdapter {
+                language: "rust".into(),
+                adapter_version: "test-v1".into(),
+            },
+        ];
+        let funnel = vec![row("rust"), row("bash")];
+        let input = ProofResolutionProjection {
+            adapter_roster: roster.clone(),
+            facts: vec![c.clone(), a.clone(), d.clone(), b.clone()],
+            funnel: vec![row("bash"), row("rust")],
+        };
+        let digest =
+            publication_fact_id_integrity_digest_for_facts(&input.facts, &roster, &funnel)?;
+        let publication = IndexPublicationRecord {
+            generation: 1,
+            generation_id: "generation".into(),
+            run_id: "run".into(),
+            mode: IndexPublicationMode::Full,
+            published_at_epoch_ms: 123,
+        };
+        let expected_manifest = ProofResolutionPublication {
+            core_generation_id: "generation".into(),
+            core_run_id: "run".into(),
+            fact_schema_version: PROOF_RESOLUTION_FACT_SCHEMA_VERSION,
+            adapter_roster: roster,
+            complete: true,
+            fact_count: 4,
+            fact_digest: digest,
+            funnel,
+            published_at_epoch_ms: 123,
+        };
+        PUBLICATION_SORT_WORK.with(|work| work.set([0; 4]));
+        PROVENANCE_KEY_CONSTRUCTIONS.with(|work| work.set(0));
+        let output = store.replace_proof_resolution_projection(&publication, &input)?;
+        let work = PUBLICATION_SORT_WORK.with(std::cell::Cell::get);
+        let provenance_work = PROVENANCE_KEY_CONSTRUCTIONS.with(std::cell::Cell::get);
+        assert_eq!(output, expected_manifest);
+        let expected_rows = vec![b.clone(), a.clone(), c.clone(), d.clone()];
+        assert_eq!(store.get_proof_resolution_facts()?, expected_rows);
+        let row_ids = store
+            .conn
+            .prepare("SELECT fact_id FROM proof_resolution_fact ORDER BY rowid")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            row_ids,
+            vec![
+                b.fact_id.clone(),
+                a.fact_id.clone(),
+                c.fact_id.clone(),
+                d.fact_id.clone()
+            ]
+        );
+        let provenance_rows = store
+            .conn
+            .prepare(
+                "SELECT provenance_id, file_id, source_sha256, parser_fingerprint, dependency_json
+                 FROM proof_resolution_provenance ORDER BY provenance_id",
+            )?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let expected_provenance = |id, file_id, fingerprint: &str| {
+            (
+                id,
+                file_id,
+                "a".repeat(64),
+                fingerprint.repeat(64),
+                format!(
+                    r#"[{{"file_id":{file_id},"source_sha256":"{}"}}]"#,
+                    "a".repeat(64)
+                ),
+            )
+        };
+        assert_eq!(
+            provenance_rows,
+            vec![
+                expected_provenance(1, 1, "1"),
+                expected_provenance(2, 1, "2"),
+                expected_provenance(3, 5, "1"),
+            ]
+        );
+        let fact_provenance_ids = store
+            .conn
+            .prepare("SELECT provenance_id FROM proof_resolution_fact ORDER BY rowid")?
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(fact_provenance_ids, vec![2, 1, 3, 3]);
+        let ordered = |ids: Vec<String>| {
+            ids.into_iter()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        let expected_ids = ordered(vec![
+            a.fact_id.clone(),
+            b.fact_id.clone(),
+            c.fact_id.clone(),
+            d.fact_id.clone(),
+        ]);
+        let expected_by_file = BTreeMap::from([
+            (FileId(1), ordered(vec![a.fact_id, b.fact_id])),
+            (FileId(5), ordered(vec![c.fact_id, d.fact_id])),
+        ]);
+        let produced = store.cache.produced_proof_resolution_validation.read();
+        let produced = produced
+            .as_ref()
+            .expect("successful writer retains exact validation");
+        assert_eq!(produced.manifest, expected_manifest);
+        assert_eq!(produced.sorted_fact_ids, expected_ids);
+        assert_eq!(produced.fact_ids_by_dependency_file, expected_by_file);
+        eprintln!(
+            "PROOF_PUBLICATION_SORT_WORK global_calls={} global_elements={} dependency_calls={} dependency_elements={}",
+            work[0], work[1], work[2], work[3]
+        );
+        assert_eq!(
+            work,
+            [1, 4, 0, 0],
+            "writer must reuse one global ID order and append already ordered dependency lists"
+        );
+        eprintln!("PROOF_PUBLICATION_PROVENANCE_KEY_WORK constructions={provenance_work}");
+        assert_eq!(
+            provenance_work, 4,
+            "each writer fact must construct its exact provenance key once"
+        );
+        Ok(())
+    }
+
+    fn dependency_decoding_fixture(
+        pattern: &[bool],
+        language: &str,
+    ) -> Result<(Storage, Vec<CallResolutionFact>), StorageError> {
+        let store = Storage::new_in_memory()?;
+        store.insert_file(&FileInfo {
+            id: 1,
+            path: "input.go".into(),
+            language: language.into(),
+            modification_time: 0,
+            indexed: true,
+            complete: true,
+            line_count: 1,
+            file_role: FileRole::Source,
+        })?;
+        store.insert_node(&Node {
+            id: NodeId(12),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "caller".into(),
+            ..Default::default()
+        })?;
+        let mut facts = Vec::new();
+        for (index, &second_group) in pattern.iter().enumerate() {
+            let dependencies: &[i64] = if second_group { &[1, 2] } else { &[1] };
+            let fact =
+                seal_call_resolution_fact(fact("", 1, index as u64 + 1, dependencies, language))?;
+            let provenance_id = if second_group { 2 } else { 1 };
+            store.conn.execute(
+                "INSERT OR IGNORE INTO proof_resolution_provenance
+                 (provenance_id,file_id,source_sha256,parser_fingerprint,dependency_json)
+                 VALUES (?1,1,?2,?3,?4)",
+                params![
+                    provenance_id,
+                    fact.callsite.source_sha256,
+                    fact.provenance.parser_fingerprint,
+                    serde_json::to_string(&fact.provenance.dependency_file_hashes).unwrap()
+                ],
+            )?;
+            store.conn.execute(
+                "INSERT INTO proof_resolution_fact
+                 (fact_id,edge_id,raw_edge_target_id,raw_callsite_identity,file_id,provenance_id,
+                  start_byte,end_byte_exclusive,line,column,callee_form,raw_target,caller_node_id,
+                  target_node_id,status,reason,evidence_json,lookup_domain_complete,producer,
+                  fact_schema_version,algorithm,language_adapter,language_adapter_version,evidence_digest)
+                 VALUES (?1,NULL,NULL,NULL,1,?2,?3,?4,1,1,'identifier','unbound',12,NULL,
+                         'missing_binding','missing_binding','[]',1,'codestory-internal',1,
+                         'exact-call-resolution-v1',?5,'test-v1',?6)",
+                params![fact.fact_id, provenance_id, fact.callsite.start_byte as i64,
+                        fact.callsite.end_byte_exclusive as i64, language, fact.provenance.evidence_sha256],
+            )?;
+            facts.push(fact);
+        }
+        Ok((store, facts))
+    }
+
+    fn dependency_decoding_legacy_columns(store: &Storage) -> Result<(), StorageError> {
+        store.conn.execute_batch(
+            "ALTER TABLE proof_resolution_fact ADD COLUMN source_sha256 TEXT;
+             ALTER TABLE proof_resolution_fact ADD COLUMN parser_fingerprint TEXT;
+             ALTER TABLE proof_resolution_fact ADD COLUMN dependency_json TEXT;
+             UPDATE proof_resolution_fact SET
+               source_sha256=(SELECT p.source_sha256 FROM proof_resolution_provenance p WHERE p.provenance_id=proof_resolution_fact.provenance_id),
+               parser_fingerprint=(SELECT p.parser_fingerprint FROM proof_resolution_provenance p WHERE p.provenance_id=proof_resolution_fact.provenance_id),
+               dependency_json=(SELECT p.dependency_json FROM proof_resolution_provenance p WHERE p.provenance_id=proof_resolution_fact.provenance_id);"
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn dependency_decoding_reuses_consecutive_bytes_in_current_and_legacy_readers()
+    -> Result<(), StorageError> {
+        for legacy in [false, true] {
+            let (store, expected) =
+                dependency_decoding_fixture(&[false, false, true, true, false, false], "go")?;
+            if legacy {
+                dependency_decoding_legacy_columns(&store)?;
+            }
+            for _ in 0..2 {
+                DEPENDENCY_CANONICAL_DECODES.set(0);
+                let mut actual = if legacy {
+                    store.read_legacy_v32_proof_resolution_facts()?
+                } else {
+                    store.read_proof_resolution_facts(None)?
+                };
+                assert_eq!(actual, expected);
+                assert_eq!(
+                    DEPENDENCY_CANONICAL_DECODES.get(),
+                    3,
+                    "A,A,B,B,A,A requires three actual canonical dependency decodes, legacy={legacy}"
+                );
+                actual[0].provenance.dependency_file_hashes[0]
+                    .source_sha256
+                    .clear();
+                assert_eq!(
+                    actual[1], expected[1],
+                    "facts must own independent dependency vectors"
+                );
+            }
+        }
+        let (store, mut expected) = dependency_decoding_fixture(&[false, false], "go")?;
+        expected[1].provenance.parser_fingerprint = "2".repeat(64);
+        expected[1] = seal_call_resolution_fact(expected[1].clone())?;
+        store.conn.execute(
+            "INSERT INTO proof_resolution_provenance
+             (provenance_id,file_id,source_sha256,parser_fingerprint,dependency_json)
+             SELECT 2,file_id,source_sha256,?1,dependency_json
+             FROM proof_resolution_provenance WHERE provenance_id=1",
+            [&expected[1].provenance.parser_fingerprint],
+        )?;
+        store.conn.execute(
+            "UPDATE proof_resolution_fact SET provenance_id=2,fact_id=?1,evidence_digest=?2
+             WHERE start_byte=?3",
+            params![
+                expected[1].fact_id,
+                expected[1].provenance.evidence_sha256,
+                expected[1].callsite.start_byte as i64
+            ],
+        )?;
+        DEPENDENCY_CANONICAL_DECODES.set(0);
+        let actual = store.read_proof_resolution_facts(None)?;
+        assert_eq!(actual, expected);
+        for fact in &actual {
+            validate_fact_seal(fact)?;
+        }
+        assert_eq!(
+            DEPENDENCY_CANONICAL_DECODES.get(),
+            1,
+            "identical canonical dependency bytes must reuse decoding across distinct provenance IDs and parser fingerprints"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dependency_decoding_preserves_by_id_chunk_order_and_checks_every_seal()
+    -> Result<(), StorageError> {
+        let (store, mut expected) = dependency_decoding_fixture(&vec![false; 402], "go")?;
+        let ids = expected
+            .iter()
+            .rev()
+            .map(|fact| fact.fact_id.clone())
+            .collect::<Vec<_>>();
+        expected.sort_by(|left, right| left.fact_id.cmp(&right.fact_id));
+        DEPENDENCY_CANONICAL_DECODES.set(0);
+        assert_eq!(store.read_proof_resolution_facts_by_ids(&ids)?, expected);
+        assert_eq!(
+            DEPENDENCY_CANONICAL_DECODES.get(),
+            1,
+            "one invocation retains its last payload across the400-ID chunk boundary"
+        );
+        assert!(store.read_proof_resolution_facts_by_ids(&[])?.is_empty());
+        store.conn.execute(
+            "UPDATE proof_resolution_fact SET evidence_digest=?1 WHERE fact_id=?2",
+            params!["0".repeat(64), expected.last().unwrap().fact_id],
+        )?;
+        let error = store
+            .read_proof_resolution_facts_by_ids(&ids)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("evidence digest or fact id mismatch"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dependency_decoding_refuses_changed_raw_bytes_and_preserves_error_order()
+    -> Result<(), StorageError> {
+        for malformed in [
+            "[".to_owned(),
+            format!(
+                " {}",
+                serde_json::to_string(&vec![DependencyFileHash {
+                    file_id: FileId(1),
+                    source_sha256: "a".repeat(64)
+                }])
+                .unwrap()
+            ),
+        ] {
+            let (store, _) = dependency_decoding_fixture(&[false, false, true], "go")?;
+            store.conn.execute(
+                "UPDATE proof_resolution_provenance SET dependency_json=?1 WHERE provenance_id=2",
+                [&malformed],
+            )?;
+            let error = store
+                .read_proof_resolution_facts(None)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("stored dependency JSON"), "{error}");
+            store.conn.execute(
+                "UPDATE proof_resolution_fact SET evidence_json='[' WHERE provenance_id=2",
+                [],
+            )?;
+            let error = store
+                .read_proof_resolution_facts(None)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("stored evidence JSON"),
+                "evidence must fail before dependency: {error}"
+            );
+        }
+        let (store, expected) = dependency_decoding_fixture(&[false, false], "go")?;
+        assert_eq!(store.read_proof_resolution_facts(None)?, expected);
+        let changed = vec![DependencyFileHash {
+            file_id: FileId(1),
+            source_sha256: "b".repeat(64),
+        }];
+        store.conn.execute(
+            "UPDATE proof_resolution_provenance SET dependency_json=?1 WHERE provenance_id=1",
+            [serde_json::to_string(&changed).unwrap()],
+        )?;
+        DEPENDENCY_CANONICAL_DECODES.set(0);
+        let actual = store.read_proof_resolution_facts(None)?;
+        assert_eq!(actual[0].provenance.dependency_file_hashes, changed);
+        assert_eq!(
+            DEPENDENCY_CANONICAL_DECODES.get(),
+            1,
+            "a separate read must parse changed bytes even under unchanged IDs"
+        );
+        let ids = expected
+            .iter()
+            .map(|fact| fact.fact_id.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            store.read_proof_resolution_facts_by_ids(&ids).is_err(),
+            "decoding does not authorize changed dependencies"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dependency_decoding_does_not_authorize_another_adapters_dependency_order()
+    -> Result<(), StorageError> {
+        let (store, _) = dependency_decoding_fixture(&[true, true], "bash")?;
+        let dependencies = vec![
+            DependencyFileHash {
+                file_id: FileId(2),
+                source_sha256: "a".repeat(64),
+            },
+            DependencyFileHash {
+                file_id: FileId(1),
+                source_sha256: "a".repeat(64),
+            },
+        ];
+        store.conn.execute(
+            "UPDATE proof_resolution_provenance SET dependency_json=?1",
+            [serde_json::to_string(&dependencies).unwrap()],
+        )?;
+        let mut facts = store.read_proof_resolution_facts(None)?;
+        for fact in &mut facts {
+            *fact = seal_call_resolution_fact(fact.clone())?;
+            store.conn.execute("UPDATE proof_resolution_fact SET fact_id=?1,evidence_digest=?2 WHERE start_byte=?3", params![fact.fact_id, fact.provenance.evidence_sha256, fact.callsite.start_byte as i64])?;
+        }
+        let ids = facts
+            .iter()
+            .map(|fact| fact.fact_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(store.read_proof_resolution_facts_by_ids(&ids)?.len(), 2);
+        store.conn.execute(
+            "UPDATE proof_resolution_fact SET language_adapter='go' WHERE fact_id=?1",
+            [ids.iter().max().unwrap()],
+        )?;
+        let error = store
+            .read_proof_resolution_facts_by_ids(&ids)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("noncanonical"),
+            "cached decoding must not bypass adapter shape checks: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "manual read-only typed-fact equivalence and actual decoder-work receipt"]
+    fn dependency_decoding_corpus_receipt() -> Result<(), Box<dyn std::error::Error>> {
+        let database = std::env::var("CODESTORY_PROOF_CORPUS_DB")?;
+        let output_root = std::path::PathBuf::from(std::env::var("CODESTORY_PROOF_CORPUS_OUTPUT")?);
+        let store = Storage::open_immutable_generation(database)?;
+        DEPENDENCY_CANONICAL_DECODES.set(0);
+        let facts = store.read_proof_resolution_facts(None)?;
+        let decodes = DEPENDENCY_CANONICAL_DECODES.get();
+        let mut hasher = Sha256::new();
+        let mut serialized_bytes = 0_u64;
+        for fact in &facts {
+            let bytes = serde_json::to_vec(fact)?;
+            hasher.update((bytes.len() as u64).to_be_bytes());
+            hasher.update(&bytes);
+            serialized_bytes += bytes.len() as u64;
+        }
+        let manifest = store
+            .get_proof_resolution_publication()?
+            .ok_or("proof manifest absent")?;
+        let receipt = serde_json::json!({
+            "fact_count": facts.len(), "ordered_length_delimited_typed_fact_sha256": format!("{:x}", hasher.finalize()),
+            "serialized_fact_bytes": serialized_bytes, "actual_dependency_canonical_decodes": decodes,
+            "publication": format!("{:?}", store.get_complete_index_publication()?),
+            "manifest": format!("{manifest:?}"), "manifest_fact_count": manifest.fact_count,
+            "manifest_fact_digest": manifest.fact_digest,
+        });
+        let output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(output_root.join("dependency-decoding-corpus.json"))?;
+        serde_json::to_writer_pretty(output, &receipt)?;
+        eprintln!("{receipt}");
+        Ok(())
+    }
 }

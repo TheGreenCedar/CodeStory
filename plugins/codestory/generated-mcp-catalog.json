@@ -10,15 +10,15 @@
     ],
     "preferredMcpProtocolVersion": "2025-11-25",
     "discoveryContracts": {
-      "2024-11-05": "f66f5345582da21a98b297b98d9f2e2dab054899746c1aa47a72c786bf1f9e69",
-      "2025-03-26": "dc0d3ed5d1ac887cb36dd65a2fbb5b4e9ae5eb32664522bed42b02830f375299",
-      "2025-06-18": "584297572e40cfb7f98c6e2446b15c2e7af4f01bbcf3a27456ec7e384fa554b8",
-      "2025-11-25": "18ce81099cb0cd0f03dd4050af9a45bbc195fdc4fd7002d7b8721cddb9582cbd"
+      "2024-11-05": "f74c388ce18796cae84ec8434064e4ff6480300622f1bc283ec53c1f96a68617",
+      "2025-03-26": "0626b69b1ecde6f48caa6225dfacfd294f466d97670790e772a5789f360b84b8",
+      "2025-06-18": "0332117af443846f3ffb5f785d2ed31ac21914eab313efba0d1609e0a61b8a62",
+      "2025-11-25": "1cbf4b0da2d2e6ab5c024284a7fdc16984ac41d0678cda8edc36da732c175c99"
     }
   },
   "revisionProfiles": {
     "2024-11-05": {
-      "discoveryContractSha256": "f66f5345582da21a98b297b98d9f2e2dab054899746c1aa47a72c786bf1f9e69",
+      "discoveryContractSha256": "f74c388ce18796cae84ec8434064e4ff6480300622f1bc283ec53c1f96a68617",
       "tools": [
         {
           "description": "Inspect CodeStory readiness for the requested repository when diagnostics are needed. CodeStory effect: observational and does not activate managed state.",
@@ -556,6 +556,118 @@
                             "null"
                           ]
                         },
+                        "scope": {
+                          "additionalProperties": false,
+                          "anyOf": [
+                            {
+                              "required": [
+                                "current"
+                              ]
+                            },
+                            {
+                              "required": [
+                                "previous"
+                              ]
+                            }
+                          ],
+                          "description": "Optional typed changed ranges; omission retains legacy broad file semantics.",
+                          "properties": {
+                            "current": {
+                              "additionalProperties": false,
+                              "description": "Current source coordinates.",
+                              "properties": {
+                                "ranges": {
+                                  "description": "Changed ranges in this source side.",
+                                  "items": {
+                                    "additionalProperties": false,
+                                    "description": "Inclusive physical line range in the explicitly hashed source side.",
+                                    "properties": {
+                                      "end_line": {
+                                        "description": "Last changed line (inclusive, at or after start_line).",
+                                        "maximum": 1000000,
+                                        "minimum": 1,
+                                        "type": "integer"
+                                      },
+                                      "start_line": {
+                                        "description": "First changed line (1-based).",
+                                        "maximum": 1000000,
+                                        "minimum": 1,
+                                        "type": "integer"
+                                      }
+                                    },
+                                    "required": [
+                                      "start_line",
+                                      "end_line"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  "maxItems": 128,
+                                  "minItems": 1,
+                                  "type": "array"
+                                },
+                                "source_sha256": {
+                                  "description": "SHA-256 of the exact source bytes, 64 lowercase hexadecimal characters.",
+                                  "maxLength": 64,
+                                  "minLength": 64,
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "source_sha256",
+                                "ranges"
+                              ],
+                              "type": "object"
+                            },
+                            "previous": {
+                              "additionalProperties": false,
+                              "description": "Removed or previous source coordinates; never reinterpret against current bytes.",
+                              "properties": {
+                                "ranges": {
+                                  "description": "Changed ranges in this source side.",
+                                  "items": {
+                                    "additionalProperties": false,
+                                    "description": "Inclusive physical line range in the explicitly hashed source side.",
+                                    "properties": {
+                                      "end_line": {
+                                        "description": "Last changed line (inclusive, at or after start_line).",
+                                        "maximum": 1000000,
+                                        "minimum": 1,
+                                        "type": "integer"
+                                      },
+                                      "start_line": {
+                                        "description": "First changed line (1-based).",
+                                        "maximum": 1000000,
+                                        "minimum": 1,
+                                        "type": "integer"
+                                      }
+                                    },
+                                    "required": [
+                                      "start_line",
+                                      "end_line"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  "maxItems": 128,
+                                  "minItems": 1,
+                                  "type": "array"
+                                },
+                                "source_sha256": {
+                                  "description": "SHA-256 of the exact source bytes, 64 lowercase hexadecimal characters.",
+                                  "maxLength": 64,
+                                  "minLength": 64,
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "source_sha256",
+                                "ranges"
+                              ],
+                              "type": "object"
+                            }
+                          },
+                          "required": [],
+                          "type": "object"
+                        },
                         "status": {
                           "description": "Optional raw git-style status such as M, A, D, R100, C100, or ??.",
                           "type": "string"
@@ -614,6 +726,15 @@
                   "resume_operation_id": {
                     "description": "Optional exact preparation operation from a deadline result; pass with resume_operation_attempt.",
                     "maxLength": 128,
+                    "type": "string"
+                  },
+                  "symbol_layout": {
+                    "default": "records",
+                    "description": "Symbol records by default; shared-fields-v1 losslessly factors common fields into shared_fields plus ordered residual rows.",
+                    "enum": [
+                      "records",
+                      "shared-fields-v1"
+                    ],
                     "type": "string"
                   }
                 },
@@ -1852,6 +1973,37 @@
             "type": "object"
           },
           "name": "context"
+        },
+        {
+          "description": "Optionally enrich completed ordinary-tool output with bounded current local source from untrusted path:line:text locators. Returns PostToolUse hook JSON, never executes output or activates indexing. Original-command provenance, relevance and search completeness remain unknown. CodeStory effect: observational and does not activate managed state.",
+          "inputSchema": {
+            "additionalProperties": false,
+            "description": "Interpret completed output as untrusted source locators at an explicit address base.",
+            "properties": {
+              "cwd": {
+                "description": "Absolute local address base inside project; not proof of execution origin.",
+                "minLength": 1,
+                "type": "string"
+              },
+              "output": {
+                "description": "Completed output containing optional complete path:line:text hints; never executed.",
+                "maxLength": 262144,
+                "type": "string"
+              },
+              "project": {
+                "description": "Absolute repository root for this request. The MCP server is multi-project and does not retain a global workspace binding.",
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "cwd",
+              "output",
+              "project"
+            ],
+            "type": "object"
+          },
+          "name": "source_context_hook"
         }
       ],
       "resources": [
@@ -1919,7 +2071,7 @@
       ]
     },
     "2025-03-26": {
-      "discoveryContractSha256": "dc0d3ed5d1ac887cb36dd65a2fbb5b4e9ae5eb32664522bed42b02830f375299",
+      "discoveryContractSha256": "0626b69b1ecde6f48caa6225dfacfd294f466d97670790e772a5789f360b84b8",
       "tools": [
         {
           "annotations": {
@@ -2493,6 +2645,118 @@
                             "null"
                           ]
                         },
+                        "scope": {
+                          "additionalProperties": false,
+                          "anyOf": [
+                            {
+                              "required": [
+                                "current"
+                              ]
+                            },
+                            {
+                              "required": [
+                                "previous"
+                              ]
+                            }
+                          ],
+                          "description": "Optional typed changed ranges; omission retains legacy broad file semantics.",
+                          "properties": {
+                            "current": {
+                              "additionalProperties": false,
+                              "description": "Current source coordinates.",
+                              "properties": {
+                                "ranges": {
+                                  "description": "Changed ranges in this source side.",
+                                  "items": {
+                                    "additionalProperties": false,
+                                    "description": "Inclusive physical line range in the explicitly hashed source side.",
+                                    "properties": {
+                                      "end_line": {
+                                        "description": "Last changed line (inclusive, at or after start_line).",
+                                        "maximum": 1000000,
+                                        "minimum": 1,
+                                        "type": "integer"
+                                      },
+                                      "start_line": {
+                                        "description": "First changed line (1-based).",
+                                        "maximum": 1000000,
+                                        "minimum": 1,
+                                        "type": "integer"
+                                      }
+                                    },
+                                    "required": [
+                                      "start_line",
+                                      "end_line"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  "maxItems": 128,
+                                  "minItems": 1,
+                                  "type": "array"
+                                },
+                                "source_sha256": {
+                                  "description": "SHA-256 of the exact source bytes, 64 lowercase hexadecimal characters.",
+                                  "maxLength": 64,
+                                  "minLength": 64,
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "source_sha256",
+                                "ranges"
+                              ],
+                              "type": "object"
+                            },
+                            "previous": {
+                              "additionalProperties": false,
+                              "description": "Removed or previous source coordinates; never reinterpret against current bytes.",
+                              "properties": {
+                                "ranges": {
+                                  "description": "Changed ranges in this source side.",
+                                  "items": {
+                                    "additionalProperties": false,
+                                    "description": "Inclusive physical line range in the explicitly hashed source side.",
+                                    "properties": {
+                                      "end_line": {
+                                        "description": "Last changed line (inclusive, at or after start_line).",
+                                        "maximum": 1000000,
+                                        "minimum": 1,
+                                        "type": "integer"
+                                      },
+                                      "start_line": {
+                                        "description": "First changed line (1-based).",
+                                        "maximum": 1000000,
+                                        "minimum": 1,
+                                        "type": "integer"
+                                      }
+                                    },
+                                    "required": [
+                                      "start_line",
+                                      "end_line"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  "maxItems": 128,
+                                  "minItems": 1,
+                                  "type": "array"
+                                },
+                                "source_sha256": {
+                                  "description": "SHA-256 of the exact source bytes, 64 lowercase hexadecimal characters.",
+                                  "maxLength": 64,
+                                  "minLength": 64,
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "source_sha256",
+                                "ranges"
+                              ],
+                              "type": "object"
+                            }
+                          },
+                          "required": [],
+                          "type": "object"
+                        },
                         "status": {
                           "description": "Optional raw git-style status such as M, A, D, R100, C100, or ??.",
                           "type": "string"
@@ -2551,6 +2815,15 @@
                   "resume_operation_id": {
                     "description": "Optional exact preparation operation from a deadline result; pass with resume_operation_attempt.",
                     "maxLength": 128,
+                    "type": "string"
+                  },
+                  "symbol_layout": {
+                    "default": "records",
+                    "description": "Symbol records by default; shared-fields-v1 losslessly factors common fields into shared_fields plus ordered residual rows.",
+                    "enum": [
+                      "records",
+                      "shared-fields-v1"
+                    ],
                     "type": "string"
                   }
                 },
@@ -3873,6 +4146,43 @@
             "type": "object"
           },
           "name": "context"
+        },
+        {
+          "annotations": {
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false,
+            "readOnlyHint": true
+          },
+          "description": "Optionally enrich completed ordinary-tool output with bounded current local source from untrusted path:line:text locators. Returns PostToolUse hook JSON, never executes output or activates indexing. Original-command provenance, relevance and search completeness remain unknown. CodeStory effect: observational and does not activate managed state.",
+          "inputSchema": {
+            "additionalProperties": false,
+            "description": "Interpret completed output as untrusted source locators at an explicit address base.",
+            "properties": {
+              "cwd": {
+                "description": "Absolute local address base inside project; not proof of execution origin.",
+                "minLength": 1,
+                "type": "string"
+              },
+              "output": {
+                "description": "Completed output containing optional complete path:line:text hints; never executed.",
+                "maxLength": 262144,
+                "type": "string"
+              },
+              "project": {
+                "description": "Absolute repository root for this request. The MCP server is multi-project and does not retain a global workspace binding.",
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "cwd",
+              "output",
+              "project"
+            ],
+            "type": "object"
+          },
+          "name": "source_context_hook"
         }
       ],
       "resources": [
@@ -3940,7 +4250,7 @@
       ]
     },
     "2025-06-18": {
-      "discoveryContractSha256": "584297572e40cfb7f98c6e2446b15c2e7af4f01bbcf3a27456ec7e384fa554b8",
+      "discoveryContractSha256": "0332117af443846f3ffb5f785d2ed31ac21914eab313efba0d1609e0a61b8a62",
       "tools": [
         {
           "_meta": {
@@ -7508,6 +7818,118 @@
                             "null"
                           ]
                         },
+                        "scope": {
+                          "additionalProperties": false,
+                          "anyOf": [
+                            {
+                              "required": [
+                                "current"
+                              ]
+                            },
+                            {
+                              "required": [
+                                "previous"
+                              ]
+                            }
+                          ],
+                          "description": "Optional typed changed ranges; omission retains legacy broad file semantics.",
+                          "properties": {
+                            "current": {
+                              "additionalProperties": false,
+                              "description": "Current source coordinates.",
+                              "properties": {
+                                "ranges": {
+                                  "description": "Changed ranges in this source side.",
+                                  "items": {
+                                    "additionalProperties": false,
+                                    "description": "Inclusive physical line range in the explicitly hashed source side.",
+                                    "properties": {
+                                      "end_line": {
+                                        "description": "Last changed line (inclusive, at or after start_line).",
+                                        "maximum": 1000000,
+                                        "minimum": 1,
+                                        "type": "integer"
+                                      },
+                                      "start_line": {
+                                        "description": "First changed line (1-based).",
+                                        "maximum": 1000000,
+                                        "minimum": 1,
+                                        "type": "integer"
+                                      }
+                                    },
+                                    "required": [
+                                      "start_line",
+                                      "end_line"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  "maxItems": 128,
+                                  "minItems": 1,
+                                  "type": "array"
+                                },
+                                "source_sha256": {
+                                  "description": "SHA-256 of the exact source bytes, 64 lowercase hexadecimal characters.",
+                                  "maxLength": 64,
+                                  "minLength": 64,
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "source_sha256",
+                                "ranges"
+                              ],
+                              "type": "object"
+                            },
+                            "previous": {
+                              "additionalProperties": false,
+                              "description": "Removed or previous source coordinates; never reinterpret against current bytes.",
+                              "properties": {
+                                "ranges": {
+                                  "description": "Changed ranges in this source side.",
+                                  "items": {
+                                    "additionalProperties": false,
+                                    "description": "Inclusive physical line range in the explicitly hashed source side.",
+                                    "properties": {
+                                      "end_line": {
+                                        "description": "Last changed line (inclusive, at or after start_line).",
+                                        "maximum": 1000000,
+                                        "minimum": 1,
+                                        "type": "integer"
+                                      },
+                                      "start_line": {
+                                        "description": "First changed line (1-based).",
+                                        "maximum": 1000000,
+                                        "minimum": 1,
+                                        "type": "integer"
+                                      }
+                                    },
+                                    "required": [
+                                      "start_line",
+                                      "end_line"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  "maxItems": 128,
+                                  "minItems": 1,
+                                  "type": "array"
+                                },
+                                "source_sha256": {
+                                  "description": "SHA-256 of the exact source bytes, 64 lowercase hexadecimal characters.",
+                                  "maxLength": 64,
+                                  "minLength": 64,
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "source_sha256",
+                                "ranges"
+                              ],
+                              "type": "object"
+                            }
+                          },
+                          "required": [],
+                          "type": "object"
+                        },
                         "status": {
                           "description": "Optional raw git-style status such as M, A, D, R100, C100, or ??.",
                           "type": "string"
@@ -7566,6 +7988,15 @@
                   "resume_operation_id": {
                     "description": "Optional exact preparation operation from a deadline result; pass with resume_operation_attempt.",
                     "maxLength": 128,
+                    "type": "string"
+                  },
+                  "symbol_layout": {
+                    "default": "records",
+                    "description": "Symbol records by default; shared-fields-v1 losslessly factors common fields into shared_fields plus ordered residual rows.",
+                    "enum": [
+                      "records",
+                      "shared-fields-v1"
+                    ],
                     "type": "string"
                   }
                 },
@@ -7708,6 +8139,118 @@
                                 "string",
                                 "null"
                               ]
+                            },
+                            "scope": {
+                              "additionalProperties": false,
+                              "anyOf": [
+                                {
+                                  "required": [
+                                    "current"
+                                  ]
+                                },
+                                {
+                                  "required": [
+                                    "previous"
+                                  ]
+                                }
+                              ],
+                              "description": "Optional typed changed ranges; omission retains legacy broad file semantics.",
+                              "properties": {
+                                "current": {
+                                  "additionalProperties": false,
+                                  "description": "Current source coordinates.",
+                                  "properties": {
+                                    "ranges": {
+                                      "description": "Changed ranges in this source side.",
+                                      "items": {
+                                        "additionalProperties": false,
+                                        "description": "Inclusive physical line range in the explicitly hashed source side.",
+                                        "properties": {
+                                          "end_line": {
+                                            "description": "Last changed line (inclusive, at or after start_line).",
+                                            "maximum": 1000000,
+                                            "minimum": 1,
+                                            "type": "integer"
+                                          },
+                                          "start_line": {
+                                            "description": "First changed line (1-based).",
+                                            "maximum": 1000000,
+                                            "minimum": 1,
+                                            "type": "integer"
+                                          }
+                                        },
+                                        "required": [
+                                          "start_line",
+                                          "end_line"
+                                        ],
+                                        "type": "object"
+                                      },
+                                      "maxItems": 128,
+                                      "minItems": 1,
+                                      "type": "array"
+                                    },
+                                    "source_sha256": {
+                                      "description": "SHA-256 of the exact source bytes, 64 lowercase hexadecimal characters.",
+                                      "maxLength": 64,
+                                      "minLength": 64,
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "source_sha256",
+                                    "ranges"
+                                  ],
+                                  "type": "object"
+                                },
+                                "previous": {
+                                  "additionalProperties": false,
+                                  "description": "Removed or previous source coordinates; never reinterpret against current bytes.",
+                                  "properties": {
+                                    "ranges": {
+                                      "description": "Changed ranges in this source side.",
+                                      "items": {
+                                        "additionalProperties": false,
+                                        "description": "Inclusive physical line range in the explicitly hashed source side.",
+                                        "properties": {
+                                          "end_line": {
+                                            "description": "Last changed line (inclusive, at or after start_line).",
+                                            "maximum": 1000000,
+                                            "minimum": 1,
+                                            "type": "integer"
+                                          },
+                                          "start_line": {
+                                            "description": "First changed line (1-based).",
+                                            "maximum": 1000000,
+                                            "minimum": 1,
+                                            "type": "integer"
+                                          }
+                                        },
+                                        "required": [
+                                          "start_line",
+                                          "end_line"
+                                        ],
+                                        "type": "object"
+                                      },
+                                      "maxItems": 128,
+                                      "minItems": 1,
+                                      "type": "array"
+                                    },
+                                    "source_sha256": {
+                                      "description": "SHA-256 of the exact source bytes, 64 lowercase hexadecimal characters.",
+                                      "maxLength": 64,
+                                      "minLength": 64,
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "source_sha256",
+                                    "ranges"
+                                  ],
+                                  "type": "object"
+                                }
+                              },
+                              "required": [],
+                              "type": "object"
                             },
                             "status": {
                               "description": "Optional raw git-style status such as M, A, D, R100, C100, or ??.",
@@ -7875,15 +8418,45 @@
                         "type": "array"
                       },
                       "impacted_symbols": {
-                        "description": "Impacted symbol DTOs.",
-                        "items": {
-                          "additionalProperties": true,
-                          "description": "Generic JSON object.",
-                          "properties": {},
-                          "required": [],
-                          "type": "object"
-                        },
-                        "type": "array"
+                        "anyOf": [
+                          {
+                            "description": "Impacted symbol DTOs in order (the default records layout).",
+                            "items": {
+                              "additionalProperties": true,
+                              "description": "Generic JSON object.",
+                              "properties": {},
+                              "required": [],
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          {
+                            "additionalProperties": false,
+                            "description": "Lossless shared-fields-v1 layout. Merge shared_fields into each ordered row to recover the symbol records; absent keys remain absent.",
+                            "properties": {
+                              "rows": {
+                                "description": "Ordered residual symbol records.",
+                                "items": {
+                                  "additionalProperties": true,
+                                  "description": "Generic JSON object.",
+                                  "properties": {},
+                                  "required": [],
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              },
+                              "shared_fields": {
+                                "description": "Fields present with identical JSON values in every symbol record.",
+                                "type": "object"
+                              }
+                            },
+                            "required": [
+                              "shared_fields",
+                              "rows"
+                            ],
+                            "type": "object"
+                          }
+                        ]
                       },
                       "impacted_tests": {
                         "description": "Likely impacted test file DTOs.",
@@ -8068,6 +8641,133 @@
                           "string",
                           "null"
                         ]
+                      },
+                      "scope_resolutions": {
+                        "description": "Present only for scoped requests. Original range outcomes before transport caps are bounded to 128.",
+                        "items": {
+                          "additionalProperties": false,
+                          "description": "One outcome per original record, side and range. Only independently verified owners are admitted; ambiguous portions admit none.",
+                          "properties": {
+                            "owner_ids": {
+                              "description": "Admitted owner IDs, at most 16 per range.",
+                              "items": {
+                                "type": "string"
+                              },
+                              "maxItems": 16,
+                              "minItems": 0,
+                              "type": "array"
+                            },
+                            "path": {
+                              "description": "Submitted path for this source side.",
+                              "type": "string"
+                            },
+                            "publication": {
+                              "additionalProperties": false,
+                              "description": "Publication of verified current source.",
+                              "properties": {
+                                "generation_id": {
+                                  "description": "Pinned core generation identity.",
+                                  "type": "string"
+                                },
+                                "project_id": {
+                                  "description": "Logical project identity.",
+                                  "type": "string"
+                                },
+                                "run_id": {
+                                  "description": "Pinned core run identity.",
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "project_id",
+                                "generation_id",
+                                "run_id"
+                              ],
+                              "type": "object"
+                            },
+                            "range": {
+                              "additionalProperties": false,
+                              "description": "Submitted physical range.",
+                              "properties": {
+                                "end_line": {
+                                  "description": "Last changed line (inclusive, at or after start_line).",
+                                  "maximum": 1000000,
+                                  "minimum": 1,
+                                  "type": "integer"
+                                },
+                                "start_line": {
+                                  "description": "First changed line (1-based).",
+                                  "maximum": 1000000,
+                                  "minimum": 1,
+                                  "type": "integer"
+                                }
+                              },
+                              "required": [
+                                "start_line",
+                                "end_line"
+                              ],
+                              "type": "object"
+                            },
+                            "range_index": {
+                              "description": "Zero-based range index within the named side.",
+                              "type": "integer"
+                            },
+                            "record_index": {
+                              "description": "Zero-based index in the original record array.",
+                              "type": "integer"
+                            },
+                            "side": {
+                              "description": "Coordinate side.",
+                              "enum": [
+                                "current",
+                                "previous"
+                              ],
+                              "type": "string"
+                            },
+                            "source_sha256": {
+                              "description": "Submitted source hash.",
+                              "maxLength": 64,
+                              "minLength": 64,
+                              "type": "string"
+                            },
+                            "status": {
+                              "description": "Scope admission outcome; only resolved establishes full unique ownership of this range.",
+                              "enum": [
+                                "resolved",
+                                "partial",
+                                "ambiguous",
+                                "unowned",
+                                "cross_owner",
+                                "caller_hash_mismatch",
+                                "source_unavailable",
+                                "previous_unavailable",
+                                "budget_exceeded",
+                                "out_of_bounds"
+                              ],
+                              "type": "string"
+                            },
+                            "verified_source_sha256": {
+                              "description": "Hash actually verified against indexed and workspace bytes.",
+                              "maxLength": 64,
+                              "minLength": 64,
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "record_index",
+                            "range_index",
+                            "path",
+                            "side",
+                            "range",
+                            "source_sha256",
+                            "status",
+                            "owner_ids"
+                          ],
+                          "type": "object"
+                        },
+                        "maxItems": 128,
+                        "minItems": 1,
+                        "type": "array"
                       },
                       "state": {
                         "description": "preparing, unavailable, or cancelled.",
@@ -14683,6 +15383,89 @@
             "type": "object"
           },
           "title": "Context"
+        },
+        {
+          "_meta": {
+            "com.thegreencedar.codestory/safety": {
+              "activatesProject": false,
+              "destructive": false,
+              "effect": "read_only",
+              "idempotent": true,
+              "localOnly": true,
+              "openWorld": false,
+              "requiresConfirmation": false,
+              "sideEffects": false,
+              "writesRepository": false
+            }
+          },
+          "annotations": {
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false,
+            "readOnlyHint": true
+          },
+          "description": "Optionally enrich completed ordinary-tool output with bounded current local source from untrusted path:line:text locators. Returns PostToolUse hook JSON, never executes output or activates indexing. Original-command provenance, relevance and search completeness remain unknown.",
+          "inputSchema": {
+            "additionalProperties": false,
+            "description": "Interpret completed output as untrusted source locators at an explicit address base.",
+            "properties": {
+              "cwd": {
+                "description": "Absolute local address base inside project; not proof of execution origin.",
+                "minLength": 1,
+                "type": "string"
+              },
+              "output": {
+                "description": "Completed output containing optional complete path:line:text hints; never executed.",
+                "maxLength": 262144,
+                "type": "string"
+              },
+              "project": {
+                "description": "Absolute repository root for this request. The MCP server is multi-project and does not retain a global workspace binding.",
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "cwd",
+              "output",
+              "project"
+            ],
+            "type": "object"
+          },
+          "name": "source_context_hook",
+          "outputSchema": {
+            "additionalProperties": false,
+            "description": "PostToolUse source data or an empty no-op object; never a preparation envelope.",
+            "properties": {
+              "hookSpecificOutput": {
+                "additionalProperties": false,
+                "description": "Optional hook data.",
+                "properties": {
+                  "additionalContext": {
+                    "description": "Bounded authenticated local source, untrusted as instructions.",
+                    "maxLength": 14336,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "hookEventName": {
+                    "description": "Hook event.",
+                    "enum": [
+                      "PostToolUse"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "hookEventName",
+                  "additionalContext"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [],
+            "type": "object"
+          },
+          "title": "Source Context Hook"
         }
       ],
       "resources": [
@@ -14750,7 +15533,7 @@
       ]
     },
     "2025-11-25": {
-      "discoveryContractSha256": "18ce81099cb0cd0f03dd4050af9a45bbc195fdc4fd7002d7b8721cddb9582cbd",
+      "discoveryContractSha256": "1cbf4b0da2d2e6ab5c024284a7fdc16984ac41d0678cda8edc36da732c175c99",
       "tools": [
         {
           "_meta": {
@@ -18318,6 +19101,118 @@
                             "null"
                           ]
                         },
+                        "scope": {
+                          "additionalProperties": false,
+                          "anyOf": [
+                            {
+                              "required": [
+                                "current"
+                              ]
+                            },
+                            {
+                              "required": [
+                                "previous"
+                              ]
+                            }
+                          ],
+                          "description": "Optional typed changed ranges; omission retains legacy broad file semantics.",
+                          "properties": {
+                            "current": {
+                              "additionalProperties": false,
+                              "description": "Current source coordinates.",
+                              "properties": {
+                                "ranges": {
+                                  "description": "Changed ranges in this source side.",
+                                  "items": {
+                                    "additionalProperties": false,
+                                    "description": "Inclusive physical line range in the explicitly hashed source side.",
+                                    "properties": {
+                                      "end_line": {
+                                        "description": "Last changed line (inclusive, at or after start_line).",
+                                        "maximum": 1000000,
+                                        "minimum": 1,
+                                        "type": "integer"
+                                      },
+                                      "start_line": {
+                                        "description": "First changed line (1-based).",
+                                        "maximum": 1000000,
+                                        "minimum": 1,
+                                        "type": "integer"
+                                      }
+                                    },
+                                    "required": [
+                                      "start_line",
+                                      "end_line"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  "maxItems": 128,
+                                  "minItems": 1,
+                                  "type": "array"
+                                },
+                                "source_sha256": {
+                                  "description": "SHA-256 of the exact source bytes, 64 lowercase hexadecimal characters.",
+                                  "maxLength": 64,
+                                  "minLength": 64,
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "source_sha256",
+                                "ranges"
+                              ],
+                              "type": "object"
+                            },
+                            "previous": {
+                              "additionalProperties": false,
+                              "description": "Removed or previous source coordinates; never reinterpret against current bytes.",
+                              "properties": {
+                                "ranges": {
+                                  "description": "Changed ranges in this source side.",
+                                  "items": {
+                                    "additionalProperties": false,
+                                    "description": "Inclusive physical line range in the explicitly hashed source side.",
+                                    "properties": {
+                                      "end_line": {
+                                        "description": "Last changed line (inclusive, at or after start_line).",
+                                        "maximum": 1000000,
+                                        "minimum": 1,
+                                        "type": "integer"
+                                      },
+                                      "start_line": {
+                                        "description": "First changed line (1-based).",
+                                        "maximum": 1000000,
+                                        "minimum": 1,
+                                        "type": "integer"
+                                      }
+                                    },
+                                    "required": [
+                                      "start_line",
+                                      "end_line"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  "maxItems": 128,
+                                  "minItems": 1,
+                                  "type": "array"
+                                },
+                                "source_sha256": {
+                                  "description": "SHA-256 of the exact source bytes, 64 lowercase hexadecimal characters.",
+                                  "maxLength": 64,
+                                  "minLength": 64,
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "source_sha256",
+                                "ranges"
+                              ],
+                              "type": "object"
+                            }
+                          },
+                          "required": [],
+                          "type": "object"
+                        },
                         "status": {
                           "description": "Optional raw git-style status such as M, A, D, R100, C100, or ??.",
                           "type": "string"
@@ -18376,6 +19271,15 @@
                   "resume_operation_id": {
                     "description": "Optional exact preparation operation from a deadline result; pass with resume_operation_attempt.",
                     "maxLength": 128,
+                    "type": "string"
+                  },
+                  "symbol_layout": {
+                    "default": "records",
+                    "description": "Symbol records by default; shared-fields-v1 losslessly factors common fields into shared_fields plus ordered residual rows.",
+                    "enum": [
+                      "records",
+                      "shared-fields-v1"
+                    ],
                     "type": "string"
                   }
                 },
@@ -18518,6 +19422,118 @@
                                 "string",
                                 "null"
                               ]
+                            },
+                            "scope": {
+                              "additionalProperties": false,
+                              "anyOf": [
+                                {
+                                  "required": [
+                                    "current"
+                                  ]
+                                },
+                                {
+                                  "required": [
+                                    "previous"
+                                  ]
+                                }
+                              ],
+                              "description": "Optional typed changed ranges; omission retains legacy broad file semantics.",
+                              "properties": {
+                                "current": {
+                                  "additionalProperties": false,
+                                  "description": "Current source coordinates.",
+                                  "properties": {
+                                    "ranges": {
+                                      "description": "Changed ranges in this source side.",
+                                      "items": {
+                                        "additionalProperties": false,
+                                        "description": "Inclusive physical line range in the explicitly hashed source side.",
+                                        "properties": {
+                                          "end_line": {
+                                            "description": "Last changed line (inclusive, at or after start_line).",
+                                            "maximum": 1000000,
+                                            "minimum": 1,
+                                            "type": "integer"
+                                          },
+                                          "start_line": {
+                                            "description": "First changed line (1-based).",
+                                            "maximum": 1000000,
+                                            "minimum": 1,
+                                            "type": "integer"
+                                          }
+                                        },
+                                        "required": [
+                                          "start_line",
+                                          "end_line"
+                                        ],
+                                        "type": "object"
+                                      },
+                                      "maxItems": 128,
+                                      "minItems": 1,
+                                      "type": "array"
+                                    },
+                                    "source_sha256": {
+                                      "description": "SHA-256 of the exact source bytes, 64 lowercase hexadecimal characters.",
+                                      "maxLength": 64,
+                                      "minLength": 64,
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "source_sha256",
+                                    "ranges"
+                                  ],
+                                  "type": "object"
+                                },
+                                "previous": {
+                                  "additionalProperties": false,
+                                  "description": "Removed or previous source coordinates; never reinterpret against current bytes.",
+                                  "properties": {
+                                    "ranges": {
+                                      "description": "Changed ranges in this source side.",
+                                      "items": {
+                                        "additionalProperties": false,
+                                        "description": "Inclusive physical line range in the explicitly hashed source side.",
+                                        "properties": {
+                                          "end_line": {
+                                            "description": "Last changed line (inclusive, at or after start_line).",
+                                            "maximum": 1000000,
+                                            "minimum": 1,
+                                            "type": "integer"
+                                          },
+                                          "start_line": {
+                                            "description": "First changed line (1-based).",
+                                            "maximum": 1000000,
+                                            "minimum": 1,
+                                            "type": "integer"
+                                          }
+                                        },
+                                        "required": [
+                                          "start_line",
+                                          "end_line"
+                                        ],
+                                        "type": "object"
+                                      },
+                                      "maxItems": 128,
+                                      "minItems": 1,
+                                      "type": "array"
+                                    },
+                                    "source_sha256": {
+                                      "description": "SHA-256 of the exact source bytes, 64 lowercase hexadecimal characters.",
+                                      "maxLength": 64,
+                                      "minLength": 64,
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "source_sha256",
+                                    "ranges"
+                                  ],
+                                  "type": "object"
+                                }
+                              },
+                              "required": [],
+                              "type": "object"
                             },
                             "status": {
                               "description": "Optional raw git-style status such as M, A, D, R100, C100, or ??.",
@@ -18685,15 +19701,45 @@
                         "type": "array"
                       },
                       "impacted_symbols": {
-                        "description": "Impacted symbol DTOs.",
-                        "items": {
-                          "additionalProperties": true,
-                          "description": "Generic JSON object.",
-                          "properties": {},
-                          "required": [],
-                          "type": "object"
-                        },
-                        "type": "array"
+                        "anyOf": [
+                          {
+                            "description": "Impacted symbol DTOs in order (the default records layout).",
+                            "items": {
+                              "additionalProperties": true,
+                              "description": "Generic JSON object.",
+                              "properties": {},
+                              "required": [],
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          {
+                            "additionalProperties": false,
+                            "description": "Lossless shared-fields-v1 layout. Merge shared_fields into each ordered row to recover the symbol records; absent keys remain absent.",
+                            "properties": {
+                              "rows": {
+                                "description": "Ordered residual symbol records.",
+                                "items": {
+                                  "additionalProperties": true,
+                                  "description": "Generic JSON object.",
+                                  "properties": {},
+                                  "required": [],
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              },
+                              "shared_fields": {
+                                "description": "Fields present with identical JSON values in every symbol record.",
+                                "type": "object"
+                              }
+                            },
+                            "required": [
+                              "shared_fields",
+                              "rows"
+                            ],
+                            "type": "object"
+                          }
+                        ]
                       },
                       "impacted_tests": {
                         "description": "Likely impacted test file DTOs.",
@@ -18878,6 +19924,133 @@
                           "string",
                           "null"
                         ]
+                      },
+                      "scope_resolutions": {
+                        "description": "Present only for scoped requests. Original range outcomes before transport caps are bounded to 128.",
+                        "items": {
+                          "additionalProperties": false,
+                          "description": "One outcome per original record, side and range. Only independently verified owners are admitted; ambiguous portions admit none.",
+                          "properties": {
+                            "owner_ids": {
+                              "description": "Admitted owner IDs, at most 16 per range.",
+                              "items": {
+                                "type": "string"
+                              },
+                              "maxItems": 16,
+                              "minItems": 0,
+                              "type": "array"
+                            },
+                            "path": {
+                              "description": "Submitted path for this source side.",
+                              "type": "string"
+                            },
+                            "publication": {
+                              "additionalProperties": false,
+                              "description": "Publication of verified current source.",
+                              "properties": {
+                                "generation_id": {
+                                  "description": "Pinned core generation identity.",
+                                  "type": "string"
+                                },
+                                "project_id": {
+                                  "description": "Logical project identity.",
+                                  "type": "string"
+                                },
+                                "run_id": {
+                                  "description": "Pinned core run identity.",
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "project_id",
+                                "generation_id",
+                                "run_id"
+                              ],
+                              "type": "object"
+                            },
+                            "range": {
+                              "additionalProperties": false,
+                              "description": "Submitted physical range.",
+                              "properties": {
+                                "end_line": {
+                                  "description": "Last changed line (inclusive, at or after start_line).",
+                                  "maximum": 1000000,
+                                  "minimum": 1,
+                                  "type": "integer"
+                                },
+                                "start_line": {
+                                  "description": "First changed line (1-based).",
+                                  "maximum": 1000000,
+                                  "minimum": 1,
+                                  "type": "integer"
+                                }
+                              },
+                              "required": [
+                                "start_line",
+                                "end_line"
+                              ],
+                              "type": "object"
+                            },
+                            "range_index": {
+                              "description": "Zero-based range index within the named side.",
+                              "type": "integer"
+                            },
+                            "record_index": {
+                              "description": "Zero-based index in the original record array.",
+                              "type": "integer"
+                            },
+                            "side": {
+                              "description": "Coordinate side.",
+                              "enum": [
+                                "current",
+                                "previous"
+                              ],
+                              "type": "string"
+                            },
+                            "source_sha256": {
+                              "description": "Submitted source hash.",
+                              "maxLength": 64,
+                              "minLength": 64,
+                              "type": "string"
+                            },
+                            "status": {
+                              "description": "Scope admission outcome; only resolved establishes full unique ownership of this range.",
+                              "enum": [
+                                "resolved",
+                                "partial",
+                                "ambiguous",
+                                "unowned",
+                                "cross_owner",
+                                "caller_hash_mismatch",
+                                "source_unavailable",
+                                "previous_unavailable",
+                                "budget_exceeded",
+                                "out_of_bounds"
+                              ],
+                              "type": "string"
+                            },
+                            "verified_source_sha256": {
+                              "description": "Hash actually verified against indexed and workspace bytes.",
+                              "maxLength": 64,
+                              "minLength": 64,
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "record_index",
+                            "range_index",
+                            "path",
+                            "side",
+                            "range",
+                            "source_sha256",
+                            "status",
+                            "owner_ids"
+                          ],
+                          "type": "object"
+                        },
+                        "maxItems": 128,
+                        "minItems": 1,
+                        "type": "array"
                       },
                       "state": {
                         "description": "preparing, unavailable, or cancelled.",
@@ -25493,6 +26666,89 @@
             "type": "object"
           },
           "title": "Context"
+        },
+        {
+          "_meta": {
+            "com.thegreencedar.codestory/safety": {
+              "activatesProject": false,
+              "destructive": false,
+              "effect": "read_only",
+              "idempotent": true,
+              "localOnly": true,
+              "openWorld": false,
+              "requiresConfirmation": false,
+              "sideEffects": false,
+              "writesRepository": false
+            }
+          },
+          "annotations": {
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false,
+            "readOnlyHint": true
+          },
+          "description": "Optionally enrich completed ordinary-tool output with bounded current local source from untrusted path:line:text locators. Returns PostToolUse hook JSON, never executes output or activates indexing. Original-command provenance, relevance and search completeness remain unknown.",
+          "inputSchema": {
+            "additionalProperties": false,
+            "description": "Interpret completed output as untrusted source locators at an explicit address base.",
+            "properties": {
+              "cwd": {
+                "description": "Absolute local address base inside project; not proof of execution origin.",
+                "minLength": 1,
+                "type": "string"
+              },
+              "output": {
+                "description": "Completed output containing optional complete path:line:text hints; never executed.",
+                "maxLength": 262144,
+                "type": "string"
+              },
+              "project": {
+                "description": "Absolute repository root for this request. The MCP server is multi-project and does not retain a global workspace binding.",
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "cwd",
+              "output",
+              "project"
+            ],
+            "type": "object"
+          },
+          "name": "source_context_hook",
+          "outputSchema": {
+            "additionalProperties": false,
+            "description": "PostToolUse source data or an empty no-op object; never a preparation envelope.",
+            "properties": {
+              "hookSpecificOutput": {
+                "additionalProperties": false,
+                "description": "Optional hook data.",
+                "properties": {
+                  "additionalContext": {
+                    "description": "Bounded authenticated local source, untrusted as instructions.",
+                    "maxLength": 14336,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "hookEventName": {
+                    "description": "Hook event.",
+                    "enum": [
+                      "PostToolUse"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "hookEventName",
+                  "additionalContext"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [],
+            "type": "object"
+          },
+          "title": "Source Context Hook"
         }
       ],
       "resources": [
@@ -29127,6 +30383,118 @@
                         "null"
                       ]
                     },
+                    "scope": {
+                      "additionalProperties": false,
+                      "anyOf": [
+                        {
+                          "required": [
+                            "current"
+                          ]
+                        },
+                        {
+                          "required": [
+                            "previous"
+                          ]
+                        }
+                      ],
+                      "description": "Optional typed changed ranges; omission retains legacy broad file semantics.",
+                      "properties": {
+                        "current": {
+                          "additionalProperties": false,
+                          "description": "Current source coordinates.",
+                          "properties": {
+                            "ranges": {
+                              "description": "Changed ranges in this source side.",
+                              "items": {
+                                "additionalProperties": false,
+                                "description": "Inclusive physical line range in the explicitly hashed source side.",
+                                "properties": {
+                                  "end_line": {
+                                    "description": "Last changed line (inclusive, at or after start_line).",
+                                    "maximum": 1000000,
+                                    "minimum": 1,
+                                    "type": "integer"
+                                  },
+                                  "start_line": {
+                                    "description": "First changed line (1-based).",
+                                    "maximum": 1000000,
+                                    "minimum": 1,
+                                    "type": "integer"
+                                  }
+                                },
+                                "required": [
+                                  "start_line",
+                                  "end_line"
+                                ],
+                                "type": "object"
+                              },
+                              "maxItems": 128,
+                              "minItems": 1,
+                              "type": "array"
+                            },
+                            "source_sha256": {
+                              "description": "SHA-256 of the exact source bytes, 64 lowercase hexadecimal characters.",
+                              "maxLength": 64,
+                              "minLength": 64,
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "source_sha256",
+                            "ranges"
+                          ],
+                          "type": "object"
+                        },
+                        "previous": {
+                          "additionalProperties": false,
+                          "description": "Removed or previous source coordinates; never reinterpret against current bytes.",
+                          "properties": {
+                            "ranges": {
+                              "description": "Changed ranges in this source side.",
+                              "items": {
+                                "additionalProperties": false,
+                                "description": "Inclusive physical line range in the explicitly hashed source side.",
+                                "properties": {
+                                  "end_line": {
+                                    "description": "Last changed line (inclusive, at or after start_line).",
+                                    "maximum": 1000000,
+                                    "minimum": 1,
+                                    "type": "integer"
+                                  },
+                                  "start_line": {
+                                    "description": "First changed line (1-based).",
+                                    "maximum": 1000000,
+                                    "minimum": 1,
+                                    "type": "integer"
+                                  }
+                                },
+                                "required": [
+                                  "start_line",
+                                  "end_line"
+                                ],
+                                "type": "object"
+                              },
+                              "maxItems": 128,
+                              "minItems": 1,
+                              "type": "array"
+                            },
+                            "source_sha256": {
+                              "description": "SHA-256 of the exact source bytes, 64 lowercase hexadecimal characters.",
+                              "maxLength": 64,
+                              "minLength": 64,
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "source_sha256",
+                            "ranges"
+                          ],
+                          "type": "object"
+                        }
+                      },
+                      "required": [],
+                      "type": "object"
+                    },
                     "status": {
                       "description": "Optional raw git-style status such as M, A, D, R100, C100, or ??.",
                       "type": "string"
@@ -29185,6 +30553,15 @@
               "resume_operation_id": {
                 "description": "Optional exact preparation operation from a deadline result; pass with resume_operation_attempt.",
                 "maxLength": 128,
+                "type": "string"
+              },
+              "symbol_layout": {
+                "default": "records",
+                "description": "Symbol records by default; shared-fields-v1 losslessly factors common fields into shared_fields plus ordered residual rows.",
+                "enum": [
+                  "records",
+                  "shared-fields-v1"
+                ],
                 "type": "string"
               }
             },
@@ -29327,6 +30704,118 @@
                             "string",
                             "null"
                           ]
+                        },
+                        "scope": {
+                          "additionalProperties": false,
+                          "anyOf": [
+                            {
+                              "required": [
+                                "current"
+                              ]
+                            },
+                            {
+                              "required": [
+                                "previous"
+                              ]
+                            }
+                          ],
+                          "description": "Optional typed changed ranges; omission retains legacy broad file semantics.",
+                          "properties": {
+                            "current": {
+                              "additionalProperties": false,
+                              "description": "Current source coordinates.",
+                              "properties": {
+                                "ranges": {
+                                  "description": "Changed ranges in this source side.",
+                                  "items": {
+                                    "additionalProperties": false,
+                                    "description": "Inclusive physical line range in the explicitly hashed source side.",
+                                    "properties": {
+                                      "end_line": {
+                                        "description": "Last changed line (inclusive, at or after start_line).",
+                                        "maximum": 1000000,
+                                        "minimum": 1,
+                                        "type": "integer"
+                                      },
+                                      "start_line": {
+                                        "description": "First changed line (1-based).",
+                                        "maximum": 1000000,
+                                        "minimum": 1,
+                                        "type": "integer"
+                                      }
+                                    },
+                                    "required": [
+                                      "start_line",
+                                      "end_line"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  "maxItems": 128,
+                                  "minItems": 1,
+                                  "type": "array"
+                                },
+                                "source_sha256": {
+                                  "description": "SHA-256 of the exact source bytes, 64 lowercase hexadecimal characters.",
+                                  "maxLength": 64,
+                                  "minLength": 64,
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "source_sha256",
+                                "ranges"
+                              ],
+                              "type": "object"
+                            },
+                            "previous": {
+                              "additionalProperties": false,
+                              "description": "Removed or previous source coordinates; never reinterpret against current bytes.",
+                              "properties": {
+                                "ranges": {
+                                  "description": "Changed ranges in this source side.",
+                                  "items": {
+                                    "additionalProperties": false,
+                                    "description": "Inclusive physical line range in the explicitly hashed source side.",
+                                    "properties": {
+                                      "end_line": {
+                                        "description": "Last changed line (inclusive, at or after start_line).",
+                                        "maximum": 1000000,
+                                        "minimum": 1,
+                                        "type": "integer"
+                                      },
+                                      "start_line": {
+                                        "description": "First changed line (1-based).",
+                                        "maximum": 1000000,
+                                        "minimum": 1,
+                                        "type": "integer"
+                                      }
+                                    },
+                                    "required": [
+                                      "start_line",
+                                      "end_line"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  "maxItems": 128,
+                                  "minItems": 1,
+                                  "type": "array"
+                                },
+                                "source_sha256": {
+                                  "description": "SHA-256 of the exact source bytes, 64 lowercase hexadecimal characters.",
+                                  "maxLength": 64,
+                                  "minLength": 64,
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "source_sha256",
+                                "ranges"
+                              ],
+                              "type": "object"
+                            }
+                          },
+                          "required": [],
+                          "type": "object"
                         },
                         "status": {
                           "description": "Optional raw git-style status such as M, A, D, R100, C100, or ??.",
@@ -29494,15 +30983,45 @@
                     "type": "array"
                   },
                   "impacted_symbols": {
-                    "description": "Impacted symbol DTOs.",
-                    "items": {
-                      "additionalProperties": true,
-                      "description": "Generic JSON object.",
-                      "properties": {},
-                      "required": [],
-                      "type": "object"
-                    },
-                    "type": "array"
+                    "anyOf": [
+                      {
+                        "description": "Impacted symbol DTOs in order (the default records layout).",
+                        "items": {
+                          "additionalProperties": true,
+                          "description": "Generic JSON object.",
+                          "properties": {},
+                          "required": [],
+                          "type": "object"
+                        },
+                        "type": "array"
+                      },
+                      {
+                        "additionalProperties": false,
+                        "description": "Lossless shared-fields-v1 layout. Merge shared_fields into each ordered row to recover the symbol records; absent keys remain absent.",
+                        "properties": {
+                          "rows": {
+                            "description": "Ordered residual symbol records.",
+                            "items": {
+                              "additionalProperties": true,
+                              "description": "Generic JSON object.",
+                              "properties": {},
+                              "required": [],
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          "shared_fields": {
+                            "description": "Fields present with identical JSON values in every symbol record.",
+                            "type": "object"
+                          }
+                        },
+                        "required": [
+                          "shared_fields",
+                          "rows"
+                        ],
+                        "type": "object"
+                      }
+                    ]
                   },
                   "impacted_tests": {
                     "description": "Likely impacted test file DTOs.",
@@ -29687,6 +31206,133 @@
                       "string",
                       "null"
                     ]
+                  },
+                  "scope_resolutions": {
+                    "description": "Present only for scoped requests. Original range outcomes before transport caps are bounded to 128.",
+                    "items": {
+                      "additionalProperties": false,
+                      "description": "One outcome per original record, side and range. Only independently verified owners are admitted; ambiguous portions admit none.",
+                      "properties": {
+                        "owner_ids": {
+                          "description": "Admitted owner IDs, at most 16 per range.",
+                          "items": {
+                            "type": "string"
+                          },
+                          "maxItems": 16,
+                          "minItems": 0,
+                          "type": "array"
+                        },
+                        "path": {
+                          "description": "Submitted path for this source side.",
+                          "type": "string"
+                        },
+                        "publication": {
+                          "additionalProperties": false,
+                          "description": "Publication of verified current source.",
+                          "properties": {
+                            "generation_id": {
+                              "description": "Pinned core generation identity.",
+                              "type": "string"
+                            },
+                            "project_id": {
+                              "description": "Logical project identity.",
+                              "type": "string"
+                            },
+                            "run_id": {
+                              "description": "Pinned core run identity.",
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "project_id",
+                            "generation_id",
+                            "run_id"
+                          ],
+                          "type": "object"
+                        },
+                        "range": {
+                          "additionalProperties": false,
+                          "description": "Submitted physical range.",
+                          "properties": {
+                            "end_line": {
+                              "description": "Last changed line (inclusive, at or after start_line).",
+                              "maximum": 1000000,
+                              "minimum": 1,
+                              "type": "integer"
+                            },
+                            "start_line": {
+                              "description": "First changed line (1-based).",
+                              "maximum": 1000000,
+                              "minimum": 1,
+                              "type": "integer"
+                            }
+                          },
+                          "required": [
+                            "start_line",
+                            "end_line"
+                          ],
+                          "type": "object"
+                        },
+                        "range_index": {
+                          "description": "Zero-based range index within the named side.",
+                          "type": "integer"
+                        },
+                        "record_index": {
+                          "description": "Zero-based index in the original record array.",
+                          "type": "integer"
+                        },
+                        "side": {
+                          "description": "Coordinate side.",
+                          "enum": [
+                            "current",
+                            "previous"
+                          ],
+                          "type": "string"
+                        },
+                        "source_sha256": {
+                          "description": "Submitted source hash.",
+                          "maxLength": 64,
+                          "minLength": 64,
+                          "type": "string"
+                        },
+                        "status": {
+                          "description": "Scope admission outcome; only resolved establishes full unique ownership of this range.",
+                          "enum": [
+                            "resolved",
+                            "partial",
+                            "ambiguous",
+                            "unowned",
+                            "cross_owner",
+                            "caller_hash_mismatch",
+                            "source_unavailable",
+                            "previous_unavailable",
+                            "budget_exceeded",
+                            "out_of_bounds"
+                          ],
+                          "type": "string"
+                        },
+                        "verified_source_sha256": {
+                          "description": "Hash actually verified against indexed and workspace bytes.",
+                          "maxLength": 64,
+                          "minLength": 64,
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "record_index",
+                        "range_index",
+                        "path",
+                        "side",
+                        "range",
+                        "source_sha256",
+                        "status",
+                        "owner_ids"
+                      ],
+                      "type": "object"
+                    },
+                    "maxItems": 128,
+                    "minItems": 1,
+                    "type": "array"
                   },
                   "state": {
                     "description": "preparing, unavailable, or cancelled.",
@@ -36302,6 +37948,89 @@
         "type": "object"
       },
       "title": "Context"
+    },
+    {
+      "_meta": {
+        "com.thegreencedar.codestory/safety": {
+          "activatesProject": false,
+          "destructive": false,
+          "effect": "read_only",
+          "idempotent": true,
+          "localOnly": true,
+          "openWorld": false,
+          "requiresConfirmation": false,
+          "sideEffects": false,
+          "writesRepository": false
+        }
+      },
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Optionally enrich completed ordinary-tool output with bounded current local source from untrusted path:line:text locators. Returns PostToolUse hook JSON, never executes output or activates indexing. Original-command provenance, relevance and search completeness remain unknown.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "Interpret completed output as untrusted source locators at an explicit address base.",
+        "properties": {
+          "cwd": {
+            "description": "Absolute local address base inside project; not proof of execution origin.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "output": {
+            "description": "Completed output containing optional complete path:line:text hints; never executed.",
+            "maxLength": 262144,
+            "type": "string"
+          },
+          "project": {
+            "description": "Absolute repository root for this request. The MCP server is multi-project and does not retain a global workspace binding.",
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "cwd",
+          "output",
+          "project"
+        ],
+        "type": "object"
+      },
+      "name": "source_context_hook",
+      "outputSchema": {
+        "additionalProperties": false,
+        "description": "PostToolUse source data or an empty no-op object; never a preparation envelope.",
+        "properties": {
+          "hookSpecificOutput": {
+            "additionalProperties": false,
+            "description": "Optional hook data.",
+            "properties": {
+              "additionalContext": {
+                "description": "Bounded authenticated local source, untrusted as instructions.",
+                "maxLength": 14336,
+                "minLength": 1,
+                "type": "string"
+              },
+              "hookEventName": {
+                "description": "Hook event.",
+                "enum": [
+                  "PostToolUse"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "hookEventName",
+              "additionalContext"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "title": "Source Context Hook"
     }
   ],
   "resources": [

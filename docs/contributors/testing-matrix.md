@@ -504,8 +504,9 @@ named fault and race cases for:
   rows after a bound;
 - Markdown fence, YAML block-scalar/URL, TOML multiline-string, shell heredoc,
   and PowerShell block-comment false-anchor suppression;
-- distinct malformed, binary/non-UTF-8, and unreadable coverage round trips,
-  plus previous-publication survival for those outcomes;
+- verified identity-only malformed and binary/non-UTF-8 coverage round trips,
+  with no stale projection or retry loop; unreadable/unverified source and
+  publication faults preserve the previous complete publication;
 - structural cache compatibility, corruption, restored-mtime source changes,
   per-file incremental replacement, and structural-only copy-forward;
 - missing, legacy, corrupt, or source-drifted structural manifests at full,

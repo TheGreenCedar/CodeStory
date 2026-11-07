@@ -216,22 +216,31 @@ const CASES: &[SnapshotCase] = &[
 
 #[test]
 fn moved_language_rules_keep_the_fidelity_lab_projection_byte_identical() -> Result<()> {
+    let mut changed = Vec::new();
     for case in CASES {
         let (nodes, edges, root) =
             index_through_store(case.fidelity_filename, case.fidelity_source)?;
         let rendered = render_resolved_projection(&nodes, &edges, &root);
-        assert_eq!(
-            rendered.trim_end(),
-            case.fidelity_golden.trim_end(),
-            "{} fidelity_lab projection changed; the S3 move must be output-equal",
-            case.language
-        );
+        if rendered.trim_end() != case.fidelity_golden.trim_end() {
+            eprintln!(
+                "{} fidelity_lab projection changed\n  left: {:?}\n right: {:?}",
+                case.language,
+                rendered.trim_end(),
+                case.fidelity_golden.trim_end()
+            );
+            changed.push(case.language);
+        }
     }
+    assert!(
+        changed.is_empty(),
+        "fidelity_lab projections changed: {changed:?}"
+    );
     Ok(())
 }
 
 #[test]
 fn moved_language_rules_keep_the_tictactoe_projection_byte_identical() -> Result<()> {
+    let mut changed = Vec::new();
     for case in CASES {
         let result = index_raw(
             case.extension,
@@ -239,13 +248,20 @@ fn moved_language_rules_keep_the_tictactoe_projection_byte_identical() -> Result
             case.tictactoe_source,
         )?;
         let rendered = render_index_result(&result);
-        assert_eq!(
-            rendered.trim_end(),
-            case.tictactoe_golden.trim_end(),
-            "{} tictactoe projection changed; the S3 move must be output-equal",
-            case.language
-        );
+        if rendered.trim_end() != case.tictactoe_golden.trim_end() {
+            eprintln!(
+                "{} tictactoe projection changed\n  left: {:?}\n right: {:?}",
+                case.language,
+                rendered.trim_end(),
+                case.tictactoe_golden.trim_end()
+            );
+            changed.push(case.language);
+        }
     }
+    assert!(
+        changed.is_empty(),
+        "tictactoe projections changed: {changed:?}"
+    );
     Ok(())
 }
 

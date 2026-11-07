@@ -72,6 +72,7 @@ fn affected_identity_matching_visits_one_bucket_for_all_same_identity_aliases() 
             kind: AffectedChangeKindDto::Renamed,
             status: "R".to_string(),
             previous_path: Some(format!("previous-alias-{index}.rs")),
+            scope: None,
         })
         .collect::<Vec<_>>();
     let indexed_files = (0..25_000)
@@ -408,6 +409,7 @@ fn affected_identity_matching_reports_unavailable_observations() {
         kind: AffectedChangeKindDto::Modified,
         status: "M".to_string(),
         previous_path: None,
+        scope: None,
     }];
     let indexed_path = PathBuf::from("identity-unavailable.rs");
     let resolver_calls = std::cell::Cell::new(0_usize);
@@ -846,6 +848,7 @@ fn affected_test_record(kind: AffectedChangeKindDto, path: &str) -> AffectedChan
         kind,
         status: "test".to_string(),
         previous_path: None,
+        scope: None,
     }
 }
 
@@ -859,6 +862,7 @@ fn affected_test_move_record(
         kind,
         status: "test".to_string(),
         previous_path: Some(previous_path.to_string()),
+        scope: None,
     }
 }
 
@@ -1257,7 +1261,7 @@ fn affected_unrelated_stale_file_does_not_downgrade_fresh_requested_identity() {
                 file_role: codestory_store::FileRole::Source,
             },
         ] {
-            storage.insert_file(&file).expect("insert fixture file");
+            insert_indexed_file_with_current_identity(&mut storage, file);
         }
         storage
             .insert_nodes_batch(&[
@@ -1284,6 +1288,8 @@ fn affected_unrelated_stale_file_does_not_downgrade_fresh_requested_identity() {
             ])
             .expect("insert fixture nodes");
     }
+    fs::write(&unrelated, "export function unrelated() { return 1; }\n")
+        .expect("make only the unrelated source stale after coherent insertion");
     let controller = AppController::new_with_owned_cache_root(process_cache.path());
     controller
         .open_project(OpenProjectRequest {
@@ -2335,6 +2341,541 @@ fn affected_symbol_prefix_retains_typed_impacts_before_unknown_occurrences() {
 }
 
 #[test]
+fn affected_changed_range_scope_admits_owners_and_preserves_unresolved_boundaries() {
+    use codestory_contracts::api::AffectedScopeStatusDto as Status;
+    use sha2::{Digest, Sha256};
+
+    let process_cache = tempdir().expect("owned runtime cache root");
+    let project = tempdir().expect("project");
+    let source = concat!(
+        "use std::fmt;\n",
+        "pub fn untouched_owner() -> u32 { 1 }\n",
+        "pub fn edited_owner() -> u32 {\n",
+        "    2\n",
+        "}\n",
+        "pub fn downstream_caller() -> u32 { edited_owner() }\n",
+        "pub fn left_ambiguous() {} pub fn right_ambiguous() {}\n",
+        "pub fn nested_container() -> u32 {\n",
+        "    fn nested_owner() -> u32 {\n",
+        "        7\n",
+        "    }\n",
+        "    let anonymous = || {\n",
+        "        9\n",
+        "    };\n",
+        "    anonymous() + nested_owner()\n",
+        "}\n",
+    );
+    let removed_source = "pub fn removed_owner() {}\n";
+    let asset = "<svg/>\n";
+    let source_path = project.path().join("lib.rs");
+    let removed_path = project.path().join("removed.rs");
+    fs::write(&source_path, source).expect("write source");
+    fs::write(&removed_path, removed_source).expect("write source before deletion");
+    fs::write(project.path().join("asset.svg"), asset).expect("write non-symbol source");
+    let storage_path = project.path().join(".cache/codestory.db");
+    let controller = AppController::new_with_owned_cache_root(process_cache.path());
+    controller
+        .open_project_summary_with_storage_path(project.path().to_path_buf(), storage_path.clone())
+        .expect("open real scoped-impact fixture");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("publish real declarations, source hashes and caller edges");
+    let storage = Storage::open(&storage_path).expect("open published fixture");
+    let publication = storage
+        .get_complete_index_publication()
+        .expect("read publication")
+        .expect("real complete publication");
+    let source_hash = format!("{:x}", Sha256::digest(source.as_bytes()));
+    let source_file = storage
+        .get_files()
+        .expect("indexed files")
+        .into_iter()
+        .find(|file| file.path.ends_with("lib.rs"))
+        .expect("indexed requested file");
+    assert_eq!(
+        storage
+            .get_file_content_hash(source_file.id)
+            .expect("indexed source hash"),
+        Some(source_hash.clone())
+    );
+    let nodes = storage.get_nodes().expect("real indexed nodes");
+    let owner_id = |name: &str| {
+        let matches = nodes
+            .iter()
+            .filter(|node| {
+                node.kind == NodeKind::FUNCTION
+                    && node.file_node_id == Some(CoreNodeId(source_file.id))
+                    && node.serialized_name.rsplit("::").next() == Some(name)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(matches.len(), 1, "fixture must have one {name} declaration");
+        matches[0].id.0.to_string()
+    };
+    let edited_id = owner_id("edited_owner");
+    let caller_id = owner_id("downstream_caller");
+    let untouched_id = owner_id("untouched_owner");
+    let ambiguous_ids = [owner_id("left_ambiguous"), owner_id("right_ambiguous")];
+    let nested_id = owner_id("nested_owner");
+    let enclosing_id = owner_id("nested_container");
+    let call_edges = storage
+        .get_edges()
+        .expect("real indexed caller edges")
+        .into_iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL)
+        .collect::<Vec<_>>();
+    assert!(
+        call_edges.iter().any(|edge| {
+            edge.effective_source().0.to_string() == caller_id
+                && edge.effective_target().0.to_string() == edited_id
+        }),
+        "fixture needs the same effective caller {caller_id} -> owner {edited_id} endpoints that affected walks; CALLs: {call_edges:?}"
+    );
+    drop(storage);
+
+    let analyze = |input| {
+        controller.affected_analysis(AffectedAnalysisRequest {
+            input,
+            depth: Some(2),
+            filter: None,
+        })
+    };
+    let legacy =
+        analyze(AffectedAnalysisInput::Paths(vec!["lib.rs".into()])).expect("legacy path analysis");
+    let legacy_record: AffectedChangeRecordDto = serde_json::from_value(serde_json::json!({
+        "path": "lib.rs", "kind": "modified", "status": "M"
+    }))
+    .expect("legacy JSON record");
+    let legacy_records = analyze(AffectedAnalysisInput::ChangeRecords(vec![legacy_record]))
+        .expect("legacy record analysis");
+    let identities = |result: &codestory_contracts::api::AffectedAnalysisDto| {
+        result
+            .impacted_symbols
+            .iter()
+            .map(|symbol| (symbol.node_id.0.clone(), symbol.distance))
+            .collect::<BTreeMap<_, _>>()
+    };
+    let legacy_json = serde_json::to_value(&legacy_records).expect("legacy JSON");
+    assert!(legacy_json.get("scope_resolutions").is_none());
+    assert!(
+        legacy_json["change_records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|record| record.get("scope").is_none())
+    );
+    let broad = identities(&legacy);
+    assert!(legacy.completeness.complete, "{legacy:?}");
+    assert_eq!(broad, identities(&legacy_records));
+    assert_eq!(broad.get(&untouched_id), Some(&0));
+    assert_eq!(broad.get(&edited_id), Some(&0));
+    assert_eq!(broad.get(&caller_id), Some(&0));
+
+    let current_scope = |hash: &str, line: u32| {
+        serde_json::json!({"current": {
+            "source_sha256": hash,
+            "ranges": [{"start_line": line, "end_line": line}]
+        }})
+    };
+    let unknown_hash = "0".repeat(64);
+    let mut failures = Vec::new();
+    let mut check = |label: &str,
+                     path: &str,
+                     kind: &str,
+                     scope,
+                     expected_status: Status,
+                     allow_source_error: bool| {
+        let precise = expected_status == Status::Resolved;
+        let record = serde_json::from_value::<AffectedChangeRecordDto>(serde_json::json!({
+            "path": path, "kind": kind, "status": "test", "scope": scope
+        }));
+        let result = match record {
+            Ok(record) => analyze(AffectedAnalysisInput::ChangeRecords(vec![record])),
+            Err(error) => {
+                failures.push(format!("{label}: typed scope was rejected: {error}"));
+                return;
+            }
+        };
+        let result = match result {
+            Ok(result) => result,
+            Err(_) if allow_source_error => return,
+            Err(error) => {
+                failures.push(format!("{label}: valid scoped input failed: {error:?}"));
+                return;
+            }
+        };
+        let actual = identities(&result);
+        if result.scope_resolutions.len() != 1
+            || result.scope_resolutions[0].status != expected_status
+        {
+            failures.push(format!(
+                "{label}: missing or incorrect scope outcome: {:?}",
+                result.scope_resolutions
+            ));
+        }
+        if let Some(resolution) = result.scope_resolutions.first() {
+            if resolution.record_index != 0 || resolution.range_index != 0 {
+                failures.push(format!("{label}: scope provenance changed"));
+            }
+            if precise
+                && (resolution.owner_ids.len() != 1
+                    || resolution.owner_ids[0].0 != edited_id
+                    || resolution.verified_source_sha256.as_deref() != Some(source_hash.as_str())
+                    || !resolution.publication.as_ref().is_some_and(|pin| {
+                        pin.generation_id == publication.generation_id
+                            && pin.run_id == publication.run_id
+                            && pin.project_id
+                                == codestory_workspace::project_identity_v3(project.path())
+                                    .project_id
+                    }))
+            {
+                failures.push(format!(
+                    "{label}: owner lacked verified source/publication binding: {resolution:?}"
+                ));
+            }
+            if !precise && !resolution.owner_ids.is_empty() {
+                failures.push(format!(
+                    "{label}: unresolved scope admitted owners: {resolution:?}"
+                ));
+            }
+            if expected_status == Status::CallerHashMismatch
+                && resolution.verified_source_sha256.as_deref() != Some(source_hash.as_str())
+            {
+                failures.push(format!(
+                    "{label}: caller mismatch hid the verified indexed hash"
+                ));
+            }
+        }
+        if precise {
+            if actual.get(&edited_id) != Some(&0) || actual.get(&caller_id) != Some(&1) {
+                failures.push(format!(
+                    "{label}: expected owner distance 0/caller distance 1, got {:?}/{:?}",
+                    actual.get(&edited_id),
+                    actual.get(&caller_id)
+                ));
+            }
+            if actual.contains_key(&untouched_id) {
+                failures.push(format!("{label}: unchanged declaration was expanded"));
+            }
+            if !result.completeness.complete {
+                failures.push(format!(
+                    "{label}: verified unique owner was unresolved: {:?}",
+                    result.completeness
+                ));
+            }
+        } else {
+            if result.completeness.complete {
+                failures.push(format!("{label}: unresolved scope claimed completeness"));
+            }
+            if actual.contains_key(&untouched_id) {
+                failures.push(format!(
+                    "{label}: file fallback expanded unchanged declarations"
+                ));
+            }
+            if actual.contains_key(&edited_id) || actual.contains_key(&caller_id) {
+                failures.push(format!(
+                    "{label}: unresolved scope fabricated edited-owner impact"
+                ));
+            }
+            if kind == "deleted" && !actual.is_empty() {
+                failures.push(format!(
+                    "{label}: deleted-source ownership lacked historical bytes"
+                ));
+            }
+        }
+    };
+    check(
+        "interior owner",
+        "lib.rs",
+        "modified",
+        current_scope(&source_hash, 4),
+        Status::Resolved,
+        false,
+    );
+    check(
+        "wrong source hash",
+        "lib.rs",
+        "modified",
+        current_scope(&unknown_hash, 4),
+        Status::CallerHashMismatch,
+        false,
+    );
+    check(
+        "import without owner",
+        "lib.rs",
+        "modified",
+        current_scope(&source_hash, 1),
+        Status::Unowned,
+        false,
+    );
+    check(
+        "same-row owners",
+        "lib.rs",
+        "modified",
+        current_scope(&source_hash, 7),
+        Status::Ambiguous,
+        false,
+    );
+    check(
+        "range past EOF",
+        "lib.rs",
+        "modified",
+        current_scope(&source_hash, 99),
+        Status::OutOfBounds,
+        false,
+    );
+    check(
+        "previous bytes unavailable",
+        "lib.rs",
+        "modified",
+        serde_json::json!({
+            "previous": {"source_sha256": unknown_hash,
+                "ranges": [{"start_line": 4, "end_line": 4}]}
+        }),
+        Status::PreviousUnavailable,
+        false,
+    );
+    check(
+        "non-symbol source",
+        "asset.svg",
+        "modified",
+        current_scope(&format!("{:x}", Sha256::digest(asset.as_bytes())), 1),
+        Status::SourceUnavailable,
+        false,
+    );
+
+    let scoped_owner = serde_json::json!({
+        "path": "lib.rs", "kind": "modified", "status": "M",
+        "scope": current_scope(&source_hash, 4)
+    });
+    let scoped_second_owner = serde_json::json!({
+        "path": "lib.rs", "kind": "modified", "status": "M",
+        "scope": current_scope(&source_hash, 2)
+    });
+    let wrong_hash_record = serde_json::json!({"path":"lib.rs","kind":"modified","status":"M",
+        "scope":current_scope(&unknown_hash, 4)});
+    let broad_record = serde_json::json!({"path": "lib.rs", "kind": "modified", "status": "M"});
+    let mixed_ranges = serde_json::json!({
+        "path": "lib.rs", "kind": "modified", "status": "M",
+        "scope": {"current": {"source_sha256": source_hash, "ranges": [
+            {"start_line": 4, "end_line": 4}, {"start_line": 1, "end_line": 1}
+        ]}}
+    });
+    let mut control_failures = Vec::new();
+    for (label, records, complete, second_owner, broad_expected) in [
+        (
+            "valid and stale caller hashes",
+            vec![scoped_owner.clone(), wrong_hash_record],
+            false,
+            false,
+            false,
+        ),
+        (
+            "valid plus unowned ranges",
+            vec![mixed_ranges],
+            false,
+            false,
+            false,
+        ),
+        (
+            "two scoped records",
+            vec![scoped_owner.clone(), scoped_second_owner.clone()],
+            true,
+            true,
+            false,
+        ),
+        (
+            "reversed scoped records",
+            vec![scoped_second_owner, scoped_owner.clone()],
+            true,
+            true,
+            false,
+        ),
+        (
+            "broad then scoped",
+            vec![broad_record.clone(), scoped_owner.clone()],
+            true,
+            true,
+            true,
+        ),
+        (
+            "scoped then broad",
+            vec![scoped_owner, broad_record],
+            true,
+            true,
+            true,
+        ),
+    ] {
+        let records = match serde_json::from_value::<Vec<AffectedChangeRecordDto>>(
+            serde_json::json!(records),
+        ) {
+            Ok(records) => records,
+            Err(error) => {
+                control_failures.push(format!("{label}: typed scopes were rejected: {error}"));
+                continue;
+            }
+        };
+        let result = match analyze(AffectedAnalysisInput::ChangeRecords(records)) {
+            Ok(result) => result,
+            Err(error) => {
+                control_failures.push(format!("{label}: valid current scopes failed: {error:?}"));
+                continue;
+            }
+        };
+        let actual = identities(&result);
+        let expected_rows = if label == "valid plus unowned ranges" || !broad_expected {
+            2
+        } else {
+            1
+        };
+        if result.scope_resolutions.len() != expected_rows {
+            control_failures.push(format!(
+                "{label}: a submitted scope/range disappeared: {:?}",
+                result.scope_resolutions
+            ));
+        }
+        if label == "valid plus unowned ranges"
+            && result
+                .scope_resolutions
+                .iter()
+                .map(|row| row.status)
+                .collect::<Vec<_>>()
+                != vec![Status::Resolved, Status::Unowned]
+        {
+            control_failures.push(format!("{label}: lost partial-scope outcomes"));
+        }
+        if !broad_expected
+            && label != "valid plus unowned ranges"
+            && result
+                .scope_resolutions
+                .iter()
+                .map(|row| row.record_index)
+                .collect::<Vec<_>>()
+                != vec![0, 1]
+        {
+            control_failures.push(format!("{label}: duplicate file records were collapsed"));
+        }
+        if result.completeness.complete != complete {
+            control_failures.push(format!(
+                "{label}: wrong completeness: {:?}",
+                result.completeness
+            ));
+        }
+        if broad_expected {
+            if actual != broad {
+                control_failures.push(format!("{label}: scoped record narrowed legacy file scope"));
+            }
+        } else if actual.get(&edited_id) != Some(&0)
+            || actual.get(&caller_id) != Some(&1)
+            || actual.get(&untouched_id).copied() != second_owner.then_some(0)
+            || ambiguous_ids.iter().any(|id| actual.contains_key(id))
+        {
+            control_failures.push(format!(
+                "{label}: scopes were collapsed or broad fallback was expanded: {actual:?}"
+            ));
+        }
+    }
+    for (label, line, expected_owner, other_owner) in [
+        ("named nested callable", 10, &nested_id, &enclosing_id),
+        (
+            "anonymous body retains enclosing owner",
+            13,
+            &enclosing_id,
+            &nested_id,
+        ),
+    ] {
+        let record = serde_json::from_value::<AffectedChangeRecordDto>(serde_json::json!({
+            "path":"lib.rs","kind":"modified","status":"M",
+            "scope":current_scope(&source_hash, line)
+        }))
+        .expect("nested scope record");
+        let result = analyze(AffectedAnalysisInput::ChangeRecords(vec![record]))
+            .expect("real nested owner analysis");
+        let actual = identities(&result);
+        if result.scope_resolutions.len() != 1
+            || result.scope_resolutions[0].status != Status::Resolved
+            || result.scope_resolutions[0]
+                .owner_ids
+                .iter()
+                .map(|id| &id.0)
+                .collect::<Vec<_>>()
+                != vec![expected_owner]
+            || result.scope_resolutions[0]
+                .verified_source_sha256
+                .as_deref()
+                != Some(source_hash.as_str())
+            || !result.scope_resolutions[0]
+                .publication
+                .as_ref()
+                .is_some_and(|pin| {
+                    pin.generation_id == publication.generation_id
+                        && pin.run_id == publication.run_id
+                })
+            || actual.get(expected_owner) != Some(&0)
+            || actual.get(other_owner) == Some(&0)
+            || actual.contains_key(&untouched_id)
+        {
+            control_failures.push(format!(
+                "{label}: nested source ownership was not preserved: {result:?}"
+            ));
+        }
+    }
+    let crossing: AffectedChangeRecordDto = serde_json::from_value(serde_json::json!({
+        "path":"lib.rs","kind":"modified","status":"M","scope":{"current":{
+            "source_sha256":source_hash,"ranges":[{"start_line":2,"end_line":6}]
+        }}
+    }))
+    .unwrap();
+    let crossing =
+        analyze(AffectedAnalysisInput::ChangeRecords(vec![crossing])).expect("cross-owner range");
+    let crossing_ids = identities(&crossing);
+    if crossing.completeness.complete
+        || crossing.scope_resolutions.len() != 1
+        || crossing.scope_resolutions[0].status != Status::CrossOwner
+        || crossing.scope_resolutions[0].owner_ids.len() != 3
+        || [&edited_id, &caller_id, &untouched_id]
+            .iter()
+            .any(|id| crossing_ids.get(*id) != Some(&0))
+    {
+        control_failures.push(format!(
+            "cross-owner range lost its explicit partial/co-owner evidence: {crossing:?}"
+        ));
+    }
+    fs::write(&source_path, source.replace("    2", "    3"))
+        .expect("drift actual bytes after publication");
+    check(
+        "published source drift",
+        "lib.rs",
+        "modified",
+        current_scope(&source_hash, 4),
+        Status::SourceUnavailable,
+        true,
+    );
+    fs::write(&source_path, source).expect("restore baseline before independent deletion control");
+    assert_eq!(
+        format!(
+            "{:x}",
+            Sha256::digest(fs::read(&source_path).expect("restored source"))
+        ),
+        source_hash,
+        "deletion control must not inherit source drift"
+    );
+    fs::remove_file(&removed_path).expect("delete source after its real publication");
+    check(
+        "deleted source has no authenticated historical bytes",
+        "removed.rs",
+        "deleted",
+        serde_json::json!({
+            "previous": {"source_sha256": format!("{:x}", Sha256::digest(removed_source.as_bytes())),
+                "ranges": [{"start_line": 1, "end_line": 1}]}
+        }),
+        Status::PreviousUnavailable,
+        true,
+    );
+    failures.extend(control_failures);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
 fn indexable_source_path_tracks_indexer_structural_and_template_surfaces() {
     for relative_path in [
         "src/lib.rs",
@@ -2719,7 +3260,44 @@ fn affected_absolute_excluded_structural_path_is_valid_but_uncovered() {
     assert!(reason.contains("outside current graph/index coverage"));
 }
 
-fn insert_current_indexed_file(storage: &Storage, id: i64, path: &Path) {
+fn insert_indexed_file_with_current_identity(storage: &mut Storage, file: FileInfo) {
+    use sha2::{Digest, Sha256};
+
+    let hash = format!(
+        "{:x}",
+        Sha256::digest(fs::read(&file.path).expect("actual indexed bytes"))
+    );
+    let identity = codestory_store::FileExtractionIdentity {
+        file_id: file.id,
+        language: file.language.clone(),
+        source_content_hash: hash.clone(),
+        extraction_revision: codestory_indexer::current_file_extraction_revision(&file.language)
+            .expect("fixture language has a current extraction revision")
+            .to_string(),
+    };
+    storage
+        .projections()
+        .flush_projection_batch(codestory_store::ProjectionBatch {
+            files: &[file],
+            file_content_hashes: &[codestory_store::FileContentHash {
+                file_id: identity.file_id,
+                content_hash: hash,
+            }],
+            file_extraction_identities: &[identity],
+            nodes: &[],
+            structural_text_units: &[],
+            structural_text_projections: &[],
+            structural_text_cache_writes: &[],
+            edges: &[],
+            occurrences: &[],
+            component_access: &[],
+            callable_projection_states: &[],
+            file_errors: &[],
+        })
+        .expect("persist coherent fixture hash and current extraction identity");
+}
+
+fn insert_current_indexed_file(storage: &mut Storage, id: i64, path: &Path) {
     let modification_time = fs::metadata(path)
         .expect("source metadata")
         .modified()
@@ -2728,8 +3306,9 @@ fn insert_current_indexed_file(storage: &Storage, id: i64, path: &Path) {
         .expect("mtime since epoch")
         .as_millis()
         .min(i64::MAX as u128) as i64;
-    storage
-        .insert_file(&FileInfo {
+    insert_indexed_file_with_current_identity(
+        storage,
+        FileInfo {
             id,
             path: path.to_path_buf(),
             language: "javascript".into(),
@@ -2738,8 +3317,8 @@ fn insert_current_indexed_file(storage: &Storage, id: i64, path: &Path) {
             complete: true,
             line_count: 1,
             file_role: codestory_store::FileRole::Source,
-        })
-        .expect("insert current indexed file");
+        },
+    );
 }
 
 #[test]
@@ -2750,8 +3329,8 @@ fn newly_discovered_hardlink_alias_remains_new_for_freshness() {
     fs::write(&indexed, "export function indexed() {}\n").expect("write indexed source");
     fs::hard_link(&indexed, &alias).expect("create source hardlink alias");
     let workspace = WorkspaceManifest::open(project.path().to_path_buf()).expect("workspace");
-    let storage = Storage::new_in_memory().expect("storage");
-    insert_current_indexed_file(&storage, 1, &indexed);
+    let mut storage = Storage::new_in_memory().expect("storage");
+    insert_current_indexed_file(&mut storage, 1, &indexed);
 
     let freshness = index_freshness_from_storage(project.path(), &workspace, &storage);
 
@@ -2773,8 +3352,8 @@ fn unsupported_extension_hardlink_alias_stays_outside_freshness() {
     fs::hard_link(&indexed, &alias).expect("create unsupported hardlink alias");
     assert!(!indexable_source_path(&alias));
     let workspace = WorkspaceManifest::open(project.path().to_path_buf()).expect("workspace");
-    let storage = Storage::new_in_memory().expect("storage");
-    insert_current_indexed_file(&storage, 1, &indexed);
+    let mut storage = Storage::new_in_memory().expect("storage");
+    insert_current_indexed_file(&mut storage, 1, &indexed);
 
     let freshness = index_freshness_from_storage(project.path(), &workspace, &storage);
 
@@ -2826,29 +3405,10 @@ fn owned_freshness_observation_pins_fence_and_inventory_across_a_concurrent_writ
     let project = tempdir().expect("project");
     let source_path = project.path().join("lib.js");
     fs::write(&source_path, "export function indexed() {}\n").expect("write source");
-    let modification_time = fs::metadata(&source_path)
-        .expect("source metadata")
-        .modified()
-        .expect("source mtime")
-        .duration_since(UNIX_EPOCH)
-        .expect("mtime since epoch")
-        .as_millis()
-        .min(i64::MAX as u128) as i64;
     let database = tempdir().expect("database directory");
     let storage_path = database.path().join("codestory.db");
-    let keeper = Storage::open(&storage_path).expect("open fixture storage");
-    keeper
-        .insert_file(&FileInfo {
-            id: 1,
-            path: source_path,
-            language: "javascript".into(),
-            modification_time,
-            indexed: true,
-            complete: true,
-            line_count: 1,
-            file_role: codestory_store::FileRole::Source,
-        })
-        .expect("insert coherent file projection");
+    let mut keeper = Storage::open(&storage_path).expect("open fixture storage");
+    insert_current_indexed_file(&mut keeper, 1, &source_path);
     assert!(
         storage_path.with_extension("db-wal").is_file(),
         "fixture must retain WAL state"
@@ -2931,9 +3491,10 @@ fn parser_partial_freshness_distinguishes_file_level_errors() {
         .as_millis()
         .min(i64::MAX as u128) as i64;
     let workspace = WorkspaceManifest::open(project.path().to_path_buf()).expect("workspace");
-    let storage = Storage::new_in_memory().expect("storage");
-    storage
-        .insert_file(&FileInfo {
+    let mut storage = Storage::new_in_memory().expect("storage");
+    insert_indexed_file_with_current_identity(
+        &mut storage,
+        FileInfo {
             id: 1,
             path: source_path,
             language: "javascript".into(),
@@ -2942,8 +3503,8 @@ fn parser_partial_freshness_distinguishes_file_level_errors() {
             complete: false,
             line_count: 1,
             file_role: codestory_store::FileRole::Source,
-        })
-        .expect("insert parser-partial file");
+        },
+    );
 
     let freshness = index_freshness_from_storage(project.path(), &workspace, &storage);
     assert_eq!(freshness.status, IndexFreshnessStatusDto::Fresh);

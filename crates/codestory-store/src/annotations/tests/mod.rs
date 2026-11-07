@@ -1311,6 +1311,203 @@ fn rust_ordinal_bookmark(
 }
 
 #[test]
+fn script_ordinal_epoch_requires_historical_discrimination_and_retains_orphans() {
+    use codestory_contracts::graph::SCRIPT_ORDINAL_CANONICAL_ID_PREFIX;
+    for (
+        label,
+        tuple_unique,
+        shape_unique,
+        previous_shape,
+        current_shape,
+        extra_tuple,
+        same_epoch,
+        binds,
+    ) in [
+        (
+            "previously unique tuple survives body edits",
+            Some(true),
+            false,
+            ALPHA_SIGNATURE,
+            OTHER_SIGNATURE,
+            false,
+            false,
+            true,
+        ),
+        (
+            "previously unique matching strong shape",
+            Some(false),
+            true,
+            ALPHA_SIGNATURE,
+            ALPHA_SIGNATURE,
+            false,
+            false,
+            true,
+        ),
+        (
+            "current unique tuple cannot prove historical uniqueness",
+            Some(false),
+            false,
+            ALPHA_SIGNATURE,
+            ALPHA_SIGNATURE,
+            false,
+            false,
+            false,
+        ),
+        (
+            "missing historical discrimination",
+            None,
+            false,
+            ALPHA_SIGNATURE,
+            ALPHA_SIGNATURE,
+            false,
+            false,
+            false,
+        ),
+        (
+            "historically unique shape changed",
+            Some(false),
+            true,
+            ALPHA_SIGNATURE,
+            OTHER_SIGNATURE,
+            false,
+            false,
+            false,
+        ),
+        (
+            "outline is not strong shape evidence",
+            Some(false),
+            true,
+            OUTLINE_SIGNATURE,
+            OUTLINE_SIGNATURE,
+            false,
+            false,
+            false,
+        ),
+        (
+            "current tuple remains ambiguous",
+            Some(true),
+            false,
+            ALPHA_SIGNATURE,
+            ALPHA_SIGNATURE,
+            true,
+            false,
+            false,
+        ),
+        (
+            "same epoch exact identity survives body edits",
+            Some(false),
+            false,
+            ALPHA_SIGNATURE,
+            OTHER_SIGNATURE,
+            true,
+            true,
+            true,
+        ),
+    ] {
+        let dir = TempDir::new().expect("temp dir");
+        let store = open_store(&dir, "unix:1:1");
+        let category = store.create_category("Script anchors").unwrap();
+        let file = "/repo/src/owner.js";
+        let new_key = format!("{SCRIPT_ORDINAL_CANONICAL_ID_PREFIX}{file}:alpha#0");
+        let old_key = if same_epoch {
+            new_key.clone()
+        } else {
+            format!("{file}:alpha#2")
+        };
+        let kind = codestory_contracts::graph::NodeKind::FUNCTION as i64;
+        let discrimination = tuple_unique.map(|anchor_tuple_unique| AnchorDiscrimination {
+            anchor_tuple_unique,
+            signature_unique_in_file: shape_unique,
+            qualified_name_unique: false,
+        });
+        let bookmark = store
+            .create_bookmark(
+                category.id,
+                &BookmarkAnchorInput {
+                    canonical_id: Some(old_key.clone()),
+                    file_identity: Some(file.into()),
+                    qualified_name: Some("alpha".into()),
+                    kind: Some(kind),
+                    normalized_signature: Some(previous_shape.into()),
+                    start_line: Some(10),
+                    comment: Some("keep script bookmark".into()),
+                    evidence: Some(BookmarkAnchorEvidence {
+                        generation: Some(4),
+                        node_id: Some(7),
+                        canonical_id: Some(old_key),
+                        file_identity: Some(file.into()),
+                        qualified_name: Some("alpha".into()),
+                        kind: Some(kind),
+                        normalized_signature: Some(previous_shape.into()),
+                        start_line: Some(10),
+                        discrimination,
+                    }),
+                },
+            )
+            .unwrap();
+        let mut core = FakeCore::at_generation(5).with(CoreAnchorCandidate {
+            canonical_id: Some(new_key.clone()),
+            kind: Some(kind),
+            ..candidate_with_signature(99, file, "alpha", current_shape)
+        });
+        if extra_tuple {
+            core = core.with(CoreAnchorCandidate {
+                canonical_id: Some(format!(
+                    "{SCRIPT_ORDINAL_CANONICAL_ID_PREFIX}{file}:alpha#1"
+                )),
+                kind: Some(kind),
+                ..candidate_with_signature(100, file, "alpha", OTHER_SIGNATURE)
+            });
+        }
+        let resolution = resolve_bookmark(&bookmark, &core).unwrap();
+        if binds {
+            assert_eq!(resolution.node_id(), Some(99), "{label}");
+        } else {
+            assert_eq!(
+                resolution.orphan_reason(),
+                Some(OrphanReason::AmbiguousMatch),
+                "{label}"
+            );
+        }
+        store.apply_resolution(&bookmark.uuid, &resolution).unwrap();
+        let stored = store
+            .bookmark(&bookmark.uuid)
+            .unwrap()
+            .expect("migration must retain bookmark");
+        assert_eq!(stored.comment, bookmark.comment, "{label}");
+        assert_eq!(
+            store.bookmarks(None).unwrap().len(),
+            1,
+            "{label}: no bookmark deletion"
+        );
+        if binds {
+            assert_eq!(
+                stored.canonical_id.as_deref(),
+                Some(new_key.as_str()),
+                "{label}"
+            );
+        } else {
+            assert_eq!(
+                stored.resolution_status,
+                ResolutionStatus::Orphaned,
+                "{label}"
+            );
+            assert_eq!(stored.canonical_id, bookmark.canonical_id, "{label}");
+            assert_eq!(
+                stored.last_known_evidence, bookmark.last_known_evidence,
+                "{label}"
+            );
+            let repeated = resolve_bookmark(&stored, &core).unwrap();
+            assert_eq!(
+                repeated.orphan_reason(),
+                Some(OrphanReason::AmbiguousMatch),
+                "{label}"
+            );
+        }
+    }
+}
+
+#[test]
 fn an_anchorless_bookmark_is_an_unresolvable_orphan() {
     let dir = TempDir::new().expect("temp dir");
     let store = open_store(&dir, "unix:1:1");
