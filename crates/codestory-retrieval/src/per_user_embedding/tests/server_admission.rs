@@ -480,3 +480,306 @@ fn finished_connection_handlers_are_reaped_under_high_churn() {
         );
     }
 }
+
+#[test]
+fn incompatible_authenticated_handoff_delivers_reply_before_owner_teardown() {
+    use super::super::{
+        EmbeddingServerBudgets, EmbeddingServerProtocolSnapshot, PerUserEmbeddingServerConfig,
+        run_per_user_embedding_server,
+    };
+    use super::transport_fixtures::{HandoffLifecycleFixture, HandoffOwnerProgress};
+
+    let mut operation = test_hello_operation("activate");
+    if let EmbeddingOperation::Hello {
+        client_executable_sha256,
+        ..
+    } = &mut operation
+    {
+        *client_executable_sha256 = "b".repeat(64);
+    }
+    let hello = request("handoff", EmbeddingCompatibility::current(true), operation);
+    let fixture = HandoffLifecycleFixture::new(encode_test_frame(&hello, &[]));
+    let control = Arc::clone(&fixture.control);
+    let transport = Arc::clone(&fixture.transport);
+    let (returned_tx, returned_rx) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || {
+        control.set_owner_thread();
+        let result = run_per_user_embedding_server(PerUserEmbeddingServerConfig {
+            transport,
+            engine_cache_root: std::path::PathBuf::new(),
+            executable: test_executable(),
+            allow_cpu: true,
+            budgets: EmbeddingServerBudgets::current(),
+            protocol: EmbeddingServerProtocolSnapshot::current(),
+        });
+        control.record("server_returned");
+        let _ = returned_tx.send(());
+        result
+    });
+
+    // No assertion may strand a write/clock gate or the owned server thread.
+    // One already-in-flight accept/sleep is allowed to finish after write
+    // entry. Waiting parks only a subsequent owner-loop callback; baseline
+    // must instead consume its committed drain and report actual Closed.
+    let entered = fixture.entered.recv_timeout(Duration::from_secs(5)).is_ok();
+    let progress = fixture.progress.recv_timeout(Duration::from_secs(5)).ok();
+    let bytes_while_blocked = fixture
+        .output
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .len();
+    let returned_while_blocked = if progress == Some(HandoffOwnerProgress::Closed) {
+        returned_rx.recv_timeout(Duration::from_secs(5)).is_ok()
+    } else {
+        false
+    };
+    fixture.control.release_write();
+    let dropped = fixture.dropped.recv_timeout(Duration::from_secs(5)).is_ok();
+    fixture.control.release_owner();
+    let returned_after_release =
+        returned_while_blocked || returned_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+    fixture.control.abort();
+    let joined = server.join();
+    let events = fixture
+        .control
+        .events
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let bytes = fixture
+        .output
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let (mut response_stream, _) = MemoryStream::new(bytes, true);
+    let response: anyhow::Result<(EmbeddingProtocolResponse, Vec<u8>)> =
+        read_frame(&mut response_stream);
+
+    assert!(
+        entered,
+        "authenticated mismatch must reach the blocked first response write: {events:?}"
+    );
+    assert!(
+        progress.is_some(),
+        "actual owner must close or reach a synchronized waiting checkpoint: {events:?}"
+    );
+    assert_eq!(
+        bytes_while_blocked, 0,
+        "gate must precede all response bytes"
+    );
+    assert!(
+        dropped && returned_after_release && matches!(joined, Ok(Ok(()))),
+        "cleanup must drain the stream and join the actual owner: {events:?}"
+    );
+    assert_eq!(fixture.control.fail_stops.load(Ordering::Acquire), 0);
+    let (response, payload) =
+        response.expect("complete correlated handoff frame after gate release");
+    assert!(payload.is_empty());
+    assert_eq!(response.request_id, "handoff");
+    assert_eq!(
+        response.error.expect("incompatible activating owner").code,
+        "embedding_server_draining"
+    );
+    assert_eq!(fixture.deliveries.load(Ordering::Acquire), 1);
+    assert!(
+        progress != Some(HandoffOwnerProgress::Closed) && !returned_while_blocked,
+        "owner teardown overtook an authenticated incompatible Hello before its first reply byte; the typed retry was not yet deliverable: {events:?}"
+    );
+    let delivered = events.iter().position(|event| *event == "reply_delivered");
+    let closed = events.iter().position(|event| *event == "listener_closed");
+    assert!(
+        matches!((delivered, closed), (Some(delivered), Some(closed)) if delivered < closed),
+        "terminal response delivery must precede actual listener teardown: {events:?}"
+    );
+}
+
+#[test]
+fn handoff_response_reservation_covers_delivery_errors_and_unwind() {
+    use super::transport_fixtures::{FaultingHandoffReply, HandoffReplyFault};
+    use std::sync::atomic::AtomicBool;
+    for fault in [
+        HandoffReplyFault::None,
+        HandoffReplyFault::WriteAfter(0),
+        HandoffReplyFault::WriteAfter(3),
+        HandoffReplyFault::FinalDelivery,
+        HandoffReplyFault::Unwind,
+    ] {
+        let state = test_server_state();
+        let mut operation = test_hello_operation("activate");
+        if let EmbeddingOperation::Hello {
+            client_executable_sha256,
+            ..
+        } = &mut operation
+        {
+            *client_executable_sha256 = "b".repeat(64);
+        }
+        let hello = request(
+            "handoff-fault",
+            EmbeddingCompatibility::current(true),
+            operation,
+        );
+        let fixture = MemoryStream::with_delivery_tracking(encode_test_frame(&hello, &[]), true);
+        let blocked = Arc::new(AtomicBool::new(false));
+        let stream = FaultingHandoffReply {
+            inner: fixture.stream,
+            state: Arc::clone(&state),
+            fault,
+            written: 0,
+            retirement_blocked_at_delivery: Arc::clone(&blocked),
+        };
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            serve_embedding_connection(Arc::clone(&state), Box::new(stream))
+        }));
+        let bytes = fixture
+            .output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        match fault {
+            HandoffReplyFault::None => {
+                assert!(matches!(outcome, Ok(Ok(()))));
+                assert!(
+                    blocked.load(Ordering::Acquire),
+                    "reservation must outlive inner handler"
+                );
+                let (mut stream, _) = MemoryStream::new(bytes, true);
+                let (response, _): (EmbeddingProtocolResponse, Vec<u8>) =
+                    read_frame(&mut stream).unwrap();
+                assert_eq!(response.request_id, "handoff-fault");
+                assert_eq!(response.error.unwrap().code, "embedding_server_draining");
+                assert_eq!(fixture.finished_deliveries.load(Ordering::Acquire), 1);
+            }
+            HandoffReplyFault::WriteAfter(count) => {
+                let error = outcome.unwrap().unwrap_err();
+                assert!(format!("{error:#}").contains("injected handoff write failure"));
+                assert_eq!(bytes.len(), count);
+                assert_eq!(fixture.finished_deliveries.load(Ordering::Acquire), 0);
+            }
+            HandoffReplyFault::FinalDelivery => {
+                let error = outcome.unwrap().unwrap_err();
+                assert!(format!("{error:#}").contains("injected handoff final delivery failure"));
+                assert!(
+                    blocked.load(Ordering::Acquire),
+                    "failed delivery still owns its reservation"
+                );
+                assert_eq!(fixture.finished_deliveries.load(Ordering::Acquire), 0);
+            }
+            HandoffReplyFault::Unwind => {
+                assert!(outcome.is_err());
+                assert!(bytes.is_empty());
+                assert_eq!(fixture.finished_deliveries.load(Ordering::Acquire), 0);
+            }
+        }
+        assert!(
+            state.commit_retirement_when_ready(false),
+            "{fault:?}: reservation must be reclaimed on every terminal path"
+        );
+        assert!(
+            state.begin_authenticated_handoff().is_err(),
+            "sealed retirement rejects late reservations"
+        );
+    }
+}
+
+#[test]
+fn handoff_retirement_seals_after_all_responses_and_abort_remains_fail_stop() {
+    let state = test_server_state();
+    let (first_idle, first) = state.begin_authenticated_handoff().unwrap();
+    let (second_idle, second) = state.begin_authenticated_handoff().unwrap();
+    assert!(first_idle && second_idle && state.draining.load(Ordering::Acquire));
+    assert!(!state.commit_retirement_when_ready(false));
+    drop(first);
+    assert!(
+        !state.commit_retirement_when_ready(false),
+        "second authenticated initiator still owns delivery"
+    );
+    drop(second);
+    assert!(state.commit_retirement_when_ready(false));
+    assert!(
+        state.begin_authenticated_handoff().is_err(),
+        "no response may reserve after retirement commits"
+    );
+
+    let aborting = test_server_state();
+    let (_, response) = aborting.begin_authenticated_handoff().unwrap();
+    assert!(
+        aborting.commit_retirement_when_ready(true),
+        "abort never waits for a peer"
+    );
+    assert!(aborting.begin_authenticated_handoff().is_err());
+    drop(response);
+    assert!(
+        aborting.commit_retirement_when_ready(false),
+        "committed retirement is irreversible"
+    );
+}
+
+#[test]
+fn busy_handoff_never_exposes_transient_idle_drain() {
+    let state = test_server_state();
+    let request = begin_test_request(&state, EmbeddingRequestClass::Query, "busy-handoff");
+    let active = state.active.lock().unwrap();
+    let caller = Arc::clone(&state);
+    let worker = thread::spawn(move || caller.begin_authenticated_handoff());
+    // Positively observe that the caller owns admission and is blocked on our
+    // active map; do not infer this ordering from a sleep or absence of drain.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut admission_owned = false;
+    while std::time::Instant::now() < deadline {
+        match state.admission_gate.try_lock() {
+            Err(std::sync::TryLockError::WouldBlock) => {
+                admission_owned = true;
+                break;
+            }
+            Ok(guard) => drop(guard),
+            Err(std::sync::TryLockError::Poisoned(_)) => break,
+        }
+        thread::yield_now();
+    }
+    let transient_drain = state.draining.load(Ordering::Acquire);
+    drop(active);
+    let joined = worker.join();
+    // Release the response and real admitted request before asserting.
+    let outcome = joined.ok().and_then(Result::ok).map(|(idle, response)| {
+        drop(response);
+        idle
+    });
+    drop(request);
+    assert!(
+        admission_owned,
+        "must observe the blocked idle check under admission ownership"
+    );
+    assert!(
+        !transient_drain,
+        "busy/native idle checks must precede observable drain commitment"
+    );
+    assert_eq!(outcome, Some(false));
+    assert!(!state.draining.load(Ordering::Acquire));
+    assert!(state.begin_draining_if_idle());
+    assert!(state.commit_retirement_when_ready(false));
+}
+
+#[test]
+fn unauthenticated_and_observe_hellos_never_own_handoff_retirement() {
+    let observed = test_server_state();
+    let error = serve_mismatched_peer_hello(&observed, "observe");
+    assert_eq!(error.code, "embedding_server_incompatible_active_owner");
+    assert!(!observed.draining.load(Ordering::Acquire));
+    assert!(observed.begin_draining_if_idle());
+    assert!(observed.commit_retirement_when_ready(false));
+
+    let unverified = test_server_state();
+    let hello = request(
+        "unverified",
+        EmbeddingCompatibility::current(true),
+        test_hello_operation("activate"),
+    );
+    let (mut stream, output) = MemoryStream::new(encode_test_frame(&hello, &[]), true);
+    stream.identity.peer_verified = false;
+    let error = serve_embedding_connection(Arc::clone(&unverified), Box::new(stream)).unwrap_err();
+    assert!(format!("{error:#}").contains("embedding_server_peer_unverified"));
+    assert!(output.lock().unwrap().is_empty());
+    assert!(!unverified.draining.load(Ordering::Acquire));
+    assert!(unverified.begin_draining_if_idle());
+    assert!(unverified.commit_retirement_when_ready(false));
+}

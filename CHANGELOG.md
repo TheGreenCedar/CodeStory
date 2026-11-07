@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Graceful embedding-server version handoffs keep their retry response alive until delivery finishes or fails.
+
 - Indexing handles chained receiver calls in C#, Swift and Dart without interrupting repository preparation. Existing indexes refresh their cached call records automatically.
 
 - An experimental Codex post-tool hook can add verified Python, Rust and Go source context after ordinary searches without rewriting or rerunning commands.

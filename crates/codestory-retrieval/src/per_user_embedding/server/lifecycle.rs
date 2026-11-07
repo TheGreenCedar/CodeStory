@@ -64,7 +64,7 @@ pub fn run_per_user_embedding_server(config: PerUserEmbeddingServerConfig) -> Re
         },
         connections: AtomicUsize::new(0),
         pre_request_connections: AtomicUsize::new(0),
-        admission_gate: Mutex::new(()),
+        admission_gate: Mutex::default(),
         request_admission: Arc::new(ServerRequestAdmission::default()),
         active: Mutex::new(std::collections::BTreeMap::new()),
         cancellations: Mutex::new(std::collections::BTreeMap::new()),
@@ -173,6 +173,13 @@ pub fn run_per_user_embedding_server(config: PerUserEmbeddingServerConfig) -> Re
     })();
 
     state.draining.store(true, Ordering::Release);
+    while !state.commit_retirement_when_ready(
+        serve_result.is_err() || state.stopped.load(Ordering::Acquire),
+    ) {
+        // Only authenticated handoff replies retain this bounded delivery
+        // window. Arbitrary connection handlers never hold owner retirement.
+        clock.sleep(SERVER_ACCEPT_POLL);
+    }
     let _ = listener.close();
     let state_for_cleanup = Arc::clone(&state);
     let cleanup = thread::Builder::new()

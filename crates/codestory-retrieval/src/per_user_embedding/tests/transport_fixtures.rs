@@ -812,3 +812,413 @@ impl EmbeddingServerStream for StallingHelloStream {
         Ok(())
     }
 }
+
+/// Checkpoints the actual owner loop through its existing listener/clock traits.
+/// The first post-write callback may be an already-in-flight accept: let it
+/// finish without parking. Only the next callback can witness a later owner
+/// loop. A Waiting event parks that owner until cleanup releases it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum HandoffOwnerProgress {
+    Waiting,
+    Closed,
+}
+
+pub(super) struct HandoffLifecycleControl {
+    gates: Mutex<(bool, bool)>,
+    wake: std::sync::Condvar,
+    write_waiting: AtomicBool,
+    owner_checkpoint_sent: AtomicBool,
+    owner_callbacks_after_write: AtomicUsize,
+    owner: Mutex<Option<thread::ThreadId>>,
+    abort: AtomicBool,
+    progress: std::sync::mpsc::Sender<HandoffOwnerProgress>,
+    pub(super) events: Mutex<Vec<&'static str>>,
+    pub(super) fail_stops: AtomicUsize,
+}
+
+impl HandoffLifecycleControl {
+    pub(super) fn set_owner_thread(&self) {
+        *self
+            .owner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(thread::current().id());
+    }
+
+    pub(super) fn record(&self, event: &'static str) {
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(event);
+    }
+
+    fn wait_gate(&self, owner: bool) -> bool {
+        let gates = self
+            .gates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (gates, _) = self
+            .wake
+            .wait_timeout_while(gates, Duration::from_secs(10), |gates| {
+                !(if owner { gates.1 } else { gates.0 })
+            })
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if owner { gates.1 } else { gates.0 }
+    }
+
+    fn owner_checkpoint(&self) {
+        if !self.write_waiting.load(Ordering::Acquire) {
+            return;
+        }
+        if self
+            .owner_callbacks_after_write
+            .fetch_add(1, Ordering::AcqRel)
+            == 0
+        {
+            // The owner may have read draining=false before Hello committed
+            // drain, then entered this accept after the first-write gate.
+            // Return None / finish that sleep so it must re-enter its loop.
+            self.record("owner_stale_iteration_passed");
+            return;
+        }
+        if !self.owner_checkpoint_sent.swap(true, Ordering::AcqRel) {
+            self.record("owner_waiting");
+            let _ = self.progress.send(HandoffOwnerProgress::Waiting);
+            let _ = self.wait_gate(true);
+        }
+    }
+
+    pub(super) fn release_write(&self) {
+        self.gates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0 = true;
+        self.wake.notify_all();
+    }
+
+    pub(super) fn release_owner(&self) {
+        self.gates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .1 = true;
+        self.wake.notify_all();
+    }
+
+    pub(super) fn abort(&self) {
+        self.abort.store(true, Ordering::Release);
+        self.release_write();
+        self.release_owner();
+    }
+}
+
+struct HandoffLifecycleClock {
+    started: std::time::Instant,
+    control: Arc<HandoffLifecycleControl>,
+}
+
+impl AwakeMonotonicClock for HandoffLifecycleClock {
+    fn now_ns(&self) -> u64 {
+        self.started
+            .elapsed()
+            .as_nanos()
+            .min(u128::from(u64::MAX - 1)) as u64
+            + 1
+    }
+
+    fn sleep(&self, duration: Duration) {
+        let is_owner = self
+            .control
+            .owner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some_and(|owner| owner == thread::current().id());
+        if is_owner {
+            self.control.owner_checkpoint();
+        }
+        // A full lifecycle must not fast-forward idle expiry via TestClock.
+        thread::sleep(duration.min(Duration::from_millis(1)));
+    }
+
+    fn snapshot(&self) -> EmbeddingServerClockSnapshot {
+        let mut snapshot = TestClock::new().snapshot();
+        snapshot.api = "in_memory_handoff_lifecycle".into();
+        // This is an ordinary activation fixture, not qualification. If an
+        // ambient qualification controller is enabled, fail setup before Hello
+        // instead of allowing its pre-drain freeze/sleep branch to fake progress.
+        snapshot.boot_id = None;
+        snapshot
+    }
+}
+
+struct GatedHandoffReply {
+    inner: MemoryStream,
+    control: Arc<HandoffLifecycleControl>,
+    entered: Option<std::sync::mpsc::Sender<()>>,
+    dropped: std::sync::mpsc::Sender<()>,
+}
+
+impl Read for GatedHandoffReply {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buffer)
+    }
+}
+
+impl Write for GatedHandoffReply {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if let Some(entered) = self.entered.take() {
+            self.control.write_waiting.store(true, Ordering::Release);
+            self.control.record("first_write_blocked");
+            let _ = entered.send(());
+            if !self.control.wait_gate(false) {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "fixture write gate not released",
+                ));
+            }
+        }
+        self.inner.write(buffer)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl EmbeddingServerStream for GatedHandoffReply {
+    fn transport_identity(&self) -> &EmbeddingTransportIdentity {
+        self.inner.transport_identity()
+    }
+    fn set_read_timeout(&self, value: Option<Duration>) -> io::Result<()> {
+        self.inner.set_read_timeout(value)
+    }
+    fn set_write_timeout(&self, value: Option<Duration>) -> io::Result<()> {
+        self.inner.set_write_timeout(value)
+    }
+    fn peer_is_alive(&self) -> io::Result<bool> {
+        self.inner.peer_is_alive()
+    }
+    fn finish_response_delivery(&self) -> io::Result<()> {
+        self.inner.finish_response_delivery()?;
+        self.control.record("reply_delivered");
+        Ok(())
+    }
+    fn shutdown(&self) -> io::Result<()> {
+        self.inner.shutdown()
+    }
+}
+
+impl Drop for GatedHandoffReply {
+    fn drop(&mut self) {
+        self.control.record("stream_dropped");
+        let _ = self.dropped.send(());
+    }
+}
+
+struct HandoffLifecycleListener {
+    identity: EmbeddingTransportIdentity,
+    stream: Mutex<Option<Box<dyn EmbeddingServerStream>>>,
+    control: Arc<HandoffLifecycleControl>,
+}
+
+impl super::super::EmbeddingServerListener for HandoffLifecycleListener {
+    fn accept(
+        &self,
+        timeout: Duration,
+    ) -> Result<Option<Box<dyn EmbeddingServerStream>>, super::super::EmbeddingTransportFailure>
+    {
+        if self.control.abort.load(Ordering::Acquire) {
+            return Err(super::super::EmbeddingTransportFailure {
+                code: "fixture_cleanup".into(),
+                message: "stop owned in-memory lifecycle".into(),
+            });
+        }
+        if let Some(stream) = self
+            .stream
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            return Ok(Some(stream));
+        }
+        self.control.owner_checkpoint();
+        thread::sleep(timeout.min(Duration::from_millis(1)));
+        Ok(None)
+    }
+    fn identity(&self) -> &EmbeddingTransportIdentity {
+        &self.identity
+    }
+    fn close(&self) -> Result<(), super::super::EmbeddingTransportFailure> {
+        self.control.record("listener_closed");
+        let _ = self.control.progress.send(HandoffOwnerProgress::Closed);
+        Ok(())
+    }
+}
+
+pub(super) struct HandoffLifecycleTransport {
+    listener: Mutex<Option<Box<dyn super::super::EmbeddingServerListener>>>,
+    clock: Arc<HandoffLifecycleClock>,
+}
+
+impl super::super::EmbeddingServerTransport for HandoffLifecycleTransport {
+    fn bind(
+        &self,
+    ) -> Result<super::super::EmbeddingServerBindOutcome, super::super::EmbeddingTransportFailure>
+    {
+        Ok(
+            match self
+                .listener
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                Some(listener) => super::super::EmbeddingServerBindOutcome::Bound(listener),
+                None => super::super::EmbeddingServerBindOutcome::AlreadyOwned,
+            },
+        )
+    }
+    fn clock(&self) -> Arc<dyn AwakeMonotonicClock> {
+        self.clock.clone()
+    }
+    fn fail_stop(&self, _: &str) {
+        self.clock.control.fail_stops.fetch_add(1, Ordering::AcqRel);
+        self.clock.control.abort();
+    }
+}
+
+pub(super) struct HandoffLifecycleFixture {
+    pub(super) transport: Arc<HandoffLifecycleTransport>,
+    pub(super) control: Arc<HandoffLifecycleControl>,
+    pub(super) entered: std::sync::mpsc::Receiver<()>,
+    pub(super) progress: std::sync::mpsc::Receiver<HandoffOwnerProgress>,
+    pub(super) dropped: std::sync::mpsc::Receiver<()>,
+    pub(super) output: Arc<Mutex<Vec<u8>>>,
+    pub(super) deliveries: Arc<AtomicUsize>,
+}
+
+impl HandoffLifecycleFixture {
+    pub(super) fn new(input: Vec<u8>) -> Self {
+        let (progress_tx, progress) = std::sync::mpsc::channel();
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (dropped_tx, dropped) = std::sync::mpsc::channel();
+        let control = Arc::new(HandoffLifecycleControl {
+            gates: Mutex::new((false, false)),
+            wake: std::sync::Condvar::new(),
+            write_waiting: AtomicBool::new(false),
+            owner_checkpoint_sent: AtomicBool::new(false),
+            owner_callbacks_after_write: AtomicUsize::new(0),
+            owner: Mutex::new(None),
+            abort: AtomicBool::new(false),
+            progress: progress_tx,
+            events: Mutex::new(Vec::new()),
+            fail_stops: AtomicUsize::new(0),
+        });
+        let base = MemoryStream::with_delivery_tracking(input, true);
+        let output = Arc::clone(&base.output);
+        let deliveries = Arc::clone(&base.finished_deliveries);
+        let stream = GatedHandoffReply {
+            inner: base.stream,
+            control: Arc::clone(&control),
+            entered: Some(entered_tx),
+            dropped: dropped_tx,
+        };
+        let listener = HandoffLifecycleListener {
+            identity: test_transport_identity(),
+            stream: Mutex::new(Some(Box::new(stream))),
+            control: Arc::clone(&control),
+        };
+        let clock = Arc::new(HandoffLifecycleClock {
+            started: std::time::Instant::now(),
+            control: Arc::clone(&control),
+        });
+        let transport = Arc::new(HandoffLifecycleTransport {
+            listener: Mutex::new(Some(Box::new(listener))),
+            clock,
+        });
+        Self {
+            transport,
+            control,
+            entered,
+            progress,
+            dropped,
+            output,
+            deliveries,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) enum HandoffReplyFault {
+    None,
+    WriteAfter(usize),
+    FinalDelivery,
+    Unwind,
+}
+
+/// Faults the real connection wrapper while independently attempting owner
+/// retirement at the final-delivery boundary. An inner-only guard would fail.
+pub(super) struct FaultingHandoffReply {
+    pub(super) inner: MemoryStream,
+    pub(super) state: Arc<super::super::PerUserEmbeddingServerState>,
+    pub(super) fault: HandoffReplyFault,
+    pub(super) written: usize,
+    pub(super) retirement_blocked_at_delivery: Arc<AtomicBool>,
+}
+
+impl Read for FaultingHandoffReply {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buffer)
+    }
+}
+
+impl Write for FaultingHandoffReply {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if matches!(self.fault, HandoffReplyFault::Unwind) {
+            panic!("injected handoff write unwind");
+        }
+        let limit = match self.fault {
+            HandoffReplyFault::WriteAfter(limit) => limit.saturating_sub(self.written),
+            _ => buffer.len(),
+        };
+        if limit == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "injected handoff write failure",
+            ));
+        }
+        let count = self.inner.write(&buffer[..buffer.len().min(limit)])?;
+        self.written += count;
+        Ok(count)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl EmbeddingServerStream for FaultingHandoffReply {
+    fn transport_identity(&self) -> &EmbeddingTransportIdentity {
+        self.inner.transport_identity()
+    }
+    fn set_read_timeout(&self, value: Option<Duration>) -> io::Result<()> {
+        self.inner.set_read_timeout(value)
+    }
+    fn set_write_timeout(&self, value: Option<Duration>) -> io::Result<()> {
+        self.inner.set_write_timeout(value)
+    }
+    fn peer_is_alive(&self) -> io::Result<bool> {
+        self.inner.peer_is_alive()
+    }
+    fn finish_response_delivery(&self) -> io::Result<()> {
+        self.retirement_blocked_at_delivery.store(
+            !self.state.commit_retirement_when_ready(false),
+            Ordering::Release,
+        );
+        if matches!(self.fault, HandoffReplyFault::FinalDelivery) {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "injected handoff final delivery failure",
+            ));
+        }
+        self.inner.finish_response_delivery()
+    }
+    fn shutdown(&self) -> io::Result<()> {
+        self.inner.shutdown()
+    }
+}
