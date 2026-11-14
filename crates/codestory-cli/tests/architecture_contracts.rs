@@ -688,7 +688,7 @@ fn repository_derived_compiler_is_the_public_evidence_planning_boundary() {
     }
     let orchestrator = read("crates/codestory-runtime/src/agent/orchestrator.rs");
     let compiler_preparation = orchestrator
-        .find("let prepared_compilation = prepare_packet_compilation")
+        .find("prepared_compilation = prepare_packet_compilation(")
         .expect("runtime prepares authenticated repository evidence for the compiler");
     let presentation_cap = orchestrator
         .find("let budget = apply_packet_budget")
