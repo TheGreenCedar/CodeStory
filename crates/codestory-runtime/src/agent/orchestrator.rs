@@ -575,7 +575,7 @@ fn agent_packet_with_session(
     if let Some(publication) = active_retrieval_publication.clone() {
         answer.retrieval_trace.retrieval_publication = Some(publication);
     }
-    let prepared_compilation = prepare_packet_compilation(
+    let mut prepared_compilation = prepare_packet_compilation(
         controller,
         &project_id,
         &plan.probe_resolutions,
@@ -637,7 +637,8 @@ fn agent_packet_with_session(
         answer_sufficiency: Default::default(),
     };
     append_packet_non_trace_phase(&mut packet.answer, "packet_dto", phase_started);
-    if let Some((_caller, measure)) = representation_measure {
+    if let Some((caller, measure)) = representation_measure {
+        prepared_compilation.bind_representation_caller(caller, &req);
         let mut replay = replay_enrollment.and_then(|enrollment| {
             super::packet_replay::PacketReplayTrace::begin(
                 enrollment,

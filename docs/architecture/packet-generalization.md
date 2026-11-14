@@ -105,6 +105,14 @@ extent and authenticated navigation paths. That final measurement refuses
 changed size, cancellation or errors. Existing per-proposal latency and
 cancellation checks remain in force.
 
+For stdio option requests without an issued record, if the requested pages
+cannot fit alongside the measured current context, up to four distinct views
+of the already verified requested pages can use the same renderer. The
+response must deliver at least one requested page and report omitted requested
+pages and newly retrieved context before it is remeasured. The original
+refusal applies if no such response fits. The existing request-wide
+measurement limit still applies.
+
 The default pure compilation reserves one graph witness row when space permits.
 Measured selection also considers a source-first allocation at each row limit,
 alongside that graph-preserving allocation, using only the same admitted and

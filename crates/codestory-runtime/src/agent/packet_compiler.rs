@@ -80,6 +80,8 @@ pub(crate) struct PreparedPacketCompilationV1 {
     // Historical replay records fail closed to the existing baseline policy.
     #[serde(default)]
     fresh_retrieval_only: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    legacy_stdio_option_request: bool,
 }
 
 impl PreparedPacketCompilationV1 {
@@ -108,7 +110,23 @@ impl PreparedPacketCompilationV1 {
             requested_source_minimum_ends: BTreeMap::new(),
             issued_context_sources: None,
             fresh_retrieval_only: false,
+            legacy_stdio_option_request: false,
         }
+    }
+
+    pub(crate) fn bind_representation_caller(
+        &mut self,
+        caller: &str,
+        request: &AgentPacketRequestDto,
+    ) {
+        self.legacy_stdio_option_request = caller == "codestory-stdio"
+            && request
+                .parent_packet_id
+                .as_deref()
+                .is_some_and(|id| !id.is_empty() && !id.starts_with("psr1:"))
+            && !request.option_ids.is_empty()
+            && request.probes.is_empty()
+            && self.issued_context_sources.is_none();
     }
 
     pub(crate) fn supports_served_source_record(&self) -> bool {
@@ -216,7 +234,8 @@ impl PreparedPacketCompilationV1 {
         let mut bounded_measure =
             |prepared: &Self,
              product: &RepositoryDerivedCompilationV1,
-             baseline: Option<&RepositoryDerivedCompilationV1>| {
+             baseline: Option<&RepositoryDerivedCompilationV1>,
+             allow_matched_source_omission: bool| {
                 let limit = 8 * codestory_agent::evidence_compiler::REPOSITORY_EVIDENCE_MAX_MEASURED_CANDIDATES_V1 + 1;
                 if calls >= limit {
                     return Err(codestory_contracts::api::ApiError::internal(
@@ -227,7 +246,7 @@ impl PreparedPacketCompilationV1 {
                 if !matched_source_retained(
                     &product.support,
                     &prepared.matched_source_floor,
-                    fresh_retrieval_only,
+                    fresh_retrieval_only || allow_matched_source_omission,
                 ) {
                     return Ok(None);
                 }
@@ -280,7 +299,7 @@ impl PreparedPacketCompilationV1 {
             // reaching the representation callback.
             let preserve_original_context = self.issued_context_sources.is_some()
                 || !source_floor_retained(&original_context.support, &original_context.support)
-                || bounded_measure(&self, &original_context, None)?
+                || bounded_measure(&self, &original_context, None, false)?
                     .is_some_and(|bytes| bytes <= PUBLIC_PACKET_SERIALIZED_MAX_BYTES);
             let mut candidates_examined = 0usize;
             let mut floor_predicate_rejected = 0usize;
@@ -310,7 +329,7 @@ impl PreparedPacketCompilationV1 {
                         return Ok(None);
                     }
                     floor_preserving_measurements += 1;
-                    let measured = bounded_measure(&self, &displayed, None)?;
+                    let measured = bounded_measure(&self, &displayed, None, false)?;
                     if let Some(bytes) = measured {
                         minimum_measured_bytes = Some(
                             minimum_measured_bytes.map_or(bytes, |minimum| minimum.min(bytes)),
@@ -439,7 +458,7 @@ impl PreparedPacketCompilationV1 {
                 {
                     return Ok(None);
                 }
-                bounded_measure(&self, &product, None)
+                bounded_measure(&self, &product, None, false)
             };
             let selection = if fresh_retrieval_only {
                 compile_repository_evidence_body_aware_baseline_for_representation(
@@ -553,7 +572,7 @@ impl PreparedPacketCompilationV1 {
                         }) {
                             return Ok(None);
                         }
-                        bounded_measure(&self, &displayed, Some(&displayed_baseline))
+                        bounded_measure(&self, &displayed, Some(&displayed_baseline), false)
                     },
                 )?;
                 if let JointRepresentationSelectionV1::Complete {
@@ -596,7 +615,7 @@ impl PreparedPacketCompilationV1 {
             if context_floor
                 .as_ref()
                 .is_some_and(|floor| !source_floor_retained(&product.support, &floor.support))
-                || bounded_measure(&self, &product, Some(&displayed_baseline))?
+                || bounded_measure(&self, &product, Some(&displayed_baseline), false)?
                     .is_none_or(|bytes| bytes > PUBLIC_PACKET_SERIALIZED_MAX_BYTES)
             {
                 return Err(codestory_contracts::api::ApiError::internal(
@@ -608,10 +627,20 @@ impl PreparedPacketCompilationV1 {
             return Ok(frozen);
         }
         if let Some(floor) = context_floor {
+            if self.legacy_stdio_option_request
+                && self.issued_context_sources.is_none()
+                && !self.requested_source_identities.is_empty()
+                && let Some(product) = self
+                    .select_requested_only_progress(verified_extents, |prepared, product| {
+                        bounded_measure(prepared, product, None, true)
+                    })?
+            {
+                return Ok(self.into_frozen(product));
+            }
             self.input.sources = context_sources;
             self.source_refusals.extend(self.requested_source_identities.iter().map(|identity|
                 format!("{identity}: no requested complete-line page fits without losing authenticated context.")));
-            let fits = bounded_measure(&self, &floor, Some(&floor))?
+            let fits = bounded_measure(&self, &floor, Some(&floor), false)?
                 .is_some_and(|bytes| bytes <= PUBLIC_PACKET_SERIALIZED_MAX_BYTES);
             if !fits {
                 return Err(codestory_contracts::api::ApiError::new(
@@ -632,7 +661,7 @@ impl PreparedPacketCompilationV1 {
         let selection = compile_repository_evidence_for_representation(&self.input, |product| {
             let mut product = product.clone();
             attach_file_navigation_paths(&mut product.support, &self.file_navigation_paths);
-            bounded_measure(&self, &product, None)
+            bounded_measure(&self, &product, None, false)
         })?;
         let product = match selection {
             RepresentationBudgetSelectionV1::Complete { product, .. }
@@ -640,6 +669,113 @@ impl PreparedPacketCompilationV1 {
         };
         Ok(self.into_frozen(product))
     }
+    fn select_requested_only_progress(
+        &mut self,
+        verified_extents: Vec<Vec<PacketHydratedSourceRangeV1>>,
+        mut measure: impl FnMut(
+            &Self,
+            &RepositoryDerivedCompilationV1,
+        ) -> Result<Option<usize>, codestory_contracts::api::ApiError>,
+    ) -> Result<Option<RepositoryDerivedCompilationV1>, codestory_contracts::api::ApiError> {
+        // The legacy child has no authenticated parent floor. Reuse its
+        // verified requested pages and keep prior hydration refusals intact.
+        let mut extents = Vec::new();
+        for mut sources in verified_extents {
+            sources.retain(|source| {
+                self.requested_source_identities
+                    .contains(&source.stable_identity)
+            });
+            if !extents.contains(&sources) {
+                extents.push(sources);
+            }
+        }
+        if extents.len() > 4 {
+            return Err(codestory_contracts::api::ApiError::internal(
+                "Verified requested-only extent bound exhausted.",
+            ));
+        }
+
+        let refusal_count = self.source_refusals.len();
+        let mut measure_requested =
+            |prepared: &mut Self, product: &RepositoryDerivedCompilationV1| {
+                let mut product = product.clone();
+                attach_file_navigation_paths(&mut product.support, &prepared.file_navigation_paths);
+                let delivered = prepared
+                    .input
+                    .sources
+                    .iter()
+                    .filter(|source| {
+                        source.delivery.as_ref().is_some_and(|delivery| {
+                            delivery.matches_delivery(source.start_line, source.end_line)
+                        }) && prepared
+                            .requested_source_minimum_ends
+                            .get(&source.stable_identity)
+                            .is_some_and(|minimum| source.start_line == *minimum)
+                            && product.support.iter().any(|row| {
+                                row.kind == SupportUnitKindDto::SourceRange
+                                    && final_support_stable_identity(row).as_ref()
+                                        == Some(&source.stable_identity)
+                                    && row.path.as_deref() == Some(source.path.as_str())
+                                    && row.start_line == Some(source.start_line)
+                                    && row.end_line == Some(source.end_line)
+                                    && row.snippet.as_deref() == Some(source.source.as_str())
+                                    && row.source_delivery == source.delivery
+                            })
+                    })
+                    .map(|source| &source.stable_identity)
+                    .collect::<BTreeSet<_>>();
+                if delivered.is_empty() {
+                    return Ok(None);
+                }
+                prepared.source_refusals.truncate(refusal_count);
+                prepared.source_refusals.push(
+                    "Omitted newly retrieved source context to fit requested source pages.".into(),
+                );
+                for identity in prepared.requested_source_minimum_ends.keys() {
+                    if !delivered.contains(identity) {
+                        let reason = if prepared.requested_source_identities.contains(identity) {
+                            "requested source page omitted from the public response"
+                        } else {
+                            "requested source page was unavailable under the pinned publication"
+                        };
+                        prepared
+                            .source_refusals
+                            .push(format!("{identity}: {reason}."));
+                    }
+                }
+                measure(prepared, &product)
+            };
+
+        let mut best = None;
+        for sources in extents {
+            self.input.sources = sources;
+            let input = self.input.clone();
+            let navigation = self.call_navigation.clone();
+            let selection = compile_repository_evidence_baseline_for_representation(
+                &input,
+                &navigation,
+                |product| measure_requested(self, product),
+            )?;
+            if let RepresentationBudgetSelectionV1::Complete { product, .. } = selection {
+                let rank = repository_evidence_baseline_rank(&input, &navigation, &product);
+                if best.as_ref().is_none_or(|(old, _, _)| rank > *old) {
+                    best = Some((rank, input.sources, product));
+                }
+            }
+        }
+        if let Some((_, sources, mut product)) = best {
+            self.input.sources = sources;
+            attach_file_navigation_paths(&mut product.support, &self.file_navigation_paths);
+            if measure_requested(self, &product)?
+                .is_some_and(|bytes| bytes <= PUBLIC_PACKET_SERIALIZED_MAX_BYTES)
+            {
+                return Ok(Some(product));
+            }
+        }
+        self.source_refusals.truncate(refusal_count);
+        Ok(None)
+    }
+
     /// Freeze the original offered frontier while joint evidence is measured.
     /// Internal coverage only nominates removals: the final served-frame guard
     /// must still authenticate every resolving witness before acceptance.
@@ -1152,6 +1288,7 @@ pub(crate) fn prepare_packet_compilation(
         requested_source_minimum_ends,
         issued_context_sources,
         fresh_retrieval_only,
+        legacy_stdio_option_request: false,
     })
 }
 
@@ -1217,6 +1354,7 @@ pub(crate) fn replay_prepare_from_sealed_admissions(
         requested_source_minimum_ends: BTreeMap::new(),
         issued_context_sources: None,
         fresh_retrieval_only: false,
+        legacy_stdio_option_request: false,
     })
 }
 
@@ -4287,6 +4425,262 @@ mod tests {
         assert_eq!(delivery.requested_range, range);
         assert_eq!(delivery.next_start_line, Some(old.end_line + 2));
         assert!(delivery.remaining_source_bytes > 0);
+    }
+
+    #[test]
+    fn legacy_stdio_continuation_delivers_requested_source_under_context_pressure() {
+        use crate::evidence_projection_v3::representation_budget_test_support as fixture;
+        use codestory_contracts::packet_projection_v3::PacketProjectionV3Dto;
+
+        let page = |id, start_line, line: &str, count, cap| {
+            let body = "\n".repeat(start_line as usize - 1) + &line.repeat(count);
+            let range = PacketSourceRangeV1 {
+                start_line,
+                end_line: body.lines().count() as u32,
+            };
+            let hash = format!("{:x}", Sha256::digest(body.as_bytes()));
+            let (source, end_line, delivery) =
+                complete_node_page(&body, range, cap, &hash).unwrap();
+            PacketHydratedSourceRangeV1 {
+                callable_body: None,
+                stable_identity: format!("node:{id}"),
+                path: format!("source_{id}.rs"),
+                symbol: None,
+                start_line,
+                end_line,
+                source,
+                delivery: Some(delivery),
+                parser_completeness: PacketParserCompletenessV1::Complete,
+            }
+        };
+        let context = page(1, 1, "current_retrieval_context(arguments);\n", 48, 4096);
+        let requested = |cap| page(2, 9, "selected_operation(value, context);\n", 72, cap);
+        let omitted_line = "x".repeat(3900) + "\n";
+        let omitted = page(3, 1, &omitted_line, 1, 4096);
+        let publication = PacketCompilationPublicationV1 {
+            project_id: "project-1".into(),
+            core_generation_id: "core-generation-1".into(),
+            retrieval_generation: Some("retrieval-generation-1".into()),
+        };
+        let sources = vec![context.clone(), requested(4096), omitted];
+        let input = PacketCompilationInputV1 {
+            contract_version: PACKET_COMPILATION_CONTRACT_VERSION_V1,
+            publication,
+            admissions: sources
+                .iter()
+                .enumerate()
+                .map(|(i, source)| PacketAdmissionReceiptV1 {
+                    packet_ordinal: i as u32,
+                    stable_identity: source.stable_identity.clone(),
+                    score_version: "ordinary".into(),
+                    reserved_source_bytes: 4096,
+                    origin: if i == 0 {
+                        PacketAdmissionOriginV1::Retrieval
+                    } else {
+                        PacketAdmissionOriginV1::ExactTypedSelector
+                    },
+                })
+                .collect(),
+            sources,
+            relations: Vec::new(),
+            ambiguities: Vec::new(),
+            admission_gaps: Vec::new(),
+        };
+        let request: AgentPacketRequestDto = serde_json::from_value(serde_json::json!({
+            "question":"Read the selected repository source pages",
+            "parent_packet_id":"legacy-request",
+            "option_ids":["ms1:9:80:2","ms1:1:1:3","ms1:1:1:4"],
+            "core_generation_id":"core-generation-1",
+            "retrieval_generation":"retrieval-generation-1",
+        }))
+        .unwrap();
+        let (base, _) = fixture::default_packet(input.clone(), &request);
+        let mut control = PreparedPacketCompilationV1::from_fixture_input(input);
+        control.requested_source_identities = BTreeSet::from(["node:2".into(), "node:3".into()]);
+        control.requested_source_minimum_ends = BTreeMap::from([
+            ("node:2".into(), 9),
+            ("node:3".into(), 1),
+            ("node:4".into(), 1),
+        ]);
+        control.matched_source_floor = vec![context.clone()];
+        control
+            .source_refusals
+            .push("Existing authenticated source refusal.".into());
+        for cap in [2048, 1024, 512] {
+            control
+                .source_page_alternatives
+                .insert(cap, vec![requested(cap)]);
+        }
+        let mut floor_only = control.clone();
+        floor_only.input.sources = vec![context.clone()];
+        let mut floor_packet = base.clone();
+        floor_only.apply_proposal(
+            &mut floor_packet,
+            Some(&request),
+            &floor_only.default_product(),
+        );
+        let floor_projection = fixture::project_packet(&request, &floor_packet, |_| Ok(0))
+            .unwrap()
+            .projection;
+        let opaque_bytes = PUBLIC_PACKET_SERIALIZED_MAX_BYTES
+            - serde_json::to_vec(&floor_projection).unwrap().len()
+            - 850;
+        let wire_bytes = |projection: &PacketProjectionV3Dto| {
+            serde_json::to_vec(projection).unwrap().len() + opaque_bytes
+        };
+
+        for mode in [
+            "legacy",
+            "typed",
+            "other-caller",
+            "issued",
+            "old-replay",
+            "no-fit",
+        ] {
+            let mut prepared = control.clone();
+            let mut request = request.clone();
+            if mode == "typed" {
+                request
+                    .probes
+                    .push(codestory_contracts::api::PacketProbeDto::SymbolId { id: "2".into() });
+            }
+            if mode == "issued" {
+                prepared.issued_context_sources = Some(vec![context.clone()]);
+            }
+            let caller = if mode == "other-caller" {
+                "codestory-cli"
+            } else {
+                "codestory-stdio"
+            };
+            prepared.bind_representation_caller(caller, &request);
+            let mut snapshot = prepared.replay_snapshot();
+            if mode == "old-replay" {
+                snapshot
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("legacy_stdio_option_request");
+            }
+            let prepared: PreparedPacketCompilationV1 = serde_json::from_value(snapshot).unwrap();
+            let mut measured = 0;
+            let mut final_frame = None;
+            let frozen = prepared
+                .select_for_representation_with_baseline(|prepared, product, _| {
+                    measured += 1;
+                    let mut candidate = base.clone();
+                    prepared.apply_proposal(&mut candidate, Some(&request), product);
+                    let refuses_requested = mode == "no-fit"
+                        && product.support.iter().any(|row| {
+                            row.kind == SupportUnitKindDto::SourceRange
+                                && row.symbol_id.as_deref() == Some("2")
+                        });
+                    let size = |p: &PacketProjectionV3Dto| {
+                        if refuses_requested && matches!(p, PacketProjectionV3Dto::Complete { .. })
+                        {
+                            PUBLIC_PACKET_SERIALIZED_MAX_BYTES + 1
+                        } else {
+                            wire_bytes(p)
+                        }
+                    };
+                    let projection =
+                        fixture::project_packet(&request, &candidate, |p| Ok(size(p)))?.projection;
+                    if !matches!(projection, PacketProjectionV3Dto::Complete { .. }) {
+                        return Ok(None);
+                    }
+                    let bytes = size(&projection);
+                    assert!(bytes <= PUBLIC_PACKET_SERIALIZED_MAX_BYTES, "{mode}");
+                    final_frame = Some((candidate, projection, bytes));
+                    Ok(Some(bytes))
+                })
+                .unwrap_or_else(|error| panic!("{mode}: {error:?}"));
+            assert!(measured <= 615, "{mode}: {measured} callbacks");
+            let (candidate, projection, bytes) = final_frame.unwrap();
+            assert_eq!(candidate.support, frozen.product.support, "{mode}");
+            assert_eq!(bytes, wire_bytes(&projection));
+            let PacketProjectionV3Dto::Complete {
+                evidence,
+                gaps,
+                continuation,
+                ..
+            } = projection
+            else {
+                unreachable!()
+            };
+            assert!(
+                continuation.is_none(),
+                "{mode}: a used drill cannot start another round"
+            );
+            if mode == "legacy" {
+                let rows = evidence.as_slice();
+                let row = rows
+                    .iter()
+                    .find(|row| row.symbol_id.as_ref().is_some_and(|id| id.as_str() == "2"))
+                    .unwrap();
+                let delivery = row.source_delivery.as_ref().unwrap();
+                let witness = [2048, 1024, 512]
+                    .into_iter()
+                    .map(requested)
+                    .find(|page| page.delivery.as_ref() == Some(delivery))
+                    .unwrap();
+                assert_eq!(row.path.as_ref().unwrap().as_str(), witness.path);
+                let displayed = crate::evidence_projection_v3::compact_numbered_source_page(
+                    &witness.source,
+                    witness.start_line,
+                    witness.end_line,
+                )
+                .unwrap();
+                assert_eq!(row.summary.as_ref().unwrap().as_str(), displayed);
+                assert_eq!(row.start_line, Some(9));
+                assert_eq!(row.end_line, Some(witness.end_line));
+                assert_eq!(delivery.next_start_line, Some(witness.end_line + 1));
+                assert_eq!(delivery.requested_range.end_line, 80);
+                assert!(delivery.remaining_source_bytes > 0);
+                assert!(row.packet_request_patch.is_some());
+                assert_eq!(
+                    rows.iter()
+                        .filter(|row| row.source_delivery.is_some())
+                        .count(),
+                    1
+                );
+                assert!(frozen.context_floor.is_empty());
+                for expected in [
+                    "Omitted newly retrieved source context",
+                    "node:3: requested source page omitted",
+                    "node:4: requested source page was unavailable",
+                    "Existing authenticated source refusal",
+                ] {
+                    assert!(
+                        gaps.as_slice().iter().any(|gap| gap
+                            .message
+                            .as_ref()
+                            .is_some_and(|message| message.as_str().contains(expected))),
+                        "{expected}"
+                    );
+                }
+            } else {
+                assert!(
+                    evidence
+                        .as_slice()
+                        .iter()
+                        .any(|row| row.source_delivery == context.delivery),
+                    "{mode}"
+                );
+                assert!(
+                    evidence
+                        .as_slice()
+                        .iter()
+                        .all(|row| row.source_delivery.is_none()
+                            || row.source_delivery == context.delivery),
+                    "{mode}"
+                );
+                assert!(
+                    frozen
+                        .source_refusals
+                        .iter()
+                        .any(|message| message.contains("no requested complete-line page fits")),
+                    "{mode}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -7758,6 +8152,7 @@ mod tests {
             requested_source_minimum_ends: BTreeMap::new(),
             issued_context_sources: None,
             fresh_retrieval_only: false,
+            legacy_stdio_option_request: false,
         };
         let mut measured = Vec::new();
         let mut accepted = None;

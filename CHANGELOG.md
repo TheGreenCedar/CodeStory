@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- CodeStory MCP packet follow-ups can return requested source pages when the reply cannot also fit newly retrieved context. The reply identifies source it could not return.
+
 - Graceful embedding-server version handoffs keep their retry response alive until delivery finishes or fails.
 
 - Indexing handles chained receiver calls in C#, Swift and Dart without interrupting repository preparation. Existing indexes refresh their cached call records automatically.
