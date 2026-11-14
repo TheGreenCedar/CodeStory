@@ -78,7 +78,10 @@ jobs:
       - name: Deny rustdoc warnings
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --workspace --no-deps --locked
+        run: |
+          # The pinned llama build still stages shared libraries in the legacy deps directory.
+          mkdir -p target/debug/deps
+          cargo doc --workspace --no-deps --locked
 
       - name: Save Cargo registry, git sources, and build output
         if: success() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''
