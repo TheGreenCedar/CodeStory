@@ -5,7 +5,8 @@ use super::super::resolution::{quote_command_value, resolve_source_target_or_emi
 use super::affected_rendering::render_files_markdown;
 use crate::args;
 use crate::args::{
-    FilesCommand, ProjectArgs, QueryCommand, QueryOutput, SnippetCommand, SnippetJsonOutput,
+    FilesCommand, ProjectArgs, QueryCommand, QueryOutput, ReadCommand, SnippetCommand,
+    SnippetJsonOutput,
 };
 use crate::explore;
 use crate::output::{
@@ -16,6 +17,80 @@ use crate::runtime::{RuntimeContext, ensure_index_ready, map_api_error};
 use anyhow::{Context, Result, bail};
 use codestory_contracts::api::IndexedFilesRequest;
 use std::io::IsTerminal;
+
+pub(in crate::app) fn run_read(cmd: ReadCommand) -> Result<()> {
+    use std::fmt::Write as _;
+
+    let selectors = cmd
+        .selectors
+        .iter()
+        .map(|selector| {
+            selector
+                .split_once("::")
+                .filter(|(path, symbol)| !path.is_empty() && !symbol.is_empty())
+                .with_context(|| format!("Expected path::Symbol, got {selector}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let format = args::OutputFormat::Markdown;
+    let runtime = RuntimeContext::new(&cmd.project)?;
+    ensure_index_ready(&runtime.ensure_core_open(args::RefreshMode::None)?, "read")?;
+    let response = runtime.run_public_operation("source_snippet", || {
+        let mut text = String::new();
+        for (path, symbol) in &selectors {
+            let exact = codestory_workspace::resolve_project_relative_path(
+                &runtime.project_root,
+                std::path::Path::new(path),
+            )?;
+            let codestory_workspace::ProjectRelativePathResolution::Existing { absolute, .. } =
+                exact
+            else {
+                bail!("Source file does not exist: {path}");
+            };
+            let target = resolve_source_target_or_emit_ambiguity(
+                &runtime,
+                args::TargetSelection::Query {
+                    query: (*symbol).to_owned(),
+                    choose: None,
+                },
+                Some(&absolute.to_string_lossy()),
+                format,
+                None,
+            )?;
+            if !target
+                .selected
+                .file_path
+                .as_deref()
+                .is_some_and(|candidate| {
+                    let candidate = runtime.project_root.join(candidate);
+                    codestory_workspace::same_workspace_path(&absolute, &candidate)
+                })
+            {
+                bail!("Could not resolve {symbol} in {path}");
+            }
+            let target = runtime::prefer_function_body_target(&runtime.project_root, target);
+            let context = runtime
+                .browser
+                .snippet_function_body_context(target.selected.node_id, 0)
+                .map_err(map_api_error)?;
+            if context.scope != codestory_contracts::api::SnippetScopeDto::FunctionBody
+                || context.snippet_truncated
+            {
+                bail!("Complete declaration unavailable for {path}::{symbol}");
+            }
+            let _ = writeln!(
+                text,
+                "{}:{} {}
+{}",
+                crate::display::relative_path(&runtime.project_root, &context.path),
+                context.line,
+                symbol,
+                context.snippet
+            );
+        }
+        Ok(RenderedPublicOutput::text(text.replace('\u{1b}', "\\x1b")))
+    })?;
+    emit_public_operation(format, response, None)
+}
 
 pub(in crate::app) fn run_snippet(cmd: SnippetCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "snippet")?;

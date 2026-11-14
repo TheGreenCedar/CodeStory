@@ -1325,6 +1325,7 @@ fn explore_trail_command(
         depth: Some(2),
         direction: Some(args::CliDirection::Both),
         max_nodes: trail.trail.nodes.len().min(u32::MAX as usize) as u32,
+        page: None,
         include_tests: false,
         show_utility_calls: false,
         hide_speculative: false,

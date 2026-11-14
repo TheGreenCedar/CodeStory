@@ -91,6 +91,8 @@ pub(crate) enum Command {
     Cache(CacheCommand),
     #[command(about = "Find symbols and repo text evidence.")]
     Search(SearchCommand),
+    #[command(about = "Find literal source text.")]
+    Find(FindCommand),
     #[command(about = "Run a repeatable grounding quality check.")]
     Drill(DrillCommand),
     #[command(about = "Run a drill manifest across repositories.")]
@@ -105,12 +107,16 @@ pub(crate) enum Command {
     Trail(TrailCommand),
     #[command(about = "Show incoming callers for a symbol.")]
     Callers(TrailCommand),
+    #[command(about = "Show direct reference sites for a symbol.")]
+    References(TrailCommand),
     #[command(about = "Show outgoing callees for a symbol.")]
     Callees(TrailCommand),
     #[command(about = "Show a readable trace around a symbol.")]
     Trace(TrailCommand),
     #[command(about = "Show source around a symbol.")]
     Snippet(SnippetCommand),
+    #[command(about = "Read complete declarations as path::Symbol selectors.")]
+    Read(ReadCommand),
     #[command(about = "Run structured graph queries.")]
     Query(QueryCommand),
     #[command(about = "Open the terminal explorer or print an exploration packet.")]
@@ -1180,6 +1186,24 @@ pub(crate) struct DrillSuiteCommand {
     pub(crate) jobs: usize,
 }
 
+#[derive(Args, Debug)]
+pub(crate) struct FindCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(value_name = "QUERY")]
+    pub(crate) queries: Vec<String>,
+    #[arg(long = "file-glob", value_name = "GLOB")]
+    pub(crate) path_patterns: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ReadCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(required = true, value_name = "PATH::SYMBOL")]
+    pub(crate) selectors: Vec<String>,
+}
+
 #[derive(Args, Debug, Clone)]
 #[command(group(
     ArgGroup::new("selector")
@@ -1256,6 +1280,8 @@ pub(crate) struct TrailCommand {
     pub(crate) direction: Option<CliDirection>,
     #[arg(long, default_value_t = 120)]
     pub(crate) max_nodes: u32,
+    #[arg(long, hide = true)]
+    pub(crate) page: Option<std::num::NonZeroUsize>,
     #[arg(long)]
     pub(crate) include_tests: bool,
     #[arg(long)]

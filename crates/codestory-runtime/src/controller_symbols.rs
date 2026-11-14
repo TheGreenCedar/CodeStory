@@ -16,7 +16,7 @@ use codestory_contracts::api::{
 };
 use codestory_contracts::compilation::INTERIM_MAX_ADMITTED_CANDIDATES;
 use codestory_contracts::graph::Node as GraphNode;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 /// Identity-index result that can be considered before a packet candidate is
@@ -807,6 +807,96 @@ impl AppController {
                 .then(left.end_col.cmp(&right.end_col))
         });
         Ok(occurrences)
+    }
+
+    pub(crate) fn direct_reference_lines(
+        &self,
+        target: NodeId,
+        calls_only: bool,
+    ) -> Result<Vec<(String, String, u32, String)>, ApiError> {
+        use codestory_contracts::graph::{
+            EdgeKind, OccurrenceKind, ResolutionCertainty, TrailCallerScope,
+        };
+
+        let target = target.to_core()?;
+        let storage = self.open_storage_read_only()?;
+        let root = self.require_project_root()?;
+        let failure = |error: codestory_store::StorageError| ApiError::internal(error.to_string());
+        let filter = if calls_only {
+            &[EdgeKind::CALL][..]
+        } else {
+            &[]
+        };
+        let edges = storage
+            .get_incoming_edges_for_node_id(
+                target,
+                filter,
+                TrailCallerScope::IncludeTestsAndBenches,
+                true,
+            )
+            .map_err(failure)?;
+        let mut sites = BTreeMap::<_, BTreeSet<_>>::new();
+        for edge in edges {
+            if edge.effective_target() != target
+                || matches!(edge.certainty, Some(ResolutionCertainty::Uncertain))
+            {
+                continue;
+            }
+            let caller = storage
+                .get_node(edge.effective_source())
+                .map_err(failure)?
+                .ok_or_else(|| ApiError::internal("Reference owner is missing"))?;
+            let label = node_display_name(&caller);
+            let mut found_occurrence = false;
+            for occurrence in storage
+                .get_occurrences_for_element(edge.id.0)
+                .map_err(failure)?
+            {
+                if matches!(
+                    occurrence.kind,
+                    OccurrenceKind::REFERENCE | OccurrenceKind::MACRO_REFERENCE
+                ) {
+                    let location = occurrence.location;
+                    sites
+                        .entry(location.file_node_id.0)
+                        .or_default()
+                        .insert((location.start_line, label.clone()));
+                    found_occurrence = true;
+                }
+            }
+            if !found_occurrence && let (Some(file), Some(line)) = (edge.file_node_id, edge.line) {
+                sites.entry(file.0).or_default().insert((line, label));
+            }
+        }
+        let mut result = Vec::new();
+        for (file, sites) in sites {
+            let file = storage
+                .get_file_by_id(file)
+                .map_err(failure)?
+                .ok_or_else(|| ApiError::internal("Reference file is missing"))?;
+            let source =
+                crate::search_evidence::verified_file_checked(&storage, Some(&root), &file)
+                    .map_err(|_| {
+                        ApiError::new(
+                            "source_unavailable",
+                            "Reference source no longer matches the index",
+                        )
+                    })?;
+            let path = codestory_workspace::workspace_relative_path(&root, &source.path)
+                .ok_or_else(|| ApiError::internal("Reference file is outside the project"))?
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            let lines: Vec<_> = source.content.lines().collect();
+            for (line, label) in sites {
+                let code = line
+                    .checked_sub(1)
+                    .and_then(|index| lines.get(index as usize))
+                    .ok_or_else(|| ApiError::internal("Reference line is missing"))?;
+                result.push((label, path.clone(), line, code.trim_start().to_string()));
+            }
+        }
+        result.sort();
+        Ok(result)
     }
 
     pub fn edge_occurrences(

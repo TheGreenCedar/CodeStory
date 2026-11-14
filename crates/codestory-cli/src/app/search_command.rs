@@ -7,6 +7,32 @@ use crate::runtime::map_api_error;
 use anyhow::Result;
 use codestory_contracts::api::SearchRequest;
 
+pub(super) fn run_find(cmd: crate::args::FindCommand) -> Result<()> {
+    use std::fmt::Write as _;
+    let root = crate::runtime::canonicalize_project_root(&cmd.project.project)?;
+    let (hits, truncated) =
+        codestory_runtime::find_live_text(&root, &cmd.queries, &cmd.path_patterns, 12)
+            .map_err(map_api_error)?;
+    let mut text = String::from(if truncated {
+        "Text search (partial)\n"
+    } else {
+        "Text search\n"
+    });
+    for (path, line, code) in hits {
+        if line == 0 {
+            let _ = writeln!(text, "File: {path}");
+        } else {
+            let _ = writeln!(text, "{path}:{line}: {code}");
+        }
+    }
+    crate::output::emit(
+        crate::args::OutputFormat::Markdown,
+        &(),
+        text.replace('\u{1b}', "\\x1b"),
+        None,
+    )
+}
+
 pub(super) fn run_search(cmd: SearchCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "search")?;
     preflight_output_file(cmd.output_file.as_deref())?;

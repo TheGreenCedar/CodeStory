@@ -14,6 +14,7 @@ v3-evidence-separation-support = ["codestory-agent/v3-evidence-separation-suppor
 test-support = ["codestory-agent/test-support", "codestory-store/test-support"]
 
 [dependencies]
+glob.workspace = true
 anyhow = { workspace = true }
 codestory-agent = { workspace = true }
 codestory-contracts = { workspace = true }

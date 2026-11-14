@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `callers` and `references` print source lines grouped by the calling symbol. `read` returns complete numbered declarations for multiple `path::Symbol` selectors in one call.
+
 ## 0.18.0
 
 - Packets reuse one repository identity snapshot while selecting a response, avoiding repeated Git status scans within the same request.

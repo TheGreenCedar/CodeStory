@@ -75,6 +75,96 @@ pub fn schedule_index(project_path: &str) -> usize {
     .expect("write runtime.rs");
 }
 
+#[test]
+fn callers_text_shows_only_direct_call_sites() {
+    let workspace = tempdir().expect("workspace");
+    let cache = tempdir().expect("cache");
+    write_tiny_rust_workspace(workspace.path());
+    run_cli_json(
+        workspace.path(),
+        cache.path(),
+        &["index", "--refresh", "full", "--format", "json"],
+    );
+
+    let output = run_cli(
+        workspace.path(),
+        cache.path(),
+        &["callers", "--query", "normalize_project"],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).expect("text response");
+    assert_eq!(
+        text.trim_end(),
+        "open_project
+src/lib.rs:24: runtime::normalize_project(project_name)"
+    );
+}
+
+#[test]
+fn read_returns_complete_bodies_in_one_call() {
+    let workspace = tempdir().expect("workspace");
+    let cache = tempdir().expect("cache");
+    write_tiny_rust_workspace(workspace.path());
+    run_cli_json(
+        workspace.path(),
+        cache.path(),
+        &["index", "--refresh", "full", "--format", "json"],
+    );
+    let output = run_cli(
+        workspace.path(),
+        cache.path(),
+        &[
+            "read",
+            "src/lib.rs::open_project",
+            "src/runtime.rs::normalize_project",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).expect("text response");
+    assert!(text.contains("src/lib.rs:23 open_project"));
+    assert!(text.contains("24 |     runtime::normalize_project(project_name)"));
+    assert!(text.contains("25 | }"));
+    assert!(text.contains("src/runtime.rs:1 normalize_project"));
+    assert!(text.contains("3 | }"));
+}
+
+#[test]
+fn live_find_reads_terms_and_filename_patterns_without_an_index() {
+    let workspace = tempdir().expect("workspace");
+    let cache = tempdir().expect("cache");
+    write_tiny_rust_workspace(workspace.path());
+    let output = run_cli(
+        workspace.path(),
+        cache.path(),
+        &[
+            "find",
+            "schedule_index",
+            "normalize_project",
+            "--file-glob",
+            "lib.rs",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).expect("text response");
+    assert!(text.starts_with("Text search"));
+    assert!(text.contains("File: src/lib.rs"));
+    assert!(text.contains("src/runtime.rs:1: pub fn normalize_project"));
+    assert!(text.contains("src/runtime.rs:5: pub fn schedule_index"));
+    assert!(!cache.path().join("codestory.db").exists());
+}
+
 fn write_docker_compose_fixture(root: &Path) {
     let docker = root.join("docker");
     fs::create_dir_all(&docker).expect("create docker dir");
