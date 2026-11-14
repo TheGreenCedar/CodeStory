@@ -79,8 +79,8 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: |
-          # The pinned llama build still stages shared libraries in the legacy deps directory.
-          mkdir -p target/debug/deps
+          # The pinned llama build walks three parents from OUT_DIR to stage its shared libraries.
+          mkdir -p target/debug/{deps,build/deps}
           cargo doc --workspace --no-deps --locked
 
       - name: Save Cargo registry, git sources, and build output
