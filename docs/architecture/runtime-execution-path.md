@@ -38,8 +38,8 @@ refresh a project, initialize the engine, or mutate status state.
 | Class | Examples | May activate work | Required state |
 | --- | --- | --- | --- |
 | Observational | `status`, `doctor`, retrieval-engine diagnostics | No | readable current state |
-| Graph-only | `ground`, `files`, `symbol`, `callers`, `trail` | bounded local refresh | current or retained core publication for the requested surface |
-| Source-backed | `snippet` by symbol id, explicit `search --repo-text off` | bounded local refresh | a fresh complete core publication |
+| Graph-only | `ground`, `files`, ID-selected `symbol`, `callers`, `trail` | bounded local refresh | current or retained core publication for the requested surface |
+| Source-backed | `snippet`, indexed-name symbol and graph navigation, explicit `search --repo-text off` | bounded local refresh | a fresh complete core publication |
 | Broad retrieval | `packet`, ordinary `search`, broad query-based `context` | local refresh, engine init, retrieval finalization | coherent retrieval publication and live policy-compliant engine |
 | Exact target | definition/reference/node and focused context calls | only what the selected operation needs | resolved target plus its declared readiness |
 
@@ -142,6 +142,14 @@ usable. Explicit `search --repo-text off` is one such complete-core operation:
 it returns exact indexed-symbol matches with source evidence, no retrieval
 publication, and a symbolic retrieval state. Its output is never presented as
 full broad or semantic search.
+
+Indexed-name target resolution uses the same complete-Core symbol matcher without
+attaching persisted search state. The `resolution` operation is source-backed:
+name-selected symbol, call-graph, trail and exploration reads wait for fresh Core
+and never serve a retained historical selection. ID-selected graph reads keep
+their existing retained-publication boundary. The graph-query DSL retains its
+`graph_assisted` full-retrieval admission. No Core-only navigation result gains a
+retrieval-publication identity from this path.
 
 Packet callers may supply tagged probes for an exact project-relative path,
 stable symbol ID, file-scoped symbol, free query, or continuation. CLI and

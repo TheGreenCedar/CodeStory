@@ -245,7 +245,7 @@ fn stale_rust_extraction_replaces_old_macro_duplicates_even_with_current_cached_
     let empty_path = dir.path().join("empty.rs");
     std::fs::write(
         &path,
-        "// before\n#[test]\nfn worker() {\n    println!(\"Hello\");\n}\n",
+        "// before\n#[test]\nfn worker() {\n    println!(\"Hello\");\n}\n#[derive(Debug)]\npub struct Record { pub value: u8 }\n",
     )?;
     std::fs::write(&empty_path, "const VALUE: u8 = 1;\n")?;
     let indexer = WorkspaceIndexer::new(dir.path().to_path_buf());
@@ -282,6 +282,42 @@ fn stale_rust_extraction_replaces_old_macro_duplicates_even_with_current_cached_
     };
     assert_eq!(stored_span(&store)?, (2, 1, 5, 2));
     let source_hash = store.get_file_content_hash(file.id)?.unwrap();
+    let record = store
+        .get_nodes()?
+        .into_iter()
+        .find(|node| node.kind == NodeKind::STRUCT && node_matches_name(node, "Record"))
+        .unwrap();
+    // Actual file-owned derived rows must be removed even when the current
+    // parser artifact and graph projection are already equal to the refresh.
+    store.get_connection().execute(
+        "INSERT INTO symbol_search_doc (
+             node_id, file_node_id, kind, display_name, start_line, doc_text,
+             doc_version, doc_hash, policy_version, source_provenance, updated_at_epoch_ms
+         ) SELECT id, file_node_id, kind, serialized_name, start_line,
+             'v5 expanded type input', 10, 'v5-sentinel', 'graph_first_v3', 'extracted', 1
+           FROM node WHERE id = ?1",
+        [record.id.0],
+    )?;
+    store.get_connection().execute(
+        "INSERT INTO dense_anchor_input (
+             node_id, file_node_id, kind, display_name, start_line, end_line, file_role,
+             source_provenance, document_text, document_hash, selection_reason,
+             policy_version, source_identity, updated_at_epoch_ms
+         ) SELECT id, file_node_id, kind, serialized_name, start_line, end_line, 'source',
+             'extracted', 'v5 expanded type input', 'v5-sentinel', 'public_api',
+             'graph_first_v3', 'core:old-v5', 1 FROM node WHERE id = ?1",
+        [record.id.0],
+    )?;
+    assert_eq!(
+        store
+            .get_symbol_search_docs_for_node_ids(&[record.id])?
+            .len(),
+        1
+    );
+    assert_eq!(
+        store.get_dense_anchor_inputs_batch_after(None, 10)?.len(),
+        1
+    );
     let legacy_key = format!("{}:worker#0", WorkspaceIndexer::file_identity_path(&path));
     let phantom_key = format!("{}:worker#1", WorkspaceIndexer::file_identity_path(&path));
     store.get_connection().execute(
@@ -300,7 +336,7 @@ fn stale_rust_extraction_replaces_old_macro_duplicates_even_with_current_cached_
         end_line: Some(3),
         end_col: Some(10),
     })?;
-    let legacy_revision = "rust-callable-declaration-v3";
+    let legacy_revision = "canonical-reference-occurrences-v1;rust-declaration-source-v5";
     assert_ne!(
         revision, legacy_revision,
         "the previous Rust producer must be retired"
@@ -337,12 +373,33 @@ fn stale_rust_extraction_replaces_old_macro_duplicates_even_with_current_cached_
         store.file_extraction_identity_matches(file.id, "rust", legacy_revision)?,
         "cancelled extraction never advances the producer"
     );
+    assert_eq!(
+        store
+            .get_symbol_search_docs_for_node_ids(&[record.id])?
+            .len(),
+        1
+    );
+    assert_eq!(
+        store.get_dense_anchor_inputs_batch_after(None, 10)?.len(),
+        1
+    );
     let repaired = indexer.run_incremental(&mut store, &plan, &EventBus::new(), None)?;
     assert_eq!(
         repaired.artifact_cache_hits, 2,
         "both files replay authenticated current cached projections"
     );
     assert!(repaired.graph_projection_changed);
+    assert!(
+        store
+            .get_symbol_search_docs_for_node_ids(&[record.id])?
+            .is_empty()
+    );
+    assert!(
+        store
+            .get_dense_anchor_inputs_batch_after(None, 10)?
+            .is_empty()
+    );
+    assert_eq!(store.get_node(record.id)?.unwrap().start_line, Some(6));
     assert_eq!(stored_span(&store)?, (2, 1, 5, 2));
     let repaired_workers = workers(&store)?;
     assert_eq!(

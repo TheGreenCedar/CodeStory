@@ -561,7 +561,7 @@ impl ReadOnlyBrowserService {
     ) -> Result<SymbolWorkflowOutcome, ApiError> {
         let operation = match &request.target {
             TargetSelection::Id(_) => "graph",
-            TargetSelection::Query { .. } => "graph_assisted",
+            TargetSelection::Query { .. } => "resolution",
         };
         self.run_public(operation, || {
             self.controller.symbol_workflow(request.clone())

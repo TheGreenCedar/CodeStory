@@ -100,6 +100,15 @@ fn embedding_client_transport_startup_keeps_non_status_and_server_boundaries() {
         embedding_client_transport_mode(&parsed_command(&["internal-embedding-server"])),
         None
     );
+    assert_eq!(
+        embedding_client_transport_mode(&parsed_command(&[
+            "internal-session-context",
+            "--project",
+            "/project"
+        ])),
+        None,
+        "the passive startup map must not install any retrieval client"
+    );
 }
 
 pub(super) struct EnvVarSnapshot<'a> {

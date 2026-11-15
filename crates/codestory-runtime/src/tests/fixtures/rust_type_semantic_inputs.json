@@ -1,0 +1,99 @@
+[
+  {
+    "node": {
+      "id": 777823269696499265,
+      "kind": "STRUCT",
+      "serialized_name": "StructuralSourceProofContract",
+      "qualified_name": "StructuralSourceProofContract",
+      "start_line": 146,
+      "start_col": 1,
+      "end_line": 158,
+      "end_col": 2,
+      "file_node_id": 1,
+      "canonical_id": "crates/codestory-contracts/src/language_support.rs:StructuralSourceProofContract"
+    },
+    "path": "crates/codestory-contracts/src/language_support.rs",
+    "first_line": 141,
+    "source": "/// Structural collector contract for structural-text, non-semantic proof.\n///\n/// Each row is a product evidence boundary. `semantic_proof_allowed = false`\n/// means the collector may support navigation or diagnostics, but must not be\n/// promoted as typed semantic evidence without a separate proof tier.\n#[derive(Debug, Clone, Copy, PartialEq)]\npub struct StructuralSourceProofContract {\n    pub collector_name: &'static str,\n    pub path_pattern: &'static str,\n    pub emitted_node_kinds: &'static [NodeKind],\n    pub source_span: &'static str,\n    pub evidence_tier: PacketEvidenceTierDto,\n    pub resolution: PacketEvidenceResolutionDto,\n    pub confidence: f32,\n    pub unsupported_shape_notes: &'static [&'static str],\n    pub claim_boundary: &'static str,\n    pub semantic_proof_allowed: bool,\n}\n",
+    "precise": {
+      "file_node_id": 1,
+      "start_line": 147,
+      "start_col": 12,
+      "end_line": 147,
+      "end_col": 41
+    },
+    "before": "semantic_doc_version: 10\nsymbol: StructuralSourceProofContract\nlanguage: rust\nterminal_alias:\nsignature: pub struct StructuralSourceProofContract {\ncomments: /// Each row is a product evidence boundary. `semantic_proof_allowed = false` ///\nfile: crates/codestory-contracts/src/language_support.rs\nedge_digest: MEMBER=10;\n",
+    "expanded": "semantic_doc_version: 10\nsymbol: StructuralSourceProofContract\nlanguage: rust\nterminal_alias:\nsignature: #[derive(Debug, Clone, Copy, PartialEq)]\nbody_summary: pub struct StructuralSourceProofContract { pub collector_name: &'static str, pub\nfile: crates/codestory-contracts/src/language_support.rs\nedge_digest: MEMBER=10;\n",
+    "attached": "Structural collector contract for structural-text, non-semantic proof.\nEach row is a product evidence boundary. `semantic_proof_allowed = false`\nmeans the collector may support navigation or diagnostics, but must not be\npromoted as typed semantic evidence without a separate proof tier.",
+    "children": [],
+    "digest": [
+      "MEMBER=10"
+    ]
+  },
+  {
+    "node": {
+      "id": 511750560671980200,
+      "kind": "STRUCT",
+      "serialized_name": "StructuralTextUnit",
+      "qualified_name": "StructuralTextUnit",
+      "start_line": 3168,
+      "start_col": 1,
+      "end_line": 3186,
+      "end_col": 2,
+      "file_node_id": 1,
+      "canonical_id": "crates/codestory-store/src/storage_impl/mod.rs:StructuralTextUnit"
+    },
+    "path": "crates/codestory-store/src/storage_impl/mod.rs",
+    "first_line": 3167,
+    "source": "/// Verified structural source evidence attached to one file-scoped graph node.\n#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]\npub struct StructuralTextUnit {\n    pub node_id: NodeId,\n    pub file_id: i64,\n    pub placement_id: String,\n    pub content_hash: String,\n    pub source_content_hash: String,\n    pub descriptor_version: u32,\n    pub producer: String,\n    pub evidence_tier: String,\n    pub resolution: String,\n    pub language: String,\n    pub kind: NodeKind,\n    pub start_line: u32,\n    pub start_col: u32,\n    pub end_line: u32,\n    pub end_col: u32,\n    pub file_role: FileRole,\n}\n",
+    "precise": {
+      "file_node_id": 1,
+      "start_line": 3169,
+      "start_col": 12,
+      "end_line": 3169,
+      "end_col": 30
+    },
+    "before": "semantic_doc_version: 10\nsymbol: StructuralTextUnit\nlanguage: rust\nterminal_alias: structural\nsignature: pub struct StructuralTextUnit {\ncomments: /// Verified structural source evidence attached to one file-scoped graph node. #[derive(Debug,\nfile: crates/codestory-store/src/storage_impl/mod.rs\nedge_digest: MEMBER=16; IMPORT=3;\n",
+    "expanded": "semantic_doc_version: 10\nsymbol: StructuralTextUnit\nlanguage: rust\nterminal_alias: structural\nsignature: #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]\nbody_summary: pub struct StructuralTextUnit { pub node_id: NodeId, pub\nfile: crates/codestory-store/src/storage_impl/mod.rs\nedge_digest: MEMBER=16; IMPORT=3;\n",
+    "attached": "Verified structural source evidence attached to one file-scoped graph node.",
+    "children": [],
+    "digest": [
+      "MEMBER=16",
+      "IMPORT=3"
+    ]
+  },
+  {
+    "node": {
+      "id": -8458611587012161011,
+      "kind": "ENUM",
+      "serialized_name": "ScipEvidenceSource",
+      "qualified_name": "ScipEvidenceSource",
+      "start_line": 296,
+      "start_col": 1,
+      "end_line": 300,
+      "end_col": 2,
+      "file_node_id": 1,
+      "canonical_id": "crates/codestory-retrieval/src/scip_index.rs:ScipEvidenceSource"
+    },
+    "path": "crates/codestory-retrieval/src/scip_index.rs",
+    "first_line": 296,
+    "source": "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub(crate) enum ScipEvidenceSource {\n    ImportedProof,\n    GraphProjection,\n}\n",
+    "precise": {
+      "file_node_id": 1,
+      "start_line": 297,
+      "start_col": 17,
+      "end_line": 297,
+      "end_col": 35
+    },
+    "before": "semantic_doc_version: 10\nsymbol: ScipEvidenceSource\nlanguage: rust\nterminal_alias: scip evidence\nsignature: pub(crate) enum ScipEvidenceSource {\ncomments: #[derive(Debug, Clone, Copy, PartialEq, Eq)]\nfile: crates/codestory-retrieval/src/scip_index.rs\nmembers: ScipEvidenceSource::GraphProjection, ScipEvidenceSource::ImportedProof\nedge_digest:\n",
+    "expanded": "semantic_doc_version: 10\nsymbol: ScipEvidenceSource\nlanguage: rust\nterminal_alias: scip evidence\nsignature: #[derive(Debug, Clone, Copy, PartialEq, Eq)]\nbody_summary: pub(crate) enum ScipEvidenceSource { ImportedProof, GraphProjection,\nfile: crates/codestory-retrieval/src/scip_index.rs\nmembers: ScipEvidenceSource::GraphProjection, ScipEvidenceSource::ImportedProof\nedge_digest:\n",
+    "attached": "",
+    "children": [
+      "ScipEvidenceSource::GraphProjection",
+      "ScipEvidenceSource::ImportedProof"
+    ],
+    "digest": [
+      "MEMBER=2"
+    ]
+  }
+]

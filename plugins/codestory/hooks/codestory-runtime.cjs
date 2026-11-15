@@ -222,7 +222,60 @@ function writeHookOutput(event, context) {
   process.stdout.write(context);
 }
 
+const MAX_RUNTIME_RECEIPT_BYTES = 256 * 1024;
+
+function sha256(file) {
+  return createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+}
+
+function verifiedCliCandidate(candidate, expectedSha256 = null) {
+  if (!candidate || !path.isAbsolute(candidate)) return null;
+  try {
+    const metadata = fs.lstatSync(candidate);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) return null;
+    if (process.platform !== 'win32' && (metadata.mode & 0o111) === 0) return null;
+    if (expectedSha256) {
+      if (!/^[0-9a-f]{64}$/iu.test(expectedSha256)) return null;
+      if (sha256(candidate) !== expectedSha256.toLowerCase()) return null;
+    }
+    return candidate;
+  } catch {
+    return null;
+  }
+}
+
+function runtimeReceiptCli(dataDir) {
+  if (!dataDir) return null;
+  const receiptPath = path.join(dataDir, '.codestory-mcp-runtime.json');
+  try {
+    const metadata = fs.lstatSync(receiptPath);
+    if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > MAX_RUNTIME_RECEIPT_BYTES) {
+      return null;
+    }
+    const receipt = JSON.parse(fs.readFileSync(receiptPath, 'utf8'));
+    if (!/^[0-9a-f]{64}$/iu.test(receipt?.sha256 || '')) return null;
+    return verifiedCliCandidate(receipt?.path, receipt?.sha256);
+  } catch {
+    return null;
+  }
+}
+
+function resolveCli(args, dataDir) {
+  const cliIndex = args.indexOf('--cli');
+  for (const candidate of [
+    cliIndex === -1 ? null : args[cliIndex + 1] || null,
+    process.env.CODESTORY_PLUGIN_CLI_PATH,
+    process.env.CODESTORY_CLI,
+  ]) {
+    const verified = verifiedCliCandidate(candidate);
+    if (verified) return verified;
+    if (candidate) return null;
+  }
+  return runtimeReceiptCli(dataDir);
+}
+
 module.exports = {
+  resolveCli,
   confirmedCursorIdentity,
   cursorDogfoodMarker,
   dirtyMarkerPathForProject,

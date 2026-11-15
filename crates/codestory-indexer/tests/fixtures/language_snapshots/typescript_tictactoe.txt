@@ -4,119 +4,119 @@ node CLASS name=GameObject qn=GameObject canonical=game.ts:GameObject line=23 co
 node CLASS name=HumanPlayer qn=HumanPlayer canonical=game.ts:HumanPlayer line=154 col=7 end=154:18 file=FILE:game.ts@1
 node CLASS name=Player qn=Player canonical=game.ts:Player line=154 col=27 end=154:33 file=FILE:game.ts@1
 node CLASS name=TicTacToe qn=TicTacToe canonical=game.ts:TicTacToe line=238 col=14 end=238:23 file=FILE:game.ts@1
-node FIELD name=Token qn=Token canonical=game.ts:Token#0 line=30 col=10 end=30:15 file=FILE:game.ts@1
-node FIELD name=col qn=col canonical=game.ts:col#0 line=8 col=3 end=8:6 file=FILE:game.ts@1
-node FIELD name=field qn=field canonical=game.ts:field#0 line=239 col=11 end=239:16 file=FILE:game.ts@1
-node FIELD name=grid qn=grid canonical=game.ts:grid#0 line=36 col=11 end=36:15 file=FILE:game.ts@1
-node FIELD name=left qn=left canonical=game.ts:left#0 line=37 col=11 end=37:15 file=FILE:game.ts@1
-node FIELD name=move qn=move canonical=game.ts:move#0 line=198 col=41 end=198:45 file=FILE:game.ts@1
-node FIELD name=name qn=name canonical=game.ts:name#0 line=143 col=3 end=143:7 file=FILE:game.ts@1
-node FIELD name=players qn=players canonical=game.ts:players#0 line=240 col=11 end=240:18 file=FILE:game.ts@1
-node FIELD name=row qn=row canonical=game.ts:row#0 line=7 col=3 end=7:6 file=FILE:game.ts@1
-node FIELD name=token qn=token canonical=game.ts:token#0 line=142 col=3 end=142:8 file=FILE:game.ts@1
-node FIELD name=value qn=value canonical=game.ts:value#0 line=198 col=53 end=198:58 file=FILE:game.ts@1
+node FIELD name=Token qn=Token canonical=script-ordinal-v1:game.ts:Token#0 line=30 col=10 end=30:15 file=FILE:game.ts@1
+node FIELD name=col qn=col canonical=script-ordinal-v1:game.ts:col#0 line=8 col=3 end=8:6 file=FILE:game.ts@1
+node FIELD name=field qn=field canonical=script-ordinal-v1:game.ts:field#0 line=239 col=11 end=239:16 file=FILE:game.ts@1
+node FIELD name=grid qn=grid canonical=script-ordinal-v1:game.ts:grid#0 line=36 col=11 end=36:15 file=FILE:game.ts@1
+node FIELD name=left qn=left canonical=script-ordinal-v1:game.ts:left#0 line=37 col=11 end=37:15 file=FILE:game.ts@1
+node FIELD name=move qn=move canonical=script-ordinal-v1:game.ts:move#0 line=198 col=41 end=198:45 file=FILE:game.ts@1
+node FIELD name=name qn=name canonical=script-ordinal-v1:game.ts:name#0 line=143 col=3 end=143:7 file=FILE:game.ts@1
+node FIELD name=players qn=players canonical=script-ordinal-v1:game.ts:players#0 line=240 col=11 end=240:18 file=FILE:game.ts@1
+node FIELD name=row qn=row canonical=script-ordinal-v1:game.ts:row#0 line=7 col=3 end=7:6 file=FILE:game.ts@1
+node FIELD name=token qn=token canonical=script-ordinal-v1:game.ts:token#0 line=142 col=3 end=142:8 file=FILE:game.ts@1
+node FIELD name=value qn=value canonical=script-ordinal-v1:game.ts:value#0 line=198 col=53 end=198:58 file=FILE:game.ts@1
 node FILE name=game.ts qn=game.ts canonical=game.ts:game.ts:1 line=1 col=1 end=309:0 file=FILE:game.ts@1
-node FUNCTION name=main qn=main canonical=game.ts:main#0 line=304 col=8 end=309:2 file=FILE:game.ts@1
-node FUNCTION name=numberIn qn=numberIn canonical=game.ts:numberIn#0 line=11 col=1 end=13:2 file=FILE:game.ts@1
-node FUNCTION name=numberOut qn=numberOut canonical=game.ts:numberOut#0 line=15 col=1 end=17:2 file=FILE:game.ts@1
-node FUNCTION name=stringOut qn=stringOut canonical=game.ts:stringOut#0 line=19 col=1 end=21:2 file=FILE:game.ts@1
-node METHOD name=ArtificialPlayer.evaluate qn=ArtificialPlayer.evaluate canonical=game.ts:ArtificialPlayer.evaluate#0 line=185 col=3 end=196:4 file=FILE:game.ts@1
-node METHOD name=ArtificialPlayer.minMax qn=ArtificialPlayer.minMax canonical=game.ts:ArtificialPlayer.minMax#0 line=198 col=3 end=229:4 file=FILE:game.ts@1
-node METHOD name=ArtificialPlayer.turn qn=ArtificialPlayer.turn canonical=game.ts:ArtificialPlayer.turn#0 line=231 col=3 end=235:4 file=FILE:game.ts@1
-node METHOD name=Field.clearMove qn=Field.clearMove canonical=game.ts:Field.clearMove#0 line=109 col=3 end=115:4 file=FILE:game.ts@1
-node METHOD name=Field.cloneField qn=Field.cloneField canonical=game.ts:Field.cloneField#0 line=45 col=3 end=54:4 file=FILE:game.ts@1
-node METHOD name=Field.constructor qn=Field.constructor canonical=game.ts:Field.constructor#0 line=39 col=3 end=43:4 file=FILE:game.ts@1
-node METHOD name=Field.inRange qn=Field.inRange canonical=game.ts:Field.inRange#0 line=66 col=3 end=68:4 file=FILE:game.ts@1
-node METHOD name=Field.isDraw qn=Field.isDraw canonical=game.ts:Field.isDraw#0 line=74 col=3 end=76:4 file=FILE:game.ts@1
-node METHOD name=Field.isEmpty qn=Field.isEmpty canonical=game.ts:Field.isEmpty#0 line=70 col=3 end=72:4 file=FILE:game.ts@1
-node METHOD name=Field.makeMove qn=Field.makeMove canonical=game.ts:Field.makeMove#0 line=98 col=3 end=107:4 file=FILE:game.ts@1
-node METHOD name=Field.opponent qn=Field.opponent canonical=game.ts:Field.opponent#0 line=56 col=3 end=64:4 file=FILE:game.ts@1
-node METHOD name=Field.sameInRow qn=Field.sameInRow canonical=game.ts:Field.sameInRow#0 line=78 col=3 end=96:4 file=FILE:game.ts@1
-node METHOD name=Field.show qn=Field.show canonical=game.ts:Field.show#0 line=117 col=3 end=138:4 file=FILE:game.ts@1
-node METHOD name=GameObject.announce qn=GameObject.announce canonical=game.ts:GameObject.announce#0 line=24 col=3 end=26:4 file=FILE:game.ts@1
-node METHOD name=HumanPlayer.check qn=HumanPlayer.check canonical=game.ts:HumanPlayer.check#0 line=159 col=3 end=169:4 file=FILE:game.ts@1
-node METHOD name=HumanPlayer.input qn=HumanPlayer.input canonical=game.ts:HumanPlayer.input#0 line=155 col=3 end=157:4 file=FILE:game.ts@1
-node METHOD name=HumanPlayer.turn qn=HumanPlayer.turn canonical=game.ts:HumanPlayer.turn#0 line=171 col=3 end=181:4 file=FILE:game.ts@1
-node METHOD name=TicTacToe.checkWinner qn=TicTacToe.checkWinner canonical=game.ts:TicTacToe.checkWinner#0 line=248 col=3 end=250:4 file=FILE:game.ts@1
-node METHOD name=TicTacToe.constructor qn=TicTacToe.constructor canonical=game.ts:TicTacToe.constructor#0 line=242 col=3 end=246:4 file=FILE:game.ts@1
-node METHOD name=TicTacToe.isDraw qn=TicTacToe.isDraw canonical=game.ts:TicTacToe.isDraw#0 line=252 col=3 end=254:4 file=FILE:game.ts@1
-node METHOD name=TicTacToe.probeCalls qn=TicTacToe.probeCalls canonical=game.ts:TicTacToe.probeCalls#0 line=273 col=3 end=275:4 file=FILE:game.ts@1
-node METHOD name=TicTacToe.run qn=TicTacToe.run canonical=game.ts:TicTacToe.run#0 line=277 col=3 end=301:4 file=FILE:game.ts@1
-node METHOD name=TicTacToe.selectPlayer qn=TicTacToe.selectPlayer canonical=game.ts:TicTacToe.selectPlayer#0 line=256 col=3 end=265:4 file=FILE:game.ts@1
-node METHOD name=TicTacToe.start qn=TicTacToe.start canonical=game.ts:TicTacToe.start#0 line=267 col=3 end=271:4 file=FILE:game.ts@1
-node METHOD name=constructor qn=constructor canonical=game.ts:constructor#0 line=145 col=3 end=149:4 file=FILE:game.ts@1
-node MODULE name="./helper" qn="./helper" canonical=game.ts:"./helper"#0 line=2 col=24 end=2:34 file=FILE:game.ts@1
-node MODULE name="./random" qn="./random" canonical=game.ts:"./random"#0 line=1 col=27 end=1:37 file=FILE:game.ts@1
+node FUNCTION name=main qn=main canonical=script-ordinal-v1:game.ts:main#0 line=304 col=8 end=309:2 file=FILE:game.ts@1
+node FUNCTION name=numberIn qn=numberIn canonical=script-ordinal-v1:game.ts:numberIn#0 line=11 col=1 end=13:2 file=FILE:game.ts@1
+node FUNCTION name=numberOut qn=numberOut canonical=script-ordinal-v1:game.ts:numberOut#0 line=15 col=1 end=17:2 file=FILE:game.ts@1
+node FUNCTION name=stringOut qn=stringOut canonical=script-ordinal-v1:game.ts:stringOut#0 line=19 col=1 end=21:2 file=FILE:game.ts@1
+node METHOD name=ArtificialPlayer.evaluate qn=ArtificialPlayer.evaluate canonical=script-ordinal-v1:game.ts:ArtificialPlayer.evaluate#0 line=185 col=3 end=196:4 file=FILE:game.ts@1
+node METHOD name=ArtificialPlayer.minMax qn=ArtificialPlayer.minMax canonical=script-ordinal-v1:game.ts:ArtificialPlayer.minMax#0 line=198 col=3 end=229:4 file=FILE:game.ts@1
+node METHOD name=ArtificialPlayer.turn qn=ArtificialPlayer.turn canonical=script-ordinal-v1:game.ts:ArtificialPlayer.turn#0 line=231 col=3 end=235:4 file=FILE:game.ts@1
+node METHOD name=Field.clearMove qn=Field.clearMove canonical=script-ordinal-v1:game.ts:Field.clearMove#0 line=109 col=3 end=115:4 file=FILE:game.ts@1
+node METHOD name=Field.cloneField qn=Field.cloneField canonical=script-ordinal-v1:game.ts:Field.cloneField#0 line=45 col=3 end=54:4 file=FILE:game.ts@1
+node METHOD name=Field.constructor qn=Field.constructor canonical=script-ordinal-v1:game.ts:Field.constructor#0 line=39 col=3 end=43:4 file=FILE:game.ts@1
+node METHOD name=Field.inRange qn=Field.inRange canonical=script-ordinal-v1:game.ts:Field.inRange#0 line=66 col=3 end=68:4 file=FILE:game.ts@1
+node METHOD name=Field.isDraw qn=Field.isDraw canonical=script-ordinal-v1:game.ts:Field.isDraw#0 line=74 col=3 end=76:4 file=FILE:game.ts@1
+node METHOD name=Field.isEmpty qn=Field.isEmpty canonical=script-ordinal-v1:game.ts:Field.isEmpty#0 line=70 col=3 end=72:4 file=FILE:game.ts@1
+node METHOD name=Field.makeMove qn=Field.makeMove canonical=script-ordinal-v1:game.ts:Field.makeMove#0 line=98 col=3 end=107:4 file=FILE:game.ts@1
+node METHOD name=Field.opponent qn=Field.opponent canonical=script-ordinal-v1:game.ts:Field.opponent#0 line=56 col=3 end=64:4 file=FILE:game.ts@1
+node METHOD name=Field.sameInRow qn=Field.sameInRow canonical=script-ordinal-v1:game.ts:Field.sameInRow#0 line=78 col=3 end=96:4 file=FILE:game.ts@1
+node METHOD name=Field.show qn=Field.show canonical=script-ordinal-v1:game.ts:Field.show#0 line=117 col=3 end=138:4 file=FILE:game.ts@1
+node METHOD name=GameObject.announce qn=GameObject.announce canonical=script-ordinal-v1:game.ts:GameObject.announce#0 line=24 col=3 end=26:4 file=FILE:game.ts@1
+node METHOD name=HumanPlayer.check qn=HumanPlayer.check canonical=script-ordinal-v1:game.ts:HumanPlayer.check#0 line=159 col=3 end=169:4 file=FILE:game.ts@1
+node METHOD name=HumanPlayer.input qn=HumanPlayer.input canonical=script-ordinal-v1:game.ts:HumanPlayer.input#0 line=155 col=3 end=157:4 file=FILE:game.ts@1
+node METHOD name=HumanPlayer.turn qn=HumanPlayer.turn canonical=script-ordinal-v1:game.ts:HumanPlayer.turn#0 line=171 col=3 end=181:4 file=FILE:game.ts@1
+node METHOD name=TicTacToe.checkWinner qn=TicTacToe.checkWinner canonical=script-ordinal-v1:game.ts:TicTacToe.checkWinner#0 line=248 col=3 end=250:4 file=FILE:game.ts@1
+node METHOD name=TicTacToe.constructor qn=TicTacToe.constructor canonical=script-ordinal-v1:game.ts:TicTacToe.constructor#0 line=242 col=3 end=246:4 file=FILE:game.ts@1
+node METHOD name=TicTacToe.isDraw qn=TicTacToe.isDraw canonical=script-ordinal-v1:game.ts:TicTacToe.isDraw#0 line=252 col=3 end=254:4 file=FILE:game.ts@1
+node METHOD name=TicTacToe.probeCalls qn=TicTacToe.probeCalls canonical=script-ordinal-v1:game.ts:TicTacToe.probeCalls#0 line=273 col=3 end=275:4 file=FILE:game.ts@1
+node METHOD name=TicTacToe.run qn=TicTacToe.run canonical=script-ordinal-v1:game.ts:TicTacToe.run#0 line=277 col=3 end=301:4 file=FILE:game.ts@1
+node METHOD name=TicTacToe.selectPlayer qn=TicTacToe.selectPlayer canonical=script-ordinal-v1:game.ts:TicTacToe.selectPlayer#0 line=256 col=3 end=265:4 file=FILE:game.ts@1
+node METHOD name=TicTacToe.start qn=TicTacToe.start canonical=script-ordinal-v1:game.ts:TicTacToe.start#0 line=267 col=3 end=271:4 file=FILE:game.ts@1
+node METHOD name=constructor qn=constructor canonical=script-ordinal-v1:game.ts:constructor#0 line=145 col=3 end=149:4 file=FILE:game.ts@1
+node MODULE name="./helper" qn="./helper" canonical=script-ordinal-v1:game.ts:"./helper"#0 line=2 col=24 end=2:34 file=FILE:game.ts@1
+node MODULE name="./random" qn="./random" canonical=script-ordinal-v1:game.ts:"./random"#0 line=1 col=27 end=1:37 file=FILE:game.ts@1
 node TYPEDEF name=Move qn=Move canonical=game.ts:Move line=6 col=1 end=9:3 file=FILE:game.ts@1
 node TYPEDEF name=Token qn=Token canonical=game.ts:Token line=4 col=1 end=4:24 file=FILE:game.ts@1
-node UNKNOWN name=Array qn=Array canonical=game.ts:Array#0 line=41 col=49 end=41:54 file=FILE:game.ts@1
-node UNKNOWN name=Boolean qn=Boolean canonical=game.ts:Boolean#0 line=270 col=12 end=270:19 file=FILE:game.ts@1
-node UNKNOWN name=String qn=String canonical=game.ts:String#0 line=16 col=24 end=16:30 file=FILE:game.ts@1
-node UNKNOWN name=announce qn=announce canonical=game.ts:announce#0 line=290 col=14 end=290:22 file=FILE:game.ts@1
-node UNKNOWN name=announce qn=announce canonical=game.ts:announce#1 line=295 col=14 end=295:22 file=FILE:game.ts@1
-node UNKNOWN name=check qn=check canonical=game.ts:check#0 line=176 col=12 end=176:17 file=FILE:game.ts@1
-node UNKNOWN name=check qn=check canonical=game.ts:check#1 line=177 col=16 end=177:21 file=FILE:game.ts@1
-node UNKNOWN name=checkWinner qn=checkWinner canonical=game.ts:checkWinner#0 line=274 col=10 end=274:21 file=FILE:game.ts@1
-node UNKNOWN name=checkWinner qn=checkWinner canonical=game.ts:checkWinner#1 line=287 col=12 end=287:23 file=FILE:game.ts@1
-node UNKNOWN name=checkWinner qn=checkWinner canonical=game.ts:checkWinner#2 line=289 col=16 end=289:27 file=FILE:game.ts@1
-node UNKNOWN name=clearMove qn=clearMove canonical=game.ts:clearMove#0 line=214 col=15 end=214:24 file=FILE:game.ts@1
-node UNKNOWN name=cloneField qn=cloneField canonical=game.ts:cloneField#0 line=232 col=24 end=232:34 file=FILE:game.ts@1
-node UNKNOWN name=evaluate qn=evaluate canonical=game.ts:evaluate#0 line=210 col=30 end=210:38 file=FILE:game.ts@1
-node UNKNOWN name=fill qn=fill canonical=game.ts:fill#0 line=41 col=65 end=41:69 file=FILE:game.ts@1
-node UNKNOWN name=from qn=from canonical=game.ts:from#0 line=41 col=23 end=41:27 file=FILE:game.ts@1
-node UNKNOWN name=helper qn=helper canonical=game.ts:helper#0 line=2 col=10 end=2:16 file=FILE:game.ts@1
-node UNKNOWN name=helper qn=helper canonical=game.ts:helper#1 line=25 col=5 end=25:11 file=FILE:game.ts@1
-node UNKNOWN name=inRange qn=inRange canonical=game.ts:inRange#0 line=99 col=15 end=99:22 file=FILE:game.ts@1
-node UNKNOWN name=inRange qn=inRange canonical=game.ts:inRange#1 line=110 col=15 end=110:22 file=FILE:game.ts@1
-node UNKNOWN name=inRange qn=inRange canonical=game.ts:inRange#2 line=160 col=16 end=160:23 file=FILE:game.ts@1
-node UNKNOWN name=input qn=input canonical=game.ts:input#0 line=175 col=25 end=175:30 file=FILE:game.ts@1
-node UNKNOWN name=isDraw qn=isDraw canonical=game.ts:isDraw#0 line=105 col=10 end=105:16 file=FILE:game.ts@1
-node UNKNOWN name=isDraw qn=isDraw canonical=game.ts:isDraw#1 line=211 col=39 end=211:45 file=FILE:game.ts@1
-node UNKNOWN name=isDraw qn=isDraw canonical=game.ts:isDraw#2 line=253 col=23 end=253:29 file=FILE:game.ts@1
-node UNKNOWN name=isDraw qn=isDraw canonical=game.ts:isDraw#3 line=288 col=12 end=288:18 file=FILE:game.ts@1
-node UNKNOWN name=isDraw qn=isDraw canonical=game.ts:isDraw#4 line=294 col=16 end=294:22 file=FILE:game.ts@1
-node UNKNOWN name=isEmpty qn=isEmpty canonical=game.ts:isEmpty#0 line=99 col=38 end=99:45 file=FILE:game.ts@1
-node UNKNOWN name=isEmpty qn=isEmpty canonical=game.ts:isEmpty#1 line=110 col=37 end=110:44 file=FILE:game.ts@1
-node UNKNOWN name=isEmpty qn=isEmpty canonical=game.ts:isEmpty#2 line=164 col=16 end=164:23 file=FILE:game.ts@1
-node UNKNOWN name=isEmpty qn=isEmpty canonical=game.ts:isEmpty#3 line=205 col=20 end=205:27 file=FILE:game.ts@1
-node UNKNOWN name=makeMove qn=makeMove canonical=game.ts:makeMove#0 line=209 col=15 end=209:23 file=FILE:game.ts@1
-node UNKNOWN name=makeMove qn=makeMove canonical=game.ts:makeMove#1 line=286 col=18 end=286:26 file=FILE:game.ts@1
-node UNKNOWN name=minMax qn=minMax canonical=game.ts:minMax#0 line=212 col=29 end=212:35 file=FILE:game.ts@1
-node UNKNOWN name=minMax qn=minMax canonical=game.ts:minMax#1 line=233 col=23 end=233:29 file=FILE:game.ts@1
-node UNKNOWN name=numberIn qn=numberIn canonical=game.ts:numberIn#1 line=156 col=40 end=156:48 file=FILE:game.ts@1
-node UNKNOWN name=numberIn qn=numberIn canonical=game.ts:numberIn#2 line=257 col=23 end=257:31 file=FILE:game.ts@1
-node UNKNOWN name=numberOut qn=numberOut canonical=game.ts:numberOut#1 line=120 col=7 end=120:16 file=FILE:game.ts@1
-node UNKNOWN name=opponent qn=opponent canonical=game.ts:opponent#0 line=189 col=31 end=189:39 file=FILE:game.ts@1
-node UNKNOWN name=opponent qn=opponent canonical=game.ts:opponent#1 line=212 col=49 end=212:57 file=FILE:game.ts@1
-node UNKNOWN name=randomInt qn=randomInt canonical=game.ts:randomInt#0 line=1 col=10 end=1:19 file=FILE:game.ts@1
-node UNKNOWN name=randomInt qn=randomInt canonical=game.ts:randomInt#1 line=221 col=15 end=221:24 file=FILE:game.ts@1
-node UNKNOWN name=run qn=run canonical=game.ts:run#0 line=307 col=10 end=307:13 file=FILE:game.ts@1
-node UNKNOWN name=sameInRow qn=sameInRow canonical=game.ts:sameInRow#0 line=104 col=10 end=104:19 file=FILE:game.ts@1
-node UNKNOWN name=sameInRow qn=sameInRow canonical=game.ts:sameInRow#1 line=186 col=15 end=186:24 file=FILE:game.ts@1
-node UNKNOWN name=sameInRow qn=sameInRow canonical=game.ts:sameInRow#2 line=189 col=15 end=189:24 file=FILE:game.ts@1
-node UNKNOWN name=sameInRow qn=sameInRow canonical=game.ts:sameInRow#3 line=192 col=15 end=192:24 file=FILE:game.ts@1
-node UNKNOWN name=sameInRow qn=sameInRow canonical=game.ts:sameInRow#4 line=249 col=23 end=249:32 file=FILE:game.ts@1
-node UNKNOWN name=selectPlayer qn=selectPlayer canonical=game.ts:selectPlayer#0 line=268 col=28 end=268:40 file=FILE:game.ts@1
-node UNKNOWN name=selectPlayer qn=selectPlayer canonical=game.ts:selectPlayer#1 line=269 col=28 end=269:40 file=FILE:game.ts@1
-node UNKNOWN name=show qn=show canonical=game.ts:show#0 line=278 col=16 end=278:20 file=FILE:game.ts@1
-node UNKNOWN name=start qn=start canonical=game.ts:start#0 line=306 col=12 end=306:17 file=FILE:game.ts@1
-node UNKNOWN name=stringOut qn=stringOut canonical=game.ts:stringOut#1 line=118 col=5 end=118:14 file=FILE:game.ts@1
-node UNKNOWN name=stringOut qn=stringOut canonical=game.ts:stringOut#10 line=165 col=7 end=165:16 file=FILE:game.ts@1
-node UNKNOWN name=stringOut qn=stringOut canonical=game.ts:stringOut#11 line=172 col=5 end=172:14 file=FILE:game.ts@1
-node UNKNOWN name=stringOut qn=stringOut canonical=game.ts:stringOut#12 line=173 col=5 end=173:14 file=FILE:game.ts@1
-node UNKNOWN name=stringOut qn=stringOut canonical=game.ts:stringOut#13 line=291 col=9 end=291:18 file=FILE:game.ts@1
-node UNKNOWN name=stringOut qn=stringOut canonical=game.ts:stringOut#14 line=296 col=9 end=296:18 file=FILE:game.ts@1
-node UNKNOWN name=stringOut qn=stringOut canonical=game.ts:stringOut#2 line=121 col=7 end=121:16 file=FILE:game.ts@1
-node UNKNOWN name=stringOut qn=stringOut canonical=game.ts:stringOut#3 line=125 col=11 end=125:20 file=FILE:game.ts@1
-node UNKNOWN name=stringOut qn=stringOut canonical=game.ts:stringOut#4 line=127 col=11 end=127:20 file=FILE:game.ts@1
-node UNKNOWN name=stringOut qn=stringOut canonical=game.ts:stringOut#5 line=129 col=11 end=129:20 file=FILE:game.ts@1
-node UNKNOWN name=stringOut qn=stringOut canonical=game.ts:stringOut#6 line=132 col=11 end=132:20 file=FILE:game.ts@1
-node UNKNOWN name=stringOut qn=stringOut canonical=game.ts:stringOut#7 line=135 col=7 end=135:16 file=FILE:game.ts@1
-node UNKNOWN name=stringOut qn=stringOut canonical=game.ts:stringOut#8 line=137 col=5 end=137:14 file=FILE:game.ts@1
-node UNKNOWN name=stringOut qn=stringOut canonical=game.ts:stringOut#9 line=161 col=7 end=161:16 file=FILE:game.ts@1
-node UNKNOWN name=turn qn=turn canonical=game.ts:turn#0 line=285 col=27 end=285:31 file=FILE:game.ts@1
-node UNKNOWN name=write qn=write canonical=game.ts:write#0 line=16 col=18 end=16:23 file=FILE:game.ts@1
-node UNKNOWN name=write qn=write canonical=game.ts:write#1 line=20 col=18 end=20:23 file=FILE:game.ts@1
+node UNKNOWN name=Array qn=Array canonical=script-ordinal-v1:game.ts:Array#0 line=41 col=49 end=41:54 file=FILE:game.ts@1
+node UNKNOWN name=Boolean qn=Boolean canonical=script-ordinal-v1:game.ts:Boolean#0 line=270 col=12 end=270:19 file=FILE:game.ts@1
+node UNKNOWN name=String qn=String canonical=script-ordinal-v1:game.ts:String#0 line=16 col=24 end=16:30 file=FILE:game.ts@1
+node UNKNOWN name=announce qn=announce canonical=script-ordinal-v1:game.ts:announce#0 line=290 col=14 end=290:22 file=FILE:game.ts@1
+node UNKNOWN name=announce qn=announce canonical=script-ordinal-v1:game.ts:announce#1 line=295 col=14 end=295:22 file=FILE:game.ts@1
+node UNKNOWN name=check qn=check canonical=script-ordinal-v1:game.ts:check#0 line=176 col=12 end=176:17 file=FILE:game.ts@1
+node UNKNOWN name=check qn=check canonical=script-ordinal-v1:game.ts:check#1 line=177 col=16 end=177:21 file=FILE:game.ts@1
+node UNKNOWN name=checkWinner qn=checkWinner canonical=script-ordinal-v1:game.ts:checkWinner#0 line=274 col=10 end=274:21 file=FILE:game.ts@1
+node UNKNOWN name=checkWinner qn=checkWinner canonical=script-ordinal-v1:game.ts:checkWinner#1 line=287 col=12 end=287:23 file=FILE:game.ts@1
+node UNKNOWN name=checkWinner qn=checkWinner canonical=script-ordinal-v1:game.ts:checkWinner#2 line=289 col=16 end=289:27 file=FILE:game.ts@1
+node UNKNOWN name=clearMove qn=clearMove canonical=script-ordinal-v1:game.ts:clearMove#0 line=214 col=15 end=214:24 file=FILE:game.ts@1
+node UNKNOWN name=cloneField qn=cloneField canonical=script-ordinal-v1:game.ts:cloneField#0 line=232 col=24 end=232:34 file=FILE:game.ts@1
+node UNKNOWN name=evaluate qn=evaluate canonical=script-ordinal-v1:game.ts:evaluate#0 line=210 col=30 end=210:38 file=FILE:game.ts@1
+node UNKNOWN name=fill qn=fill canonical=script-ordinal-v1:game.ts:fill#0 line=41 col=65 end=41:69 file=FILE:game.ts@1
+node UNKNOWN name=from qn=from canonical=script-ordinal-v1:game.ts:from#0 line=41 col=23 end=41:27 file=FILE:game.ts@1
+node UNKNOWN name=helper qn=helper canonical=script-ordinal-v1:game.ts:helper#0 line=2 col=10 end=2:16 file=FILE:game.ts@1
+node UNKNOWN name=helper qn=helper canonical=script-ordinal-v1:game.ts:helper#1 line=25 col=5 end=25:11 file=FILE:game.ts@1
+node UNKNOWN name=inRange qn=inRange canonical=script-ordinal-v1:game.ts:inRange#0 line=99 col=15 end=99:22 file=FILE:game.ts@1
+node UNKNOWN name=inRange qn=inRange canonical=script-ordinal-v1:game.ts:inRange#1 line=110 col=15 end=110:22 file=FILE:game.ts@1
+node UNKNOWN name=inRange qn=inRange canonical=script-ordinal-v1:game.ts:inRange#2 line=160 col=16 end=160:23 file=FILE:game.ts@1
+node UNKNOWN name=input qn=input canonical=script-ordinal-v1:game.ts:input#0 line=175 col=25 end=175:30 file=FILE:game.ts@1
+node UNKNOWN name=isDraw qn=isDraw canonical=script-ordinal-v1:game.ts:isDraw#0 line=105 col=10 end=105:16 file=FILE:game.ts@1
+node UNKNOWN name=isDraw qn=isDraw canonical=script-ordinal-v1:game.ts:isDraw#1 line=211 col=39 end=211:45 file=FILE:game.ts@1
+node UNKNOWN name=isDraw qn=isDraw canonical=script-ordinal-v1:game.ts:isDraw#2 line=253 col=23 end=253:29 file=FILE:game.ts@1
+node UNKNOWN name=isDraw qn=isDraw canonical=script-ordinal-v1:game.ts:isDraw#3 line=288 col=12 end=288:18 file=FILE:game.ts@1
+node UNKNOWN name=isDraw qn=isDraw canonical=script-ordinal-v1:game.ts:isDraw#4 line=294 col=16 end=294:22 file=FILE:game.ts@1
+node UNKNOWN name=isEmpty qn=isEmpty canonical=script-ordinal-v1:game.ts:isEmpty#0 line=99 col=38 end=99:45 file=FILE:game.ts@1
+node UNKNOWN name=isEmpty qn=isEmpty canonical=script-ordinal-v1:game.ts:isEmpty#1 line=110 col=37 end=110:44 file=FILE:game.ts@1
+node UNKNOWN name=isEmpty qn=isEmpty canonical=script-ordinal-v1:game.ts:isEmpty#2 line=164 col=16 end=164:23 file=FILE:game.ts@1
+node UNKNOWN name=isEmpty qn=isEmpty canonical=script-ordinal-v1:game.ts:isEmpty#3 line=205 col=20 end=205:27 file=FILE:game.ts@1
+node UNKNOWN name=makeMove qn=makeMove canonical=script-ordinal-v1:game.ts:makeMove#0 line=209 col=15 end=209:23 file=FILE:game.ts@1
+node UNKNOWN name=makeMove qn=makeMove canonical=script-ordinal-v1:game.ts:makeMove#1 line=286 col=18 end=286:26 file=FILE:game.ts@1
+node UNKNOWN name=minMax qn=minMax canonical=script-ordinal-v1:game.ts:minMax#0 line=212 col=29 end=212:35 file=FILE:game.ts@1
+node UNKNOWN name=minMax qn=minMax canonical=script-ordinal-v1:game.ts:minMax#1 line=233 col=23 end=233:29 file=FILE:game.ts@1
+node UNKNOWN name=numberIn qn=numberIn canonical=script-ordinal-v1:game.ts:numberIn#1 line=156 col=40 end=156:48 file=FILE:game.ts@1
+node UNKNOWN name=numberIn qn=numberIn canonical=script-ordinal-v1:game.ts:numberIn#2 line=257 col=23 end=257:31 file=FILE:game.ts@1
+node UNKNOWN name=numberOut qn=numberOut canonical=script-ordinal-v1:game.ts:numberOut#1 line=120 col=7 end=120:16 file=FILE:game.ts@1
+node UNKNOWN name=opponent qn=opponent canonical=script-ordinal-v1:game.ts:opponent#0 line=189 col=31 end=189:39 file=FILE:game.ts@1
+node UNKNOWN name=opponent qn=opponent canonical=script-ordinal-v1:game.ts:opponent#1 line=212 col=49 end=212:57 file=FILE:game.ts@1
+node UNKNOWN name=randomInt qn=randomInt canonical=script-ordinal-v1:game.ts:randomInt#0 line=1 col=10 end=1:19 file=FILE:game.ts@1
+node UNKNOWN name=randomInt qn=randomInt canonical=script-ordinal-v1:game.ts:randomInt#1 line=221 col=15 end=221:24 file=FILE:game.ts@1
+node UNKNOWN name=run qn=run canonical=script-ordinal-v1:game.ts:run#0 line=307 col=10 end=307:13 file=FILE:game.ts@1
+node UNKNOWN name=sameInRow qn=sameInRow canonical=script-ordinal-v1:game.ts:sameInRow#0 line=104 col=10 end=104:19 file=FILE:game.ts@1
+node UNKNOWN name=sameInRow qn=sameInRow canonical=script-ordinal-v1:game.ts:sameInRow#1 line=186 col=15 end=186:24 file=FILE:game.ts@1
+node UNKNOWN name=sameInRow qn=sameInRow canonical=script-ordinal-v1:game.ts:sameInRow#2 line=189 col=15 end=189:24 file=FILE:game.ts@1
+node UNKNOWN name=sameInRow qn=sameInRow canonical=script-ordinal-v1:game.ts:sameInRow#3 line=192 col=15 end=192:24 file=FILE:game.ts@1
+node UNKNOWN name=sameInRow qn=sameInRow canonical=script-ordinal-v1:game.ts:sameInRow#4 line=249 col=23 end=249:32 file=FILE:game.ts@1
+node UNKNOWN name=selectPlayer qn=selectPlayer canonical=script-ordinal-v1:game.ts:selectPlayer#0 line=268 col=28 end=268:40 file=FILE:game.ts@1
+node UNKNOWN name=selectPlayer qn=selectPlayer canonical=script-ordinal-v1:game.ts:selectPlayer#1 line=269 col=28 end=269:40 file=FILE:game.ts@1
+node UNKNOWN name=show qn=show canonical=script-ordinal-v1:game.ts:show#0 line=278 col=16 end=278:20 file=FILE:game.ts@1
+node UNKNOWN name=start qn=start canonical=script-ordinal-v1:game.ts:start#0 line=306 col=12 end=306:17 file=FILE:game.ts@1
+node UNKNOWN name=stringOut qn=stringOut canonical=script-ordinal-v1:game.ts:stringOut#1 line=118 col=5 end=118:14 file=FILE:game.ts@1
+node UNKNOWN name=stringOut qn=stringOut canonical=script-ordinal-v1:game.ts:stringOut#10 line=165 col=7 end=165:16 file=FILE:game.ts@1
+node UNKNOWN name=stringOut qn=stringOut canonical=script-ordinal-v1:game.ts:stringOut#11 line=172 col=5 end=172:14 file=FILE:game.ts@1
+node UNKNOWN name=stringOut qn=stringOut canonical=script-ordinal-v1:game.ts:stringOut#12 line=173 col=5 end=173:14 file=FILE:game.ts@1
+node UNKNOWN name=stringOut qn=stringOut canonical=script-ordinal-v1:game.ts:stringOut#13 line=291 col=9 end=291:18 file=FILE:game.ts@1
+node UNKNOWN name=stringOut qn=stringOut canonical=script-ordinal-v1:game.ts:stringOut#14 line=296 col=9 end=296:18 file=FILE:game.ts@1
+node UNKNOWN name=stringOut qn=stringOut canonical=script-ordinal-v1:game.ts:stringOut#2 line=121 col=7 end=121:16 file=FILE:game.ts@1
+node UNKNOWN name=stringOut qn=stringOut canonical=script-ordinal-v1:game.ts:stringOut#3 line=125 col=11 end=125:20 file=FILE:game.ts@1
+node UNKNOWN name=stringOut qn=stringOut canonical=script-ordinal-v1:game.ts:stringOut#4 line=127 col=11 end=127:20 file=FILE:game.ts@1
+node UNKNOWN name=stringOut qn=stringOut canonical=script-ordinal-v1:game.ts:stringOut#5 line=129 col=11 end=129:20 file=FILE:game.ts@1
+node UNKNOWN name=stringOut qn=stringOut canonical=script-ordinal-v1:game.ts:stringOut#6 line=132 col=11 end=132:20 file=FILE:game.ts@1
+node UNKNOWN name=stringOut qn=stringOut canonical=script-ordinal-v1:game.ts:stringOut#7 line=135 col=7 end=135:16 file=FILE:game.ts@1
+node UNKNOWN name=stringOut qn=stringOut canonical=script-ordinal-v1:game.ts:stringOut#8 line=137 col=5 end=137:14 file=FILE:game.ts@1
+node UNKNOWN name=stringOut qn=stringOut canonical=script-ordinal-v1:game.ts:stringOut#9 line=161 col=7 end=161:16 file=FILE:game.ts@1
+node UNKNOWN name=turn qn=turn canonical=script-ordinal-v1:game.ts:turn#0 line=285 col=27 end=285:31 file=FILE:game.ts@1
+node UNKNOWN name=write qn=write canonical=script-ordinal-v1:game.ts:write#0 line=16 col=18 end=16:23 file=FILE:game.ts@1
+node UNKNOWN name=write qn=write canonical=script-ordinal-v1:game.ts:write#1 line=20 col=18 end=20:23 file=FILE:game.ts@1
 edge CALL src=FUNCTION:main@304 dst=CLASS:TicTacToe@238 resolved_src=- resolved_dst=- line=305 confidence=- certainty=- callsite=h0:305:1:h1 candidates=[]
 edge CALL src=FUNCTION:main@304 dst=METHOD:TicTacToe.run@277 resolved_src=- resolved_dst=METHOD:TicTacToe.run@277 line=307 confidence=1.0000 certainty=Certain callsite=h0:307:1:h2 candidates=[]
 edge CALL src=FUNCTION:main@304 dst=METHOD:TicTacToe.start@267 resolved_src=- resolved_dst=METHOD:TicTacToe.start@267 line=306 confidence=1.0000 certainty=Certain callsite=h0:306:1:h3 candidates=[]
@@ -139,7 +139,6 @@ edge CALL src=METHOD:ArtificialPlayer.turn@231 dst=METHOD:Field.cloneField@45 re
 edge CALL src=METHOD:Field.clearMove@109 dst=METHOD:Field.inRange@66 resolved_src=- resolved_dst=METHOD:Field.inRange@66 line=110 confidence=1.0000 certainty=Certain callsite=h0:110:1:h17 candidates=[]
 edge CALL src=METHOD:Field.clearMove@109 dst=METHOD:Field.isEmpty@70 resolved_src=- resolved_dst=METHOD:Field.isEmpty@70 line=110 confidence=1.0000 certainty=Certain callsite=h0:110:1:h12 candidates=[]
 edge CALL src=METHOD:Field.cloneField@45 dst=CLASS:Field@29 resolved_src=- resolved_dst=- line=46 confidence=- certainty=- callsite=h0:46:1:h18 candidates=[]
-edge CALL src=METHOD:Field.constructor@39 dst=CLASS:Field@29 resolved_src=- resolved_dst=- line=244 confidence=- certainty=- callsite=h0:244:1:h18 candidates=[]
 edge CALL src=METHOD:Field.constructor@39 dst=UNKNOWN:from@41 resolved_src=METHOD:Field.constructor@39 resolved_dst=- line=41 confidence=- certainty=- callsite=h0:41:23:h19|syntax:ts-member-call candidates=[]
 edge CALL src=METHOD:Field.makeMove@98 dst=METHOD:Field.inRange@66 resolved_src=- resolved_dst=METHOD:Field.inRange@66 line=99 confidence=1.0000 certainty=Certain callsite=h0:99:1:h17 candidates=[]
 edge CALL src=METHOD:Field.makeMove@98 dst=METHOD:Field.isDraw@74 resolved_src=- resolved_dst=METHOD:Field.isDraw@74 line=105 confidence=1.0000 certainty=Certain callsite=h0:105:1:h11 candidates=[]
@@ -167,6 +166,7 @@ edge CALL src=METHOD:HumanPlayer.turn@171 dst=METHOD:HumanPlayer.input@155 resol
 edge CALL src=METHOD:HumanPlayer.turn@171 dst=UNKNOWN:stringOut@172 resolved_src=METHOD:HumanPlayer.turn@171 resolved_dst=- line=172 confidence=- certainty=- callsite=h0:172:5:h35 candidates=[]
 edge CALL src=METHOD:HumanPlayer.turn@171 dst=UNKNOWN:stringOut@173 resolved_src=METHOD:HumanPlayer.turn@171 resolved_dst=- line=173 confidence=- certainty=- callsite=h0:173:5:h36 candidates=[]
 edge CALL src=METHOD:TicTacToe.checkWinner@248 dst=METHOD:Field.sameInRow@78 resolved_src=- resolved_dst=METHOD:Field.sameInRow@78 line=249 confidence=1.0000 certainty=Certain callsite=h0:249:1:h8 candidates=[]
+edge CALL src=METHOD:TicTacToe.constructor@242 dst=CLASS:Field@29 resolved_src=- resolved_dst=- line=244 confidence=- certainty=- callsite=h0:244:1:h18 candidates=[]
 edge CALL src=METHOD:TicTacToe.isDraw@252 dst=METHOD:Field.isDraw@74 resolved_src=- resolved_dst=METHOD:Field.isDraw@74 line=253 confidence=1.0000 certainty=Certain callsite=h0:253:1:h11 candidates=[]
 edge CALL src=METHOD:TicTacToe.probeCalls@273 dst=METHOD:TicTacToe.checkWinner@248 resolved_src=- resolved_dst=METHOD:TicTacToe.checkWinner@248 line=274 confidence=1.0000 certainty=Certain callsite=h0:274:1:h37 candidates=[]
 edge CALL src=METHOD:TicTacToe.run@277 dst=METHOD:Field.makeMove@98 resolved_src=- resolved_dst=METHOD:Field.makeMove@98 line=286 confidence=1.0000 certainty=Certain callsite=h0:286:1:h13 candidates=[]
@@ -221,12 +221,12 @@ edge MEMBER src=CLASS:TicTacToe@238 dst=METHOD:TicTacToe.start@267 resolved_src=
 file path=game.ts language=typescript lines=309 complete=true role=Source
 occurrence element=CLASS:ArtificialPlayer@184 kind=DEFINITION span=184:7-184:23
 occurrence element=CLASS:Field@29 kind=DEFINITION span=29:7-29:12
-occurrence element=CLASS:GameObject@23 kind=DEFINITION span=238:32-238:42
 occurrence element=CLASS:GameObject@23 kind=DEFINITION span=23:7-23:17
-occurrence element=CLASS:GameObject@23 kind=DEFINITION span=29:21-29:31
+occurrence element=CLASS:GameObject@23 kind=REFERENCE span=238:32-238:42
+occurrence element=CLASS:GameObject@23 kind=REFERENCE span=29:21-29:31
 occurrence element=CLASS:HumanPlayer@154 kind=DEFINITION span=154:7-154:18
-occurrence element=CLASS:Player@154 kind=DEFINITION span=154:27-154:33
-occurrence element=CLASS:Player@154 kind=DEFINITION span=184:32-184:38
+occurrence element=CLASS:Player@154 kind=REFERENCE span=154:27-154:33
+occurrence element=CLASS:Player@154 kind=REFERENCE span=184:32-184:38
 occurrence element=CLASS:TicTacToe@238 kind=DEFINITION span=238:14-238:23
 occurrence element=FIELD:Token@30 kind=DEFINITION span=30:10-30:15
 occurrence element=FIELD:col@8 kind=DEFINITION span=8:3-8:6
@@ -268,78 +268,78 @@ occurrence element=METHOD:TicTacToe.run@277 kind=DEFINITION span=277:3-301:4
 occurrence element=METHOD:TicTacToe.selectPlayer@256 kind=DEFINITION span=256:3-265:4
 occurrence element=METHOD:TicTacToe.start@267 kind=DEFINITION span=267:3-271:4
 occurrence element=METHOD:constructor@145 kind=DEFINITION span=145:3-149:4
-occurrence element=MODULE:"./helper"@2 kind=DEFINITION span=2:24-2:34
-occurrence element=MODULE:"./random"@1 kind=DEFINITION span=1:27-1:37
+occurrence element=MODULE:"./helper"@2 kind=REFERENCE span=2:24-2:34
+occurrence element=MODULE:"./random"@1 kind=REFERENCE span=1:27-1:37
 occurrence element=TYPEDEF:Move@6 kind=DEFINITION span=6:1-9:3
 occurrence element=TYPEDEF:Token@4 kind=DEFINITION span=4:1-4:24
-occurrence element=UNKNOWN:Array@41 kind=DEFINITION span=41:49-41:54
-occurrence element=UNKNOWN:Boolean@270 kind=DEFINITION span=270:12-270:19
-occurrence element=UNKNOWN:String@16 kind=DEFINITION span=16:24-16:30
-occurrence element=UNKNOWN:announce@290 kind=DEFINITION span=290:14-290:22
-occurrence element=UNKNOWN:announce@295 kind=DEFINITION span=295:14-295:22
-occurrence element=UNKNOWN:check@176 kind=DEFINITION span=176:12-176:17
-occurrence element=UNKNOWN:check@177 kind=DEFINITION span=177:16-177:21
-occurrence element=UNKNOWN:checkWinner@274 kind=DEFINITION span=274:10-274:21
-occurrence element=UNKNOWN:checkWinner@287 kind=DEFINITION span=287:12-287:23
-occurrence element=UNKNOWN:checkWinner@289 kind=DEFINITION span=289:16-289:27
-occurrence element=UNKNOWN:clearMove@214 kind=DEFINITION span=214:15-214:24
-occurrence element=UNKNOWN:cloneField@232 kind=DEFINITION span=232:24-232:34
-occurrence element=UNKNOWN:evaluate@210 kind=DEFINITION span=210:30-210:38
-occurrence element=UNKNOWN:fill@41 kind=DEFINITION span=41:65-41:69
-occurrence element=UNKNOWN:from@41 kind=DEFINITION span=41:23-41:27
+occurrence element=UNKNOWN:Array@41 kind=REFERENCE span=41:49-41:54
+occurrence element=UNKNOWN:Boolean@270 kind=REFERENCE span=270:12-270:19
+occurrence element=UNKNOWN:String@16 kind=REFERENCE span=16:24-16:30
+occurrence element=UNKNOWN:announce@290 kind=REFERENCE span=290:14-290:22
+occurrence element=UNKNOWN:announce@295 kind=REFERENCE span=295:14-295:22
+occurrence element=UNKNOWN:check@176 kind=REFERENCE span=176:12-176:17
+occurrence element=UNKNOWN:check@177 kind=REFERENCE span=177:16-177:21
+occurrence element=UNKNOWN:checkWinner@274 kind=REFERENCE span=274:10-274:21
+occurrence element=UNKNOWN:checkWinner@287 kind=REFERENCE span=287:12-287:23
+occurrence element=UNKNOWN:checkWinner@289 kind=REFERENCE span=289:16-289:27
+occurrence element=UNKNOWN:clearMove@214 kind=REFERENCE span=214:15-214:24
+occurrence element=UNKNOWN:cloneField@232 kind=REFERENCE span=232:24-232:34
+occurrence element=UNKNOWN:evaluate@210 kind=REFERENCE span=210:30-210:38
+occurrence element=UNKNOWN:fill@41 kind=REFERENCE span=41:65-41:69
+occurrence element=UNKNOWN:from@41 kind=REFERENCE span=41:23-41:27
 occurrence element=UNKNOWN:helper@2 kind=DEFINITION span=2:10-2:16
-occurrence element=UNKNOWN:helper@25 kind=DEFINITION span=25:5-25:11
-occurrence element=UNKNOWN:inRange@110 kind=DEFINITION span=110:15-110:22
-occurrence element=UNKNOWN:inRange@160 kind=DEFINITION span=160:16-160:23
-occurrence element=UNKNOWN:inRange@99 kind=DEFINITION span=99:15-99:22
-occurrence element=UNKNOWN:input@175 kind=DEFINITION span=175:25-175:30
-occurrence element=UNKNOWN:isDraw@105 kind=DEFINITION span=105:10-105:16
-occurrence element=UNKNOWN:isDraw@211 kind=DEFINITION span=211:39-211:45
-occurrence element=UNKNOWN:isDraw@253 kind=DEFINITION span=253:23-253:29
-occurrence element=UNKNOWN:isDraw@288 kind=DEFINITION span=288:12-288:18
-occurrence element=UNKNOWN:isDraw@294 kind=DEFINITION span=294:16-294:22
-occurrence element=UNKNOWN:isEmpty@110 kind=DEFINITION span=110:37-110:44
-occurrence element=UNKNOWN:isEmpty@164 kind=DEFINITION span=164:16-164:23
-occurrence element=UNKNOWN:isEmpty@205 kind=DEFINITION span=205:20-205:27
-occurrence element=UNKNOWN:isEmpty@99 kind=DEFINITION span=99:38-99:45
-occurrence element=UNKNOWN:makeMove@209 kind=DEFINITION span=209:15-209:23
-occurrence element=UNKNOWN:makeMove@286 kind=DEFINITION span=286:18-286:26
-occurrence element=UNKNOWN:minMax@212 kind=DEFINITION span=212:29-212:35
-occurrence element=UNKNOWN:minMax@233 kind=DEFINITION span=233:23-233:29
-occurrence element=UNKNOWN:numberIn@156 kind=DEFINITION span=156:40-156:48
-occurrence element=UNKNOWN:numberIn@257 kind=DEFINITION span=257:23-257:31
-occurrence element=UNKNOWN:numberOut@120 kind=DEFINITION span=120:7-120:16
-occurrence element=UNKNOWN:opponent@189 kind=DEFINITION span=189:31-189:39
-occurrence element=UNKNOWN:opponent@212 kind=DEFINITION span=212:49-212:57
+occurrence element=UNKNOWN:helper@25 kind=REFERENCE span=25:5-25:11
+occurrence element=UNKNOWN:inRange@110 kind=REFERENCE span=110:15-110:22
+occurrence element=UNKNOWN:inRange@160 kind=REFERENCE span=160:16-160:23
+occurrence element=UNKNOWN:inRange@99 kind=REFERENCE span=99:15-99:22
+occurrence element=UNKNOWN:input@175 kind=REFERENCE span=175:25-175:30
+occurrence element=UNKNOWN:isDraw@105 kind=REFERENCE span=105:10-105:16
+occurrence element=UNKNOWN:isDraw@211 kind=REFERENCE span=211:39-211:45
+occurrence element=UNKNOWN:isDraw@253 kind=REFERENCE span=253:23-253:29
+occurrence element=UNKNOWN:isDraw@288 kind=REFERENCE span=288:12-288:18
+occurrence element=UNKNOWN:isDraw@294 kind=REFERENCE span=294:16-294:22
+occurrence element=UNKNOWN:isEmpty@110 kind=REFERENCE span=110:37-110:44
+occurrence element=UNKNOWN:isEmpty@164 kind=REFERENCE span=164:16-164:23
+occurrence element=UNKNOWN:isEmpty@205 kind=REFERENCE span=205:20-205:27
+occurrence element=UNKNOWN:isEmpty@99 kind=REFERENCE span=99:38-99:45
+occurrence element=UNKNOWN:makeMove@209 kind=REFERENCE span=209:15-209:23
+occurrence element=UNKNOWN:makeMove@286 kind=REFERENCE span=286:18-286:26
+occurrence element=UNKNOWN:minMax@212 kind=REFERENCE span=212:29-212:35
+occurrence element=UNKNOWN:minMax@233 kind=REFERENCE span=233:23-233:29
+occurrence element=UNKNOWN:numberIn@156 kind=REFERENCE span=156:40-156:48
+occurrence element=UNKNOWN:numberIn@257 kind=REFERENCE span=257:23-257:31
+occurrence element=UNKNOWN:numberOut@120 kind=REFERENCE span=120:7-120:16
+occurrence element=UNKNOWN:opponent@189 kind=REFERENCE span=189:31-189:39
+occurrence element=UNKNOWN:opponent@212 kind=REFERENCE span=212:49-212:57
 occurrence element=UNKNOWN:randomInt@1 kind=DEFINITION span=1:10-1:19
-occurrence element=UNKNOWN:randomInt@221 kind=DEFINITION span=221:15-221:24
-occurrence element=UNKNOWN:run@307 kind=DEFINITION span=307:10-307:13
-occurrence element=UNKNOWN:sameInRow@104 kind=DEFINITION span=104:10-104:19
-occurrence element=UNKNOWN:sameInRow@186 kind=DEFINITION span=186:15-186:24
-occurrence element=UNKNOWN:sameInRow@189 kind=DEFINITION span=189:15-189:24
-occurrence element=UNKNOWN:sameInRow@192 kind=DEFINITION span=192:15-192:24
-occurrence element=UNKNOWN:sameInRow@249 kind=DEFINITION span=249:23-249:32
-occurrence element=UNKNOWN:selectPlayer@268 kind=DEFINITION span=268:28-268:40
-occurrence element=UNKNOWN:selectPlayer@269 kind=DEFINITION span=269:28-269:40
-occurrence element=UNKNOWN:show@278 kind=DEFINITION span=278:16-278:20
-occurrence element=UNKNOWN:start@306 kind=DEFINITION span=306:12-306:17
-occurrence element=UNKNOWN:stringOut@118 kind=DEFINITION span=118:5-118:14
-occurrence element=UNKNOWN:stringOut@121 kind=DEFINITION span=121:7-121:16
-occurrence element=UNKNOWN:stringOut@125 kind=DEFINITION span=125:11-125:20
-occurrence element=UNKNOWN:stringOut@127 kind=DEFINITION span=127:11-127:20
-occurrence element=UNKNOWN:stringOut@129 kind=DEFINITION span=129:11-129:20
-occurrence element=UNKNOWN:stringOut@132 kind=DEFINITION span=132:11-132:20
-occurrence element=UNKNOWN:stringOut@135 kind=DEFINITION span=135:7-135:16
-occurrence element=UNKNOWN:stringOut@137 kind=DEFINITION span=137:5-137:14
-occurrence element=UNKNOWN:stringOut@161 kind=DEFINITION span=161:7-161:16
-occurrence element=UNKNOWN:stringOut@165 kind=DEFINITION span=165:7-165:16
-occurrence element=UNKNOWN:stringOut@172 kind=DEFINITION span=172:5-172:14
-occurrence element=UNKNOWN:stringOut@173 kind=DEFINITION span=173:5-173:14
-occurrence element=UNKNOWN:stringOut@291 kind=DEFINITION span=291:9-291:18
-occurrence element=UNKNOWN:stringOut@296 kind=DEFINITION span=296:9-296:18
-occurrence element=UNKNOWN:turn@285 kind=DEFINITION span=285:27-285:31
-occurrence element=UNKNOWN:write@16 kind=DEFINITION span=16:18-16:23
-occurrence element=UNKNOWN:write@20 kind=DEFINITION span=20:18-20:23
+occurrence element=UNKNOWN:randomInt@221 kind=REFERENCE span=221:15-221:24
+occurrence element=UNKNOWN:run@307 kind=REFERENCE span=307:10-307:13
+occurrence element=UNKNOWN:sameInRow@104 kind=REFERENCE span=104:10-104:19
+occurrence element=UNKNOWN:sameInRow@186 kind=REFERENCE span=186:15-186:24
+occurrence element=UNKNOWN:sameInRow@189 kind=REFERENCE span=189:15-189:24
+occurrence element=UNKNOWN:sameInRow@192 kind=REFERENCE span=192:15-192:24
+occurrence element=UNKNOWN:sameInRow@249 kind=REFERENCE span=249:23-249:32
+occurrence element=UNKNOWN:selectPlayer@268 kind=REFERENCE span=268:28-268:40
+occurrence element=UNKNOWN:selectPlayer@269 kind=REFERENCE span=269:28-269:40
+occurrence element=UNKNOWN:show@278 kind=REFERENCE span=278:16-278:20
+occurrence element=UNKNOWN:start@306 kind=REFERENCE span=306:12-306:17
+occurrence element=UNKNOWN:stringOut@118 kind=REFERENCE span=118:5-118:14
+occurrence element=UNKNOWN:stringOut@121 kind=REFERENCE span=121:7-121:16
+occurrence element=UNKNOWN:stringOut@125 kind=REFERENCE span=125:11-125:20
+occurrence element=UNKNOWN:stringOut@127 kind=REFERENCE span=127:11-127:20
+occurrence element=UNKNOWN:stringOut@129 kind=REFERENCE span=129:11-129:20
+occurrence element=UNKNOWN:stringOut@132 kind=REFERENCE span=132:11-132:20
+occurrence element=UNKNOWN:stringOut@135 kind=REFERENCE span=135:7-135:16
+occurrence element=UNKNOWN:stringOut@137 kind=REFERENCE span=137:5-137:14
+occurrence element=UNKNOWN:stringOut@161 kind=REFERENCE span=161:7-161:16
+occurrence element=UNKNOWN:stringOut@165 kind=REFERENCE span=165:7-165:16
+occurrence element=UNKNOWN:stringOut@172 kind=REFERENCE span=172:5-172:14
+occurrence element=UNKNOWN:stringOut@173 kind=REFERENCE span=173:5-173:14
+occurrence element=UNKNOWN:stringOut@291 kind=REFERENCE span=291:9-291:18
+occurrence element=UNKNOWN:stringOut@296 kind=REFERENCE span=296:9-296:18
+occurrence element=UNKNOWN:turn@285 kind=REFERENCE span=285:27-285:31
+occurrence element=UNKNOWN:write@16 kind=REFERENCE span=16:18-16:23
+occurrence element=UNKNOWN:write@20 kind=REFERENCE span=20:18-20:23
 access node=FIELD:field@239 kind=Private
 access node=FIELD:grid@36 kind=Private
 access node=FIELD:left@37 kind=Private
@@ -369,33 +369,33 @@ access node=METHOD:TicTacToe.run@277 kind=Public
 access node=METHOD:TicTacToe.selectPlayer@256 kind=Public
 access node=METHOD:TicTacToe.start@267 kind=Public
 access node=METHOD:constructor@145 kind=Public
-callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "13:main", node_id: NodeId(6727796206157739310), signature_hash: -4671339478033693080, normalized_signature: Some("shape:984563778702004951"), body_hash: -1339483200538649359, start_line: 304, end_line: 309 }
-callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "13:numberIn", node_id: NodeId(3473737834801802537), signature_hash: 2477812878330356949, normalized_signature: Some("outline:-1795207361013140379"), body_hash: -5799076556058130842, start_line: 11, end_line: 13 }
-callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "13:numberOut", node_id: NodeId(2691679804232393048), signature_hash: -1579019679195996938, normalized_signature: Some("shape:-7518921926393888768"), body_hash: 1773761828586619323, start_line: 15, end_line: 17 }
-callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "13:stringOut", node_id: NodeId(4167814038827373872), signature_hash: -5818630870471287222, normalized_signature: Some("shape:3196082884056502991"), body_hash: -1105524873463016425, start_line: 19, end_line: 21 }
-callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:ArtificialPlayer.evaluate", node_id: NodeId(1906316733576003705), signature_hash: -3339369090062122330, normalized_signature: Some("shape:-1550214276137000799"), body_hash: 4865134386501077365, start_line: 185, end_line: 196 }
-callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:ArtificialPlayer.minMax", node_id: NodeId(-9215380114239242716), signature_hash: 2816889471617643129, normalized_signature: Some("shape:-8096502567202063894"), body_hash: -9111603883803791990, start_line: 198, end_line: 229 }
-callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:ArtificialPlayer.turn", node_id: NodeId(-6003445242777965111), signature_hash: 5754064973517794814, normalized_signature: Some("shape:4612479691636639645"), body_hash: -2652296153239786616, start_line: 231, end_line: 235 }
-callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:Field.clearMove", node_id: NodeId(4704277302161329637), signature_hash: -3022140259302478, normalized_signature: Some("shape:-5609033441938793590"), body_hash: -3657826705311905325, start_line: 109, end_line: 115 }
-callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:Field.cloneField", node_id: NodeId(1650801215023779134), signature_hash: 7778963861333372529, normalized_signature: Some("shape:-3975393857557175234"), body_hash: 1514400683417181067, start_line: 45, end_line: 54 }
-callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:Field.constructor", node_id: NodeId(6082613119388305725), signature_hash: 6795144599545714474, normalized_signature: Some("shape:-8369853602839018229"), body_hash: 5734499906934074816, start_line: 39, end_line: 43 }
-callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:Field.inRange", node_id: NodeId(4472881972003103213), signature_hash: -8452809604799432690, normalized_signature: Some("outline:-5084961018881034800"), body_hash: -5167291170261496876, start_line: 66, end_line: 68 }
-callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:Field.isDraw", node_id: NodeId(886495427333575839), signature_hash: 7260325517996505566, normalized_signature: Some("outline:-5084961018881034800"), body_hash: -8570124094816548714, start_line: 74, end_line: 76 }
-callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:Field.isEmpty", node_id: NodeId(-671469649200364532), signature_hash: -7303087957103600159, normalized_signature: Some("outline:-5084961018881034800"), body_hash: 4841627472070151509, start_line: 70, end_line: 72 }
-callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:Field.makeMove", node_id: NodeId(-5785535772821068934), signature_hash: -7686617887134063555, normalized_signature: Some("shape:7170642633197633617"), body_hash: -2264748847672571460, start_line: 98, end_line: 107 }
-callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:Field.opponent", node_id: NodeId(-5320923615143741384), signature_hash: 5718448952121283431, normalized_signature: Some("outline:-5075390869670978506"), body_hash: 3150201255156974284, start_line: 56, end_line: 64 }
-callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:Field.sameInRow", node_id: NodeId(-6464330170131321362), signature_hash: 8317776364922746511, normalized_signature: Some("outline:39053722370928195"), body_hash: -3121208784735839042, start_line: 78, end_line: 96 }
-callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:Field.show", node_id: NodeId(188395735819345816), signature_hash: -3470856697129697909, normalized_signature: Some("shape:-6393741377204873923"), body_hash: -3495881934444085860, start_line: 117, end_line: 138 }
-callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:GameObject.announce", node_id: NodeId(-5496480953283077615), signature_hash: 6265382829821424686, normalized_signature: Some("shape:-6937714838043631087"), body_hash: 9060101469011990814, start_line: 24, end_line: 26 }
-callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:HumanPlayer.check", node_id: NodeId(-6905842643888710123), signature_hash: 1939816138975990522, normalized_signature: Some("shape:-2041748163681691964"), body_hash: 6755104114373655926, start_line: 159, end_line: 169 }
-callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:HumanPlayer.input", node_id: NodeId(183754848538877801), signature_hash: -3809286021505677146, normalized_signature: Some("shape:6789306045084434438"), body_hash: 4491673168165617379, start_line: 155, end_line: 157 }
-callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:HumanPlayer.turn", node_id: NodeId(-8324596310372862362), signature_hash: -1551097434895889655, normalized_signature: Some("shape:-2090442267130361162"), body_hash: 3961063157937872487, start_line: 171, end_line: 181 }
-callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:TicTacToe.checkWinner", node_id: NodeId(-7937628806665507258), signature_hash: -7287660358945405677, normalized_signature: Some("shape:4326649433580919058"), body_hash: -2443578222395850134, start_line: 248, end_line: 250 }
-callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:TicTacToe.constructor", node_id: NodeId(-8175768614593770731), signature_hash: -9167033954688097950, normalized_signature: Some("outline:-5087212818695232478"), body_hash: -2050067086679050707, start_line: 242, end_line: 246 }
-callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:TicTacToe.isDraw", node_id: NodeId(-8135066250664865561), signature_hash: -160070021693570394, normalized_signature: Some("shape:-6509214657003215474"), body_hash: -8276095482876337186, start_line: 252, end_line: 254 }
-callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:TicTacToe.probeCalls", node_id: NodeId(-7539491653391818166), signature_hash: -1793306237384058767, normalized_signature: Some("shape:-108337260977001481"), body_hash: 1528036088194583991, start_line: 273, end_line: 275 }
-callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:TicTacToe.run", node_id: NodeId(-3944937904098589468), signature_hash: 5136661510898306809, normalized_signature: Some("shape:5464110797373327035"), body_hash: -3276779779116204195, start_line: 277, end_line: 301 }
-callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:TicTacToe.selectPlayer", node_id: NodeId(8835952981887312508), signature_hash: -6255132847551752433, normalized_signature: Some("shape:-2914839126246499349"), body_hash: -7359832389293900462, start_line: 256, end_line: 265 }
-callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:TicTacToe.start", node_id: NodeId(2562878172647700229), signature_hash: -2053738397397415406, normalized_signature: Some("shape:8996267714814229957"), body_hash: 887848642609666891, start_line: 267, end_line: 271 }
-callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:constructor", node_id: NodeId(4164354656018189599), signature_hash: 8020987290552271096, normalized_signature: Some("outline:-5087212818695232478"), body_hash: -1094593521566738173, start_line: 145, end_line: 149 }
-callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "__file_structural__", node_id: NodeId(3342959304880589176), signature_hash: -4627684888110694517, normalized_signature: None, body_hash: 5312641816907042554, start_line: 1, end_line: 309 }
+callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "13:main", node_id: NodeId(-5962966682422212147), signature_hash: -4671339478033693080, normalized_signature: Some("shape:5424010113764478142"), body_hash: 379626505811852693, start_line: 304, end_line: 309 }
+callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "13:numberIn", node_id: NodeId(4392555447609376986), signature_hash: 2477812878330356949, normalized_signature: Some("outline:-1795207361013140379"), body_hash: 6471312948306873393, start_line: 11, end_line: 13 }
+callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "13:numberOut", node_id: NodeId(3164802997543820753), signature_hash: -1579019679195996938, normalized_signature: Some("shape:7823895796336292216"), body_hash: -9167707983394116015, start_line: 15, end_line: 17 }
+callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "13:stringOut", node_id: NodeId(1035083789310384205), signature_hash: -5818630870471287222, normalized_signature: Some("shape:-985299362455954216"), body_hash: 1808787374246220102, start_line: 19, end_line: 21 }
+callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:ArtificialPlayer.evaluate", node_id: NodeId(-7690856147057786688), signature_hash: -3339369090062122330, normalized_signature: Some("shape:-3647047289344311577"), body_hash: -9050090991956470111, start_line: 185, end_line: 196 }
+callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:ArtificialPlayer.minMax", node_id: NodeId(4948827097341475201), signature_hash: 2816889471617643129, normalized_signature: Some("shape:4985245370400007558"), body_hash: -4084098442974405278, start_line: 198, end_line: 229 }
+callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:ArtificialPlayer.turn", node_id: NodeId(8425442450457209580), signature_hash: 5754064973517794814, normalized_signature: Some("shape:5951238413337074039"), body_hash: -2933996046244119161, start_line: 231, end_line: 235 }
+callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:Field.clearMove", node_id: NodeId(-5891396727714948628), signature_hash: -3022140259302478, normalized_signature: Some("shape:-5622465565475747310"), body_hash: -2727394587957939266, start_line: 109, end_line: 115 }
+callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:Field.cloneField", node_id: NodeId(-6793004120238140259), signature_hash: 7778963861333372529, normalized_signature: Some("shape:-3975393857557175234"), body_hash: 6005593621625860881, start_line: 45, end_line: 54 }
+callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:Field.constructor", node_id: NodeId(-4718667122536534148), signature_hash: 6795144599545714474, normalized_signature: Some("shape:-2409328986531500290"), body_hash: -5350939135759647724, start_line: 39, end_line: 43 }
+callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:Field.inRange", node_id: NodeId(-4387062906331932872), signature_hash: -8452809604799432690, normalized_signature: Some("outline:-5084961018881034800"), body_hash: 5897566281536094665, start_line: 66, end_line: 68 }
+callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:Field.isDraw", node_id: NodeId(5490180355340580592), signature_hash: 7260325517996505566, normalized_signature: Some("outline:-5084961018881034800"), body_hash: -2759138838327574675, start_line: 74, end_line: 76 }
+callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:Field.isEmpty", node_id: NodeId(-5212680306416661995), signature_hash: -7303087957103600159, normalized_signature: Some("outline:-5084961018881034800"), body_hash: -2609546619830500292, start_line: 70, end_line: 72 }
+callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:Field.makeMove", node_id: NodeId(7283576780647623645), signature_hash: -7686617887134063555, normalized_signature: Some("shape:-6438645187570589374"), body_hash: -5435326783473060762, start_line: 98, end_line: 107 }
+callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:Field.opponent", node_id: NodeId(374856825624028591), signature_hash: 5718448952121283431, normalized_signature: Some("outline:-5075390869670978506"), body_hash: 6561241717266314017, start_line: 56, end_line: 64 }
+callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:Field.sameInRow", node_id: NodeId(-2230377676176756425), signature_hash: 8317776364922746511, normalized_signature: Some("outline:39053722370928195"), body_hash: -5886082329796246776, start_line: 78, end_line: 96 }
+callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:Field.show", node_id: NodeId(-5838042433045357529), signature_hash: -3470856697129697909, normalized_signature: Some("shape:4847564119089187482"), body_hash: -4266320312850009646, start_line: 117, end_line: 138 }
+callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:GameObject.announce", node_id: NodeId(4204532477701542244), signature_hash: 6265382829821424686, normalized_signature: Some("shape:6808619229913785770"), body_hash: 8578638567265802209, start_line: 24, end_line: 26 }
+callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:HumanPlayer.check", node_id: NodeId(2578136475971884556), signature_hash: 1939816138975990522, normalized_signature: Some("shape:-4144309756167526887"), body_hash: -7950939647028859512, start_line: 159, end_line: 169 }
+callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:HumanPlayer.input", node_id: NodeId(8113106682834204640), signature_hash: -3809286021505677146, normalized_signature: Some("shape:-3172203780225309815"), body_hash: -2587149995948873700, start_line: 155, end_line: 157 }
+callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:HumanPlayer.turn", node_id: NodeId(8885322828202818089), signature_hash: -1551097434895889655, normalized_signature: Some("shape:3296817966382307547"), body_hash: 7068864796957247860, start_line: 171, end_line: 181 }
+callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:TicTacToe.checkWinner", node_id: NodeId(9179125452665211459), signature_hash: -7287660358945405677, normalized_signature: Some("shape:-7439341035152162824"), body_hash: -4460542110204930347, start_line: 248, end_line: 250 }
+callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:TicTacToe.constructor", node_id: NodeId(-5192918628831244028), signature_hash: -9167033954688097950, normalized_signature: Some("shape:-1845269496892975840"), body_hash: 2385910862562098728, start_line: 242, end_line: 246 }
+callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:TicTacToe.isDraw", node_id: NodeId(-2765535906217605016), signature_hash: -160070021693570394, normalized_signature: Some("shape:-3490697350913837648"), body_hash: 8674860967964217920, start_line: 252, end_line: 254 }
+callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:TicTacToe.probeCalls", node_id: NodeId(4335942503556536001), signature_hash: -1793306237384058767, normalized_signature: Some("shape:7593522361388085370"), body_hash: -4731638027388991154, start_line: 273, end_line: 275 }
+callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:TicTacToe.run", node_id: NodeId(7035130650717231305), signature_hash: 5136661510898306809, normalized_signature: Some("shape:7743440556383458026"), body_hash: 3920386449977181940, start_line: 277, end_line: 301 }
+callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:TicTacToe.selectPlayer", node_id: NodeId(6964790643981501323), signature_hash: -6255132847551752433, normalized_signature: Some("shape:4515701429304701314"), body_hash: 2583671001314965481, start_line: 256, end_line: 265 }
+callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:TicTacToe.start", node_id: NodeId(3665286394890785124), signature_hash: -2053738397397415406, normalized_signature: Some("shape:-5536079139116412811"), body_hash: 8267794242836536259, start_line: 267, end_line: 271 }
+callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "14:constructor", node_id: NodeId(593141902140768990), signature_hash: 8020987290552271096, normalized_signature: Some("outline:-5087212818695232478"), body_hash: 5018112432214997121, start_line: 145, end_line: 149 }
+callable_state CallableProjectionState { file_id: 3342959304880589176, symbol_key: "__file_structural__", node_id: NodeId(3342959304880589176), signature_hash: -6727803205567410003, normalized_signature: None, body_hash: 7190569558596518844, start_line: 1, end_line: 309 }

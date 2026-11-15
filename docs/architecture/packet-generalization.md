@@ -105,6 +105,14 @@ extent and authenticated navigation paths. That final measurement refuses
 changed size, cancellation or errors. Existing per-proposal latency and
 cancellation checks remain in force.
 
+For stdio option requests without an issued record, if the requested pages
+cannot fit alongside the measured current context, up to four distinct views
+of the already verified requested pages can use the same renderer. The
+response must deliver at least one requested page and report omitted requested
+pages and newly retrieved context before it is remeasured. The original
+refusal applies if no such response fits. The existing request-wide
+measurement limit still applies.
+
 The default pure compilation reserves one graph witness row when space permits.
 Measured selection also considers a source-first allocation at each row limit,
 alongside that graph-preserving allocation, using only the same admitted and
@@ -257,6 +265,14 @@ Admission rank protection does not guarantee public source retention or answer
 coverage. Source-row selection remains a separate measured allocation over
 admitted evidence; below-cutoff identities remain absent unless independently
 admitted through supported selectors.
+
+Fresh implicit retrieval uses authenticated callable-body progress when selecting
+its baseline from the existing bounded families. Known source-page demands receive
+spare capacity in admission order within the existing per-source and total limits.
+Automatic FILE substitution does not make a never-served source unit mandatory:
+omitted units retain their canonical gaps and continuation authority. A returned
+FILE source still preserves every matched range. Requested and issued context
+retain their existing source-floor and prefix protections.
 
 The additive joint stage accepts a partial callable page only when verified body
 metadata intersects its delivered physical lines. It preserves every baseline

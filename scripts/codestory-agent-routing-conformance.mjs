@@ -2069,18 +2069,8 @@ export async function validateStaticHostParity(pluginRoot, expectedIdentity) {
       if (command.command !== "node \"${CURSOR_PLUGIN_ROOT}/hooks/codestory-activate.cjs\""
           || command.timeout !== 300) fail("cursor hook command is not the canonical launcher");
     } else if (host === "claude_code") {
-      const sessionStart = hook.hooks?.SessionStart;
-      if (!Array.isArray(sessionStart) || sessionStart.length !== 1
-          || sessionStart[0].matcher !== "startup|resume|clear|compact"
-          || !Array.isArray(sessionStart[0].hooks) || sessionStart[0].hooks.length !== 1) {
-        fail("claude_code hook structure is invalid");
-      }
-      const command = sessionStart[0].hooks[0];
-      requireExactKeys(command, ["type", "command", "commandWindows", "timeout", "statusMessage"], "claude_code hook command");
-      if (command.type !== "command"
-          || command.command !== "command -v node >/dev/null 2>&1 && node \"${CLAUDE_PLUGIN_ROOT}/hooks/codestory-activate.cjs\" || exit 0"
-          || command.commandWindows !== "if (Get-Command node -ErrorAction SilentlyContinue) { node \"$env:CLAUDE_PLUGIN_ROOT\\hooks\\codestory-activate.cjs\" }"
-          || command.timeout !== 300) fail("claude_code hook command is not the canonical launcher");
+      requireExactKeys(hook, ["hooks"], "claude_code hook");
+      requireExactKeys(hook.hooks, [], "claude_code hook registrations");
     } else {
       if (hook.version !== 1 || !Array.isArray(hook.hooks?.sessionStart) || hook.hooks.sessionStart.length !== 1) {
         fail(`${host} hook structure is invalid`);

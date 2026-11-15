@@ -180,7 +180,7 @@ accelerator authorization.
 | Engine still initializing | The original MCP call waits with progress; its deadline can return `preparing` with exact resume arguments | Let the owner finish; resume only after the stated deadline |
 | Unsupported or software adapter | Broad search returns unavailable; local map remains usable | Capture diagnostics and verify the packaged platform policy |
 | Queue full or soft deadline elapsed | Typed capacity state reports class, capacity, depth, opaque active phase, retry delay, and a useful retry condition | Retry the same product call after the named condition; do not run doctor or reindex |
-| Incompatible server is fully idle | The server closes admission and exits before the exact requesting CLI can win authority | Retry the same operation |
+| Incompatible server is fully idle | The server closes admission and exits; an activating, spawn-capable client reconnects within its original remaining connect window and caller deadline. Timeout retains the named retry condition | Let the same call converge; if its budget expires, retry after the named condition |
 | Incompatible server has active work or leases | Request returns typed `after_owner_idle` state; no second server starts | Wait for the named idle condition |
 | Server process crashes | A pure embedding RPC may reconnect and replay once; lease operations do not replay | Let the whole product operation retry when its publication lease was lost |
 | Native worker stops making progress | The independent watchdog fail-stops the server | Retain the event evidence; the next product call elects a replacement |

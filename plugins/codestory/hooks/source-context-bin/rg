@@ -1,0 +1,3 @@
+#!/bin/sh
+# Only the ordinary tool's process-local PATH selects this packaged shim.
+exec "${CODESTORY_SOURCE_CONTEXT_CLI:?}" internal-source-context rg -- "$@"

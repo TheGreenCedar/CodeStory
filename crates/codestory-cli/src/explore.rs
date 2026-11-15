@@ -53,7 +53,7 @@ pub(crate) fn run_explore(cmd: ExploreCommand) -> Result<()> {
     let profile = resolve_explore_profile(cmd.profile, cmd.depth, cmd.max_nodes);
     let file_filter = cmd.target.file_filter();
     let operation = if cmd.target.query.is_some() {
-        "graph_assisted"
+        "resolution"
     } else {
         "graph"
     };

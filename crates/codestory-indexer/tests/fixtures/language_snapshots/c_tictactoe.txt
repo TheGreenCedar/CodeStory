@@ -125,60 +125,60 @@ occurrence element=FUNCTION:read_move@122 kind=DEFINITION span=122:1-129:2
 occurrence element=FUNCTION:run@155 kind=DEFINITION span=155:1-180:2
 occurrence element=FUNCTION:same_in_row@68 kind=DEFINITION span=68:1-88:2
 occurrence element=FUNCTION:string_out@33 kind=DEFINITION span=33:1-35:2
-occurrence element=MODULE:<stdbool.h>@1 kind=DEFINITION span=1:10-1:21
-occurrence element=MODULE:<stdio.h>@2 kind=DEFINITION span=2:10-2:19
-occurrence element=UNKNOWN:check_move@160 kind=DEFINITION span=160:9-160:19
-occurrence element=UNKNOWN:check_move@161 kind=DEFINITION span=161:14-161:24
-occurrence element=UNKNOWN:check_winner@148 kind=DEFINITION span=148:5-148:17
-occurrence element=UNKNOWN:check_winner@166 kind=DEFINITION span=166:9-166:21
-occurrence element=UNKNOWN:check_winner@169 kind=DEFINITION span=169:13-169:25
-occurrence element=UNKNOWN:clear_field@189 kind=DEFINITION span=189:5-189:16
-occurrence element=UNKNOWN:in_range@112 kind=DEFINITION span=112:10-112:18
-occurrence element=UNKNOWN:in_range@132 kind=DEFINITION span=132:10-132:18
-occurrence element=UNKNOWN:in_range@91 kind=DEFINITION span=91:10-91:18
-occurrence element=UNKNOWN:is_draw@100 kind=DEFINITION span=100:9-100:16
-occurrence element=UNKNOWN:is_draw@107 kind=DEFINITION span=107:5-107:12
-occurrence element=UNKNOWN:is_draw@152 kind=DEFINITION span=152:5-152:12
-occurrence element=UNKNOWN:is_draw@167 kind=DEFINITION span=167:9-167:16
-occurrence element=UNKNOWN:is_draw@174 kind=DEFINITION span=174:13-174:20
-occurrence element=UNKNOWN:is_empty@115 kind=DEFINITION span=115:9-115:17
-occurrence element=UNKNOWN:is_empty@136 kind=DEFINITION span=136:10-136:18
-occurrence element=UNKNOWN:is_empty@94 kind=DEFINITION span=94:10-94:18
-occurrence element=UNKNOWN:make_move@165 kind=DEFINITION span=165:9-165:18
-occurrence element=UNKNOWN:number_in@125 kind=DEFINITION span=125:16-125:25
-occurrence element=UNKNOWN:number_in@127 kind=DEFINITION span=127:16-127:25
-occurrence element=UNKNOWN:printf@30 kind=DEFINITION span=30:5-30:11
-occurrence element=UNKNOWN:printf@34 kind=DEFINITION span=34:5-34:11
-occurrence element=UNKNOWN:probe_check_winner@190 kind=DEFINITION span=190:5-190:23
-occurrence element=UNKNOWN:probe_is_draw@191 kind=DEFINITION span=191:5-191:18
-occurrence element=UNKNOWN:read_move@159 kind=DEFINITION span=159:21-159:30
-occurrence element=UNKNOWN:run@192 kind=DEFINITION span=192:5-192:8
-occurrence element=UNKNOWN:same_in_row@106 kind=DEFINITION span=106:5-106:16
-occurrence element=UNKNOWN:same_in_row@144 kind=DEFINITION span=144:12-144:23
-occurrence element=UNKNOWN:string_out@124 kind=DEFINITION span=124:5-124:15
-occurrence element=UNKNOWN:string_out@126 kind=DEFINITION span=126:5-126:15
-occurrence element=UNKNOWN:string_out@133 kind=DEFINITION span=133:9-133:19
-occurrence element=UNKNOWN:string_out@137 kind=DEFINITION span=137:9-137:19
-occurrence element=UNKNOWN:string_out@170 kind=DEFINITION span=170:13-170:23
-occurrence element=UNKNOWN:string_out@171 kind=DEFINITION span=171:13-171:23
-occurrence element=UNKNOWN:string_out@175 kind=DEFINITION span=175:13-175:23
+occurrence element=MODULE:<stdbool.h>@1 kind=REFERENCE span=1:10-1:21
+occurrence element=MODULE:<stdio.h>@2 kind=REFERENCE span=2:10-2:19
+occurrence element=UNKNOWN:check_move@160 kind=REFERENCE span=160:9-160:19
+occurrence element=UNKNOWN:check_move@161 kind=REFERENCE span=161:14-161:24
+occurrence element=UNKNOWN:check_winner@148 kind=REFERENCE span=148:5-148:17
+occurrence element=UNKNOWN:check_winner@166 kind=REFERENCE span=166:9-166:21
+occurrence element=UNKNOWN:check_winner@169 kind=REFERENCE span=169:13-169:25
+occurrence element=UNKNOWN:clear_field@189 kind=REFERENCE span=189:5-189:16
+occurrence element=UNKNOWN:in_range@112 kind=REFERENCE span=112:10-112:18
+occurrence element=UNKNOWN:in_range@132 kind=REFERENCE span=132:10-132:18
+occurrence element=UNKNOWN:in_range@91 kind=REFERENCE span=91:10-91:18
+occurrence element=UNKNOWN:is_draw@100 kind=REFERENCE span=100:9-100:16
+occurrence element=UNKNOWN:is_draw@107 kind=REFERENCE span=107:5-107:12
+occurrence element=UNKNOWN:is_draw@152 kind=REFERENCE span=152:5-152:12
+occurrence element=UNKNOWN:is_draw@167 kind=REFERENCE span=167:9-167:16
+occurrence element=UNKNOWN:is_draw@174 kind=REFERENCE span=174:13-174:20
+occurrence element=UNKNOWN:is_empty@115 kind=REFERENCE span=115:9-115:17
+occurrence element=UNKNOWN:is_empty@136 kind=REFERENCE span=136:10-136:18
+occurrence element=UNKNOWN:is_empty@94 kind=REFERENCE span=94:10-94:18
+occurrence element=UNKNOWN:make_move@165 kind=REFERENCE span=165:9-165:18
+occurrence element=UNKNOWN:number_in@125 kind=REFERENCE span=125:16-125:25
+occurrence element=UNKNOWN:number_in@127 kind=REFERENCE span=127:16-127:25
+occurrence element=UNKNOWN:printf@30 kind=REFERENCE span=30:5-30:11
+occurrence element=UNKNOWN:printf@34 kind=REFERENCE span=34:5-34:11
+occurrence element=UNKNOWN:probe_check_winner@190 kind=REFERENCE span=190:5-190:23
+occurrence element=UNKNOWN:probe_is_draw@191 kind=REFERENCE span=191:5-191:18
+occurrence element=UNKNOWN:read_move@159 kind=REFERENCE span=159:21-159:30
+occurrence element=UNKNOWN:run@192 kind=REFERENCE span=192:5-192:8
+occurrence element=UNKNOWN:same_in_row@106 kind=REFERENCE span=106:5-106:16
+occurrence element=UNKNOWN:same_in_row@144 kind=REFERENCE span=144:12-144:23
+occurrence element=UNKNOWN:string_out@124 kind=REFERENCE span=124:5-124:15
+occurrence element=UNKNOWN:string_out@126 kind=REFERENCE span=126:5-126:15
+occurrence element=UNKNOWN:string_out@133 kind=REFERENCE span=133:9-133:19
+occurrence element=UNKNOWN:string_out@137 kind=REFERENCE span=137:9-137:19
+occurrence element=UNKNOWN:string_out@170 kind=REFERENCE span=170:13-170:23
+occurrence element=UNKNOWN:string_out@171 kind=REFERENCE span=171:13-171:23
+occurrence element=UNKNOWN:string_out@175 kind=REFERENCE span=175:13-175:23
 access node=FIELD:Player::name@22 kind=Public
-callable_state CallableProjectionState { file_id: 1457259746375545610, symbol_key: "13:check_move", node_id: NodeId(2704087370987425433), signature_hash: -2712995450531007393, normalized_signature: Some("shape:-4906042743006286134"), body_hash: -1563507536679530370, start_line: 131, end_line: 141 }
-callable_state CallableProjectionState { file_id: 1457259746375545610, symbol_key: "13:check_winner", node_id: NodeId(2305727274757481839), signature_hash: -2648810083447582743, normalized_signature: Some("shape:-1046006657030350265"), body_hash: 8210371638223130607, start_line: 143, end_line: 145 }
+callable_state CallableProjectionState { file_id: 1457259746375545610, symbol_key: "13:check_move", node_id: NodeId(2704087370987425433), signature_hash: -2712995450531007393, normalized_signature: Some("shape:3215189511743234420"), body_hash: -6228607558326254280, start_line: 131, end_line: 141 }
+callable_state CallableProjectionState { file_id: 1457259746375545610, symbol_key: "13:check_winner", node_id: NodeId(2305727274757481839), signature_hash: -2648810083447582743, normalized_signature: Some("shape:8665138820109830114"), body_hash: -8810439092590559894, start_line: 143, end_line: 145 }
 callable_state CallableProjectionState { file_id: 1457259746375545610, symbol_key: "13:clear_field", node_id: NodeId(-5353315189879792641), signature_hash: 3203989088815718345, normalized_signature: Some("outline:-1790703761384934248"), body_hash: 7453578686775248622, start_line: 47, end_line: 54 }
-callable_state CallableProjectionState { file_id: 1457259746375545610, symbol_key: "13:clear_move", node_id: NodeId(-3453952544240331322), signature_hash: 4053264788486661686, normalized_signature: Some("shape:-4135293417695198898"), body_hash: 8491530735048577798, start_line: 111, end_line: 120 }
+callable_state CallableProjectionState { file_id: 1457259746375545610, symbol_key: "13:clear_move", node_id: NodeId(-3453952544240331322), signature_hash: 4053264788486661686, normalized_signature: Some("shape:3374749433746875160"), body_hash: -8732693112821336944, start_line: 111, end_line: 120 }
 callable_state CallableProjectionState { file_id: 1457259746375545610, symbol_key: "13:in_range", node_id: NodeId(3660492456631779612), signature_hash: -280153408496604712, normalized_signature: Some("outline:-1795207361013140379"), body_hash: -384701727932461514, start_line: 56, end_line: 58 }
 callable_state CallableProjectionState { file_id: 1457259746375545610, symbol_key: "13:is_draw", node_id: NodeId(-5511174041263820786), signature_hash: -2481105112044182130, normalized_signature: Some("outline:-1795207361013140379"), body_hash: -7757855165555768783, start_line: 64, end_line: 66 }
 callable_state CallableProjectionState { file_id: 1457259746375545610, symbol_key: "13:is_empty", node_id: NodeId(-4301313601792103081), signature_hash: -6286950451528583535, normalized_signature: Some("outline:-1795207361013140379"), body_hash: 3767209694411330471, start_line: 60, end_line: 62 }
-callable_state CallableProjectionState { file_id: 1457259746375545610, symbol_key: "13:main", node_id: NodeId(-1601201279493667204), signature_hash: -4671339478033693080, normalized_signature: Some("shape:3643000767609313152"), body_hash: -1389465381567680842, start_line: 182, end_line: 194 }
-callable_state CallableProjectionState { file_id: 1457259746375545610, symbol_key: "13:make_move", node_id: NodeId(5375874603102615923), signature_hash: 55429150749807581, normalized_signature: Some("shape:4442856660529207549"), body_hash: -9210060538565369041, start_line: 90, end_line: 109 }
+callable_state CallableProjectionState { file_id: 1457259746375545610, symbol_key: "13:main", node_id: NodeId(-1601201279493667204), signature_hash: -4671339478033693080, normalized_signature: Some("shape:-4686592633115575084"), body_hash: -8630884251732842158, start_line: 182, end_line: 194 }
+callable_state CallableProjectionState { file_id: 1457259746375545610, symbol_key: "13:make_move", node_id: NodeId(5375874603102615923), signature_hash: 55429150749807581, normalized_signature: Some("shape:-3878786631760846024"), body_hash: -4160747155087791386, start_line: 90, end_line: 109 }
 callable_state CallableProjectionState { file_id: 1457259746375545610, symbol_key: "13:number_in", node_id: NodeId(-837631666988213272), signature_hash: 8955686532900880052, normalized_signature: Some("outline:-1795207361013140379"), body_hash: -6868134985798561214, start_line: 25, end_line: 27 }
-callable_state CallableProjectionState { file_id: 1457259746375545610, symbol_key: "13:number_out", node_id: NodeId(26570935858040467), signature_hash: 2127726226258782589, normalized_signature: Some("shape:-6801512337194447702"), body_hash: -3309466215557826661, start_line: 29, end_line: 31 }
+callable_state CallableProjectionState { file_id: 1457259746375545610, symbol_key: "13:number_out", node_id: NodeId(26570935858040467), signature_hash: 2127726226258782589, normalized_signature: Some("shape:4215157848036834017"), body_hash: 5074887394441823272, start_line: 29, end_line: 31 }
 callable_state CallableProjectionState { file_id: 1457259746375545610, symbol_key: "13:opponent", node_id: NodeId(7027451624830733368), signature_hash: 6774245625084809988, normalized_signature: Some("outline:-1800836860548445349"), body_hash: -8038024982520682465, start_line: 37, end_line: 45 }
-callable_state CallableProjectionState { file_id: 1457259746375545610, symbol_key: "13:probe_check_winner", node_id: NodeId(-2456927471834830580), signature_hash: 8230045360579097032, normalized_signature: Some("shape:1265513034608852480"), body_hash: 7256518770695948132, start_line: 147, end_line: 149 }
-callable_state CallableProjectionState { file_id: 1457259746375545610, symbol_key: "13:probe_is_draw", node_id: NodeId(-2887063418588689501), signature_hash: 2557602451772864317, normalized_signature: Some("shape:7408600186025005213"), body_hash: -4123325542446629950, start_line: 151, end_line: 153 }
-callable_state CallableProjectionState { file_id: 1457259746375545610, symbol_key: "13:read_move", node_id: NodeId(7870502520948050833), signature_hash: 4658735340749529447, normalized_signature: Some("shape:609998321147429568"), body_hash: 5305534806482152596, start_line: 122, end_line: 129 }
-callable_state CallableProjectionState { file_id: 1457259746375545610, symbol_key: "13:run", node_id: NodeId(-8715716562211938420), signature_hash: 5222842858713591688, normalized_signature: Some("shape:-4928889977839016696"), body_hash: -2642590055592073554, start_line: 155, end_line: 180 }
+callable_state CallableProjectionState { file_id: 1457259746375545610, symbol_key: "13:probe_check_winner", node_id: NodeId(-2456927471834830580), signature_hash: 8230045360579097032, normalized_signature: Some("shape:3356880541736520027"), body_hash: -8497293206199464545, start_line: 147, end_line: 149 }
+callable_state CallableProjectionState { file_id: 1457259746375545610, symbol_key: "13:probe_is_draw", node_id: NodeId(-2887063418588689501), signature_hash: 2557602451772864317, normalized_signature: Some("shape:-3743563417283133090"), body_hash: 5618633801127169025, start_line: 151, end_line: 153 }
+callable_state CallableProjectionState { file_id: 1457259746375545610, symbol_key: "13:read_move", node_id: NodeId(7870502520948050833), signature_hash: 4658735340749529447, normalized_signature: Some("shape:1469930057568998790"), body_hash: 470778926128581234, start_line: 122, end_line: 129 }
+callable_state CallableProjectionState { file_id: 1457259746375545610, symbol_key: "13:run", node_id: NodeId(-8715716562211938420), signature_hash: 5222842858713591688, normalized_signature: Some("shape:8706428642558937741"), body_hash: -8960311091512953745, start_line: 155, end_line: 180 }
 callable_state CallableProjectionState { file_id: 1457259746375545610, symbol_key: "13:same_in_row", node_id: NodeId(-2488583266892461566), signature_hash: 7104852787496627314, normalized_signature: Some("outline:5692122449894876869"), body_hash: 3616576064155022705, start_line: 68, end_line: 88 }
-callable_state CallableProjectionState { file_id: 1457259746375545610, symbol_key: "13:string_out", node_id: NodeId(8457063497566906951), signature_hash: -3564980872777874655, normalized_signature: Some("shape:-5648167394347208128"), body_hash: -5716364989974684044, start_line: 33, end_line: 35 }
-callable_state CallableProjectionState { file_id: 1457259746375545610, symbol_key: "__file_structural__", node_id: NodeId(1457259746375545610), signature_hash: -4548180218905371706, normalized_signature: None, body_hash: -7020662506714662862, start_line: 1, end_line: 194 }
+callable_state CallableProjectionState { file_id: 1457259746375545610, symbol_key: "13:string_out", node_id: NodeId(8457063497566906951), signature_hash: -3564980872777874655, normalized_signature: Some("shape:4225157894040079831"), body_hash: 8224563259809330639, start_line: 33, end_line: 35 }
+callable_state CallableProjectionState { file_id: 1457259746375545610, symbol_key: "__file_structural__", node_id: NodeId(1457259746375545610), signature_hash: 6537944922989721154, normalized_signature: None, body_hash: 1702744799711656190, start_line: 1, end_line: 194 }

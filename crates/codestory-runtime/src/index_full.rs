@@ -348,12 +348,41 @@ impl FailedRefreshDiagnosticSink {
             proof_snapshots: &'a [FailedRefreshProofSnapshot],
             terminal: &'a FailedRefreshTerminalRecord,
         }
-        serde_json::to_string(&Report {
+        let terminal = state.terminal.as_ref().expect("terminal initialized");
+        let mut report = serde_json::to_value(&Report {
             boundaries: &state.boundaries,
             proof_snapshots: &state.snapshots,
-            terminal: state.terminal.as_ref().expect("terminal initialized"),
+            terminal,
         })
-        .ok()
+        .ok()?;
+        // Factor only identical identities in the private wire report. Keep
+        // internal identities (including the progress monotonicity guard), and
+        // preserve the original representation if any record disagrees.
+        let identity = &terminal.identity;
+        if state
+            .boundaries
+            .iter()
+            .all(|record| &record.identity == identity)
+            && state
+                .snapshots
+                .iter()
+                .all(|record| &record.identity == identity)
+        {
+            let shared_identity = serde_json::to_value(identity).ok()?;
+            for field in ["boundaries", "proof_snapshots"] {
+                for record in report.get_mut(field)?.as_array_mut()? {
+                    record.as_object_mut()?.remove("identity");
+                }
+            }
+            report
+                .get_mut("terminal")?
+                .as_object_mut()?
+                .remove("identity");
+            let object = report.as_object_mut()?;
+            object.insert("schema_version".into(), serde_json::json!(2));
+            object.insert("identity".into(), shared_identity);
+        }
+        serde_json::to_string(&report).ok()
     }
 
     pub(crate) fn attach_to_error(
@@ -1207,6 +1236,163 @@ mod failed_refresh_diagnostic_tests {
         let observed = sink.attach_to_error(original.clone(), false);
 
         assert_eq!(observed, original);
+    }
+
+    #[test]
+    fn failed_refresh_diagnostic_shared_identity_losslessly_preserves_records() {
+        for (label, bind_before, phase) in [
+            ("empty-unknown", false, 0),
+            ("empty-bound", true, 0),
+            ("coverage-unknown", false, 1),
+            ("coverage-bound", true, 1),
+            ("cancelled-unknown", false, 2),
+            ("cancelled-bound", true, 2),
+            ("raced-binding", false, 3),
+        ] {
+            let sink = sink();
+            if bind_before {
+                sink.bind_run_identity("run-before");
+            }
+            if phase == 3 {
+                let gate = Arc::new(std::sync::Barrier::new(3));
+                let workers = [true, false].map(|bind| {
+                    let sink = sink.clone();
+                    let gate = Arc::clone(&gate);
+                    std::thread::spawn(move || {
+                        gate.wait();
+                        if bind {
+                            sink.bind_run_identity("run-raced");
+                        } else {
+                            sink.record_boundary(FailedRefreshBoundary::FullIndexerReturned);
+                        }
+                    })
+                });
+                gate.wait();
+                for worker in workers {
+                    worker.join().expect("binding/event worker");
+                }
+                sink.record_boundary(FailedRefreshBoundary::FullIndexerReturned);
+            } else if phase > 0 {
+                sink.record_boundary(FailedRefreshBoundary::FullIndexerReturned);
+            }
+            if phase > 0 {
+                sink.bind_run_identity("late-run-must-not-rebind");
+                for boundary in [
+                    FailedRefreshBoundary::ForwarderJoinBegin,
+                    FailedRefreshBoundary::ForwarderJoinEnd,
+                    FailedRefreshBoundary::CoverageBegin,
+                    if phase == 2 {
+                        FailedRefreshBoundary::CoverageEnd
+                    } else {
+                        FailedRefreshBoundary::CoverageError
+                    },
+                ] {
+                    sink.record_boundary(boundary);
+                }
+            }
+            if phase == 2 {
+                sink.record_boundary(FailedRefreshBoundary::ProofBegin);
+                for calls_resolved in [1, 3] {
+                    sink.record_proof_progress(
+                        codestory_indexer::ProofResolutionProgress {
+                            calls_resolved,
+                            ..Default::default()
+                        },
+                        false,
+                    );
+                }
+            }
+            let original = ApiError::source_coverage_failure(
+                if phase == 2 {
+                    "cancelled"
+                } else {
+                    "source_unreadable"
+                },
+                "original causal failure",
+                vec![
+                    serde_json::from_value(serde_json::json!({
+                        "path": "input.rs", "reason": "unreadable", "retryable": true,
+                        "verified_source": false, "projection_available": false,
+                    }))
+                    .expect("coverage diagnostic"),
+                ],
+            );
+            let observed = sink.attach_to_error(original.clone(), phase == 2);
+            assert_eq!(observed.code, original.code, "{label}");
+            assert_eq!(observed.details, original.details, "{label}");
+            let (cause, report) = observed
+                .message
+                .split_once("\nfailed_refresh_diagnostic=")
+                .expect("original diagnostic marker");
+            assert_eq!(cause, original.message, "{label}");
+            let mut expanded: serde_json::Value =
+                serde_json::from_str(report).expect("report JSON");
+            assert_eq!(
+                expanded["schema_version"], 2,
+                "{label}: explicit shared format"
+            );
+            let identity = expanded["identity"].clone();
+            assert_eq!(identity["activation_revision"], 7, "{label}");
+            let run = identity["run_identity"].as_str();
+            if phase == 3 {
+                assert!(run.is_none() || run == Some("run-raced"), "{label}");
+            } else {
+                assert_eq!(run, bind_before.then_some("run-before"), "{label}");
+            }
+            for field in ["boundaries", "proof_snapshots"] {
+                for record in expanded[field].as_array_mut().expect("record array") {
+                    assert!(
+                        record.get("identity").is_none(),
+                        "{label}: redundant identity"
+                    );
+                    record
+                        .as_object_mut()
+                        .expect("record")
+                        .insert("identity".into(), identity.clone());
+                }
+            }
+            assert!(expanded["terminal"].get("identity").is_none(), "{label}");
+            expanded["terminal"]
+                .as_object_mut()
+                .expect("terminal")
+                .insert("identity".into(), identity);
+            expanded
+                .as_object_mut()
+                .expect("report")
+                .remove("schema_version");
+            expanded.as_object_mut().expect("report").remove("identity");
+            let expected = {
+                let state = sink.state.lock();
+                serde_json::json!({"boundaries": &state.boundaries,
+                    "proof_snapshots": &state.snapshots, "terminal": &state.terminal})
+            };
+            assert_eq!(
+                expanded, expected,
+                "{label}: every original record field survives"
+            );
+            sink.bind_run_identity("after-closeout-must-not-rebind");
+            assert_eq!(
+                sink.closeout(false).as_deref(),
+                Some(report),
+                "{label}: sealed report"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_refresh_diagnostic_shared_identity_does_not_rebind_mixed_records() {
+        let sink = sink();
+        through_coverage(&sink);
+        sink.state.lock().boundaries[0].identity.run_identity = Some("different-run".into());
+        let report = sink.closeout(false).expect("complete unnormalized report");
+        let observed: serde_json::Value = serde_json::from_str(&report).expect("report JSON");
+        let state = sink.state.lock();
+        let expected = serde_json::json!({"boundaries": &state.boundaries,
+            "proof_snapshots": &state.snapshots, "terminal": &state.terminal});
+        assert_eq!(
+            observed, expected,
+            "a shared identity must not erase disagreement"
+        );
     }
 
     #[test]
