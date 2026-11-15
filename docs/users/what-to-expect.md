@@ -35,6 +35,8 @@ what each claim does *not* mean:
 
 ## Repo size and freshness
 
+- **Shell lookups** read the current files even on an unindexed checkout. An
+  index can add symbol names and source ranges when it matches the file.
 - **First index** on a large checkout can take minutes; the agent retries the
   intended CodeStory call while preparation runs.
 - **First broad search in a process** also initializes the embedded model. Later
@@ -67,12 +69,13 @@ Plain-language trust boundaries and good vs blocked sessions:
 
 Recovery steps: [Troubleshooting](troubleshooting.md).
 
-## Benchmarks are not your repo
+## Benchmarks
 
-Public holdout suites measure token and time reduction on **pinned OSS packages**
-under controlled tasks. They do not guarantee the same numbers in your checkout.
+In a controlled Codex study, agents used shell lookups on their own when the
+commands appeared in standing instructions. Graded correctness and token use
+were similar to plain Codex. The study did not establish token savings.
 
-What the holdout proves and does not prove:
-[Evaluation scope in the README](../../README.md#evaluation).
+See the sample sizes, results, and probe timings in
+[Evaluation](../../README.md#evaluation).
 
 Better prompts help every session: [Prompt patterns](prompt-patterns.md).

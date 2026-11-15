@@ -328,12 +328,12 @@ repeated task-level results, and its preregistered gates.
 
 ## README with/without row
 
-The [README evaluation section](../../README.md#evaluation) keeps
-two recorded tiers: the focused `readme-with-without` task and a suite-total row
-for the 18-task `language-expansion-holdout` manifest
+The historical harness records the focused `readme-with-without` task and a
+suite total for the 18-task `language-expansion-holdout` manifest
 [`language-support-ab.task.json`](../../benchmarks/tasks/language-expansion-holdout/language-support-ab.task.json).
-Latest recorded medians, ranges, and per-task rows:
-[language-expansion-holdout stats](language-expansion-holdout-stats.md).
+See the [language expansion holdout](language-expansion-holdout-stats.md) for
+its results and the [README evaluation](../../README.md#evaluation) for the
+0.18 shell-lookup study.
 
 **Key concepts for benchmark harness verification:**
 

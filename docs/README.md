@@ -23,9 +23,9 @@ with portable prompts.
 | --- | --- |
 | Pick a host and install | [User guides](users/README.md) |
 | When to trust agent output | [Trust and readiness](users/trust-and-readiness.md) |
-| Codex plugin path | [Codex guide](users/codex.md) |
+| Codex setup | [Codex guide](users/codex.md) |
 | Cursor plugin | [Cursor guide](users/cursor.md) |
-| Claude Code hooks | [Claude Code guide](users/claude-code.md) |
+| Claude Code setup | [Claude Code guide](users/claude-code.md) |
 | GitHub Copilot | [Copilot guide](users/copilot.md) |
 | Session blocked or stale output | [Troubleshooting](users/troubleshooting.md) |
 | Power-user CLI repair | [CLI reference](users/cli-reference.md) |
@@ -71,7 +71,7 @@ These pages pin SHA `78cc2539` and are snapshots, not current ownership.
 | How does one process serve multiple repositories? | [Host integration](architecture/host-integration.md) | [Retrieval design](architecture/retrieval-design.md) |
 | Which test proves my docs change? | [Testing matrix - Docs-only fast path](contributors/testing-matrix.md#docs-only-fast-path) | [Contributor setup](contributors/getting-started.md) |
 | What does a term mean? | [Glossary](glossary.md) | Linked owner page for that concept |
-| With/without benchmark summary? | [README - Evaluation](../README.md#evaluation) | [Agent benchmark harness verification](testing/agent-benchmark-harness-verification.md) |
+| How did Codex use the shell lookups? | [README - Evaluation](../README.md#evaluation) | [Codex study record](https://github.com/TheGreenCedar/CodeStory/issues/2637) |
 
 ## Canonical owners
 

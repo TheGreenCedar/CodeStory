@@ -2,7 +2,9 @@
 
 ## Unreleased
 
-- `find`, `refs` and `read` answer from the current source in about the time of a text search, whatever the size of the repository. `find` and `refs` list every match grouped by file and name the enclosing function when the file still matches the index; files that changed or were never indexed are listed as plain text. `refs` lists every definition of an ambiguous name. Both include the enclosing declarations of their matches within a line budget, so one reply usually carries the code to read next; `refs` also includes the declarations its definition uses, and `read` lists them. `--no-bodies` keeps the compact listing. `read` returns complete numbered declarations for several `path::Symbol`, `path:LINE` or `path:A-B` selectors in one call, and for a bare path prints a small file whole or an outline of a large one.
+- `codestory-cli setup codex` and `codestory-cli setup claude-code` add live shell lookups to a fresh agent session through its standing instructions. Setup supports user or repository scope and can remove its own note. The shell lookups work with your existing `PATH` and need no MCP connection.
+
+- `find`, `refs` and `read` answer from current source, including files that changed or were never indexed. `find` and `refs` group matches by file and include enclosing declarations within a line budget when the file matches the index. `refs` also lists definitions and the declarations they reference. Use `--no-bodies` for a compact listing. `read` accepts several `path::Symbol`, `path:LINE` or `path:A-B` selectors in one call. With a bare path, it prints a small file whole or outlines a large one.
 
 - `callers` and `references` print source lines grouped by the calling symbol.
 
