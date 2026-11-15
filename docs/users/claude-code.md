@@ -30,6 +30,14 @@ claude plugin install ./plugins/codestory --scope project
 Use `claude --plugin-dir plugins/codestory` for a one-session test. Claude Code
 caches installed plugins, so reinstall after changing plugin files.
 
+## Shell lookups
+
+In Claude Code builds that put the enabled plugin's `bin/` on the shell tool's
+PATH, use `cs find TERM`, `cs refs NAME`, or `cs read PATH::NAME`. The
+installed CodeStory lookups skill also describes how to run the bundled command
+by absolute path. Run it from the repository you want to inspect. The command
+uses the matching native runtime prepared by the plugin's launcher.
+
 ## Configure MCP
 
 If the plugin does not register MCP for you, use the portable adapter from the

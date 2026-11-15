@@ -1,7 +1,7 @@
 //! Lookups that verify only what they serve.
 //!
-//! `find`, `refs` and `read` start from live source text: one parallel pass
-//! over the files ripgrep would search, then work proportional to the hits.
+//! `find`, `refs` and `read` start from live source text. Discovery honors
+//! ignore rules and text matching runs in parallel.
 //! Every printed line comes from bytes read during the call. Index facts
 //! (enclosing definitions, declaration ranges, resolved references) decorate a
 //! file only when those same bytes hash to the `content_hash` recorded for it
@@ -28,6 +28,7 @@ use codestory_contracts::graph::{
 };
 use codestory_store::{StorageError, Store};
 use codestory_workspace::ProjectRelativePathResolution;
+use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -35,7 +36,6 @@ use std::fmt::Write as _;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::{Mutex, PoisonError};
 
 /// Hit lines one `find` or `refs` reply lists before it switches to counts.
 pub const DEFAULT_LIMIT: usize = 150;
@@ -245,9 +245,11 @@ impl LiveFile {
     }
 }
 
-/// The files ripgrep searches by default: ignore files honoured, hidden files
-/// skipped, symlinks not followed. Globs select like `rg -g`.
-fn live_walk(root: &Path, file_globs: &[String]) -> Result<ignore::WalkParallel, ApiError> {
+/// Honor ignore rules and omit hidden files and symlink entries.
+fn live_walk(
+    root: &Path,
+    file_globs: &[String],
+) -> Result<impl Iterator<Item = PathBuf>, ApiError> {
     let mut walk = ignore::WalkBuilder::new(root);
     walk.add_custom_ignore_filename(".rgignore");
     if !file_globs.is_empty() {
@@ -263,25 +265,16 @@ fn live_walk(root: &Path, file_globs: &[String]) -> Result<ignore::WalkParallel,
                 .map_err(|error| ApiError::invalid_argument(error.to_string()))?,
         );
     }
-    Ok(walk.build_parallel())
+    Ok(walk.build().filter_map(|entry| {
+        let entry = entry.ok()?;
+        entry.file_type()?.is_file().then(|| entry.into_path())
+    }))
 }
 
 fn live_paths(root: &Path, file_globs: &[String]) -> Result<Vec<String>, ApiError> {
-    let found = Mutex::new(Vec::new());
-    let sink = &found;
-    live_walk(root, file_globs)?.run(|| {
-        Box::new(move |entry| {
-            if let Ok(entry) = entry
-                && entry.file_type().is_some_and(|kind| kind.is_file())
-            {
-                sink.lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .push(project_path(root, entry.path()));
-            }
-            ignore::WalkState::Continue
-        })
-    });
-    let mut paths = found.into_inner().unwrap_or_else(PoisonError::into_inner);
+    let mut paths = live_walk(root, file_globs)?
+        .map(|path| project_path(root, &path))
+        .collect::<Vec<_>>();
     paths.sort_unstable();
     Ok(paths)
 }
@@ -293,26 +286,18 @@ fn scan_live_tree(
     whole_word: bool,
     keep: usize,
 ) -> Result<Vec<LiveFile>, ApiError> {
-    let found = Mutex::new(Vec::new());
-    let sink = &found;
-    live_walk(root, file_globs)?.run(|| {
-        let mut bytes = Vec::new();
-        Box::new(move |entry| {
-            if let Ok(entry) = entry
-                && entry.file_type().is_some_and(|kind| kind.is_file())
-                && read_live_text(entry.path(), &mut bytes)
-                && let Some(file) =
-                    match_live_file(root, entry.path(), &bytes, needles, whole_word, keep)
-            {
-                sink.lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .push(file);
+    let paths = live_walk(root, file_globs)?.collect::<Vec<_>>();
+    let mut files = paths
+        .par_iter()
+        .map_init(Vec::new, |bytes, path| {
+            if !read_live_text(path, bytes) {
+                return None;
             }
-            ignore::WalkState::Continue
+            match_live_file(root, path, bytes, needles, whole_word, keep)
         })
-    });
-    let mut files = found.into_inner().unwrap_or_else(PoisonError::into_inner);
-    files.sort_unstable_by(|left: &LiveFile, right| left.path.cmp(&right.path));
+        .flatten()
+        .collect::<Vec<_>>();
+    files.sort_unstable_by(|left, right| left.path.cmp(&right.path));
     Ok(files)
 }
 

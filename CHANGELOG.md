@@ -100,6 +100,8 @@
 
 - Symbol search ranks standalone Go type declarations ahead of incidental matches with the same name, making definitions easier to find among configuration labels and references.
 
+- The plugin includes the `cs` shell command for live text, references, and numbered source. Run it from the target repository.
+
 ## 0.18.0
 
 - Packets reuse one repository identity snapshot while selecting a response, avoiding repeated Git status scans within the same request.

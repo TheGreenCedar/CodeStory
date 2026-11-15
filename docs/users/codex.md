@@ -32,6 +32,19 @@ codex.cmd plugin marketplace add TheGreenCedar/AgentPluginMarketplace --ref main
 
 The `/plugins` UI remains the normal install and refresh path.
 
+## Shell lookups
+
+The installed CodeStory lookups skill points to the plugin's bundled `bin/cs`.
+From a repository, run it directly or use `node` with its absolute installed
+path. Try `cs refs NAME` for definitions and mentions or
+`cs read PATH::NAME` for numbered source. The command discovers the Git root
+from the current directory. It uses the same cache as the native CLI.
+
+Once the native runtime is installed, a missing index still gives live text.
+When the host allows cache writes, the launcher requests a background index
+after a missing-index reply or a hit in a changed file. Lookups return before
+the background work finishes.
+
 ## Verify the install
 
 Ask a normal code question in the fresh session:

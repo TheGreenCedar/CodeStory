@@ -344,6 +344,7 @@ function pluginDataDir() {
   return process.env.PLUGIN_DATA
     || process.env.COPILOT_PLUGIN_DATA
     || process.env.CODESTORY_PLUGIN_DATA
+    || process.env.CLAUDE_PLUGIN_DATA
     || inferredCodexPluginDataDir()
     || inferredCursorPluginDataDir();
 }
@@ -5455,6 +5456,8 @@ if (require.main === module) {
   }
 } else {
   module.exports = {
+    pluginDataDir,
+    resolveCli,
     _test: {
       compareManagedCliVersions,
       applyCursorLocalOverrides,
