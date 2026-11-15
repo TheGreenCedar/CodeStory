@@ -91,8 +91,24 @@ pub(crate) enum Command {
     Cache(CacheCommand),
     #[command(about = "Find symbols and repo text evidence.")]
     Search(SearchCommand),
-    #[command(about = "Find literal source text.")]
+    #[command(
+        about = "Find literal text in the live source tree.",
+        long_about = "Find literal text in the live source tree.\n\n\
+            Reads the files ripgrep would search, at call time. Each hit is listed under its \
+            file as `<line> [enclosing definition] <code>`. The definition is shown only when \
+            the file's current bytes match the index; a file that changed since indexing or was \
+            never indexed is marked and listed as plain text. Nothing is refreshed."
+    )]
     Find(FindCommand),
+    #[command(
+        about = "List every whole-word mention of a name in the live source tree.",
+        long_about = "List every whole-word mention of a name in the live source tree.\n\n\
+            The header lists the definitions the index records for the name; the listing has \
+            every mention, marked like `find`. With several definitions, ` -> <path>:<line>` \
+            names the one a line resolves to. A qualifier omits the mentions the index resolved \
+            to another definition and reports how many. Nothing is refreshed."
+    )]
+    Refs(RefsCommand),
     #[command(about = "Run a repeatable grounding quality check.")]
     Drill(DrillCommand),
     #[command(about = "Run a drill manifest across repositories.")]
@@ -115,7 +131,13 @@ pub(crate) enum Command {
     Trace(TrailCommand),
     #[command(about = "Show source around a symbol.")]
     Snippet(SnippetCommand),
-    #[command(about = "Read complete declarations as path::Symbol selectors.")]
+    #[command(
+        about = "Read declarations by path::Symbol, path:LINE or path:A-B.",
+        long_about = "Read declarations by path::Symbol, path:LINE or path:A-B.\n\n\
+            Several selectors can be read in one call; one that cannot be served gets its own \
+            line. A range comes from the index when the file's current bytes match it; otherwise \
+            it is approximated from the live text and marked. Nothing is refreshed."
+    )]
     Read(ReadCommand),
     #[command(about = "Run structured graph queries.")]
     Query(QueryCommand),
@@ -1227,17 +1249,53 @@ pub(crate) struct DrillSuiteCommand {
 pub(crate) struct FindCommand {
     #[command(flatten)]
     pub(crate) project: ProjectArgs,
-    #[arg(value_name = "QUERY")]
-    pub(crate) queries: Vec<String>,
-    #[arg(long = "file-glob", value_name = "GLOB")]
-    pub(crate) path_patterns: Vec<String>,
+    #[arg(
+        value_name = "TERM",
+        help = "Literal, case-sensitive text; a line matches when it contains any term."
+    )]
+    pub(crate) terms: Vec<String>,
+    #[arg(
+        long = "file-glob",
+        value_name = "GLOB",
+        help = "Only search paths matching this glob. Without a TERM, list the matching paths."
+    )]
+    pub(crate) file_globs: Vec<String>,
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = codestory_runtime::served_lookup::DEFAULT_LIMIT,
+        help = "Lines to list before the remaining matches are only counted per file."
+    )]
+    pub(crate) limit: usize,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct RefsCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(
+        value_name = "NAME",
+        help = "An identifier, or Qualifier::Name / Qualifier.Name to narrow to one definition."
+    )]
+    pub(crate) name: String,
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = codestory_runtime::served_lookup::DEFAULT_LIMIT,
+        help = "Lines to list before the remaining references are only counted per file."
+    )]
+    pub(crate) limit: usize,
 }
 
 #[derive(Args, Debug)]
 pub(crate) struct ReadCommand {
     #[command(flatten)]
     pub(crate) project: ProjectArgs,
-    #[arg(required = true, value_name = "PATH::SYMBOL")]
+    #[arg(
+        required = true,
+        value_name = "SELECTOR",
+        help = "path::Symbol, path:LINE (the declaration around that line) or path:A-B."
+    )]
     pub(crate) selectors: Vec<String>,
 }
 

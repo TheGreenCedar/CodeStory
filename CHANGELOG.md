@@ -2,7 +2,9 @@
 
 ## Unreleased
 
-- `callers` and `references` print source lines grouped by the calling symbol. `read` returns complete numbered declarations for multiple `path::Symbol` selectors in one call.
+- `find`, `refs` and `read` answer from the current source in about the time of a text search, whatever the size of the repository. `find` and `refs` list every match grouped by file and name the enclosing function when the file still matches the index; files that changed or were never indexed are listed as plain text. `refs` lists every definition of an ambiguous name. `read` returns complete numbered declarations for several `path::Symbol`, `path:LINE` or `path:A-B` selectors in one call.
+
+- `callers` and `references` print source lines grouped by the calling symbol.
 
 - CodeStory MCP packet follow-ups can return requested source pages when the reply cannot also fit newly retrieved context. The reply identifies source it could not return.
 

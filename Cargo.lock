@@ -705,7 +705,7 @@ dependencies = [
  "codestory-workspace",
  "crossbeam-channel",
  "flate2",
- "glob",
+ "ignore",
  "libc",
  "nucleo-matcher",
  "parking_lot",

@@ -194,6 +194,7 @@ mod search_state_cache;
 mod search_terms;
 mod semantic_projection;
 mod semantic_republish;
+pub mod served_lookup;
 mod snippets;
 #[cfg(feature = "v3-evidence-separation-support")]
 #[doc(hidden)]
@@ -547,7 +548,6 @@ pub use call_path_kernel::PROOF_DOMAIN;
 #[doc(hidden)]
 pub use controller_indexing::set_mid_indexing_test_hook;
 pub use index_incremental::{StaleCachedCore, observe_stale_cached_cores};
-pub use repo_text::{LiveTextHit, find_live_text};
 pub use search_runtime::*;
 use semantic_doc_text::{
     semantic_doc_language_from_path, semantic_path_aliases, semantic_symbol_aliases,

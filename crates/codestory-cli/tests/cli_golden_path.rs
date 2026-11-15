@@ -104,65 +104,414 @@ src/lib.rs:24: runtime::normalize_project(project_name)"
     );
 }
 
-#[test]
-fn read_returns_complete_bodies_in_one_call() {
-    let workspace = tempdir().expect("workspace");
-    let cache = tempdir().expect("cache");
-    write_tiny_rust_workspace(workspace.path());
-    run_cli_json(
-        workspace.path(),
-        cache.path(),
-        &["index", "--refresh", "full", "--format", "json"],
-    );
-    let output = run_cli(
-        workspace.path(),
-        cache.path(),
-        &[
-            "read",
-            "src/lib.rs::open_project",
-            "src/runtime.rs::normalize_project",
-        ],
-    );
+/// Run a lookup that must succeed and return its reply.
+fn run_lookup(workspace: &Path, cache_dir: &Path, args: &[&str]) -> String {
+    let output = run_cli(workspace, cache_dir, args);
     assert!(
         output.status.success(),
-        "{}",
+        "lookup failed: {:?}\nstdout:\n{}\nstderr:\n{}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let text = String::from_utf8(output.stdout).expect("text response");
-    assert!(text.contains("src/lib.rs:23 open_project"));
-    assert!(text.contains("24 |     runtime::normalize_project(project_name)"));
-    assert!(text.contains("25 | }"));
-    assert!(text.contains("src/runtime.rs:1 normalize_project"));
-    assert!(text.contains("3 | }"));
+    String::from_utf8(output.stdout).expect("text reply")
+}
+
+fn index_lookup_fixture(workspace: &Path, cache_dir: &Path) {
+    run_cli_json(
+        workspace,
+        cache_dir,
+        &["index", "--refresh", "full", "--format", "json"],
+    );
+}
+
+/// Two methods share the name `apply`; one call is split over lines, one
+/// lives in a test file, and `apply_all` / `reapply` only contain the name.
+fn write_shared_name_workspace(root: &Path) {
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"[package]
+name = "shared-name-fixture"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "src/lib.rs"
+"#,
+    )
+    .expect("write Cargo.toml");
+    let src = root.join("src");
+    fs::create_dir_all(&src).expect("create src dir");
+    fs::write(
+        src.join("lib.rs"),
+        r#"pub mod audit;
+pub mod ledger;
+
+use ledger::Ledger;
+
+pub fn settle(amount: u32) -> u32 {
+    let ledger = Ledger::default();
+    ledger
+        .apply(amount)
+}
+
+pub fn apply_all(amounts: &[u32]) -> u32 {
+    amounts.iter().map(|amount| settle(*amount)).sum()
+}
+"#,
+    )
+    .expect("write lib.rs");
+    fs::write(
+        src.join("ledger.rs"),
+        r#"#[derive(Default)]
+pub struct Ledger {
+    pub total: u32,
+}
+
+impl Ledger {
+    pub fn apply(&self, amount: u32) -> u32 {
+        self.total + amount
+    }
+}
+"#,
+    )
+    .expect("write ledger.rs");
+    fs::write(
+        src.join("audit.rs"),
+        r#"pub struct Audit;
+
+impl Audit {
+    pub fn apply(&self, note: &str) -> usize {
+        note.len()
+    }
+
+    pub fn reapply(&self, note: &str) -> usize {
+        self.apply(note) * 2
+    }
+}
+"#,
+    )
+    .expect("write audit.rs");
+    let tests = root.join("tests");
+    fs::create_dir_all(&tests).expect("create tests dir");
+    fs::write(
+        tests.join("ledger_test.rs"),
+        r#"use shared_name_fixture::ledger::Ledger;
+
+#[test]
+fn applies_in_tests() {
+    assert_eq!(Ledger::default().apply(2), 2);
+}
+"#,
+    )
+    .expect("write ledger_test.rs");
 }
 
 #[test]
-fn live_find_reads_terms_and_filename_patterns_without_an_index() {
+fn find_and_refs_answer_from_live_text_without_an_index() {
     let workspace = tempdir().expect("workspace");
     let cache = tempdir().expect("cache");
     write_tiny_rust_workspace(workspace.path());
-    let output = run_cli(
-        workspace.path(),
-        cache.path(),
-        &[
+    let lookup = |args: &[&str]| run_lookup(workspace.path(), cache.path(), args);
+
+    assert_eq!(
+        lookup(&["find", "schedule_index", "normalize_project"]),
+        "no index; text matches only
+4 matches in 2 files
+src/lib.rs
+  24 runtime::normalize_project(project_name)
+  28 runtime::schedule_index(project_path)
+src/runtime.rs
+  1 pub fn normalize_project(project_name: &str) -> String {
+  5 pub fn schedule_index(project_path: &str) -> usize {
+"
+    );
+    assert_eq!(
+        lookup(&["find", "--file-glob", "lib.rs"]),
+        "1 files\nsrc/lib.rs\n"
+    );
+    // A glob narrows the search; past the limit every remaining hit is counted.
+    assert_eq!(
+        lookup(&[
             "find",
-            "schedule_index",
-            "normalize_project",
+            "project",
             "--file-glob",
-            "lib.rs",
-        ],
+            "runtime.rs",
+            "--limit",
+            "2"
+        ]),
+        "no index; text matches only
+4 matches in 1 files
+src/runtime.rs
+  1 pub fn normalize_project(project_name: &str) -> String {
+  2 format!(\"workspace:{project_name}\")
+src/runtime.rs: 2 more
+"
+    );
+
+    assert_eq!(
+        lookup(&["refs", "open_project"]),
+        "no index; text matches only
+5 references in 2 files
+src/lib.rs
+  14 pub fn open_project(&self) -> String {
+  15 open_project(&self.project_name)
+  19 run_indexing(&self.open_project())
+  23 pub fn open_project(project_name: &str) -> String {
+src/runtime.rs
+  6 super::open_project(project_path).len()
+"
+    );
+    // Whole words only: `project` is never more than part of a name here.
+    assert_eq!(
+        lookup(&["refs", "project"]),
+        "no index; text matches only\n0 references in 0 files\n"
+    );
+
+    assert_eq!(
+        lookup(&["read", "src/runtime.rs::schedule_index", "src/lib.rs:1-3"]),
+        "== src/runtime.rs:5-7 schedule_index (not from index; approximate)
+5: pub fn schedule_index(project_path: &str) -> usize {
+6:     super::open_project(project_path).len()
+7: }
+== src/lib.rs:1-3
+1: pub mod runtime;
+2:
+3: pub struct AppController {
+"
+    );
+
+    assert_eq!(
+        fs::read_dir(cache.path()).expect("list cache dir").count(),
+        0,
+        "a lookup must not create cache state"
+    );
+}
+
+#[test]
+fn refs_lists_every_whole_word_hit_with_enclosing_symbols() {
+    let workspace = tempdir().expect("workspace");
+    let cache = tempdir().expect("cache");
+    write_shared_name_workspace(workspace.path());
+    index_lookup_fixture(workspace.path(), cache.path());
+    let lookup = |args: &[&str]| run_lookup(workspace.path(), cache.path(), args);
+
+    // Both definitions are listed instead of an ambiguity error. The call
+    // split over lines is found on the line that names it, the call in the
+    // test file is listed, and `apply_all` / `reapply` are not mentions.
+    assert_eq!(
+        lookup(&["refs", "apply"]),
+        "apply: 2 definition(s)
+  src/audit.rs:4 method Audit::apply
+  src/ledger.rs:7 method Ledger::apply
+3 references in 3 files
+src/audit.rs
+  4 [Audit::apply] pub fn apply(&self, note: &str) -> usize {
+  9 [Audit::reapply] self.apply(note) * 2 -> src/audit.rs:4
+src/ledger.rs
+  7 [Ledger::apply] pub fn apply(&self, amount: u32) -> u32 {
+src/lib.rs
+  9 [settle] .apply(amount) -> src/ledger.rs:7
+tests/ledger_test.rs
+  5 [applies_in_tests] assert_eq!(Ledger::default().apply(2), 2);
+"
+    );
+
+    // A qualifier keeps the unresolved hits and drops only what the index
+    // resolved to the other definition, and says how many it dropped.
+    assert_eq!(
+        lookup(&["refs", "Ledger::apply"]),
+        "Ledger::apply: 1 definition(s)
+  src/ledger.rs:7 method Ledger::apply
+2 references in 2 files
+src/ledger.rs
+  7 [Ledger::apply] pub fn apply(&self, amount: u32) -> u32 {
+src/lib.rs
+  9 [settle] .apply(amount)
+tests/ledger_test.rs
+  5 [applies_in_tests] assert_eq!(Ledger::default().apply(2), 2);
+2 hit(s) omitted: the index resolved them to other definitions of apply
+"
+    );
+    assert!(lookup(&["refs", "Audit.apply"]).starts_with(
+        "Audit.apply: 1 definition(s)
+  src/audit.rs:4 method Audit::apply
+2 references in 2 files
+"
+    ));
+
+    // Past the limit nothing is dropped silently, and the definitions are
+    // still found in files the listing no longer reaches.
+    assert_eq!(
+        lookup(&["refs", "apply", "--limit", "2"]),
+        "apply: 2 definition(s)
+  src/audit.rs:4 method Audit::apply
+  src/ledger.rs:7 method Ledger::apply
+3 references in 3 files
+src/audit.rs
+  4 [Audit::apply] pub fn apply(&self, note: &str) -> usize {
+  9 [Audit::reapply] self.apply(note) * 2 -> src/audit.rs:4
+src/ledger.rs: 1 more
+src/lib.rs: 1 more
+tests/ledger_test.rs: 1 more
+"
+    );
+}
+
+#[test]
+fn lookups_verify_only_the_files_they_serve() {
+    let workspace = tempdir().expect("workspace");
+    let cache = tempdir().expect("cache");
+    write_tiny_rust_workspace(workspace.path());
+    index_lookup_fixture(workspace.path(), cache.path());
+    let published = cache_file_snapshots(cache.path());
+    let process_state = cache_file_snapshots(&test_support::test_state_root());
+    let lookup = |args: &[&str]| run_lookup(workspace.path(), cache.path(), args);
+
+    let indexed = "open_project: 2 definition(s)
+  src/lib.rs:14 method AppController::open_project
+  src/lib.rs:23 function open_project
+3 references in 2 files
+src/lib.rs
+  14 [AppController::open_project] pub fn open_project(&self) -> String {
+  15 [AppController::open_project] open_project(&self.project_name) -> src/lib.rs:23
+  19 [AppController::run_indexing] run_indexing(&self.open_project()) -> src/lib.rs:14
+  23 [open_project] pub fn open_project(project_name: &str) -> String {
+src/runtime.rs
+  6 [schedule_index] super::open_project(project_path).len()
+";
+    assert_eq!(lookup(&["refs", "open_project"]), indexed);
+
+    // Shift every line of one hit file and add a file the index never saw.
+    let lib = workspace.path().join("src/lib.rs");
+    let original = fs::read_to_string(&lib).expect("read lib.rs");
+    fs::write(&lib, format!("// moved down\n// by two lines\n{original}")).expect("edit lib.rs");
+    fs::write(
+        workspace.path().join("src/extra.rs"),
+        "pub fn reopen() -> String {\n    crate::open_project(\"again\")\n}\n",
+    )
+    .expect("write extra.rs");
+
+    // The changed file is served from its live bytes: new line numbers, no
+    // index facts, and a mark. The untouched file keeps its symbols.
+    let listing = r#"src/extra.rs (not indexed)
+  2 crate::open_project("again")
+src/lib.rs (changed since indexing)
+  16 pub fn open_project(&self) -> String {
+  17 open_project(&self.project_name)
+  21 run_indexing(&self.open_project())
+  25 pub fn open_project(project_name: &str) -> String {
+src/runtime.rs
+  6 [schedule_index] super::open_project(project_path).len()
+"#;
+    assert_eq!(
+        lookup(&["refs", "open_project"]),
+        format!("open_project: 0 definition(s)\n6 references in 3 files\n{listing}")
+    );
+    assert_eq!(
+        lookup(&["find", "open_project"]),
+        format!("6 matches in 3 files\n{listing}")
+    );
+
+    // Verification is by content, not by timestamp: the same bytes written
+    // again are the bytes the index describes.
+    fs::write(&lib, original).expect("restore lib.rs");
+    fs::remove_file(workspace.path().join("src/extra.rs")).expect("remove extra.rs");
+    assert_eq!(lookup(&["refs", "open_project"]), indexed);
+
+    assert_eq!(
+        cache_file_snapshots(cache.path()),
+        published,
+        "lookups must not refresh, activate, or write the project cache"
+    );
+    assert_eq!(
+        cache_file_snapshots(&test_support::test_state_root()),
+        process_state,
+        "lookups must not write process cache state"
+    );
+}
+
+#[test]
+fn read_returns_complete_declarations_for_many_selectors() {
+    let workspace = tempdir().expect("workspace");
+    let cache = tempdir().expect("cache");
+    write_tiny_rust_workspace(workspace.path());
+    let notes = (1..=305)
+        .map(|line| format!("note {line}\n"))
+        .collect::<String>();
+    fs::write(workspace.path().join("notes.txt"), notes).expect("write notes.txt");
+    index_lookup_fixture(workspace.path(), cache.path());
+    let lookup = |args: &[&str]| run_lookup(workspace.path(), cache.path(), args);
+
+    // One call, every selector form; a bad selector gets its own line.
+    assert_eq!(
+        lookup(&[
+            "read",
+            "src/lib.rs::AppController::open_project",
+            "src/lib.rs::AppController.run_indexing",
+            "src/runtime.rs:6",
+            "src/lib.rs:23-25",
+            "src/missing.rs::anything",
+            "src/lib.rs::absent",
+            "nonsense",
+        ]),
+        "== src/lib.rs:14-16 AppController::open_project
+14:     pub fn open_project(&self) -> String {
+15:         open_project(&self.project_name)
+16:     }
+== src/lib.rs:18-20 AppController::run_indexing
+18:     pub fn run_indexing(&self) -> usize {
+19:         run_indexing(&self.open_project())
+20:     }
+== src/runtime.rs:5-7 schedule_index
+5: pub fn schedule_index(project_path: &str) -> usize {
+6:     super::open_project(project_path).len()
+7: }
+== src/lib.rs:23-25
+23: pub fn open_project(project_name: &str) -> String {
+24:     runtime::normalize_project(project_name)
+25: }
+== src/missing.rs::anything: no file src/missing.rs
+== src/lib.rs::absent: no symbol absent in src/lib.rs; definitions there: AppController, \
+AppController::new, AppController::open_project, AppController::run_indexing, open_project, \
+run_indexing
+== nonsense: expected path::Symbol, path:LINE or path:A-B
+"
+    );
+
+    // A long range is cut at 300 lines and names the range that continues.
+    let long = lookup(&["read", "notes.txt:1-305"]);
+    assert!(
+        long.starts_with("== notes.txt:1-305\n1: note 1\n"),
+        "{long}"
     );
     assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+        long.ends_with("300: note 300\n... 5 more lines; read notes.txt:301-305\n"),
+        "{long}"
     );
-    let text = String::from_utf8(output.stdout).expect("text response");
-    assert!(text.starts_with("Text search"));
-    assert!(text.contains("File: src/lib.rs"));
-    assert!(text.contains("src/runtime.rs:1: pub fn normalize_project"));
-    assert!(text.contains("src/runtime.rs:5: pub fn schedule_index"));
-    assert!(!cache.path().join("codestory.db").exists());
+
+    // After an edit the index no longer describes the file, so the range is
+    // approximated from the live text and says so.
+    let runtime = workspace.path().join("src/runtime.rs");
+    let original = fs::read_to_string(&runtime).expect("read runtime.rs");
+    fs::write(&runtime, format!("// shifted\n{original}")).expect("edit runtime.rs");
+    assert_eq!(
+        lookup(&["read", "src/runtime.rs::schedule_index", "src/runtime.rs:3"]),
+        "== src/runtime.rs:6-8 schedule_index (not from index; approximate)
+6: pub fn schedule_index(project_path: &str) -> usize {
+7:     super::open_project(project_path).len()
+8: }
+== src/runtime.rs:1-8 (not from index; approximate)
+1: // shifted
+2: pub fn normalize_project(project_name: &str) -> String {
+3:     format!(\"workspace:{project_name}\")
+4: }
+5:
+6: pub fn schedule_index(project_path: &str) -> usize {
+7:     super::open_project(project_path).len()
+8: }
+"
+    );
 }
 
 fn write_docker_compose_fixture(root: &Path) {

@@ -14,7 +14,6 @@ v3-evidence-separation-support = ["codestory-agent/v3-evidence-separation-suppor
 test-support = ["codestory-agent/test-support", "codestory-store/test-support"]
 
 [dependencies]
-glob.workspace = true
 anyhow = { workspace = true }
 codestory-agent = { workspace = true }
 codestory-contracts = { workspace = true }
@@ -23,6 +22,7 @@ codestory-retrieval = { workspace = true }
 codestory-store = { workspace = true }
 codestory-workspace = { workspace = true }
 crossbeam-channel = { workspace = true }
+ignore = { workspace = true }
 nucleo-matcher = { workspace = true }
 parking_lot = { workspace = true }
 rayon = { workspace = true }
