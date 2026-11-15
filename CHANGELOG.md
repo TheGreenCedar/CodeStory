@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Lexical search highlights the source line matching the most distinct query terms, instead of stopping at an incidental match near the top of a file.
+- Reading a line deep inside a large function now includes that line in the reply.
 
 - `codestory-cli setup codex` and `codestory-cli setup claude-code` add live shell lookups to a fresh agent session through its standing instructions. Setup supports user or repository scope and can remove its own note. The shell lookups work with your existing `PATH` and need no MCP connection.
 

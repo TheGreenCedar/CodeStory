@@ -1784,9 +1784,21 @@ impl Page<'_> {
         }
     }
 
-    /// Print a definition over the lines it spans.
-    fn declaration(&mut self, out: &mut String, budget: &mut usize, definition: &Definition) {
+    /// Print a definition, starting near the requested line if the budget would omit it.
+    fn declaration(
+        &mut self,
+        out: &mut String,
+        budget: &mut usize,
+        definition: &Definition,
+        requested_line: Option<u32>,
+    ) {
         if let Some((first, last, note)) = declared_range(self.lines, definition) {
+            let first = match requested_line {
+                Some(line) if (line - first) as usize >= *budget => {
+                    line.saturating_sub(DECLARATION_WINDOW).max(first)
+                }
+                _ => first,
+            };
             let title = format!(" {}", definition.qualified);
             self.block(out, budget, first, last, &title, note);
         }
@@ -1930,7 +1942,7 @@ fn read_selector(
                 .and_then(|definitions| enclosing_scope(definitions, line))
             {
                 Some(definition) => {
-                    page.declaration(out, &mut budget, definition);
+                    page.declaration(out, &mut budget, definition, Some(line));
                     list_used_pointers(out, root, index, page.printed, definition);
                 }
                 None => page.block(
@@ -1971,7 +1983,7 @@ fn read_selector(
                         found.retain(|definition| is_scope_kind(definition.kind));
                     }
                     for definition in &found {
-                        page.declaration(out, &mut budget, definition);
+                        page.declaration(out, &mut budget, definition, None);
                         list_used_pointers(
                             out,
                             root,

@@ -675,6 +675,37 @@ run_indexing
     );
 }
 
+#[test]
+fn read_includes_anchor_in_long_indexed_declaration() {
+    let workspace = tempdir().expect("workspace");
+    let cache = tempdir().expect("cache");
+    write_tiny_rust_workspace(workspace.path());
+    let source = format!(
+        "\npub fn long_declaration() -> u32 {{\n{}    42\n}}\n",
+        "    // body\n".repeat(640)
+    );
+    fs::write(workspace.path().join("src/lib.rs"), source).expect("write long declaration");
+    index_lookup_fixture(workspace.path(), cache.path());
+    let lookup = |selector| run_lookup(workspace.path(), cache.path(), &["read", selector]);
+
+    let symbol = lookup("src/lib.rs::long_declaration");
+    assert!(symbol.starts_with("== src/lib.rs:2-644 long_declaration\n2: pub fn long_declaration"));
+    assert!(symbol.ends_with("301:     // body\n... 343 more lines; read src/lib.rs:302-644\n"));
+    assert_eq!(lookup("src/lib.rs:301"), symbol);
+
+    let boundary = lookup("src/lib.rs:302");
+    assert!(boundary.lines().any(|row| row == "302:     // body"));
+    assert!(boundary.ends_with("589:     // body\n... 55 more lines; read src/lib.rs:590-644\n"));
+
+    let late = lookup("src/lib.rs:643");
+    let header = late.lines().next().expect("declaration header");
+    assert!(header.ends_with(" long_declaration"), "{header}");
+    assert!(
+        late.lines().any(|row| row == "643:     42"),
+        "line selector omitted line 643 from {header}"
+    );
+}
+
 /// `tally` is defined once, called twice from `twice`, imported outside any
 /// declaration, and called three times from `render`, which is 170 lines long.
 fn write_body_workspace(root: &Path) {
