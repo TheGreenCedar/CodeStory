@@ -34,7 +34,7 @@ The `/plugins` UI remains the normal install and refresh path.
 
 ## Shell lookups
 
-The installed CodeStory lookups skill points to the plugin's bundled `bin/cs`.
+The installed CodeStory skill points to the plugin's bundled `bin/cs`.
 From a repository, run it directly or use `node` with its absolute installed
 path. Try `cs refs NAME` for definitions and mentions or
 `cs read PATH::NAME` for numbered source. The command discovers the Git root

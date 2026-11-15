@@ -1,11 +1,15 @@
 ---
 name: codestory-grounding
-description: Select the next useful evidence operation before CodeStory setup or tool discovery. Ordinary source reads need no CodeStory discovery. Use CodeStory MCP to locate repository code, inspect evidence, trace relationships or assess change impact; also for retrieval/plugin validation. Skip bounded named-file work needing none of these. If a CodeStory inventory is needed in Codex `ALL_TOOLS`, filter `tool.name` by the `mcp__codestory__` prefix, not generic `search` in descriptions. Emit matching names only, not full tool objects. Keep needed selected declarations complete.
+description: For codebase questions, use the bundled shell command first. Run cs find TERM, cs refs NAME, or cs read PATH::NAME from the repository. If cs is outside PATH, run node with the absolute path to ../../bin/cs relative to this SKILL.md. Returns numbered live source even without an index. Use MCP for graph and other indexed operations.
 ---
 
 # CodeStory
 
-Stay within user scope; choose CodeStory or ordinary tools. No preliminary call is required.
+Use `cs find TERM` for literal text, `cs refs NAME` for definitions and mentions, or `cs read PATH::NAME` or `cs read PATH:START-END` for numbered source.
+Run `cs` from the repository. When it is outside PATH, pass the absolute path to this plugin's `bin/cs` to `node`. From the directory containing this skill, that path is `../../bin/cs`.
+Use ordinary reads for named files and to fill any gaps. No setup or preliminary call is needed for the shell lookups.
+
+## Indexed tools
 
 For a broad question spanning several files, experimental `packet` accepts `question` and returns bounded source evidence or explicit gaps. Use targeted tools for missing evidence.
 
