@@ -13,13 +13,18 @@
 //! carries the code a reader would open next. A line budget bounds that; hits
 //! past it stay one line each.
 //!
+//! `refs` then prints the declarations each definition uses, and `read` says
+//! where they are. Those are the targets of the outgoing edges the index
+//! resolved with certainty, each one only as a declaration in a file whose
+//! live bytes the index still describes; a guessed resolution names nothing.
+//!
 //! Nothing here refreshes or activates an index, checks whole-tree freshness,
 //! or writes: the store is opened observationally and a missing or unreadable
 //! publication degrades the reply to text only.
 
 use codestory_contracts::api::ApiError;
 use codestory_contracts::graph::{
-    EdgeKind, NodeId, NodeKind, OccurrenceKind, ResolutionCertainty, TrailCallerScope,
+    Edge, EdgeKind, NodeId, NodeKind, OccurrenceKind, ResolutionCertainty, TrailCallerScope,
 };
 use codestory_store::{StorageError, Store};
 use codestory_workspace::ProjectRelativePathResolution;
@@ -36,7 +41,7 @@ use std::sync::{Mutex, PoisonError};
 pub const DEFAULT_LIMIT: usize = 150;
 /// Lines one `find` or `refs` reply spends on declaration bodies and context,
 /// counting their `==` headers and `...` gap marks.
-pub const DEFAULT_BODY_LINES: usize = 220;
+pub const DEFAULT_BODY_LINES: usize = 600;
 
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const BINARY_PROBE_BYTES: usize = 1024;
@@ -44,15 +49,25 @@ const MAX_CODE_CHARS: usize = 200;
 const READ_LINE_CAP: usize = 300;
 const APPROXIMATE_LINE_CAP: usize = 80;
 /// A declaration up to this long is shown whole; a longer one is windowed.
-const WHOLE_DECLARATION_LINES: u32 = 60;
+const WHOLE_DECLARATION_LINES: u32 = 150;
 /// Lines shown on each side of a hit inside a windowed declaration.
-const DECLARATION_WINDOW: u32 = 6;
+const DECLARATION_WINDOW: u32 = 12;
 /// Lines shown on each side of a hit that has no verified declaration.
 const TEXT_WINDOW: u32 = 3;
 /// `refs` leads with the declarations of the name when there are this few.
 const DEFINITION_BODIES: usize = 3;
+/// Declarations `refs` shows after the references for each definition's uses.
+const USED_DECLARATIONS: usize = 10;
+/// Rows `read` lists under a declaration for the declarations it uses.
+const USED_POINTERS: usize = 15;
+/// A used declaration up to this long is printed whole; a longer one is one
+/// row that says where to read it.
+const WHOLE_USED_LINES: u32 = 80;
+/// Percent of the budget the definitions left that the references may spend
+/// when the used declarations want the rest.
+const REFERENCE_SHARE: usize = 60;
 /// `read <path>` prints a file up to this long whole, and outlines a longer one.
-const WHOLE_FILE_LINES: u32 = 250;
+const WHOLE_FILE_LINES: u32 = 400;
 /// Hit files past the listed ones that `refs` still checks for definitions,
 /// so a small `--limit` does not hide where the name is defined.
 const DEFINITION_SEARCH_FILES: usize = 1_000;
@@ -122,7 +137,8 @@ pub fn find(
 /// `Qualifier::Name` / `Qualifier.Name`), with the definitions the index
 /// records for it in files whose live bytes it still describes. `body_lines`
 /// is the budget for declaration bodies and context; `None` lists one line
-/// per hit.
+/// per hit. With a budget and at most three definitions, the declarations
+/// each definition uses follow the references.
 pub fn refs(
     root: &Path,
     storage_path: &Path,
@@ -161,8 +177,10 @@ pub fn refs(
 
 /// Complete declarations for a batch of selectors: `path::Symbol`,
 /// `path:LINE` or `path:A-B`. A bare `path` is the whole file when it is
-/// short, else an outline of its declarations. A selector that cannot be
-/// served gets its own `==` line and never fails the batch.
+/// short, else an outline of its declarations. A declaration read by symbol
+/// or line is followed by `uses:` rows that say where the declarations it
+/// uses are. A selector that cannot be served gets its own `==` line and
+/// never fails the batch.
 pub fn read(root: &Path, storage_path: &Path, selectors: &[String]) -> Result<String, ApiError> {
     if selectors.is_empty() {
         return Err(ApiError::invalid_argument(
@@ -172,8 +190,9 @@ pub fn read(root: &Path, storage_path: &Path, selectors: &[String]) -> Result<St
     Ok(with_pinned_index(storage_path, |store| {
         let mut index = store.map(Index::new);
         let mut out = String::new();
+        let mut printed = Printed::default();
         for selector in selectors {
-            read_selector(&mut out, root, index.as_mut(), selector);
+            read_selector(&mut out, root, index.as_mut(), &mut printed, selector);
         }
         out
     }))
@@ -454,6 +473,23 @@ fn bounded(text: &str) -> String {
     }
 }
 
+/// One read of a live file: its bytes, and their hash under the path a reply
+/// shows for it.
+fn open_live(root: &Path, absolute: PathBuf) -> Option<(LiveFile, Vec<u8>)> {
+    let mut bytes = Vec::new();
+    if !read_live_text(&absolute, &mut bytes) {
+        return None;
+    }
+    let file = LiveFile {
+        path: project_path(root, &absolute),
+        absolute,
+        sha256: sha256_hex(&bytes),
+        hit_lines: Vec::new(),
+        kept: Vec::new(),
+    };
+    Some((file, bytes))
+}
+
 /// The text of `file`, provided its bytes are still the ones its hits and
 /// its index verification were cut from.
 fn live_text(file: &LiveFile) -> Option<String> {
@@ -486,11 +522,54 @@ impl Definition {
 
 type Served = (&'static str, Option<Rc<Vec<Definition>>>);
 
+/// A project file read once whose bytes the index describes.
+struct Verified {
+    file: LiveFile,
+    text: String,
+    definitions: Rc<Vec<Definition>>,
+}
+
+/// A definition in a verified file, over the lines it spans in the live text.
+struct Located {
+    home: Rc<Verified>,
+    /// Its position among the definitions of `home`.
+    slot: usize,
+    first: u32,
+    last: u32,
+    /// Says so when `last` is not from the index.
+    note: &'static str,
+}
+
+impl Located {
+    fn definition(&self) -> &Definition {
+        &self.home.definitions[self.slot]
+    }
+
+    fn path(&self) -> &str {
+        &self.home.file.path
+    }
+
+    /// One row that says where to read it.
+    fn pointer(&self) -> String {
+        let definition = self.definition();
+        format!(
+            "  {}:{}-{} {} {}\n",
+            self.path(),
+            self.first,
+            self.last,
+            kind_label(definition.kind),
+            definition.qualified
+        )
+    }
+}
+
 /// Index facts, handed out per file and only for bytes the index describes.
 struct Index<'a> {
     store: &'a Store,
     /// What was served for a path, and the hash of the bytes it was served for.
     served: HashMap<PathBuf, (String, Served)>,
+    /// Files opened by their index id, `None` for one that is not verified.
+    opened: HashMap<i64, Option<Rc<Verified>>>,
 }
 
 impl<'a> Index<'a> {
@@ -498,7 +577,52 @@ impl<'a> Index<'a> {
         Self {
             store,
             served: HashMap::new(),
+            opened: HashMap::new(),
         }
+    }
+
+    /// The file the index records as `file_id`, when it is inside the project
+    /// and its live bytes hash to the indexed `content_hash`.
+    fn open(&mut self, root: &Path, file_id: i64) -> Option<Rc<Verified>> {
+        if let Some(opened) = self.opened.get(&file_id) {
+            return opened.clone();
+        }
+        let opened = self.verify(root, file_id).map(Rc::new);
+        self.opened.insert(file_id, opened.clone());
+        opened
+    }
+
+    fn verify(&mut self, root: &Path, file_id: i64) -> Option<Verified> {
+        let absolute = self.store.get_file_by_id(file_id).ok()??.path;
+        absolute.strip_prefix(root).ok()?;
+        let (file, bytes) = open_live(root, absolute)?;
+        let definitions = self.serve(&file).1?;
+        Some(Verified {
+            text: String::from_utf8_lossy(&bytes).into_owned(),
+            file,
+            definitions,
+        })
+    }
+
+    /// The declaration of `id`, when the index records one in a verified file.
+    fn locate(&mut self, root: &Path, id: NodeId) -> Option<Located> {
+        let file_id = self.store.get_node(id).ok()??.file_node_id?;
+        let home = self.open(root, file_id.0)?;
+        let slot = home
+            .definitions
+            .iter()
+            .position(|definition| definition.id == id)?;
+        let (first, last, note) = declared_range(
+            &home.text.lines().collect::<Vec<_>>(),
+            &home.definitions[slot],
+        )?;
+        Some(Located {
+            home,
+            slot,
+            first,
+            last,
+            note,
+        })
     }
 
     /// The header mark for `file` and, only when the bytes just read hash to
@@ -637,6 +761,75 @@ fn name_segments(name: &str) -> Vec<&str> {
         .collect()
 }
 
+/// The declarations that `owner` and the definitions nested in it reference,
+/// in order of first use and `most` at the most: the targets of the outgoing
+/// edges the index resolved with certainty, each one only as a declaration in
+/// a verified file. A guessed resolution names nothing. `owner` itself, what
+/// is nested in it, namespaces, and what `shown` reports are left out.
+fn used_by(
+    index: &mut Index<'_>,
+    root: &Path,
+    owner: &Located,
+    most: usize,
+    shown: impl Fn(&Located) -> bool,
+) -> Vec<Located> {
+    let nested = |first: u32, last: u32| owner.first <= first && last <= owner.last;
+    // Where each edge is in the text, or else the definition it starts from.
+    let mut sites = Vec::new();
+    for source in owner
+        .home
+        .definitions
+        .iter()
+        .filter(|source| nested(source.start, source.end))
+    {
+        let edges = index
+            .store
+            .get_outgoing_edges_for_node_id(
+                source.id,
+                &[],
+                TrailCallerScope::IncludeTestsAndBenches,
+                true,
+            )
+            .unwrap_or_default();
+        for edge in edges {
+            if edge.kind != EdgeKind::MEMBER && is_certain(&edge) {
+                sites.push((
+                    edge.line.unwrap_or(source.start),
+                    edge.id.0,
+                    edge.effective_target(),
+                ));
+            }
+        }
+    }
+    sites.sort_unstable();
+    let mut seen = HashSet::new();
+    let mut used = Vec::new();
+    for (_, _, target) in sites {
+        if used.len() == most {
+            break;
+        }
+        if seen.insert(target)
+            && let Some(target) = index.locate(root, target)
+            && !(Rc::ptr_eq(&target.home, &owner.home) && nested(target.first, target.last))
+            && !matches!(
+                target.definition().kind,
+                NodeKind::MODULE | NodeKind::NAMESPACE | NodeKind::PACKAGE
+            )
+            && !shown(&target)
+        {
+            used.push(target);
+        }
+    }
+    used
+}
+
+/// Whether the index is certain of the resolution `edge` records.
+fn is_certain(edge: &Edge) -> bool {
+    edge.certainty
+        .or_else(|| ResolutionCertainty::from_confidence(edge.confidence))
+        == Some(ResolutionCertainty::Certain)
+}
+
 // ---------------------------------------------------------------------------
 // Listing
 // ---------------------------------------------------------------------------
@@ -726,13 +919,38 @@ fn list_hits(
 // Bodies
 // ---------------------------------------------------------------------------
 
+/// Line ranges one reply has printed, by the path it shows for their file.
+#[derive(Default)]
+struct Printed(HashMap<String, Vec<(u32, u32)>>);
+
+impl Printed {
+    fn add(&mut self, path: &str, first: u32, last: u32) {
+        self.0
+            .entry(path.to_owned())
+            .or_default()
+            .push((first, last));
+    }
+
+    /// Whether one printed range shows all the lines of `declaration`.
+    fn holds(&self, declaration: &Located) -> bool {
+        self.0.get(declaration.path()).is_some_and(|ranges| {
+            ranges
+                .iter()
+                .any(|(first, last)| *first <= declaration.first && declaration.last <= *last)
+        })
+    }
+}
+
 /// What one reply may still spend on declaration bodies and context.
 struct Bodies {
     /// Lines left, counting `==` headers and `...` gap marks.
     budget: usize,
     /// Declarations already printed, so that none is printed twice.
     declared: HashSet<NodeId>,
-    /// Whether a hit stayed a one-line row because its body did not fit.
+    /// The lines printed for them and for context.
+    printed: Printed,
+    /// Whether a hit or a used declaration stayed one row because its body
+    /// did not fit.
     overflowed: bool,
 }
 
@@ -741,8 +959,14 @@ impl Bodies {
         Self {
             budget,
             declared: HashSet::new(),
+            printed: Printed::default(),
             overflowed: false,
         }
+    }
+
+    /// Whether the reply already shows `declaration`, whole or windowed.
+    fn shows(&self, declaration: &Located) -> bool {
+        self.declared.contains(&declaration.definition().id) || self.printed.holds(declaration)
     }
 }
 
@@ -843,13 +1067,15 @@ fn plan_bodies<'a>(
     blocks
 }
 
-/// Print `block` window by window while the budget lasts and return the last
-/// line printed, 0 when nothing fit. `tail` is the body line printed just
-/// above under the same file header, if any. Hit lines are the keys of
-/// `notes` and end in `>`; every other line ends in `:`.
+/// Print `block` of the file shown as `path` window by window while the
+/// budget lasts and return the last line printed, 0 when nothing fit. `tail`
+/// is the body line printed just above under the same file header, if any.
+/// Hit lines are the keys of `notes` and end in `>`; every other line ends
+/// in `:`.
 fn print_body(
     out: &mut String,
     bodies: &mut Bodies,
+    path: &str,
     lines: &[&str],
     block: &Block<'_>,
     notes: &BTreeMap<u32, &str>,
@@ -873,6 +1099,7 @@ fn print_body(
             break;
         }
         bodies.budget -= cost;
+        bodies.printed.add(path, first, last);
         if let Some((definition, first, last, note)) = title {
             bodies.declared.insert(definition.id);
             let _ = writeln!(out, "  == {} {first}-{last}{note}", definition.qualified);
@@ -929,7 +1156,7 @@ fn list_bodies<'r, 'c>(
     let hits = by_line.keys().copied().collect::<Vec<_>>();
     let mut tail = 0;
     for block in plan_bodies(&lines, definitions, &hits) {
-        let end = print_body(out, bodies, &lines, &block, &notes, tail);
+        let end = print_body(out, bodies, &file.path, &lines, &block, &notes, tail);
         tail = end;
         for row in block
             .hits
@@ -987,10 +1214,48 @@ fn definition_body(
         .iter()
         .map(|(line, note)| (*line, note.as_str()))
         .collect();
-    let end = print_body(out, bodies, &lines, &block, &notes, 0);
+    let end = print_body(out, bodies, &file.path, &lines, &block, &notes, 0);
     let mut printed = block.windows;
     printed.retain(|window| window.1 <= end);
     printed
+}
+
+/// After the references: the declarations `owner` uses that the reply does
+/// not show yet. Each is printed whole under its file while it is short and
+/// the budget lasts; otherwise one row says where to read it.
+fn list_used(out: &mut String, bodies: &mut Bodies, owner: &str, used: &[Located]) {
+    let (mut titled, mut header) = (false, None);
+    for target in used {
+        if bodies.shows(target) {
+            continue;
+        }
+        if !titled {
+            let _ = writeln!(out, "{owner} uses:");
+            titled = true;
+        }
+        let mut body = String::new();
+        if target.last - target.first < WHOLE_USED_LINES {
+            let block = Block {
+                declaration: Some((target.definition(), target.first, target.last, target.note)),
+                windows: vec![(target.first, target.last)],
+                hits: Vec::new(),
+            };
+            let lines = target.home.text.lines().collect::<Vec<_>>();
+            let notes = BTreeMap::new();
+            print_body(&mut body, bodies, target.path(), &lines, &block, &notes, 0);
+            bodies.overflowed |= body.is_empty();
+        }
+        if body.is_empty() {
+            out.push_str(&target.pointer());
+            header = None;
+            continue;
+        }
+        if header != Some(target.path()) {
+            let _ = writeln!(out, "{}", target.path());
+            header = Some(target.path());
+        }
+        out.push_str(&body);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1242,6 +1507,35 @@ fn refs_with_index(
     if reported > limit {
         let _ = writeln!(out, "  ... {} more definitions", reported - limit);
     }
+    // What each definition uses is printed after the references. Both spend
+    // what the definitions left of the budget: the references their share of
+    // it, and more when the used declarations do not want all of the rest.
+    let mut used = Vec::new();
+    let mut reserved = 0;
+    if reported <= DEFINITION_BODIES
+        && let Some(bodies) = bodies.as_deref_mut()
+    {
+        for candidate in candidates
+            .iter()
+            .filter(|candidate| candidate.wanted)
+            .take(limit)
+        {
+            if let Some(owner) = index.locate(root, candidate.id) {
+                let targets = used_by(&mut index, root, &owner, USED_DECLARATIONS, |target| {
+                    bodies.shows(target)
+                });
+                used.push((candidate.qualified.as_str(), targets));
+            }
+        }
+        let wanted = used
+            .iter()
+            .flat_map(|(_, targets)| targets)
+            .filter(|target| target.last - target.first < WHOLE_USED_LINES)
+            .map(|target| (target.last - target.first) as usize + 2)
+            .sum::<usize>();
+        reserved = wanted.min(bodies.budget - bodies.budget * REFERENCE_SHARE / 100);
+        bodies.budget -= reserved;
+    }
     let _ = writeln!(out, "{references} references in {reference_files} files");
 
     let hidden = |position: usize, line: u32| {
@@ -1300,6 +1594,12 @@ fn refs_with_index(
             out,
             "{omitted_hits} hit(s) omitted: the index resolved them to other definitions of {last}"
         );
+    }
+    if let Some(bodies) = bodies {
+        bodies.budget += reserved;
+        for (owner, targets) in &used {
+            list_used(&mut out, bodies, owner, targets);
+        }
     }
     out
 }
@@ -1458,13 +1758,15 @@ fn parse_selector(selector: &str) -> Option<(&str, Target<'_>)> {
 struct Page<'a> {
     path: &'a str,
     lines: &'a [&'a str],
+    /// The lines the reply has printed so far.
+    printed: &'a mut Printed,
 }
 
 impl Page<'_> {
     /// Print `first..=last` under a header, up to `budget` lines, and name the
     /// range that continues when the budget cuts it.
     fn block(
-        &self,
+        &mut self,
         out: &mut String,
         budget: &mut usize,
         first: u32,
@@ -1474,8 +1776,11 @@ impl Page<'_> {
     ) {
         let path = self.path;
         let _ = writeln!(out, "== {path}:{first}-{last}{title}{note}");
+        let shown = ((last + 1 - first) as usize).min(*budget);
+        if shown > 0 {
+            self.printed.add(path, first, first + shown as u32 - 1);
+        }
         let (first, last) = (first as usize, last as usize);
-        let shown = (last + 1 - first).min(*budget);
         *budget -= shown;
         for (offset, code) in self.lines[first - 1..][..shown].iter().enumerate() {
             let _ = write!(out, "{}:", first + offset);
@@ -1495,7 +1800,7 @@ impl Page<'_> {
     }
 
     /// Print a definition over the lines it spans.
-    fn declaration(&self, out: &mut String, budget: &mut usize, definition: &Definition) {
+    fn declaration(&mut self, out: &mut String, budget: &mut usize, definition: &Definition) {
         if let Some((first, last, note)) = declared_range(self.lines, definition) {
             let title = format!(" {}", definition.qualified);
             self.block(out, budget, first, last, &title, note);
@@ -1507,7 +1812,12 @@ impl Page<'_> {
     /// describes these bytes, else from the lines that start a declaration
     /// and open a block. Either way a local binding is not a row. A file with
     /// nothing to outline is read from the top.
-    fn outline(&self, out: &mut String, budget: &mut usize, definitions: Option<&[Definition]>) {
+    fn outline(
+        &mut self,
+        out: &mut String,
+        budget: &mut usize,
+        definitions: Option<&[Definition]>,
+    ) {
         let (path, lines) = (self.path, self.lines);
         let mut rows = match definitions {
             Some(definitions) => definitions
@@ -1553,7 +1863,39 @@ impl Page<'_> {
     }
 }
 
-fn read_selector(out: &mut String, root: &Path, index: Option<&mut Index<'_>>, selector: &str) {
+/// Under a declaration just read: where the declarations it uses are, one
+/// row each, leaving out what the reply has already printed.
+fn list_used_pointers(
+    out: &mut String,
+    root: &Path,
+    index: Option<&mut Index<'_>>,
+    printed: &Printed,
+    definition: &Definition,
+) {
+    let Some(index) = index else {
+        return;
+    };
+    let Some(owner) = index.locate(root, definition.id) else {
+        return;
+    };
+    let used = used_by(index, root, &owner, USED_POINTERS, |target| {
+        printed.holds(target)
+    });
+    if !used.is_empty() {
+        out.push_str("uses:\n");
+    }
+    for target in &used {
+        out.push_str(&target.pointer());
+    }
+}
+
+fn read_selector(
+    out: &mut String,
+    root: &Path,
+    mut index: Option<&mut Index<'_>>,
+    printed: &mut Printed,
+    selector: &str,
+) {
     let Some((path, target)) = parse_selector(selector) else {
         let _ = writeln!(
             out,
@@ -1572,29 +1914,22 @@ fn read_selector(out: &mut String, root: &Path, index: Option<&mut Index<'_>>, s
             return;
         }
     };
-    let mut bytes = Vec::new();
-    if !read_live_text(&absolute, &mut bytes) {
+    let Some((file, bytes)) = open_live(root, absolute) else {
         let _ = writeln!(
             out,
             "== {selector}: {path} is unreadable, binary or larger than 4 MB"
         );
         return;
-    }
-    let file = LiveFile {
-        path: project_path(root, &absolute),
-        absolute,
-        sha256: sha256_hex(&bytes),
-        hit_lines: Vec::new(),
-        kept: Vec::new(),
     };
     let text = String::from_utf8_lossy(&bytes);
     let lines = text.lines().collect::<Vec<_>>();
     let count = lines.len() as u32;
-    let page = Page {
+    let mut page = Page {
         path: &file.path,
         lines: &lines,
+        printed,
     };
-    let definitions = index.and_then(|index| index.serve(&file).1);
+    let definitions = index.as_deref_mut().and_then(|index| index.serve(&file).1);
     let mut budget = READ_LINE_CAP;
     let mut approximate_budget = APPROXIMATE_LINE_CAP;
     let outside = |out: &mut String| {
@@ -1609,7 +1944,10 @@ fn read_selector(out: &mut String, root: &Path, index: Option<&mut Index<'_>>, s
                 .as_deref()
                 .and_then(|definitions| enclosing_scope(definitions, line))
             {
-                Some(definition) => page.declaration(out, &mut budget, definition),
+                Some(definition) => {
+                    page.declaration(out, &mut budget, definition);
+                    list_used_pointers(out, root, index, page.printed, definition);
+                }
                 None => page.block(
                     out,
                     &mut approximate_budget,
@@ -1623,7 +1961,7 @@ fn read_selector(out: &mut String, root: &Path, index: Option<&mut Index<'_>>, s
         Target::File if count > WHOLE_FILE_LINES => {
             page.outline(out, &mut budget, definitions.as_deref().map(Vec::as_slice));
         }
-        Target::File if count >= 1 => page.block(out, &mut budget, 1, count, "", ""),
+        Target::File if count >= 1 => page.block(out, &mut (count as usize), 1, count, "", ""),
         Target::Range(..) | Target::Line(_) | Target::File => outside(out),
         Target::Symbol(symbol) => {
             let wanted = name_segments(symbol);
@@ -1649,6 +1987,13 @@ fn read_selector(out: &mut String, root: &Path, index: Option<&mut Index<'_>>, s
                     }
                     for definition in &found {
                         page.declaration(out, &mut budget, definition);
+                        list_used_pointers(
+                            out,
+                            root,
+                            index.as_deref_mut(),
+                            page.printed,
+                            definition,
+                        );
                     }
                     if found.is_empty() {
                         let mut known = definitions

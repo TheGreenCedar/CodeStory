@@ -96,7 +96,7 @@ pub(crate) enum Command {
         long_about = "Find literal text in the live source tree.\n\n\
             Reads the files ripgrep would search, at call time. Each hit is shown under its \
             file inside its enclosing declaration (`== <name> <start>-<end>`, hit lines end in \
-            `>`); a declaration over 60 lines is cut to a few lines around each hit. The \
+            `>`); a declaration over 150 lines is cut to a few lines around each hit. The \
             declaration is shown only when the file's current bytes match the index; a file \
             that changed since indexing or was never indexed is marked and shown as a few lines \
             of plain text around each hit. Hits past --body-lines, and every hit with \
@@ -111,7 +111,12 @@ pub(crate) enum Command {
             declarations when there are at most three; the listing has every other mention, \
             shown and marked like `find`. With several definitions, ` -> <path>:<line>` names \
             the one a line resolves to. A qualifier omits the mentions the index resolved to \
-            another definition and reports how many. Nothing is refreshed."
+            another definition and reports how many. With at most three definitions, \
+            `<name> uses:` then follows the references for each one: the declarations it \
+            references that are not shown above, whole when they have at most 80 lines and \
+            fit --body-lines, else as a `<path>:<start>-<end> <kind> <name>` row. Only \
+            references the index resolved with certainty into files whose current bytes match \
+            it are followed. Nothing is refreshed."
     )]
     Refs(RefsCommand),
     #[command(about = "Run a repeatable grounding quality check.")]
@@ -141,10 +146,12 @@ pub(crate) enum Command {
         long_about = "Read a file or declarations by path, path::Symbol, path:LINE or \
             path:A-B.\n\n\
             Several selectors can be read in one call; one that cannot be served gets its own \
-            line. A bare path prints a file of up to 250 lines whole and outlines the \
+            line. A bare path prints a file of up to 400 lines whole and outlines the \
             declarations of a longer one. A range comes from the index when the file's current \
-            bytes match it; otherwise it is approximated from the live text and marked. Nothing \
-            is refreshed."
+            bytes match it; otherwise it is approximated from the live text and marked. A \
+            declaration read by path::Symbol or path:LINE from such a file is followed by \
+            `uses:` and a `<path>:<start>-<end> <kind> <name>` row for each declaration it \
+            references with certainty. Nothing is refreshed."
     )]
     Read(ReadCommand),
     #[command(about = "Run structured graph queries.")]

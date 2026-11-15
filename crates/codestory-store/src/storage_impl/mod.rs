@@ -14998,6 +14998,24 @@ impl Storage {
             show_utility_calls,
         )
     }
+
+    /// Get direct outgoing edges for a node using the same filters as trail traversal.
+    pub fn get_outgoing_edges_for_node_id(
+        &self,
+        node_id: NodeId,
+        edge_filter: &[EdgeKind],
+        caller_scope: TrailCallerScope,
+        show_utility_calls: bool,
+    ) -> Result<Vec<Edge>, StorageError> {
+        trail::get_edges_for_node(
+            self,
+            node_id,
+            &TrailDirection::Outgoing,
+            edge_filter,
+            caller_scope,
+            show_utility_calls,
+        )
+    }
 }
 
 fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
