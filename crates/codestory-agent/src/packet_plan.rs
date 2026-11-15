@@ -19,9 +19,9 @@ const GENERIC_RETRIEVAL_PURPOSE: &str =
     "unchanged question for generic lexical and semantic retrieval";
 const TYPED_FREE_QUERY_PURPOSE: &str = "typed free-query retrieval seed";
 
-/// Keep the whole query, its first slash-text atom, then literal paragraphs and
-/// sentences within the existing bound. All views have generic retrieval
-/// authority; slash text does not identify a filesystem path or a graph node.
+/// Keep the whole query, its first slash-text atom, up to two inline code atoms,
+/// then literal paragraphs and sentences. All views have generic retrieval
+/// authority.
 pub fn generic_retrieval_queries(question: &str) -> Vec<&str> {
     const MAX_SUPPLEMENTAL_QUERIES: usize = 7;
     let whole = question.trim();
@@ -29,11 +29,9 @@ pub fn generic_retrieval_queries(question: &str) -> Vec<&str> {
         return Vec::new();
     }
     let mut queries = vec![whole];
-    if let Some(literal) = first_slash_text_literal(question)
-        && !whole.eq_ignore_ascii_case(literal)
-    {
-        queries.push(literal);
-    }
+    let (slash, inline_atoms) = literal_retrieval_atoms(question);
+    queries.extend(slash.filter(|literal| !whole.eq_ignore_ascii_case(literal)));
+    queries.extend(inline_atoms);
     let paragraph_cap = MAX_SUPPLEMENTAL_QUERIES - (queries.len() - 1);
     let paragraph_count = literal_paragraphs(question).count();
     let count = paragraph_count.min(paragraph_cap);
@@ -88,13 +86,18 @@ pub fn generic_retrieval_queries(question: &str) -> Vec<&str> {
 
 // Syntax alone chooses a fallible text view, including negated/incidental text.
 // Quoted spans and fences must close before their contents can be considered.
-fn first_slash_text_literal(question: &str) -> Option<&str> {
+fn literal_retrieval_atoms(question: &str) -> (Option<&str>, Vec<&str>) {
+    const MAX_INLINE_ATOMS: usize = 2;
+    let mut slash = None;
+    let mut inline_atoms: Vec<&str> = Vec::new();
     let mut chars = question.char_indices().peekable();
     let mut fence = None;
     let mut wrapper = None;
     let mut escaped = false;
     let mut line_prefix = true;
-    while let Some((index, character)) = chars.next() {
+    while (slash.is_none() || inline_atoms.len() < MAX_INLINE_ATOMS)
+        && let Some((index, character)) = chars.next()
+    {
         let at_line_prefix = line_prefix;
         // Track prefix eligibility once per character, including inside fences.
         line_prefix = character == '\n'
@@ -102,11 +105,23 @@ fn first_slash_text_literal(question: &str) -> Option<&str> {
                 && (character.is_whitespace()
                     || character.is_ascii_digit()
                     || matches!(character, '>' | '-' | '+' | '*' | '.' | ')')));
+        // Escaping an opener consumes only the first backtick of its run.
+        if character == '`'
+            && wrapper.is_none()
+            && fence.is_none()
+            && !question.as_bytes()[..index]
+                .iter()
+                .rev()
+                .take_while(|&&byte| byte == b'\\')
+                .count()
+                .is_multiple_of(2)
+        {
+            continue;
+        }
         let mut run = 1;
         let mut end = index + character.len_utf8();
         if matches!(character, '`' | '~') {
-            while chars.peek().is_some_and(|(_, next)| *next == character) {
-                let (index, next) = chars.next()?;
+            while let Some((index, next)) = chars.next_if(|(_, next)| *next == character) {
                 run += 1;
                 end = index + next.len_utf8();
             }
@@ -115,7 +130,10 @@ fn first_slash_text_literal(question: &str) -> Option<&str> {
             if character == delimiter
                 && run >= length
                 && at_line_prefix
-                && question[end..].split('\n').next()?.trim().is_empty()
+                && question[end..]
+                    .lines()
+                    .next()
+                    .is_none_or(|line| line.trim().is_empty())
             {
                 fence = None;
             }
@@ -128,8 +146,16 @@ fn first_slash_text_literal(question: &str) -> Option<&str> {
                 escaped = true;
             } else if character == delimiter && run == length {
                 let atom = &question[start..index];
-                if slash_text_atom(atom) {
-                    return Some(atom);
+                if slash.is_none() && slash_text_atom(atom) {
+                    slash = Some(atom);
+                } else if delimiter == '`'
+                    && inline_atoms.len() < MAX_INLINE_ATOMS
+                    && inline_code_atom(atom)
+                    && !inline_atoms
+                        .iter()
+                        .any(|prior| prior.eq_ignore_ascii_case(atom))
+                {
+                    inline_atoms.push(atom);
                 }
                 wrapper = None;
             }
@@ -197,11 +223,35 @@ fn first_slash_text_literal(question: &str) -> Option<&str> {
             atom = atom[..atom.len() - close.len_utf8()]
                 .trim_end_matches(['.', ',', ';', ':', '!', '?']);
         }
-        if !atom.contains(['\'', '"', '`']) && slash_text_atom(atom) {
-            return Some(atom);
+        if slash.is_none() && !atom.contains(['\'', '"', '`']) && slash_text_atom(atom) {
+            slash = Some(atom);
         }
     }
-    None
+    (slash, inline_atoms)
+}
+
+fn inline_code_atom(atom: &str) -> bool {
+    if atom.chars().count() > PACKET_PROBE_MAX_TEXT_LENGTH {
+        return false;
+    }
+    if let Some(option) = atom.strip_prefix("--") {
+        return option.starts_with(|character: char| character.is_ascii_alphabetic())
+            && option.split('-').all(|part| {
+                !part.is_empty()
+                    && part
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            });
+    }
+    atom.split('.')
+        .flat_map(|part| part.split("::"))
+        .all(|part| {
+            let mut chars = part.chars();
+            chars
+                .next()
+                .is_some_and(|first| first == '_' || first.is_alphabetic())
+                && chars.all(|character| character == '_' || character.is_alphanumeric())
+        })
 }
 
 fn has_single_token_backtick_close(tail: &str, length: usize) -> bool {
@@ -681,6 +731,71 @@ mod tests {
     }
 
     #[test]
+    fn inline_code_views_are_bounded_generic_retrieval_queries() {
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "Inspect `DeltaStream` and `--stable-order`.\n\nInclude the check.",
+                &["DeltaStream", "--stable-order"],
+            ),
+            (
+                "Ignore `Δelta.Run`, `Delta::Send` and `third`, then /Archive.",
+                &["/Archive", "Δelta.Run", "Delta::Send"],
+            ),
+            (
+                "Inspect `Status` then `status`, ``_valid2`` and `third`.",
+                &["Status", "_valid2"],
+            ),
+            (
+                r#"Text "`hidden`" and '`also_hidden`'. Consider `visible`."#,
+                &["visible"],
+            ),
+            (r#"Ignore \`Decoy and inspect `Target`."#, &["Target"]),
+            (r#"Inspect \\`EvenTarget`."#, &["EvenTarget"]),
+            (
+                "Inspect `42`, `3.14`, `https://example.invalid/a`, `node:99`, `src/local.rs`, `one..two`, `---bad`, `--flag=value`, `two words` and `half.",
+                &[],
+            ),
+            (
+                "Opening line.\r\n> 1. ````text\r\n> `hidden`\r\n> ```\r\n> `still_hidden`\r\n> ````\r\n~~~text\n`also_hidden`\n~~~\nAfter `visible`.",
+                &["visible"],
+            ),
+        ];
+        for &(question, expected_atoms) in cases {
+            let seed = build_retrieval_seed_plan(question, &[]);
+            assert_eq!(seed.generic_query, question);
+            assert!(seed.exact_selectors.is_empty() && seed.free_queries.is_empty());
+            let plan = build_packet_plan_from_seed_plan(&seed, PacketBudgetModeDto::Standard);
+            let queries = plan
+                .queries
+                .iter()
+                .map(|query| query.query.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(queries[0], question.trim());
+            let atoms = queries
+                .iter()
+                .copied()
+                .skip(1)
+                .filter(|query| !query.contains(char::is_whitespace))
+                .collect::<Vec<_>>();
+            assert_eq!(atoms, expected_atoms, "{question}");
+            assert!(queries.len() <= 8 && queries.iter().all(|query| question.contains(query)));
+            assert!(
+                plan.queries
+                    .iter()
+                    .all(|query| !packet_plan_query_is_typed_free_query(query))
+            );
+        }
+
+        let oversized = "界".repeat(PACKET_PROBE_MAX_TEXT_LENGTH + 1);
+        let limit = "界".repeat(PACKET_PROBE_MAX_TEXT_LENGTH);
+        let question = format!("Inspect `{oversized}` and `{limit}`.");
+        assert_eq!(
+            generic_retrieval_queries(&question),
+            [question.as_str(), limit.as_str()]
+        );
+    }
+
+    #[test]
     fn sentence_views_preserve_whole_paragraph_order_and_literal_unicode() {
         let question = "背景 café first. 質問 second?\r\n\r\nвопрос third! End fourth.";
         let queries = generic_retrieval_queries(question);
@@ -944,7 +1059,9 @@ mod tests {
                 .iter()
                 .any(|query| query.query == "caller supplied concept")
         );
-        assert_eq!(plan.queries.len(), 2);
+        assert_eq!(plan.queries.len(), 3);
+        assert_eq!(plan.queries[1].query, "poison::run");
+        assert!(!packet_plan_query_is_typed_free_query(&plan.queries[1]));
         assert!(
             !seed_plan
                 .exact_selectors
@@ -955,15 +1072,18 @@ mod tests {
 
     #[test]
     fn supplemental_views_preserve_all_legal_typed_queries_in_tiny_plans() {
-        let question = "First. Second. Third. Fourth. Fifth. Sixth. Seventh.";
+        let question =
+            "First `Module`. Second `--bound`. Third /Route. Fourth. Fifth. Sixth. Seventh.";
         let free_queries = (0..16)
             .map(|index| format!("explicit input {index}"))
             .collect::<Vec<_>>();
         let plan = build_packet_plan_with_extra(question, PacketBudgetModeDto::Tiny, &free_queries);
         assert_eq!(plan.queries[0].query, question);
         assert_eq!(packet_explicit_request_probe_queries(&plan), free_queries);
-        assert!(plan.queries.len() <= 20);
-        assert!(plan.queries.iter().any(|query| query.query == "First."));
+        assert_eq!(plan.queries.len(), 20);
+        assert_eq!(plan.queries[1].query, "/Route");
+        assert_eq!(plan.queries[2].query, "Module");
+        assert_eq!(plan.queries[3].query, "--bound");
     }
 
     #[test]
@@ -1070,12 +1190,13 @@ Inspect `src/real.rs`, `node:42`, and `crate::real`.
             }],
         );
         let mut plan = build_packet_plan_from_seed_plan(&seed, PacketBudgetModeDto::Standard);
-        assert_eq!(plan.queries.len(), 2);
+        assert_eq!(plan.queries.len(), 3);
         assert_eq!(plan.queries[0].query, question);
-        assert_eq!(plan.queries[1].query, question);
-        assert_ne!(plan.queries[0].purpose, plan.queries[1].purpose);
+        assert_eq!(plan.queries[1].query, "absent");
+        assert_eq!(plan.queries[2].query, question);
+        assert_ne!(plan.queries[0].purpose, plan.queries[2].purpose);
         dedupe_packet_plan_queries(&mut plan);
-        assert_eq!(plan.queries.len(), 2);
+        assert_eq!(plan.queries.len(), 3);
         assert!(seed.exact_selectors.is_empty());
     }
 
