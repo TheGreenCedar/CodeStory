@@ -2090,16 +2090,23 @@ mod tests {
             codestory_contracts::api::PacketBudgetModeDto::Standard,
         );
         let queries = packet_retrieval_queries(&plan);
-        assert_eq!(queries.len(), 2);
-        assert_eq!(queries[0].query, seed.generic_query);
-        assert_eq!(queries[1].query, seed.generic_query);
+        let policies_for = |text: &str| {
+            queries
+                .iter()
+                .filter(|query| query.query == text)
+                .map(|query| query.lexical_policy)
+                .collect::<Vec<_>>()
+        };
         assert_eq!(
-            queries[0].lexical_policy,
-            LexicalAdmissionPolicy::BroadQuestionV1
+            policies_for(&seed.generic_query),
+            [
+                LexicalAdmissionPolicy::BroadQuestionV1,
+                LexicalAdmissionPolicy::StrictLiteralV1,
+            ]
         );
         assert_eq!(
-            queries[1].lexical_policy,
-            LexicalAdmissionPolicy::StrictLiteralV1
+            policies_for("absent"),
+            [LexicalAdmissionPolicy::BroadQuestionV1]
         );
     }
 
