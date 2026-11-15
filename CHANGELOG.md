@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- `find`, `refs` and `read` answer from the current source in about the time of a text search, whatever the size of the repository. `find` and `refs` list every match grouped by file and name the enclosing function when the file still matches the index; files that changed or were never indexed are listed as plain text. `refs` lists every definition of an ambiguous name. `read` returns complete numbered declarations for several `path::Symbol`, `path:LINE` or `path:A-B` selectors in one call.
+- `find`, `refs` and `read` answer from the current source in about the time of a text search, whatever the size of the repository. `find` and `refs` list every match grouped by file and name the enclosing function when the file still matches the index; files that changed or were never indexed are listed as plain text. `refs` lists every definition of an ambiguous name. Both include the enclosing declarations of their matches within a line budget, so one reply usually carries the code to read next; `--no-bodies` keeps the compact listing. `read` returns complete numbered declarations for several `path::Symbol`, `path:LINE` or `path:A-B` selectors in one call, and for a bare path prints a small file whole or an outline of a large one.
 
 - `callers` and `references` print source lines grouped by the calling symbol.
 

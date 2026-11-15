@@ -94,19 +94,24 @@ pub(crate) enum Command {
     #[command(
         about = "Find literal text in the live source tree.",
         long_about = "Find literal text in the live source tree.\n\n\
-            Reads the files ripgrep would search, at call time. Each hit is listed under its \
-            file as `<line> [enclosing definition] <code>`. The definition is shown only when \
-            the file's current bytes match the index; a file that changed since indexing or was \
-            never indexed is marked and listed as plain text. Nothing is refreshed."
+            Reads the files ripgrep would search, at call time. Each hit is shown under its \
+            file inside its enclosing declaration (`== <name> <start>-<end>`, hit lines end in \
+            `>`); a declaration over 60 lines is cut to a few lines around each hit. The \
+            declaration is shown only when the file's current bytes match the index; a file \
+            that changed since indexing or was never indexed is marked and shown as a few lines \
+            of plain text around each hit. Hits past --body-lines, and every hit with \
+            --no-bodies, are listed as `<line> [enclosing definition] <code>`. Nothing is \
+            refreshed."
     )]
     Find(FindCommand),
     #[command(
         about = "List every whole-word mention of a name in the live source tree.",
         long_about = "List every whole-word mention of a name in the live source tree.\n\n\
-            The header lists the definitions the index records for the name; the listing has \
-            every mention, marked like `find`. With several definitions, ` -> <path>:<line>` \
-            names the one a line resolves to. A qualifier omits the mentions the index resolved \
-            to another definition and reports how many. Nothing is refreshed."
+            The header lists the definitions the index records for the name, with their \
+            declarations when there are at most three; the listing has every other mention, \
+            shown and marked like `find`. With several definitions, ` -> <path>:<line>` names \
+            the one a line resolves to. A qualifier omits the mentions the index resolved to \
+            another definition and reports how many. Nothing is refreshed."
     )]
     Refs(RefsCommand),
     #[command(about = "Run a repeatable grounding quality check.")]
@@ -132,11 +137,14 @@ pub(crate) enum Command {
     #[command(about = "Show source around a symbol.")]
     Snippet(SnippetCommand),
     #[command(
-        about = "Read declarations by path::Symbol, path:LINE or path:A-B.",
-        long_about = "Read declarations by path::Symbol, path:LINE or path:A-B.\n\n\
+        about = "Read a file or declarations by path, path::Symbol, path:LINE or path:A-B.",
+        long_about = "Read a file or declarations by path, path::Symbol, path:LINE or \
+            path:A-B.\n\n\
             Several selectors can be read in one call; one that cannot be served gets its own \
-            line. A range comes from the index when the file's current bytes match it; otherwise \
-            it is approximated from the live text and marked. Nothing is refreshed."
+            line. A bare path prints a file of up to 250 lines whole and outlines the \
+            declarations of a longer one. A range comes from the index when the file's current \
+            bytes match it; otherwise it is approximated from the live text and marked. Nothing \
+            is refreshed."
     )]
     Read(ReadCommand),
     #[command(about = "Run structured graph queries.")]
@@ -1267,6 +1275,31 @@ pub(crate) struct FindCommand {
         help = "Lines to list before the remaining matches are only counted per file."
     )]
     pub(crate) limit: usize,
+    #[command(flatten)]
+    pub(crate) bodies: BodyArgs,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct BodyArgs {
+    #[arg(
+        long,
+        help = "List one line per hit, without declaration bodies or context."
+    )]
+    pub(crate) no_bodies: bool,
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = codestory_runtime::served_lookup::DEFAULT_BODY_LINES,
+        help = "Lines of declaration bodies and context to print before hits are listed one line each."
+    )]
+    pub(crate) body_lines: usize,
+}
+
+impl BodyArgs {
+    /// The body budget, or `None` for the one-line listing.
+    pub(crate) fn budget(&self) -> Option<usize> {
+        (!self.no_bodies).then_some(self.body_lines)
+    }
 }
 
 #[derive(Args, Debug)]
@@ -1285,6 +1318,8 @@ pub(crate) struct RefsCommand {
         help = "Lines to list before the remaining references are only counted per file."
     )]
     pub(crate) limit: usize,
+    #[command(flatten)]
+    pub(crate) bodies: BodyArgs,
 }
 
 #[derive(Args, Debug)]
@@ -1294,7 +1329,8 @@ pub(crate) struct ReadCommand {
     #[arg(
         required = true,
         value_name = "SELECTOR",
-        help = "path::Symbol, path:LINE (the declaration around that line) or path:A-B."
+        help = "path (the file, or its outline when long), path::Symbol, path:LINE (the \
+            declaration around that line) or path:A-B."
     )]
     pub(crate) selectors: Vec<String>,
 }

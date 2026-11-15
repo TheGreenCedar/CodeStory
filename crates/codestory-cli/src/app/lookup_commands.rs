@@ -20,6 +20,7 @@ pub(super) fn run_find(cmd: FindCommand) -> Result<()> {
         &cmd.terms,
         &cmd.file_globs,
         cmd.limit,
+        cmd.bodies.budget(),
     ))
 }
 
@@ -30,6 +31,7 @@ pub(super) fn run_refs(cmd: RefsCommand) -> Result<()> {
         &runtime.storage_path,
         &cmd.name,
         cmd.limit,
+        cmd.bodies.budget(),
     ))
 }
 

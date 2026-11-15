@@ -8,6 +8,11 @@
 //! in the pinned complete core publication. A file that changed since
 //! indexing, or was never indexed, is still served as plain text and marked.
 //!
+//! `find` and `refs` show each hit inside its enclosing declaration, or inside
+//! a few lines of context where the index has none to offer, so the reply
+//! carries the code a reader would open next. A line budget bounds that; hits
+//! past it stay one line each.
+//!
 //! Nothing here refreshes or activates an index, checks whole-tree freshness,
 //! or writes: the store is opened observationally and a missing or unreadable
 //! publication degrades the reply to text only.
@@ -19,7 +24,8 @@ use codestory_contracts::graph::{
 use codestory_store::{StorageError, Store};
 use codestory_workspace::ProjectRelativePathResolution;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -28,32 +34,48 @@ use std::sync::{Mutex, PoisonError};
 
 /// Hit lines one `find` or `refs` reply lists before it switches to counts.
 pub const DEFAULT_LIMIT: usize = 150;
+/// Lines one `find` or `refs` reply spends on declaration bodies and context,
+/// counting their `==` headers and `...` gap marks.
+pub const DEFAULT_BODY_LINES: usize = 220;
 
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const BINARY_PROBE_BYTES: usize = 1024;
 const MAX_CODE_CHARS: usize = 200;
 const READ_LINE_CAP: usize = 300;
 const APPROXIMATE_LINE_CAP: usize = 80;
+/// A declaration up to this long is shown whole; a longer one is windowed.
+const WHOLE_DECLARATION_LINES: u32 = 60;
+/// Lines shown on each side of a hit inside a windowed declaration.
+const DECLARATION_WINDOW: u32 = 6;
+/// Lines shown on each side of a hit that has no verified declaration.
+const TEXT_WINDOW: u32 = 3;
+/// `refs` leads with the declarations of the name when there are this few.
+const DEFINITION_BODIES: usize = 3;
+/// `read <path>` prints a file up to this long whole, and outlines a longer one.
+const WHOLE_FILE_LINES: u32 = 250;
 /// Hit files past the listed ones that `refs` still checks for definitions,
 /// so a small `--limit` does not hide where the name is defined.
 const DEFINITION_SEARCH_FILES: usize = 1_000;
 const NO_INDEX: &str = "no index; text matches only";
 const APPROXIMATE: &str = " (not from index; approximate)";
 /// Words that introduce a declaration, for the text-only range fallback.
-const DECLARATION_WORDS: &str = "abstract class const def define enum export extern final fn fun \
-    func function impl inline interface let macro_rules! mod module namespace object override \
+const DECLARATION_WORDS: &str = "abstract async class const def define enum export extern final fn \
+    fun func function impl inline interface let macro_rules! mod module namespace object override \
     package private proc protected pub public record static struct sub trait type typedef union \
     val var virtual void";
 
 /// Literal, case-sensitive text search over the live tree; any term matches.
 ///
-/// With no terms, lists the live paths selected by `file_globs`.
+/// With no terms, lists the live paths selected by `file_globs`. `body_lines`
+/// is the budget for declaration bodies and context; `None` lists one line
+/// per hit.
 pub fn find(
     root: &Path,
     storage_path: &Path,
     terms: &[String],
     file_globs: &[String],
     limit: usize,
+    body_lines: Option<usize>,
 ) -> Result<String, ApiError> {
     if terms
         .iter()
@@ -89,19 +111,24 @@ pub fn find(
         }
         let total = files.iter().map(|file| file.hit_lines.len()).sum::<usize>();
         let _ = writeln!(out, "{total} matches in {} files", files.len());
-        list_hits(&mut out, &files, limit, index.as_mut());
+        let mut bodies = body_lines.map(Bodies::new);
+        list_hits(&mut out, &files, limit, index.as_mut(), bodies.as_mut());
+        finish_bodies(&mut out, bodies);
         out
     }))
 }
 
 /// Every whole-word mention of `name` (or of the last segment of
 /// `Qualifier::Name` / `Qualifier.Name`), with the definitions the index
-/// records for it in files whose live bytes it still describes.
+/// records for it in files whose live bytes it still describes. `body_lines`
+/// is the budget for declaration bodies and context; `None` lists one line
+/// per hit.
 pub fn refs(
     root: &Path,
     storage_path: &Path,
     name: &str,
     limit: usize,
+    body_lines: Option<usize>,
 ) -> Result<String, ApiError> {
     let wanted = name_segments(name);
     let Some(last) = wanted
@@ -114,20 +141,28 @@ pub fn refs(
         ));
     };
     let files = scan_live_tree(root, &[], &[last.as_bytes()], true, limit)?;
-    Ok(with_pinned_index(storage_path, |store| match store {
-        Some(store) => refs_with_index(root, store, name, &wanted, &files, limit),
-        None => {
-            let total = files.iter().map(|file| file.hit_lines.len()).sum::<usize>();
-            let mut out = format!("{NO_INDEX}\n{total} references in {} files\n", files.len());
-            list_hits(&mut out, &files, limit, None);
-            out
-        }
+    Ok(with_pinned_index(storage_path, |store| {
+        let mut bodies = body_lines.map(Bodies::new);
+        let mut out = match store {
+            Some(store) => {
+                refs_with_index(root, store, name, &wanted, &files, limit, bodies.as_mut())
+            }
+            None => {
+                let total = files.iter().map(|file| file.hit_lines.len()).sum::<usize>();
+                let mut out = format!("{NO_INDEX}\n{total} references in {} files\n", files.len());
+                list_hits(&mut out, &files, limit, None, bodies.as_mut());
+                out
+            }
+        };
+        finish_bodies(&mut out, bodies);
+        out
     }))
 }
 
 /// Complete declarations for a batch of selectors: `path::Symbol`,
-/// `path:LINE` or `path:A-B`. A selector that cannot be served gets its own
-/// `==` line and never fails the batch.
+/// `path:LINE` or `path:A-B`. A bare `path` is the whole file when it is
+/// short, else an outline of its declarations. A selector that cannot be
+/// served gets its own `==` line and never fails the batch.
 pub fn read(root: &Path, storage_path: &Path, selectors: &[String]) -> Result<String, ApiError> {
     if selectors.is_empty() {
         return Err(ApiError::invalid_argument(
@@ -409,12 +444,22 @@ fn printable(text: &str) -> String {
 
 /// One listed code line: trimmed and bounded.
 fn code_cell(line: &[u8]) -> String {
-    let text = String::from_utf8_lossy(line);
-    let text = text.trim();
+    bounded(String::from_utf8_lossy(line).trim())
+}
+
+fn bounded(text: &str) -> String {
     match text.char_indices().nth(MAX_CODE_CHARS) {
         Some((cut, _)) => format!("{}…", printable(&text[..cut])),
         None => printable(text),
     }
+}
+
+/// The text of `file`, provided its bytes are still the ones its hits and
+/// its index verification were cut from.
+fn live_text(file: &LiveFile) -> Option<String> {
+    let mut bytes = Vec::new();
+    (read_live_text(&file.absolute, &mut bytes) && sha256_hex(&bytes) == file.sha256)
+        .then(|| String::from_utf8_lossy(&bytes).into_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -561,6 +606,30 @@ fn enclosing_scope(definitions: &[Definition], line: u32) -> Option<&Definition>
         .max_by_key(|definition| (definition.start, std::cmp::Reverse(definition.end)))
 }
 
+fn kind_label(kind: NodeKind) -> String {
+    format!("{kind:?}").to_ascii_lowercase()
+}
+
+/// The lines a definition spans: the range the index records, within the
+/// live text. A range that covers only the line opening a block (some
+/// languages index a class by its name alone) gets its end from the text,
+/// and the note says so.
+fn declared_range(lines: &[&str], definition: &Definition) -> Option<(u32, u32, &'static str)> {
+    let count = lines.len() as u32;
+    if count == 0 {
+        return None;
+    }
+    let (first, mut last) = (definition.start.min(count), definition.end.min(count));
+    let mut note = "";
+    if first == last && opens_block(lines[first as usize - 1]) {
+        last = block_end(lines, first as usize - 1) as u32 + 1;
+        if last > first {
+            note = " (end not from index; approximate)";
+        }
+    }
+    Some((first, last, note))
+}
+
 fn name_segments(name: &str) -> Vec<&str> {
     name.split("::")
         .flat_map(|part| part.split('.'))
@@ -578,33 +647,46 @@ struct Row<'a> {
     note: String,
 }
 
+/// One hit as one line: `<line> [enclosing definition] <code><note>`.
+fn list_row(out: &mut String, row: &Row<'_>, definitions: Option<&[Definition]>) {
+    let _ = write!(out, "  {}", row.line);
+    if let Some(scope) = definitions.and_then(|definitions| enclosing_scope(definitions, row.line))
+    {
+        let _ = write!(out, " [{}]", scope.name);
+    }
+    if !row.code.is_empty() {
+        let _ = write!(out, " {}", row.code);
+    }
+    let _ = writeln!(out, "{}", row.note);
+}
+
 /// List one file's rows under its header while the reply limit lasts; rows
-/// past the limit are counted, never dropped.
+/// past the limit are counted, never dropped. With `bodies`, a listed row is
+/// shown inside its declaration or a window of context while the budget
+/// lasts.
 fn list_file(
     out: &mut String,
     remaining: &mut usize,
-    path: &str,
-    mark: &str,
+    file: &LiveFile,
+    (mark, definitions): Served,
     rows: &[Row<'_>],
     unlisted: usize,
-    definitions: Option<&[Definition]>,
+    bodies: Option<&mut Bodies>,
 ) {
+    let path = &file.path;
+    let definitions = definitions.as_deref().map(Vec::as_slice);
     let shown = rows.len().min(*remaining);
     *remaining -= shown;
     if shown > 0 {
         let _ = writeln!(out, "{path}{mark}");
     }
-    for row in &rows[..shown] {
-        let _ = write!(out, "  {}", row.line);
-        if let Some(scope) =
-            definitions.and_then(|definitions| enclosing_scope(definitions, row.line))
-        {
-            let _ = write!(out, " [{}]", scope.name);
-        }
-        if !row.code.is_empty() {
-            let _ = write!(out, " {}", row.code);
-        }
-        let _ = writeln!(out, "{}", row.note);
+    let mut listed = &rows[..shown];
+    if let Some(bodies) = bodies {
+        listed = list_bodies(out, bodies, file, definitions, listed);
+        bodies.overflowed |= !listed.is_empty();
+    }
+    for row in listed {
+        list_row(out, row, definitions);
     }
     let more = rows.len() - shown + unlisted;
     if more > 0 {
@@ -619,10 +701,11 @@ fn list_hits(
     files: &[LiveFile],
     limit: usize,
     mut index: Option<&mut Index<'_>>,
+    mut bodies: Option<&mut Bodies>,
 ) {
     let mut remaining = limit;
     for file in files {
-        let (mark, definitions) = match index.as_deref_mut() {
+        let served = match index.as_deref_mut() {
             Some(index) if remaining > 0 => index.serve(file),
             _ => ("", None),
         };
@@ -630,13 +713,284 @@ fn list_hits(
         list_file(
             out,
             &mut remaining,
-            &file.path,
-            mark,
+            file,
+            served,
             &rows,
             file.hit_lines.len() - rows.len(),
-            definitions.as_deref().map(Vec::as_slice),
+            bodies.as_deref_mut(),
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Bodies
+// ---------------------------------------------------------------------------
+
+/// What one reply may still spend on declaration bodies and context.
+struct Bodies {
+    /// Lines left, counting `==` headers and `...` gap marks.
+    budget: usize,
+    /// Declarations already printed, so that none is printed twice.
+    declared: HashSet<NodeId>,
+    /// Whether a hit stayed a one-line row because its body did not fit.
+    overflowed: bool,
+}
+
+impl Bodies {
+    fn new(budget: usize) -> Self {
+        Self {
+            budget,
+            declared: HashSet::new(),
+            overflowed: false,
+        }
+    }
+}
+
+/// Say how to read the bodies that did not fit.
+fn finish_bodies(out: &mut String, bodies: Option<Bodies>) {
+    if bodies.is_some_and(|bodies| bodies.overflowed) {
+        out.push_str("more: read <path>::<Symbol> or <path>:A-B\n");
+    }
+}
+
+/// A definition, the lines it spans in the live text, and a note when the
+/// last of them is not from the index.
+type Declared<'a> = (&'a Definition, u32, u32, &'static str);
+
+/// One body under a file header: a declaration, whole or windowed around its
+/// hits, or a plain window of context.
+struct Block<'a> {
+    declaration: Option<Declared<'a>>,
+    /// Line ranges to print, ascending and apart.
+    windows: Vec<(u32, u32)>,
+    /// The hit lines it shows, ascending.
+    hits: Vec<u32>,
+}
+
+fn window_around(line: u32, radius: u32, low: u32, high: u32) -> (u32, u32) {
+    let line = line.clamp(low, high);
+    (
+        line.saturating_sub(radius).max(low),
+        (line + radius).min(high),
+    )
+}
+
+/// Add a window that starts no earlier than the last one, merging the two
+/// when they touch.
+fn add_window(windows: &mut Vec<(u32, u32)>, window: (u32, u32)) {
+    match windows.last_mut() {
+        Some(last) if window.0 <= last.1 + 1 => last.1 = last.1.max(window.1),
+        _ => windows.push(window),
+    }
+}
+
+/// Group ascending hit lines into the bodies that show them, ordered by each
+/// body's first hit. A hit belongs to its innermost declaration, or to the
+/// widest declaration printed whole that holds it, so a nested declaration
+/// is not repeated beside the one that contains it.
+fn plan_bodies<'a>(
+    lines: &[&str],
+    definitions: Option<&'a [Definition]>,
+    hits: &[u32],
+) -> Vec<Block<'a>> {
+    let count = lines.len() as u32;
+    let scopes = hits
+        .iter()
+        .map(|line| {
+            let scope = enclosing_scope(definitions?, *line)?;
+            let (first, last, note) = declared_range(lines, scope)?;
+            Some((scope, first, last, note))
+        })
+        .collect::<Vec<Option<Declared<'a>>>>();
+    let whole = |scope: &Declared<'_>| scope.2 - scope.1 < WHOLE_DECLARATION_LINES;
+    let mut blocks = Vec::<Block<'a>>::new();
+    for (line, scope) in hits.iter().copied().zip(&scopes) {
+        let owner = scopes
+            .iter()
+            .flatten()
+            .filter(|scope| whole(scope) && (scope.1..=scope.2).contains(&line))
+            .min_by_key(|scope| (scope.1, Reverse(scope.2)))
+            .or(scope.as_ref())
+            .copied();
+        let window = match owner {
+            Some(owner) if whole(&owner) => (owner.1, owner.2),
+            Some((_, first, last, _)) => window_around(line, DECLARATION_WINDOW, first, last),
+            None => window_around(line, TEXT_WINDOW, 1, count),
+        };
+        let known = blocks
+            .iter_mut()
+            .rev()
+            .find(|block| match (block.declaration, owner) {
+                (Some(left), Some(right)) => left.0.id == right.0.id,
+                (None, None) => block
+                    .windows
+                    .last()
+                    .is_some_and(|last| window.0 <= last.1 + 1),
+                _ => false,
+            });
+        match known {
+            Some(block) => {
+                block.hits.push(line);
+                add_window(&mut block.windows, window);
+            }
+            None => blocks.push(Block {
+                declaration: owner,
+                windows: vec![window],
+                hits: vec![line],
+            }),
+        }
+    }
+    blocks
+}
+
+/// Print `block` window by window while the budget lasts and return the last
+/// line printed, 0 when nothing fit. `tail` is the body line printed just
+/// above under the same file header, if any. Hit lines are the keys of
+/// `notes` and end in `>`; every other line ends in `:`.
+fn print_body(
+    out: &mut String,
+    bodies: &mut Bodies,
+    lines: &[&str],
+    block: &Block<'_>,
+    notes: &BTreeMap<u32, &str>,
+    tail: u32,
+) -> u32 {
+    if block
+        .declaration
+        .is_some_and(|(definition, ..)| bodies.declared.contains(&definition.id))
+    {
+        return 0;
+    }
+    let mut end = 0;
+    for (first, last) in block.windows.iter().copied() {
+        let title = block.declaration.filter(|_| end == 0);
+        let gap = match block.declaration {
+            Some(_) => end != 0,
+            None => tail != 0 && tail + 1 != first,
+        };
+        let cost = (last + 1 - first) as usize + usize::from(title.is_some()) + usize::from(gap);
+        if cost > bodies.budget {
+            break;
+        }
+        bodies.budget -= cost;
+        if let Some((definition, first, last, note)) = title {
+            bodies.declared.insert(definition.id);
+            let _ = writeln!(out, "  == {} {first}-{last}{note}", definition.qualified);
+        }
+        if gap {
+            out.push_str("  ...\n");
+        }
+        for number in first..=last {
+            let (sign, note) = match notes.get(&number) {
+                Some(note) => ('>', *note),
+                None => (':', ""),
+            };
+            let _ = write!(out, "  {number}{sign}");
+            let code = bounded(lines[number as usize - 1].trim_end());
+            if !code.is_empty() {
+                let _ = write!(out, " {code}");
+            }
+            let _ = writeln!(out, "{note}");
+        }
+        end = last;
+    }
+    end
+}
+
+/// Show one file's listed rows inside their declarations, or inside windows
+/// of context where the index offers none, and return the rows left to list
+/// one line each. A row whose body does not fit the budget is listed that
+/// way right after what was printed of its declaration.
+fn list_bodies<'r, 'c>(
+    out: &mut String,
+    bodies: &mut Bodies,
+    file: &LiveFile,
+    definitions: Option<&[Definition]>,
+    rows: &'r [Row<'c>],
+) -> &'r [Row<'c>] {
+    // A body spends a line on each hit it shows, so this bounds the planning.
+    let (fitting, rest) = rows.split_at(rows.len().min(bodies.budget));
+    let Some(text) = (!fitting.is_empty())
+        .then(|| live_text(file))
+        .flatten()
+        .filter(|text| !text.is_empty())
+    else {
+        return rows;
+    };
+    let lines = text.lines().collect::<Vec<_>>();
+    let by_line = fitting
+        .iter()
+        .map(|row| (row.line, row))
+        .collect::<BTreeMap<_, _>>();
+    let notes = fitting
+        .iter()
+        .map(|row| (row.line, row.note.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let hits = by_line.keys().copied().collect::<Vec<_>>();
+    let mut tail = 0;
+    for block in plan_bodies(&lines, definitions, &hits) {
+        let end = print_body(out, bodies, &lines, &block, &notes, tail);
+        tail = end;
+        for row in block
+            .hits
+            .iter()
+            .filter(|line| **line > end)
+            .filter_map(|line| by_line.get(line))
+        {
+            list_row(out, row, definitions);
+            (bodies.overflowed, tail) = (true, 0);
+        }
+    }
+    rest
+}
+
+/// Print a definition's declaration under its header line: whole, or windowed
+/// around its own line and the hits it directly holds. Returns the line
+/// ranges printed, whose hits need no listing below.
+fn definition_body(
+    out: &mut String,
+    bodies: &mut Bodies,
+    file: &LiveFile,
+    definitions: &[Definition],
+    (definition, own_line): (&Definition, u32),
+    hits: &[(u32, String)],
+) -> Vec<(u32, u32)> {
+    let Some(text) = live_text(file) else {
+        return Vec::new();
+    };
+    let lines = text.lines().collect::<Vec<_>>();
+    let Some((first, last, note)) = declared_range(&lines, definition) else {
+        return Vec::new();
+    };
+    let mut windows = Vec::new();
+    if last - first < WHOLE_DECLARATION_LINES {
+        windows.push((first, last));
+    } else {
+        let held = hits.iter().map(|(line, _)| *line).filter(|line| {
+            *line > own_line
+                && enclosing_scope(definitions, *line)
+                    .is_some_and(|scope| scope.id == definition.id)
+        });
+        for line in std::iter::once(own_line).chain(held) {
+            add_window(
+                &mut windows,
+                window_around(line, DECLARATION_WINDOW, first, last),
+            );
+        }
+    }
+    let block = Block {
+        declaration: Some((definition, first, last, note)),
+        windows,
+        hits: Vec::new(),
+    };
+    let notes = hits
+        .iter()
+        .map(|(line, note)| (*line, note.as_str()))
+        .collect();
+    let end = print_body(out, bodies, &lines, &block, &notes, 0);
+    let mut printed = block.windows;
+    printed.retain(|window| window.1 <= end);
+    printed
 }
 
 // ---------------------------------------------------------------------------
@@ -663,6 +1017,7 @@ fn refs_with_index(
     wanted: &[&str],
     files: &[LiveFile],
     limit: usize,
+    mut bodies: Option<&mut Bodies>,
 ) -> String {
     let last = wanted[wanted.len() - 1];
     let mut index = Index::new(store);
@@ -766,6 +1121,26 @@ fn refs_with_index(
             .get(&(position, line))
             .is_some_and(|slots| slots.iter().any(|slot| candidates[*slot].wanted))
     };
+    // With several definitions, say which one the index resolved a line to
+    // when it resolved it to exactly one.
+    let note = |position: usize, line: u32| {
+        let mut targets = resolved_at
+            .get(&(position, line))
+            .into_iter()
+            .flatten()
+            .map(|slot| &candidates[*slot])
+            .filter(|candidate| candidate.wanted);
+        match targets.next() {
+            Some(target)
+                if reported > 1
+                    && !defines(position, line)
+                    && targets.all(|other| other.id == target.id) =>
+            {
+                format!(" -> {}:{}", files[target.file].path, target.line)
+            }
+            _ => String::new(),
+        }
+    };
 
     // Reference lines the index records in verified files that the text
     // search did not find, read live like every other line.
@@ -816,26 +1191,70 @@ fn refs_with_index(
         );
     }
     out.push('\n');
+    // Hit lines already shown, marked, inside a definition printed up here.
+    let mut above = HashMap::<usize, Vec<(u32, u32)>>::new();
     for candidate in candidates
         .iter()
         .filter(|candidate| candidate.wanted)
         .take(limit)
     {
-        let kind = format!("{:?}", candidate.kind).to_ascii_lowercase();
+        let file = &files[candidate.file];
         let _ = writeln!(
             out,
-            "  {}:{} {kind} {}",
-            files[candidate.file].path, candidate.line, candidate.qualified
+            "  {}:{} {} {}",
+            file.path,
+            candidate.line,
+            kind_label(candidate.kind),
+            candidate.qualified
         );
+        if reported <= DEFINITION_BODIES
+            && let Some(bodies) = bodies.as_deref_mut()
+            && let Some(definitions) = index.serve(file).1
+            && let Some(definition) = definitions
+                .iter()
+                .find(|definition| definition.id == candidate.id)
+            // A constructor inside a class printed whole is already shown.
+            && !above.get(&candidate.file).is_some_and(|shown| {
+                shown
+                    .iter()
+                    .any(|(first, last)| *first <= definition.start && definition.end <= *last)
+            })
+        {
+            let hits = file
+                .hit_lines
+                .iter()
+                .filter(|line| !omitted(candidate.file, **line))
+                .map(|line| (*line, note(candidate.file, *line)))
+                .collect::<Vec<_>>();
+            above
+                .entry(candidate.file)
+                .or_default()
+                .extend(definition_body(
+                    &mut out,
+                    bodies,
+                    file,
+                    &definitions,
+                    (definition, candidate.line),
+                    &hits,
+                ));
+        }
     }
     if reported > limit {
         let _ = writeln!(out, "  ... {} more definitions", reported - limit);
     }
     let _ = writeln!(out, "{references} references in {reference_files} files");
 
+    let hidden = |position: usize, line: u32| {
+        omitted(position, line)
+            || above.get(&position).is_some_and(|shown| {
+                shown
+                    .iter()
+                    .any(|(first, last)| (*first..=*last).contains(&line))
+            })
+    };
     let mut remaining = limit;
     for (file, position, index_only) in &listing {
-        let (mark, definitions) = if remaining > 0 {
+        let served = if remaining > 0 {
             index.serve(file)
         } else {
             ("", None)
@@ -846,35 +1265,16 @@ fn refs_with_index(
             total += files[position]
                 .hit_lines
                 .iter()
-                .filter(|line| !omitted(position, **line))
+                .filter(|line| !hidden(position, **line))
                 .count();
             for (line, code) in &files[position].kept {
-                if omitted(position, *line) {
-                    continue;
+                if !hidden(position, *line) {
+                    rows.push(Row {
+                        line: *line,
+                        code,
+                        note: note(position, *line),
+                    });
                 }
-                // With several definitions, say which one the index resolved
-                // this line to when it resolved it to exactly one.
-                let mut targets = resolved_at
-                    .get(&(position, *line))
-                    .into_iter()
-                    .flatten()
-                    .map(|slot| &candidates[*slot])
-                    .filter(|candidate| candidate.wanted);
-                let note = match targets.next() {
-                    Some(target)
-                        if reported > 1
-                            && !defines(position, *line)
-                            && targets.all(|other| other.id == target.id) =>
-                    {
-                        format!(" -> {}:{}", files[target.file].path, target.line)
-                    }
-                    _ => String::new(),
-                };
-                rows.push(Row {
-                    line: *line,
-                    code,
-                    note,
-                });
             }
         }
         if let Some(index_only) = index_only {
@@ -888,11 +1288,11 @@ fn refs_with_index(
         list_file(
             &mut out,
             &mut remaining,
-            &file.path,
-            mark,
+            file,
+            served,
             &rows,
             total - rows.len(),
-            definitions.as_deref().map(Vec::as_slice),
+            bodies.as_deref_mut(),
         );
     }
     if omitted_hits > 0 {
@@ -1033,13 +1433,17 @@ enum Target<'a> {
     Symbol(&'a str),
     Line(u32),
     Range(u32, u32),
+    File,
 }
 
+/// A selector with no `:` is a path.
 fn parse_selector(selector: &str) -> Option<(&str, Target<'_>)> {
     if let Some((path, symbol)) = selector.split_once("::") {
         return (!path.is_empty() && !symbol.is_empty()).then_some((path, Target::Symbol(symbol)));
     }
-    let (path, lines) = selector.rsplit_once(':')?;
+    let Some((path, lines)) = selector.rsplit_once(':') else {
+        return (!selector.is_empty()).then_some((selector, Target::File));
+    };
     if path.is_empty() {
         return None;
     }
@@ -1090,24 +1494,62 @@ impl Page<'_> {
         }
     }
 
-    /// Print a definition over the range the index records for it. A range
-    /// that covers only the line opening a block (some languages index a
-    /// class by its name alone) gets its end from the text, and says so.
+    /// Print a definition over the lines it spans.
     fn declaration(&self, out: &mut String, budget: &mut usize, definition: &Definition) {
-        let count = self.lines.len() as u32;
-        if count == 0 {
-            return;
+        if let Some((first, last, note)) = declared_range(self.lines, definition) {
+            let title = format!(" {}", definition.qualified);
+            self.block(out, budget, first, last, &title, note);
         }
-        let (first, mut last) = (definition.start.min(count), definition.end.min(count));
-        let mut note = "";
-        if first == last && opens_block(self.lines[first as usize - 1]) {
-            last = block_end(self.lines, first as usize - 1) as u32 + 1;
-            if last > first {
-                note = " (end not from index; approximate)";
+    }
+
+    /// Where the declarations of a long file are: one row per declaration in
+    /// source order, nested ones indented. Rows come from the index when it
+    /// describes these bytes, else from the lines that start a declaration
+    /// and open a block. Either way a local binding is not a row. A file with
+    /// nothing to outline is read from the top.
+    fn outline(&self, out: &mut String, budget: &mut usize, definitions: Option<&[Definition]>) {
+        let (path, lines) = (self.path, self.lines);
+        let mut rows = match definitions {
+            Some(definitions) => definitions
+                .iter()
+                .filter(|definition| !is_local_variable(definition, definitions))
+                .filter_map(|definition| {
+                    let (first, last, _) = declared_range(lines, definition)?;
+                    let label = format!("{} {}", kind_label(definition.kind), definition.qualified);
+                    Some((first, last, label))
+                })
+                .collect::<Vec<_>>(),
+            None => (0..lines.len())
+                .filter(|at| starts_declaration(lines[*at]) && opens_block(lines[*at]))
+                .filter(|at| !lines[*at].trim_start().starts_with("let "))
+                .map(|at| (at, block_end(lines, at)))
+                .filter(|(at, end)| end > at)
+                .map(|(at, end)| (at as u32 + 1, end as u32 + 1, bounded(lines[at].trim())))
+                .collect(),
+        };
+        if rows.is_empty() {
+            return self.block(out, budget, 1, lines.len() as u32, "", "");
+        }
+        rows.sort_by_key(|(first, last, _)| (*first, Reverse(*last)));
+        let note = if definitions.is_some() {
+            ""
+        } else {
+            APPROXIMATE
+        };
+        let _ = writeln!(out, "== {path} ({} lines; outline){note}", lines.len());
+        // Last lines of the declarations that hold the row being printed.
+        let mut open = Vec::new();
+        for (first, last, label) in rows.iter().take(*budget) {
+            while open.last().is_some_and(|end| end < first) {
+                open.pop();
             }
+            let _ = writeln!(out, "{}{first}-{last} {label}", "  ".repeat(open.len()));
+            open.push(*last);
         }
-        let title = format!(" {}", definition.qualified);
-        self.block(out, budget, first, last, &title, note);
+        if rows.len() > *budget {
+            let _ = writeln!(out, "... {} more declarations", rows.len() - *budget);
+        }
+        let _ = writeln!(out, "read {path}::<Symbol> or {path}:A-B for bodies");
     }
 }
 
@@ -1115,7 +1557,7 @@ fn read_selector(out: &mut String, root: &Path, index: Option<&mut Index<'_>>, s
     let Some((path, target)) = parse_selector(selector) else {
         let _ = writeln!(
             out,
-            "== {selector}: expected path::Symbol, path:LINE or path:A-B"
+            "== {selector}: expected path, path::Symbol, path:LINE or path:A-B"
         );
         return;
     };
@@ -1178,7 +1620,11 @@ fn read_selector(out: &mut String, root: &Path, index: Option<&mut Index<'_>>, s
                 ),
             }
         }
-        Target::Range(..) | Target::Line(_) => outside(out),
+        Target::File if count > WHOLE_FILE_LINES => {
+            page.outline(out, &mut budget, definitions.as_deref().map(Vec::as_slice));
+        }
+        Target::File if count >= 1 => page.block(out, &mut budget, 1, count, "", ""),
+        Target::Range(..) | Target::Line(_) | Target::File => outside(out),
         Target::Symbol(symbol) => {
             let wanted = name_segments(symbol);
             match definitions.as_deref() {
@@ -1281,12 +1727,42 @@ fn declaration_line(lines: &[&str], word: &str, from: usize) -> Option<usize> {
                 before = before[..open].trim_end();
             }
             before
-                .rsplit(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '!'))
+                .rsplit(|ch: char| !is_declaration_char(ch))
                 .next()
-                .is_some_and(|token| DECLARATION_WORDS.split(' ').any(|word| word == token))
+                .is_some_and(is_declaration_word)
         })
         .or_else(|| mentions().next())
         .map(|(at, _)| at)
+}
+
+fn is_declaration_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_' || ch == '!'
+}
+
+fn is_declaration_word(token: &str) -> bool {
+    DECLARATION_WORDS.split(' ').any(|word| word == token)
+}
+
+/// Whether a line starts a declaration by the rule `declaration_line` uses:
+/// declaration words, each past a `(receiver)` group, lead up to a name.
+fn starts_declaration(line: &str) -> bool {
+    let mut rest = line.trim_start();
+    let mut declares = false;
+    loop {
+        let end = rest
+            .find(|ch| !is_declaration_char(ch))
+            .unwrap_or(rest.len());
+        if !is_declaration_word(&rest[..end]) {
+            return declares && end > 0;
+        }
+        declares = true;
+        rest = rest[end..].trim_start();
+        if rest.starts_with('(')
+            && let Some(close) = rest.find(')')
+        {
+            rest = rest[close + 1..].trim_start();
+        }
+    }
 }
 
 fn indent(line: &str) -> usize {
@@ -1314,7 +1790,7 @@ fn block_end(lines: &[&str], start: usize) -> usize {
             end = at;
             continue;
         }
-        let closes = code.starts_with(['}', ')', ']']) || code == "end";
+        let closes = indent(line) == depth && (code.starts_with(['}', ')', ']']) || code == "end");
         if closes {
             end = at;
         }

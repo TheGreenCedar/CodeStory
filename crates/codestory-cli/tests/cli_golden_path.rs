@@ -215,7 +215,7 @@ fn find_and_refs_answer_from_live_text_without_an_index() {
     let lookup = |args: &[&str]| run_lookup(workspace.path(), cache.path(), args);
 
     assert_eq!(
-        lookup(&["find", "schedule_index", "normalize_project"]),
+        lookup(&["find", "schedule_index", "normalize_project", "--no-bodies"]),
         "no index; text matches only
 4 matches in 2 files
 src/lib.rs
@@ -238,7 +238,8 @@ src/runtime.rs
             "--file-glob",
             "runtime.rs",
             "--limit",
-            "2"
+            "2",
+            "--no-bodies",
         ]),
         "no index; text matches only
 4 matches in 1 files
@@ -250,7 +251,7 @@ src/runtime.rs: 2 more
     );
 
     assert_eq!(
-        lookup(&["refs", "open_project"]),
+        lookup(&["refs", "open_project", "--no-bodies"]),
         "no index; text matches only
 5 references in 2 files
 src/lib.rs
@@ -266,6 +267,30 @@ src/runtime.rs
     assert_eq!(
         lookup(&["refs", "project"]),
         "no index; text matches only\n0 references in 0 files\n"
+    );
+    // Without an index a body is the few lines around a hit, never a `==`
+    // declaration; hits close together share one window.
+    assert_eq!(
+        lookup(&["refs", "run_indexing"]),
+        "no index; text matches only
+3 references in 1 files
+src/lib.rs
+  15:         open_project(&self.project_name)
+  16:     }
+  17:
+  18>     pub fn run_indexing(&self) -> usize {
+  19>         run_indexing(&self.open_project())
+  20:     }
+  21: }
+  22:
+  ...
+  24:     runtime::normalize_project(project_name)
+  25: }
+  26:
+  27> pub fn run_indexing(project_path: &str) -> usize {
+  28:     runtime::schedule_index(project_path)
+  29: }
+"
     );
 
     assert_eq!(
@@ -300,7 +325,7 @@ fn refs_lists_every_whole_word_hit_with_enclosing_symbols() {
     // split over lines is found on the line that names it, the call in the
     // test file is listed, and `apply_all` / `reapply` are not mentions.
     assert_eq!(
-        lookup(&["refs", "apply"]),
+        lookup(&["refs", "apply", "--no-bodies"]),
         "apply: 2 definition(s)
   src/audit.rs:4 method Audit::apply
   src/ledger.rs:7 method Ledger::apply
@@ -320,7 +345,7 @@ tests/ledger_test.rs
     // A qualifier keeps the unresolved hits and drops only what the index
     // resolved to the other definition, and says how many it dropped.
     assert_eq!(
-        lookup(&["refs", "Ledger::apply"]),
+        lookup(&["refs", "Ledger::apply", "--no-bodies"]),
         "Ledger::apply: 1 definition(s)
   src/ledger.rs:7 method Ledger::apply
 2 references in 2 files
@@ -333,7 +358,7 @@ tests/ledger_test.rs
 2 hit(s) omitted: the index resolved them to other definitions of apply
 "
     );
-    assert!(lookup(&["refs", "Audit.apply"]).starts_with(
+    assert!(lookup(&["refs", "Audit.apply", "--no-bodies"]).starts_with(
         "Audit.apply: 1 definition(s)
   src/audit.rs:4 method Audit::apply
 2 references in 2 files
@@ -343,7 +368,7 @@ tests/ledger_test.rs
     // Past the limit nothing is dropped silently, and the definitions are
     // still found in files the listing no longer reaches.
     assert_eq!(
-        lookup(&["refs", "apply", "--limit", "2"]),
+        lookup(&["refs", "apply", "--limit", "2", "--no-bodies"]),
         "apply: 2 definition(s)
   src/audit.rs:4 method Audit::apply
   src/ledger.rs:7 method Ledger::apply
@@ -354,6 +379,43 @@ src/audit.rs
 src/ledger.rs: 1 more
 src/lib.rs: 1 more
 tests/ledger_test.rs: 1 more
+"
+    );
+
+    // By default each definition leads with its declaration, and every other
+    // mention is marked inside the declaration that holds it.
+    assert_eq!(
+        lookup(&["refs", "apply"]),
+        "apply: 2 definition(s)
+  src/audit.rs:4 method Audit::apply
+  == Audit::apply 4-6
+  4>     pub fn apply(&self, note: &str) -> usize {
+  5:         note.len()
+  6:     }
+  src/ledger.rs:7 method Ledger::apply
+  == Ledger::apply 7-9
+  7>     pub fn apply(&self, amount: u32) -> u32 {
+  8:         self.total + amount
+  9:     }
+3 references in 3 files
+src/audit.rs
+  == Audit::reapply 8-10
+  8:     pub fn reapply(&self, note: &str) -> usize {
+  9>         self.apply(note) * 2 -> src/audit.rs:4
+  10:     }
+src/lib.rs
+  == settle 6-10
+  6: pub fn settle(amount: u32) -> u32 {
+  7:     let ledger = Ledger::default();
+  8:     ledger
+  9>         .apply(amount) -> src/ledger.rs:7
+  10: }
+tests/ledger_test.rs
+  == applies_in_tests 3-6
+  3: #[test]
+  4: fn applies_in_tests() {
+  5>     assert_eq!(Ledger::default().apply(2), 2);
+  6: }
 "
     );
 }
@@ -380,7 +442,7 @@ src/lib.rs
 src/runtime.rs
   6 [schedule_index] super::open_project(project_path).len()
 ";
-    assert_eq!(lookup(&["refs", "open_project"]), indexed);
+    assert_eq!(lookup(&["refs", "open_project", "--no-bodies"]), indexed);
 
     // Shift every line of one hit file and add a file the index never saw.
     let lib = workspace.path().join("src/lib.rs");
@@ -405,19 +467,29 @@ src/runtime.rs
   6 [schedule_index] super::open_project(project_path).len()
 "#;
     assert_eq!(
-        lookup(&["refs", "open_project"]),
+        lookup(&["refs", "open_project", "--no-bodies"]),
         format!("open_project: 0 definition(s)\n6 references in 3 files\n{listing}")
     );
     assert_eq!(
-        lookup(&["find", "open_project"]),
+        lookup(&["find", "open_project", "--no-bodies"]),
         format!("6 matches in 3 files\n{listing}")
     );
+    // Bodies are live text too, and read nothing the listing did not.
+    assert!(lookup(&["refs", "open_project"]).contains(
+        "src/extra.rs (not indexed)
+  1: pub fn reopen() -> String {
+  2>     crate::open_project(\"again\")
+  3: }
+src/lib.rs (changed since indexing)
+  13:         }
+"
+    ));
 
     // Verification is by content, not by timestamp: the same bytes written
     // again are the bytes the index describes.
     fs::write(&lib, original).expect("restore lib.rs");
     fs::remove_file(workspace.path().join("src/extra.rs")).expect("remove extra.rs");
-    assert_eq!(lookup(&["refs", "open_project"]), indexed);
+    assert_eq!(lookup(&["refs", "open_project", "--no-bodies"]), indexed);
 
     assert_eq!(
         cache_file_snapshots(cache.path()),
@@ -454,6 +526,7 @@ fn read_returns_complete_declarations_for_many_selectors() {
             "src/missing.rs::anything",
             "src/lib.rs::absent",
             "nonsense",
+            "src/lib.rs::",
         ]),
         "== src/lib.rs:14-16 AppController::open_project
 14:     pub fn open_project(&self) -> String {
@@ -475,7 +548,8 @@ fn read_returns_complete_declarations_for_many_selectors() {
 == src/lib.rs::absent: no symbol absent in src/lib.rs; definitions there: AppController, \
 AppController::new, AppController::open_project, AppController::run_indexing, open_project, \
 run_indexing
-== nonsense: expected path::Symbol, path:LINE or path:A-B
+== nonsense: no file nonsense
+== src/lib.rs::: expected path, path::Symbol, path:LINE or path:A-B
 "
     );
 
@@ -511,6 +585,267 @@ run_indexing
 7:     super::open_project(project_path).len()
 8: }
 "
+    );
+}
+
+/// `tally` is defined once, called twice from `twice`, imported outside any
+/// declaration, and called three times from `render`, which is 70 lines long.
+fn write_body_workspace(root: &Path) {
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"[package]
+name = "body-fixture"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "src/lib.rs"
+"#,
+    )
+    .expect("write Cargo.toml");
+    let src = root.join("src");
+    fs::create_dir_all(&src).expect("create src dir");
+    fs::write(
+        src.join("lib.rs"),
+        r#"pub mod report;
+
+pub fn tally(values: &[u32]) -> u32 {
+    values.iter().sum()
+}
+
+pub fn twice(values: &[u32]) -> u32 {
+    let first = tally(values);
+    let second = tally(values);
+    first + second
+}
+"#,
+    )
+    .expect("write lib.rs");
+    let mut report = String::from(
+        "use crate::tally;\n\npub fn render(values: &[u32]) -> String {\n    let mut out = String::new();\n    let mut total = tally(values);\n",
+    );
+    for line in 6..=70 {
+        report.push_str(&match line {
+            9 | 70 => "    total += tally(values);\n".to_owned(),
+            _ => format!("    out.push_str(\"row {line}\");\n"),
+        });
+    }
+    report.push_str("    format!(\"{out}{total}\")\n}\n");
+    fs::write(src.join("report.rs"), report).expect("write report.rs");
+}
+
+#[test]
+fn refs_and_find_carry_enclosing_declarations_within_budget() {
+    let workspace = tempdir().expect("workspace");
+    let cache = tempdir().expect("cache");
+    write_body_workspace(workspace.path());
+    index_lookup_fixture(workspace.path(), cache.path());
+    let lookup = |args: &[&str]| run_lookup(workspace.path(), cache.path(), args);
+    let rows = |lines: std::ops::RangeInclusive<u32>| {
+        lines
+            .map(|line| format!("  {line}:     out.push_str(\"row {line}\");\n"))
+            .collect::<String>()
+    };
+
+    // The definition's declaration comes first and is not repeated below.
+    // `twice` is printed once for its two hits. `render` is too long to print
+    // whole: a window around each hit, the two near hits sharing one. The
+    // import has no enclosing declaration, so it gets plain context.
+    let definition = "tally: 1 definition(s)
+  src/lib.rs:3 function tally
+  == tally 3-5
+  3> pub fn tally(values: &[u32]) -> u32 {
+  4:     values.iter().sum()
+  5: }
+6 references in 2 files
+src/lib.rs
+  == twice 7-11
+  7: pub fn twice(values: &[u32]) -> u32 {
+  8>     let first = tally(values);
+  9>     let second = tally(values);
+  10:     first + second
+  11: }
+";
+    let near_hits = format!(
+        "src/report.rs
+  1> use crate::tally;
+  2:
+  3: pub fn render(values: &[u32]) -> String {{
+  4:     let mut out = String::new();
+  == render 3-72
+  3: pub fn render(values: &[u32]) -> String {{
+  4:     let mut out = String::new();
+  5>     let mut total = tally(values);
+{}  9>     total += tally(values);
+{}",
+        rows(6..=8),
+        rows(10..=15)
+    );
+    assert_eq!(
+        lookup(&["refs", "tally"]),
+        format!(
+            "{definition}{near_hits}  ...
+{}  70>     total += tally(values);
+  71:     format!(\"{{out}}{{total}}\")
+  72: }}
+",
+            rows(64..=69)
+        )
+    );
+
+    // A body that does not fit the budget leaves its hit as a one-line row,
+    // and the reply says how to read what it left out.
+    assert_eq!(
+        lookup(&["refs", "tally", "--body-lines", "28"]),
+        format!(
+            "{definition}{near_hits}  70 [render] total += tally(values);
+more: read <path>::<Symbol> or <path>:A-B
+"
+        )
+    );
+
+    // `find` shows hits the same way; the declaring line is one more hit.
+    assert_eq!(
+        lookup(&["find", "tally", "--file-glob", "lib.rs"]),
+        "3 matches in 1 files
+src/lib.rs
+  == tally 3-5
+  3> pub fn tally(values: &[u32]) -> u32 {
+  4:     values.iter().sum()
+  5: }
+  == twice 7-11
+  7: pub fn twice(values: &[u32]) -> u32 {
+  8>     let first = tally(values);
+  9>     let second = tally(values);
+  10:     first + second
+  11: }
+"
+    );
+
+    // The index no longer describes a changed file, so its hits get three
+    // lines of live context each way and no declaration.
+    let report = workspace.path().join("src/report.rs");
+    let original = fs::read_to_string(&report).expect("read report.rs");
+    fs::write(&report, format!("// moved\n{original}")).expect("edit report.rs");
+    assert_eq!(
+        lookup(&["refs", "tally"]),
+        format!(
+            "{definition}src/report.rs (changed since indexing)
+  1: // moved
+  2> use crate::tally;
+  3:
+  4: pub fn render(values: &[u32]) -> String {{
+  5:     let mut out = String::new();
+  6>     let mut total = tally(values);
+  7:     out.push_str(\"row 6\");
+  8:     out.push_str(\"row 7\");
+  9:     out.push_str(\"row 8\");
+  10>     total += tally(values);
+  11:     out.push_str(\"row 10\");
+  12:     out.push_str(\"row 11\");
+  13:     out.push_str(\"row 12\");
+  ...
+  68:     out.push_str(\"row 67\");
+  69:     out.push_str(\"row 68\");
+  70:     out.push_str(\"row 69\");
+  71>     total += tally(values);
+  72:     format!(\"{{out}}{{total}}\")
+  73: }}
+"
+        )
+    );
+}
+
+#[test]
+fn read_bare_path_prints_small_files_and_outlines_large_ones() {
+    let workspace = tempdir().expect("workspace");
+    let cache = tempdir().expect("cache");
+    write_tiny_rust_workspace(workspace.path());
+    let mut long = String::from(
+        "pub struct Counter {
+    pub total: u32,
+}
+
+impl Counter {
+    pub fn bump(&mut self) -> u32 {
+        self.total += 1;
+        self.total
+    }
+}
+
+async fn outer() -> u32 {
+    fn inner() -> u32 {
+        1
+    }
+    let local = {
+        inner()
+    };
+    local
+}
+
+pub fn long() -> u32 {
+    let mut count = 0;
+",
+    );
+    long.push_str(&"    count += 1;\n".repeat(240));
+    long.push_str("    count\n}\n");
+    let long_path = workspace.path().join("src/long.rs");
+    fs::write(&long_path, &long).expect("write long.rs");
+    let notes = (1..=305)
+        .map(|line| format!("note {line}\n"))
+        .collect::<String>();
+    fs::write(workspace.path().join("notes.txt"), notes).expect("write notes.txt");
+    index_lookup_fixture(workspace.path(), cache.path());
+    let lookup = |args: &[&str]| run_lookup(workspace.path(), cache.path(), args);
+
+    // A short file is printed whole. A long one is outlined from the index,
+    // nested declarations indented, in the same call.
+    assert_eq!(
+        lookup(&["read", "src/runtime.rs", "src/long.rs"]),
+        "== src/runtime.rs:1-7
+1: pub fn normalize_project(project_name: &str) -> String {
+2:     format!(\"workspace:{project_name}\")
+3: }
+4:
+5: pub fn schedule_index(project_path: &str) -> usize {
+6:     super::open_project(project_path).len()
+7: }
+== src/long.rs (265 lines; outline)
+1-3 struct Counter
+  2-2 field Counter::total
+6-9 method Counter::bump
+12-20 function outer
+  13-15 function inner
+22-265 function long
+read src/long.rs::<Symbol> or src/long.rs:A-B for bodies
+"
+    );
+
+    // Once the file changes the outline is the lines that start a declaration
+    // and open a block, and says so. Neither outline lists a local binding.
+    fs::write(&long_path, format!("// shifted\n{long}")).expect("edit long.rs");
+    assert_eq!(
+        lookup(&["read", "src/long.rs"]),
+        "== src/long.rs (266 lines; outline) (not from index; approximate)
+2-4 pub struct Counter {
+6-11 impl Counter {
+  7-10 pub fn bump(&mut self) -> u32 {
+13-21 async fn outer() -> u32 {
+  14-16 fn inner() -> u32 {
+23-266 pub fn long() -> u32 {
+read src/long.rs::<Symbol> or src/long.rs:A-B for bodies
+"
+    );
+
+    // A long file with nothing to outline is read from the top.
+    let plain = lookup(&["read", "notes.txt"]);
+    assert!(
+        plain.starts_with("== notes.txt:1-305\n1: note 1\n"),
+        "{plain}"
+    );
+    assert!(
+        plain.ends_with("300: note 300\n... 5 more lines; read notes.txt:301-305\n"),
+        "{plain}"
     );
 }
 
