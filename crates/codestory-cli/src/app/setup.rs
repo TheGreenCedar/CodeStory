@@ -21,8 +21,8 @@ const LAUNCHER: &str = include_str!("../../../../plugins/codestory/standalone/cs
 
 pub(super) fn run_setup(cmd: SetupCommand) -> Result<()> {
     let (directory, home_var, file) = match cmd.host {
-        SetupHost::Codex => (".codex", "CODEX_HOME", "AGENTS.md"),
-        SetupHost::ClaudeCode => (".claude", "CLAUDE_CONFIG_DIR", "CLAUDE.md"),
+        SetupHost::AgentsFile => (".codex", "CODEX_HOME", "AGENTS.md"),
+        SetupHost::ClaudeFile => (".claude", "CLAUDE_CONFIG_DIR", "CLAUDE.md"),
     };
     let default_home = env::home_dir().map(|p| p.join(directory));
     let configured = env::var_os(home_var).filter(|value| !value.is_empty());

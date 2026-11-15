@@ -198,8 +198,10 @@ pub(crate) struct SetupCommand {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub(crate) enum SetupHost {
-    Codex,
-    ClaudeCode,
+    #[value(name = "codex")]
+    AgentsFile,
+    #[value(name = "claude-code")]
+    ClaudeFile,
 }
 
 #[derive(Args, Debug)]
