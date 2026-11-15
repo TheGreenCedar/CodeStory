@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Lexical search highlights the source line matching the most distinct query terms, instead of stopping at an incidental match near the top of a file.
+
 - `codestory-cli setup codex` and `codestory-cli setup claude-code` add live shell lookups to a fresh agent session through its standing instructions. Setup supports user or repository scope and can remove its own note. The shell lookups work with your existing `PATH` and need no MCP connection.
 
 - `find`, `refs` and `read` answer from current source, including files that changed or were never indexed. `find` and `refs` group matches by file and include enclosing declarations within a line budget when the file matches the index. `refs` also lists definitions and the declarations they reference. Use `--no-bodies` for a compact listing. `read` accepts several `path::Symbol`, `path:LINE` or `path:A-B` selectors in one call. With a bare path, it prints a small file whole or outlines a large one.
