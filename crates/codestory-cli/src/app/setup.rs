@@ -103,6 +103,17 @@ pub(super) fn run_setup(cmd: SetupCommand) -> Result<()> {
 }
 
 fn render_note(invocation: &str) -> String {
+    if let Some((_, body)) = NOTE.split_once("\n\n") {
+        let direct = body
+            .replace("- `cs ", &format!("- `{invocation} "))
+            .replace(
+                "`cs read path::Symbol",
+                &format!("`{invocation} read path::Symbol"),
+            );
+        if direct.len() < 800 {
+            return direct;
+        }
+    }
     let note = NOTE.replace("@COMMAND@", invocation);
     if note.len() < 800 {
         return note;
