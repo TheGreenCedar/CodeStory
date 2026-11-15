@@ -59,6 +59,8 @@ pub(crate) struct Cli {
 /// Variants should stay thin: argument validation that affects help text lives
 /// in `clap` attributes, while runtime validation belongs in the handler.
 pub(crate) enum Command {
+    #[command(about = "Install or remove CodeStory lookup instructions for an agent host.")]
+    Setup(SetupCommand),
     #[command(about = "Build or refresh the repository index.")]
     Index(IndexCommand),
     #[command(about = "Summarize indexed repository context.")]
@@ -182,6 +184,22 @@ pub(crate) enum Command {
     InternalEmbeddingServer,
     #[command(name = "internal-embedding-qualification-worker", hide = true)]
     InternalEmbeddingQualificationWorker(InternalEmbeddingQualificationCommand),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct SetupCommand {
+    #[arg(value_enum)]
+    pub(crate) host: SetupHost,
+    #[arg(long, help = "Use the instruction file in the current Git repository.")]
+    pub(crate) repo: bool,
+    #[arg(long, help = "Remove the managed lookup instructions.")]
+    pub(crate) remove: bool,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum SetupHost {
+    Codex,
+    ClaudeCode,
 }
 
 #[derive(Args, Debug)]

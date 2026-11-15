@@ -8,6 +8,7 @@ Root usage: `codestory-cli <COMMAND>`
 
 | Command | Usage |
 | --- | --- |
+| `setup` | `codestory-cli setup [OPTIONS] <HOST>` |
 | `index` | `codestory-cli index [OPTIONS]` |
 | `ground` | `codestory-cli ground [OPTIONS]` |
 | `report` | `codestory-cli report [OPTIONS]` |

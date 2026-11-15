@@ -104,6 +104,89 @@ src/lib.rs:24: runtime::normalize_project(project_name)"
     );
 }
 
+#[test]
+fn lookup_setup_round_trips_existing_host_notes() {
+    let home = tempdir().expect("scratch home");
+    let original = b"# Existing notes\r\n\r\nKeep this text without a trailing newline";
+    for (host, home_var, filename) in [
+        ("codex", "CODEX_HOME", "AGENTS.md"),
+        ("claude-code", "CLAUDE_CONFIG_DIR", "CLAUDE.md"),
+    ] {
+        let host_home = home.path().join(host);
+        fs::create_dir(&host_home).expect("host directory");
+        let instructions = host_home.join(filename);
+        fs::write(&instructions, original).expect("prior instructions");
+        let run = |extra: &[&str]| {
+            test_support::cli_command()
+                .env("HOME", home.path())
+                .env("USERPROFILE", home.path())
+                .env(home_var, &host_home)
+                .args(["setup", host])
+                .args(extra)
+                .output()
+                .expect("run setup")
+        };
+        let first = run(&[]);
+        assert!(
+            first.status.success(),
+            "{}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        let installed = fs::read(&instructions).expect("installed instructions");
+        assert!(installed.starts_with(original));
+        assert!(installed.windows(12).any(|bytes| bytes == b"cs refs NAME"));
+        assert!(run(&[]).status.success());
+        assert_eq!(fs::read(&instructions).expect("repeat install"), installed);
+        assert!(run(&["--remove"]).status.success());
+        assert_eq!(
+            fs::read(&instructions).expect("restored instructions"),
+            original
+        );
+
+        fs::write(&instructions, b"<!-- codestory-lookups:start -->\n").expect("incomplete block");
+        assert!(
+            !run(&[]).status.success(),
+            "an incomplete block was overwritten"
+        );
+        assert_eq!(
+            fs::read(&instructions).expect("untouched incomplete block"),
+            b"<!-- codestory-lookups:start -->\n"
+        );
+    }
+}
+
+#[test]
+fn lookup_setup_repo_note_is_owned_until_removed() {
+    let home = tempdir().expect("scratch home");
+    let repo = tempdir().expect("scratch checkout");
+    run_git(repo.path(), &["init", "-q"]);
+    let nested = repo.path().join("nested");
+    fs::create_dir(&nested).expect("nested directory");
+    let run = |extra: &[&str]| {
+        test_support::cli_command()
+            .env("HOME", home.path())
+            .env("USERPROFILE", home.path())
+            .env("CODEX_HOME", home.path().join(".codex"))
+            .current_dir(&nested)
+            .args(["setup", "codex", "--repo"])
+            .args(extra)
+            .output()
+            .expect("run repo setup")
+    };
+    let root_note = repo.path().join("AGENTS.md");
+    let first = run(&[]);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(root_note.is_file());
+    assert!(!nested.join("AGENTS.md").exists());
+    assert!(!home.path().join(".codex/AGENTS.md").exists());
+    assert!(run(&["--remove"]).status.success());
+    assert!(!root_note.exists());
+}
+
 /// Run a lookup that must succeed and return its reply.
 fn run_lookup(workspace: &Path, cache_dir: &Path, args: &[&str]) -> String {
     let output = run_cli(workspace, cache_dir, args);

@@ -88,6 +88,7 @@ pub(crate) mod rendering;
 pub(crate) mod resolution;
 mod search_command;
 mod server;
+mod setup;
 mod source_commands;
 pub(crate) mod source_context;
 
@@ -207,6 +208,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
             .context("install native embedding server transport")?;
     }
     match cli.command {
+        Command::Setup(cmd) => setup::run_setup(cmd),
         Command::Index(cmd) => index_command::run_index(cmd),
         Command::Ground(cmd) => ground_smoke::run_ground(cmd),
         Command::Report(cmd) => report::run_report(cmd),
