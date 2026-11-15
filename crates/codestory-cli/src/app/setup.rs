@@ -1,12 +1,12 @@
 use crate::args::{SetupCommand, SetupHost};
 use anyhow::{Context, Result, bail, ensure};
 use codestory_workspace::atomic_file::write_file_atomic;
+use codestory_workspace::discover_git_worktree_root;
 use std::{
     env, fs,
     io::{ErrorKind, Write},
     ops::Range,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 const MARKER: &[u8] = b"<!-- codestory-lookups:start";
@@ -32,7 +32,8 @@ pub(super) fn run_setup(cmd: SetupCommand) -> Result<()> {
         .context("could not resolve the agent's configuration directory")?;
     let host_home = std::path::absolute(host_home)?;
     let instructions = if cmd.repo {
-        git_root()?
+        discover_git_worktree_root(&env::current_dir()?)
+            .context("--repo requires a Git working tree")?
     } else {
         host_home.clone()
     }
@@ -120,18 +121,6 @@ fn render_note(invocation: &str) -> String {
     }
     NOTE.replacen("## `@COMMAND@` is `cs`", "cs=`@COMMAND@`", 1)
         .replace("@COMMAND@", invocation)
-}
-
-fn git_root() -> Result<PathBuf> {
-    let output = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .output()?;
-    ensure!(
-        output.status.success(),
-        "--repo requires a Git working tree"
-    );
-    let root = String::from_utf8(output.stdout)?;
-    Ok(PathBuf::from(root.trim_end_matches(['\r', '\n'])))
 }
 
 #[cfg(unix)]
