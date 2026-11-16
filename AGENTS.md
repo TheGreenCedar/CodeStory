@@ -109,6 +109,12 @@ adapter to compensate for incorrect upstream state.
 - Cleanup may remove only resources proven CodeStory-owned by a current token,
   lease, manifest, generation, or proof marker. Do not perform broad Docker,
   process, port, or user-cache cleanup.
+- `find`, `refs`, and `read` serve live working-tree bytes only. They may
+  attach index facts to a file only when the bytes just read hash to that
+  file's `content_hash` in the pinned complete publication; any other file is
+  served as plain text and marked. They never activate, refresh, or walk the
+  tree for freshness, and they claim nothing beyond the live text they
+  searched.
 - Agent-facing packet/search/context must fail closed on stale or partial
   publications, ambiguous migration, changed runtime identity, non-`full`
   sidecars, dead required infrastructure, or missing required accelerator/embed

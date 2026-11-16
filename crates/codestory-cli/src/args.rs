@@ -59,6 +59,8 @@ pub(crate) struct Cli {
 /// Variants should stay thin: argument validation that affects help text lives
 /// in `clap` attributes, while runtime validation belongs in the handler.
 pub(crate) enum Command {
+    #[command(about = "Install or remove CodeStory lookup instructions for an agent host.")]
+    Setup(SetupCommand),
     #[command(about = "Build or refresh the repository index.")]
     Index(IndexCommand),
     #[command(about = "Summarize indexed repository context.")]
@@ -91,6 +93,34 @@ pub(crate) enum Command {
     Cache(CacheCommand),
     #[command(about = "Find symbols and repo text evidence.")]
     Search(SearchCommand),
+    #[command(
+        about = "Find literal text in the live source tree.",
+        long_about = "Find literal text in the live source tree.\n\n\
+            Reads the files ripgrep would search, at call time. Each hit is shown under its \
+            file inside its enclosing declaration (`== <name> <start>-<end>`, hit lines end in \
+            `>`); a declaration over 150 lines is cut to a few lines around each hit. The \
+            declaration is shown only when the file's current bytes match the index; a file \
+            that changed since indexing or was never indexed is marked and shown as a few lines \
+            of plain text around each hit. Hits past --body-lines, and every hit with \
+            --no-bodies, are listed as `<line> [enclosing definition] <code>`. Nothing is \
+            refreshed."
+    )]
+    Find(FindCommand),
+    #[command(
+        about = "List every whole-word mention of a name in the live source tree.",
+        long_about = "List every whole-word mention of a name in the live source tree.\n\n\
+            The header lists the definitions the index records for the name, with their \
+            declarations when there are at most three; the listing has every other mention, \
+            shown and marked like `find`. With several definitions, ` -> <path>:<line>` names \
+            the one a line resolves to. A qualifier omits the mentions the index resolved to \
+            another definition and reports how many. With at most three definitions, \
+            `<name> uses:` then follows the references for each one: the declarations it \
+            references that are not shown above, whole when they have at most 80 lines and \
+            fit --body-lines, else as a `<path>:<start>-<end> <kind> <name>` row. Only \
+            references the index resolved with certainty into files whose current bytes match \
+            it are followed. Nothing is refreshed."
+    )]
+    Refs(RefsCommand),
     #[command(about = "Run a repeatable grounding quality check.")]
     Drill(DrillCommand),
     #[command(about = "Run a drill manifest across repositories.")]
@@ -105,12 +135,27 @@ pub(crate) enum Command {
     Trail(TrailCommand),
     #[command(about = "Show incoming callers for a symbol.")]
     Callers(TrailCommand),
+    #[command(about = "Show direct reference sites for a symbol.")]
+    References(TrailCommand),
     #[command(about = "Show outgoing callees for a symbol.")]
     Callees(TrailCommand),
     #[command(about = "Show a readable trace around a symbol.")]
     Trace(TrailCommand),
     #[command(about = "Show source around a symbol.")]
     Snippet(SnippetCommand),
+    #[command(
+        about = "Read a file or declarations by path, path::Symbol, path:LINE or path:A-B.",
+        long_about = "Read a file or declarations by path, path::Symbol, path:LINE or \
+            path:A-B.\n\n\
+            Several selectors can be read in one call; one that cannot be served gets its own \
+            line. A bare path prints a file of up to 400 lines whole and outlines the \
+            declarations of a longer one. A range comes from the index when the file's current \
+            bytes match it; otherwise it is approximated from the live text and marked. A \
+            declaration read by path::Symbol or path:LINE from such a file is followed by \
+            `uses:` and a `<path>:<start>-<end> <kind> <name>` row for each declaration it \
+            references with certainty. Nothing is refreshed."
+    )]
+    Read(ReadCommand),
     #[command(about = "Run structured graph queries.")]
     Query(QueryCommand),
     #[command(about = "Open the terminal explorer or print an exploration packet.")]
@@ -129,12 +174,34 @@ pub(crate) enum Command {
     Retrieval(RetrievalCommand),
     #[command(name = "internal-owned-delete", hide = true)]
     InternalOwnedDelete(InternalOwnedDeleteCommand),
+    #[command(name = "internal-source-context", hide = true)]
+    InternalSourceContext(InternalSourceContextCommand),
+    #[command(name = "internal-session-context", hide = true)]
+    InternalSessionContext(InternalSessionContextCommand),
     #[command(name = "internal-dirty-hook", hide = true)]
     InternalDirtyHook(InternalDirtyHookCommand),
     #[command(name = "internal-embedding-server", hide = true)]
     InternalEmbeddingServer,
     #[command(name = "internal-embedding-qualification-worker", hide = true)]
     InternalEmbeddingQualificationWorker(InternalEmbeddingQualificationCommand),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct SetupCommand {
+    #[arg(value_enum)]
+    pub(crate) host: SetupHost,
+    #[arg(long, help = "Use the instruction file in the current Git repository.")]
+    pub(crate) repo: bool,
+    #[arg(long, help = "Remove the managed lookup instructions.")]
+    pub(crate) remove: bool,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum SetupHost {
+    #[value(name = "codex")]
+    AgentsFile,
+    #[value(name = "claude-code")]
+    ClaudeFile,
 }
 
 #[derive(Args, Debug)]
@@ -173,6 +240,39 @@ pub(crate) enum InternalDirtyHookAction {
     Install,
     Uninstall,
     Status,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct InternalSourceContextCommand {
+    #[command(subcommand)]
+    pub(crate) mode: InternalSourceContextMode,
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum InternalSourceContextMode {
+    Context,
+    Capture {
+        #[arg(long)]
+        payload: String,
+    },
+    Rg {
+        #[arg(last = true, allow_hyphen_values = true)]
+        operands: Vec<std::ffi::OsString>,
+    },
+    Setup {
+        #[arg(long)]
+        payload: String,
+        #[arg(long)]
+        rg: PathBuf,
+        #[arg(long)]
+        original_path: std::ffi::OsString,
+    },
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct InternalSessionContextCommand {
+    #[arg(long, value_name = "REPOSITORY")]
+    pub(crate) project: PathBuf,
 }
 
 #[derive(Args, Debug)]
@@ -1180,6 +1280,88 @@ pub(crate) struct DrillSuiteCommand {
     pub(crate) jobs: usize,
 }
 
+#[derive(Args, Debug)]
+pub(crate) struct FindCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(
+        value_name = "TERM",
+        help = "Literal, case-sensitive text; a line matches when it contains any term."
+    )]
+    pub(crate) terms: Vec<String>,
+    #[arg(
+        long = "file-glob",
+        value_name = "GLOB",
+        help = "Only search paths matching this glob. Without a TERM, list the matching paths."
+    )]
+    pub(crate) file_globs: Vec<String>,
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = codestory_runtime::served_lookup::DEFAULT_LIMIT,
+        help = "Lines to list before the remaining matches are only counted per file."
+    )]
+    pub(crate) limit: usize,
+    #[command(flatten)]
+    pub(crate) bodies: BodyArgs,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct BodyArgs {
+    #[arg(
+        long,
+        help = "List one line per hit, without declaration bodies or context."
+    )]
+    pub(crate) no_bodies: bool,
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = codestory_runtime::served_lookup::DEFAULT_BODY_LINES,
+        help = "Lines of declaration bodies and context to print before hits are listed one line each."
+    )]
+    pub(crate) body_lines: usize,
+}
+
+impl BodyArgs {
+    /// The body budget, or `None` for the one-line listing.
+    pub(crate) fn budget(&self) -> Option<usize> {
+        (!self.no_bodies).then_some(self.body_lines)
+    }
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct RefsCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(
+        value_name = "NAME",
+        help = "An identifier, or Qualifier::Name / Qualifier.Name to narrow to one definition."
+    )]
+    pub(crate) name: String,
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = codestory_runtime::served_lookup::DEFAULT_LIMIT,
+        help = "Lines to list before the remaining references are only counted per file."
+    )]
+    pub(crate) limit: usize,
+    #[command(flatten)]
+    pub(crate) bodies: BodyArgs,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ReadCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(
+        required = true,
+        value_name = "SELECTOR",
+        help = "path (the file, or its outline when long), path::Symbol, path:LINE (the \
+            declaration around that line) or path:A-B."
+    )]
+    pub(crate) selectors: Vec<String>,
+}
+
 #[derive(Args, Debug, Clone)]
 #[command(group(
     ArgGroup::new("selector")
@@ -1256,6 +1438,8 @@ pub(crate) struct TrailCommand {
     pub(crate) direction: Option<CliDirection>,
     #[arg(long, default_value_t = 120)]
     pub(crate) max_nodes: u32,
+    #[arg(long, hide = true)]
+    pub(crate) page: Option<std::num::NonZeroUsize>,
     #[arg(long)]
     pub(crate) include_tests: bool,
     #[arg(long)]

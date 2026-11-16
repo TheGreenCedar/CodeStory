@@ -20,12 +20,14 @@ flowchart LR
 
 The released executable includes CodeRankEmbed Q8 and its accelerator engine.
 There is no service to start, model to fetch separately, port to manage, or
-retrieval setup to approve. The plugin downloads that executable once, the first
-time you use it, and reports progress while it does. Source, indexes, and
-queries stay local by default.
+retrieval setup to approve. If you install the plugin, it downloads the matching
+executable on first use and reports its progress. Source, indexes, and queries
+stay local by default.
 
 ## What it adds
 
+- **Live code lookups:** find text, locate symbol mentions, and read numbered
+  source with `cs find`, `cs refs`, and `cs read`. Lookups work before indexing.
 - **Repository grounding:** a compact map of the checkout, its languages,
   components, and important paths.
 - **Symbol and impact navigation:** definitions, callers, references, trails,
@@ -39,30 +41,29 @@ queries stay local by default.
 
 | Host | Start here |
 | --- | --- |
-| Codex | [Codex guide](docs/users/codex.md) — the recommended first install |
+| Codex | [Set up shell lookups](docs/users/codex.md) |
 | Cursor | [Cursor guide](docs/users/cursor.md) — add the marketplace in Customize |
-| Claude Code | [Claude Code guide](docs/users/claude-code.md) |
+| Claude Code | [Set up shell lookups](docs/users/claude-code.md) |
 | GitHub Copilot | [Copilot guide](docs/users/copilot.md) |
 
 Capability comparison, day-1 checklist, and shared prompts: [User guides](docs/users/README.md).
 
 ## Quick start
 
-1. Open the [guide for your host](docs/users/README.md#pick-your-host) and install
-   CodeStory once.
+1. Follow the [setup guide for your host](docs/users/README.md#pick-your-host).
 2. Start a fresh agent session in the repository you want to understand.
 3. Ask an ordinary code question.
 
-That is the normal CodeStory setup. The first relevant call builds the local
-map. The first broad question also initializes the embedded model and prepares
-semantic search. If it needs more than one foreground turn, the agent retries
-the same call. CodeStory does not ask you to start a service or approve a
-retrieval helper. Some hosts still have their own steps: Cursor requires
-enabling the MCP server once, and Copilot and Claude Code need MCP connected
-before tools appear. Use the host page for those gestures.
+For Codex and Claude Code, run the setup command after installing the 0.18 CLI.
+It adds the lookup commands to the agent's standing instructions. The agent
+can read current source before the first index exists. This workflow works with
+your existing `PATH` and needs no MCP connection.
 
-One host process can work across several repositories. Their indexes stay
-isolated while they share one warm embedding engine:
+The optional plugin provides MCP tools for the repository map and broad
+retrieval. Its first relevant call prepares the repository. The first broad
+search also initializes the embedded model. On that path, one host can work
+across several repositories with separate indexes and a shared warm embedding
+engine:
 
 ```mermaid
 flowchart LR
@@ -136,49 +137,46 @@ Full routing: [docs/README.md](docs/README.md).
 
 ## Evaluation
 
-ChatGPT Codex (`gpt-5.6-sol`) answered one architecture question in each of 18
-pinned public repositories, three times with CodeStory and three times without,
-with `--max-source-reads-after-packet 0`. Overall passing answers were 45 of 54
-with CodeStory and 44 of 54 without. Tokens and tool calls dropped sharply. C++
-and Bash each fell from 3 of 3 without to 2 of 3 with. HTML forms and the
-Chinook schema failed in both arms.
+The trial of `codestory-cli setup codex` compared 12 setup sessions with 12
+earlier plain Codex sessions for each repository size. Codex chose to use the
+lookups on its own.
 
-This sheet is a Codex harness sample used as a quality budget, not the product
-ICP and not a host-agnostic result. Cursor and Claude sheets are not in yet. It
-is historical, non-current evidence and not a publishable promotion run: dirty tree, no
-`summary.json`, not `--publishable`, and the without-arm was reused from an
-earlier window. A later publishable `summary.json` can replace the table.
+| Repositories | Lookups per task | Sessions that received source | Graded requirements (setup vs. plain) | Raw tokens vs. plain |
+| --- | ---: | ---: | ---: | ---: |
+| Large | 6.67 | 11/12 | 72/75 vs. 74/75 | −0.03% |
+| Small | 3.50 | 11/12 | 45/45 in both groups | −17.12% |
 
-| | Without CodeStory | With CodeStory |
-| --- | ---: | ---: |
-| Passing answers | 44 of 54 | 45 of 54 |
-| Tokens | 19.8 million | 1.7 million (−91%) |
-| Tool calls | 834 | 54 (−94%) |
+The setup missed the correctness target on large repositories. The token
+decrease on small repositories applies to that group of sessions. General
+token savings and equal correctness across repository sizes remain unestablished.
+[Setup confirmation](https://github.com/TheGreenCedar/CodeStory/issues/2637#issuecomment-6898340226)
 
-| Language | Asked about | Without | With |
-| --- | --- | ---: | ---: |
-| Python | Requests session send | 3 of 3 | 3 of 3 |
-| Java | Commons Lang string checks | 3 of 3 | 3 of 3 |
-| Rust | ripgrep search pipeline | 3 of 3 | 3 of 3 |
-| JavaScript | Express routing | 3 of 3 | 3 of 3 |
-| TypeScript | SWR hooks | 3 of 3 | 3 of 3 |
-| C++ | fmt formatting | 3 of 3 | 2 of 3 |
-| C | Redis command loop | 3 of 3 | 3 of 3 |
-| Go | Gin route dispatch | 3 of 3 | 3 of 3 |
-| Ruby | Jekyll site build | 3 of 3 | 3 of 3 |
-| PHP | Monolog records | 3 of 3 | 3 of 3 |
-| C# | AutoMapper maps | 2 of 3 | 2 of 3 |
-| Kotlin | Okio buffers | 0 of 3 | 3 of 3 |
-| Swift | Alamofire requests | 3 of 3 | 3 of 3 |
-| Dart | HTTP client | 3 of 3 | 3 of 3 |
-| Bash | nvm install | 3 of 3 | 2 of 3 |
-| HTML | MDN form validation | 0 of 3 | 0 of 3 |
-| CSS | animate.css keyframes | 3 of 3 | 3 of 3 |
-| SQL | Chinook schema relations | 0 of 3 | 0 of 3 |
+### Earlier comparisons
 
-These numbers describe this suite, not your checkout. Day-to-day limits:
-[What to expect](docs/users/what-to-expect.md). How this was measured:
-[holdout evidence](docs/testing/language-expansion-holdout-stats.md).
+The earlier comparison used a hand-configured shell command and standing
+instructions, with 36 sessions per arm. Across 12 read-only tasks, Codex
+(`gpt-6.1-sol`, high reasoning) averaged 14.1 lookups per task. Blind grading
+found 224 of 225 requirements met with lookups and 223 of 225 with plain Codex.
+
+| How Codex received the lookups | Sessions | Lookups per task | Raw tokens vs. plain Codex |
+| --- | ---: | ---: | ---: |
+| Hand-configured shell command and standing instructions | 36 | 14.1 | +3.1% |
+| Plugin with the lookup note in a skill | 12 | 0 | +16.6% |
+| Plugin with the skill reworded to lead with lookups | 12 | 1.17 | +31.9% |
+| Plugin on small repositories | 12 | 1.08 | +19.7% |
+
+The +3.1% raw-token difference was within the study's noise.
+[Standing-instructions study](https://github.com/TheGreenCedar/CodeStory/issues/2637#issuecomment-6889401376)
+
+### Command probes
+
+In command probes on checkouts of about 6,900 to 28,000 files, replies took about
+0.2 to 0.9 seconds. All 20 reference probes included every match from the
+corresponding whole-word text search. A separate unindexed probe returned live
+source in 0.37 seconds. [Installed-candidate probes](https://github.com/TheGreenCedar/CodeStory/issues/2637#issuecomment-6896217366)
+
+For language coverage and repository limits, see
+[What to expect](docs/users/what-to-expect.md).
 
 ## License
 

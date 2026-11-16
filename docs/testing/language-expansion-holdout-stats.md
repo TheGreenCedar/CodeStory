@@ -2,9 +2,9 @@
 
 **Audience:** Evidence record, not an install guide.
 
-This is the evidence behind the [README evaluation section](../../README.md#evaluation). The [`language-support-ab.task.json`](../../benchmarks/tasks/language-expansion-holdout/language-support-ab.task.json) manifest covers 18 pinned public OSS packages with one architecture question per package.
+This is a historical harness record. The [`language-support-ab.task.json`](../../benchmarks/tasks/language-expansion-holdout/language-support-ab.task.json) manifest covers 18 pinned public OSS packages with one architecture question per package. See the [README evaluation](../../README.md#evaluation) for the 0.18 shell-lookup study.
 
-The latest nested 18×3 sheet (`language-support-ab-window6`) is the ChatGPT Codex / `gpt-5.6-sol` harness sample behind the [README evaluation table](../../README.md#evaluation): CodeStory **45/54** versus no-CodeStory **44/54**, with `--max-source-reads-after-packet 0`, token and tool reductions, and zero post-packet source reads. It is a quality budget, not the product ICP and not a host-agnostic result. Cursor and Claude sheets are not in yet. It has no `summary.json` because attestation requires a clean tracked checkout, and it was not run with `--publishable`. Do not quote the 2026-08-10 token line, the packet-gate 16/18 score, or any four-task excerpt as that claim.
+The nested 18×3 sheet (`language-support-ab-window6`) used ChatGPT Codex with `gpt-5.6-sol` and graded CodeStory **45/54** versus no-CodeStory **44/54**. The CodeStory arm ran with `--max-source-reads-after-packet 0`. Treat this sample as a quality budget for that harness. It has no `summary.json` because attestation requires a clean tracked checkout, and it ran without `--publishable`. These figures do not establish a product savings claim.
 
 ## 2026-08-19 nested A/B (quality bar met)
 

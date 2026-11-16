@@ -66,7 +66,8 @@ pub(super) fn select_broad_search_result_breadth(
     hits.into_iter()
         .filter(|hit| {
             if matches!(
-                search_hit_match_quality(query, hit),
+                hit.match_quality
+                    .unwrap_or_else(|| search_hit_match_quality(query, hit)),
                 SearchMatchQualityDto::Exact | SearchMatchQualityDto::NormalizedExact
             ) {
                 return true;
@@ -1805,14 +1806,17 @@ impl AppController {
         let intent_query = parse_search_intent_query(&original_query);
         let query = intent_query.effective_query.clone();
         let limit_per_source = req.limit_per_source.clamp(1, 50) as usize;
-        let mut hits = self.resolve_core_symbol_candidates(&query, limit_per_source)?;
+        let mut hits = self.resolve_core_symbol_candidates(&query, 50)?;
+        let project_root = self.require_project_root()?;
+        let storage = self.open_storage_read_only()?;
+        let public_exports =
+            self.admit_public_exports(&storage, project_root.as_path(), &query, &mut hits)?;
         apply_search_intent_filters(&mut hits, &intent_query.filters);
         dedupe_inexact_search_hits_by_display_key(&query, &mut hits);
         hits.truncate(limit_per_source);
         annotate_search_hit_match_quality(&query, &mut hits);
+        Self::annotate_public_exports(&query, &mut hits, &public_exports);
 
-        let project_root = self.require_project_root()?;
-        let storage = self.open_storage_read_only()?;
         crate::search_evidence::attach_pinned_exact_search_source(
             &storage,
             project_root.as_path(),
@@ -1833,7 +1837,7 @@ impl AppController {
             None,
             None,
         );
-        let retrieval = RetrievalStateDto {
+        let mut retrieval = RetrievalStateDto {
             mode: RetrievalModeDto::Symbolic,
             hybrid_configured: false,
             semantic_ready: false,
@@ -1849,7 +1853,9 @@ impl AppController {
             ),
         };
 
+        Self::note_public_export_coverage(&mut retrieval, &public_exports);
         Ok(SearchResultsDto {
+            public_exports,
             query: original_query,
             retrieval_publication: None,
             retrieval,
@@ -1932,14 +1938,21 @@ impl AppController {
             ));
         }
         let initial_sidecar_hits = indexed_symbol_hits.clone();
+        let project_root = self.require_project_root()?;
+        let storage = self.open_storage_read_only()?;
+        let mut public_exports = self.admit_public_exports(
+            &storage,
+            project_root.as_path(),
+            &query,
+            &mut indexed_symbol_hits,
+        )?;
 
         apply_search_intent_filters(&mut indexed_symbol_hits, &intent_query.filters);
         dedupe_inexact_search_hits_by_display_key(&query, &mut indexed_symbol_hits);
         annotate_search_hit_match_quality(&query, &mut indexed_symbol_hits);
+        Self::annotate_public_exports(&query, &mut indexed_symbol_hits, &public_exports);
 
-        let project_root = self.require_project_root()?;
-        let storage = self.open_storage_read_only()?;
-        let retrieval = retrieval_state_from_storage_for_runtime(
+        let mut retrieval = retrieval_state_from_storage_for_runtime(
             &storage,
             &project_root,
             &self.runtime_config,
@@ -1973,6 +1986,7 @@ impl AppController {
             )?;
             let mut hits = scan.hits;
             annotate_search_hit_match_quality(&query, &mut hits);
+            Self::annotate_public_exports(&query, &mut hits, &public_exports);
             (hits, Some(scan.stats))
         } else {
             (Vec::new(), None)
@@ -2051,6 +2065,7 @@ impl AppController {
         let orientation = orientation_evidence.as_ref();
         dedupe_inexact_search_hits_by_display_key(&query, &mut indexed_symbol_hits);
         let total_root_candidates = indexed_symbol_hits.len();
+        Self::annotate_public_exports(&query, &mut indexed_symbol_hits, &public_exports);
         // QueryResult already carries weighted-RRF-v2 order. Search plans may
         // append new evidence but must not replace that canonical score with a
         // second runtime comparator or an anchor-order prior.
@@ -2063,8 +2078,19 @@ impl AppController {
                 indexed_symbol_hits,
             );
         }
+        Self::rank_public_exports(
+            project_root.as_path(),
+            &query,
+            &mut indexed_symbol_hits,
+            &public_exports,
+        );
+        if !public_exports.matches.is_empty() && indexed_symbol_hits.len() > 200 {
+            indexed_symbol_hits.truncate(200);
+            public_exports.bounded = true;
+        }
         indexed_symbol_hits.truncate(limit_per_source);
         annotate_search_hit_match_quality(&query, &mut indexed_symbol_hits);
+        Self::annotate_public_exports(&query, &mut indexed_symbol_hits, &public_exports);
         crate::search_evidence::attach_pinned_search_evidence(
             &storage,
             Some(project_root.as_path()),
@@ -2097,7 +2123,9 @@ impl AppController {
             ),
         );
 
+        Self::note_public_export_coverage(&mut retrieval, &public_exports);
         Ok(SearchResultsDto {
+            public_exports,
             query: original_query,
             retrieval_publication: None,
             retrieval,

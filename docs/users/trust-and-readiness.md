@@ -1,13 +1,13 @@
 # Trust and readiness
 
-CodeStory has two evidence lanes. They can be ready at different times, so a
-useful local answer does not automatically prove that broad repository search
-is current.
+Shell lookups read live source and work before the repository map or broad
+search is ready. Each of these tools proves only what its result shows.
 
 ## Evidence lanes
 
 | Lane | Covers | Trust it when |
 | --- | --- | --- |
+| **Shell lookups** | Text matches, symbol mentions, and numbered source | The result shows the current source. Index annotations apply only to files that match the index |
 | **Repository map** | Files, symbols, definitions, callers, trails, snippets, and changed-file impact hints | Returned paths exist, symbols resolve, and the tool served a complete local publication |
 | **Broad search** | Packet, semantic search, and broad context across lexical, vector, and graph artifacts | The requested tool succeeds against `retrieval_mode=full` and its citations resolve |
 
@@ -39,7 +39,7 @@ must not run yet.
 ## When to stop trusting a CodeStory claim
 
 - Paths or symbols do not match the checkout.
-- The answer came from an old host session that does not expose CodeStory MCP.
+- The answer cites an MCP tool that the host session did not expose.
 - A broad tool is still preparing or unavailable, or returned
   `continuation_available` / `no_useful_evidence` without the evidence needed
   for the claim.

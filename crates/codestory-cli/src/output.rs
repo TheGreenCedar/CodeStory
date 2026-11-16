@@ -4739,6 +4739,7 @@ mod tests {
             format: OutputFormat::Markdown,
             output_file: None,
             mermaid: false,
+            page: None,
         }
     }
 

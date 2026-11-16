@@ -1,29 +1,27 @@
 # CodeStory user guide
 
-CodeStory gives a coding agent a local map of your checkout and a cited search
-index. Install the adapter for your host, open a repository, and ask an ordinary
-code question. Repository preparation happens on the first relevant tool call;
-there is no background service for you to configure or approve.
+CodeStory gives a coding agent live source lookups, a local repository map, and
+cited search. Set it up for your host, open a fresh session in your repository,
+and ask a code question.
 
-The very first call also downloads the CodeStory runtime, which is a few hundred
-megabytes because it carries the local model. It happens once per version,
-reports progress while it runs, and resumes if it is interrupted. See
+For Codex and Claude Code, use the CLI setup command for shell lookups. The
+optional plugin adds the repository map and broad search through MCP. On the
+plugin path, the first call downloads the matching runtime when needed. See
 [First use downloads the runtime](troubleshooting.md#first-use-downloads-the-runtime).
 
 ## Pick your host
 
 | Host | Setup | What is automatic |
 | --- | --- | --- |
-| [Codex](codex.md) | Install from `/plugins` | MCP, hooks, skill, matching CLI |
+| [Codex](codex.md) | `codestory-cli setup codex` | Lookup note in standing instructions |
 | [Cursor](cursor.md) | Add the marketplace in Customize, then enable MCP once | Rule, hook, skill, and launcher; matching CLI fetched after the first MCP call |
-| [Claude Code](claude-code.md) | Install the plugin and configure MCP | Hooks; preparation after MCP connects |
+| [Claude Code](claude-code.md) | `codestory-cli setup claude-code` | Lookup note in standing instructions |
 | [Copilot CLI](copilot.md#copilot-cli) | Install hooks and configure MCP | Session instructions; preparation after MCP connects |
 | [Copilot editor](copilot.md#copilot-editor) | Add repository instructions and optionally MCP | CodeStory evidence only when MCP is connected |
 
-Codex and Cursor install complete host packages. Other hosts use the same
-project-scoped MCP runtime with the adapter setup described in their guides.
-
 ## Capability matrix
+
+The table describes the plugin and MCP setup for each host.
 
 | Host | MCP auto-start | Hooks | Grounding skill or rule | Managed CLI through adapter |
 | --- | --- | --- | --- | --- |
@@ -33,7 +31,7 @@ project-scoped MCP runtime with the adapter setup described in their guides.
 | Copilot CLI | No | Session hook | Partial | Yes, after MCP connects |
 | Copilot editor | No | No | Repository instructions | Only when MCP is configured |
 
-Codex is the most automatic install, not the product ICP.
+The Codex and Claude Code guides also cover installing the optional plugin.
 
 ## Other MCP hosts
 
@@ -75,7 +73,7 @@ For existing installations and custom integrations, read the
 
 ## First use
 
-1. Install the plugin or adapter for your host.
+1. Follow the setup guide for your host.
 2. Start a fresh agent session in the repository.
 3. Ask a concrete repository question, such as:
 
@@ -83,11 +81,10 @@ For existing installations and custom integrations, read the
    Where is request authentication implemented, who calls it, and which tests cover it?
    ```
 
-The first call builds or refreshes the local repository map. A broad question
-may also initialize semantic search and publish its first complete retrieval
-generation. On a large checkout this can take several minutes. The agent should
-retry the same CodeStory tool after its returned delay while local navigation
-remains available.
+Shell lookups can read current source before an index exists. With the plugin,
+the first relevant call builds or refreshes the repository map. A broad query
+may also initialize semantic search. If a tool returns a delay while it
+prepares the repository, the agent retries that tool.
 
 Success looks like an answer that names real files and symbols, cites its
 evidence, and says when coverage is incomplete. It should not ask you to install

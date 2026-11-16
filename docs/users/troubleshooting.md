@@ -1,5 +1,12 @@
 # Troubleshooting
 
+If Codex or Claude Code misses shell lookups, check that setup ran for the
+intended scope and start a fresh session. If you moved the native CLI, run
+setup again. See [Codex](codex.md#set-up-shell-lookups) or
+[Claude Code](claude-code.md#set-up-shell-lookups).
+
+The steps below cover plugin and MCP tools.
+
 Start with the failed CodeStory call. Most first-use and refresh states resolve
 by retrying that same tool; status and CLI commands are diagnostics, not setup
 rituals.

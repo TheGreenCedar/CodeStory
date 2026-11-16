@@ -427,6 +427,7 @@ fn symbol_to_hit(
             .node_id
             .as_ref()
             .map(|_| codestory_contracts::compilation::INTERIM_SOURCE_ROW_UPPER_BOUND as u32),
+        whole_file_length_evidence: None,
         score,
         lane_scores: Default::default(),
         source: CandidateSource::Scip,

@@ -4,6 +4,26 @@ pub(crate) enum McpRevisionV3 {
     March2025,
     June2025,
     November2025,
+    June2025JsonText,
+    November2025JsonText,
+}
+
+/// Explicit process-owned display choice, independent of protocol negotiation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum McpResultDisplay {
+    #[default]
+    Mirrors,
+    CodexJsonText,
+}
+
+impl McpResultDisplay {
+    pub(crate) fn from_env_value(value: Option<&str>) -> Self {
+        if value == Some("codex-json-text-v1") {
+            Self::CodexJsonText
+        } else {
+            Self::Mirrors
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,8 +45,28 @@ impl McpRevisionV3 {
         match self {
             Self::November2024 => "2024-11-05",
             Self::March2025 => "2025-03-26",
-            Self::June2025 => "2025-06-18",
-            Self::November2025 => "2025-11-25",
+            Self::June2025 | Self::June2025JsonText => "2025-06-18",
+            Self::November2025 | Self::November2025JsonText => "2025-11-25",
+        }
+    }
+
+    pub(crate) const fn canonical(self) -> Self {
+        match self {
+            Self::June2025JsonText => Self::June2025,
+            Self::November2025JsonText => Self::November2025,
+            other => other,
+        }
+    }
+
+    pub(crate) const fn json_text_only(self) -> bool {
+        matches!(self, Self::June2025JsonText | Self::November2025JsonText)
+    }
+
+    pub(crate) const fn with_result_display(self, display: McpResultDisplay) -> Self {
+        match (self.canonical(), display) {
+            (Self::June2025, McpResultDisplay::CodexJsonText) => Self::June2025JsonText,
+            (Self::November2025, McpResultDisplay::CodexJsonText) => Self::November2025JsonText,
+            (revision, _) => revision,
         }
     }
 
@@ -66,6 +106,19 @@ impl McpRevisionV3 {
                 tool_fields: &["name", "description", "inputSchema", "annotations"],
                 structured_content: false,
                 batch_policy: BatchPolicyV3::AcceptIndependentOrdered,
+            },
+            Self::June2025JsonText | Self::November2025JsonText => RevisionProfileV3 {
+                revision: self,
+                tool_fields: &[
+                    "name",
+                    "title",
+                    "description",
+                    "inputSchema",
+                    "annotations",
+                    "_meta",
+                ],
+                structured_content: true,
+                batch_policy: BatchPolicyV3::Reject,
             },
             Self::June2025 | Self::November2025 => RevisionProfileV3 {
                 revision: self,

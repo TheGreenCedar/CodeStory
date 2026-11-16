@@ -1,7 +1,9 @@
 use super::super::artifacts::preflight_output_file;
 use super::super::lifecycle::open_target_surface;
 use super::super::rendering::build_query_resolution_output_with_runtime;
-use super::super::resolution::resolve_target_or_emit_ambiguity;
+use super::super::resolution::{
+    resolve_source_target_or_emit_ambiguity, resolve_target_or_emit_ambiguity,
+};
 use crate::args;
 use crate::args::{
     CliDirection, CliTrailMode, TrailCommand, TrailJsonOutput, build_trail_request,
@@ -11,7 +13,7 @@ use crate::output::{
     RenderedPublicOutput, emit_public_operation, render_trail_dot, render_trail_markdown,
     render_trail_mermaid, render_trail_story_markdown,
 };
-use crate::runtime::map_api_error;
+use crate::runtime::{RuntimeContext, ensure_index_ready, map_api_error};
 use anyhow::{Result, bail};
 use codestory_contracts::api::TrailCallerScope;
 use std::fmt::Write as _;
@@ -29,7 +31,7 @@ pub(in crate::app) fn run_trail(cmd: TrailCommand) -> Result<()> {
 
     let file_filter = cmd.target.file_filter();
     let operation = if cmd.target.query.is_some() {
-        "graph_assisted"
+        "resolution"
     } else {
         "graph"
     };
@@ -83,7 +85,52 @@ pub(in crate::app) fn run_trail(cmd: TrailCommand) -> Result<()> {
 pub(in crate::app) fn run_callers(mut cmd: TrailCommand) -> Result<()> {
     cmd.mode = CliTrailMode::Referencing;
     cmd.direction = Some(CliDirection::Incoming);
-    run_trail(cmd)
+    if cmd.format != args::OutputFormat::Markdown || cmd.mermaid || cmd.story {
+        return run_trail(cmd);
+    }
+    run_reference_lines(cmd, true)
+}
+
+pub(in crate::app) fn run_references(cmd: TrailCommand) -> Result<()> {
+    run_reference_lines(cmd, false)
+}
+
+fn run_reference_lines(cmd: TrailCommand, calls_only: bool) -> Result<()> {
+    preflight_output_file(cmd.output_file.as_deref())?;
+    let runtime = RuntimeContext::new(&cmd.project)?;
+    ensure_index_ready(&runtime.ensure_core_open(cmd.refresh)?, "references")?;
+    let selection = cmd.target.selection()?;
+    let file = cmd.target.file_filter();
+    let operation = runtime.run_public_operation("source_snippet", || {
+        let target = resolve_source_target_or_emit_ambiguity(
+            &runtime,
+            selection.clone(),
+            file.as_deref(),
+            cmd.format,
+            cmd.output_file.as_deref(),
+        )?;
+        let rows = runtime
+            .browser
+            .direct_reference_lines(target.selected.node_id, calls_only)
+            .map_err(map_api_error)?;
+        let limit = (cmd.max_nodes as usize).max(1);
+        let page = cmd.page.map_or(1, std::num::NonZeroUsize::get);
+        let offset = (page - 1).saturating_mul(limit);
+        let mut previous = None;
+        let mut text = String::new();
+        for (caller, path, line, code) in rows.iter().skip(offset).take(limit) {
+            if previous != Some(caller) {
+                let _ = writeln!(text, "{caller}");
+                previous = Some(caller);
+            }
+            let _ = writeln!(text, "{path}:{line}: {code}");
+        }
+        if rows.len() > offset.saturating_add(limit) {
+            let _ = writeln!(text, "Next page: --page {}", page + 1);
+        }
+        Ok(RenderedPublicOutput::text(text.replace('\u{1b}', "\\x1b")))
+    })?;
+    emit_public_operation(cmd.format, operation, cmd.output_file.as_deref())
 }
 
 pub(in crate::app) fn run_callees(mut cmd: TrailCommand) -> Result<()> {

@@ -47,11 +47,15 @@ impl<'a> FileStore<'a> {
             .filter(|error| {
                 // Stable format rejection is coverage, not transient failure.
                 // Missing verification or any other error still requires retry.
-                !(error.coverage_reason
-                    == Some(codestory_contracts::graph::FileCoverageReason::Malformed)
-                    && error
-                        .file_id
-                        .is_some_and(|id| content_hashes.contains_key(&id.0)))
+                !(matches!(
+                    error.coverage_reason,
+                    Some(
+                        codestory_contracts::graph::FileCoverageReason::Malformed
+                            | codestory_contracts::graph::FileCoverageReason::Binary
+                    )
+                ) && error
+                    .file_id
+                    .is_some_and(|id| content_hashes.contains_key(&id.0)))
             })
             .filter_map(|error| error.file_id.map(|id| id.0))
             .collect::<HashSet<_>>();
@@ -80,10 +84,13 @@ mod tests {
     use codestory_contracts::graph::{ErrorInfo, FileCoverageReason, IndexStep, NodeId};
 
     #[test]
-    fn inventory_only_skips_retry_for_verified_format_rejection() {
+    fn inventory_only_skips_retry_for_verified_source_rejection() {
         for (reason, verified, retry) in [
             (FileCoverageReason::Malformed, true, false),
             (FileCoverageReason::Malformed, false, true),
+            (FileCoverageReason::Binary, true, false),
+            (FileCoverageReason::Binary, false, true),
+            (FileCoverageReason::Oversized, true, true),
             (FileCoverageReason::CollectorFailure, true, true),
             (FileCoverageReason::SourceChanged, true, true),
             (FileCoverageReason::Unreadable, false, true),

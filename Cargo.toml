@@ -34,7 +34,8 @@ tree-sitter-java = "0.23.5"
 tree-sitter-cpp = "0.23.4"
 tree-sitter-c = "0.24.2"
 tree-sitter-javascript = "0.25.0"
-tree-sitter-typescript = "0.23.2"
+# Type-star grammar fix, exact contributor revision from upstream PR358.
+tree-sitter-typescript = { git = "https://github.com/gthb/tree-sitter-typescript", rev = "8a43a912d4a941767829a00ff0be80318762a4f1" }
 tree-sitter-go = "0.25.0"
 tree-sitter-ruby = "0.23.1"
 tree-sitter-php = "0.24.2"

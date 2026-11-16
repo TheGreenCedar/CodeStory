@@ -51,6 +51,39 @@ sequenceDiagram
 
 That split is intentional: the runtime orchestrates the run, the indexer performs indexing work, and the store owns persistence mechanics.
 
+## Explicit public export navigation
+
+Core schema 38 adds a typed public-export projection for JavaScript and
+TypeScript class/function declarations. The indexer collects named export
+bindings from the existing parse tree, authenticates parser inputs against the
+staged source hashes, and binds only a unique declaration. Supported forms are
+same-file named exports, named relative imports followed by a local export,
+and direct named relative reexports ending at a direct exported declaration.
+Resolution stops after one relative module hop. TypeScript `.js` spelling may
+navigate to a unique `.ts`/`.tsx` source; competing concrete candidates remain
+ambiguous. Default, star, namespace, type-only, package, expression and chained
+exports are not resolved by this projection.
+
+Graph flush invalidates alias rows and their coverage receipt in the same
+transaction as graph/error/dirty state. The full derived replacement is a
+transaction in the unpublished candidate, rebuilt across unchanged exporters
+as well as changed targets. A failed or cancelled stage retains the previous
+publication. Parser artifacts are reconstruction inputs, never query authority:
+missing/corrupt/oversized required records cannot prove an empty export set.
+Old cores have no export receipt until refreshed; the parser artifact version
+and durable JS/TS extraction revision require re-extraction through the existing
+refresh planner without broadening exact-call resolution admission.
+
+Core-only and full search supplement candidates from the pinned projection,
+deduplicate canonical IDs, and retain the existing 200-candidate and 1–50
+presentation bounds. A verified public spelling participates in name matching;
+definition quality still comes from the canonical declaration. Modern search
+renders export/import witness locations in its existing presentation label,
+while legacy results retain canonical names and existing verification targets.
+IDs, source locations and excerpts are unchanged. Incomplete, ambiguous and
+bounded projection coverage remains explicit; export navigation does not prove
+runtime dispatch or source absence.
+
 ## Two publication fences
 
 ```mermaid

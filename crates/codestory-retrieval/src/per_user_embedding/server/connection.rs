@@ -15,7 +15,9 @@ use super::response::{
     protocol_error, success_response, valid_cancel_token, validate_protocol_request,
     write_anyhow_failure, write_deadline_exceeded, write_deadline_invalid, write_protocol_response,
 };
-use super::state::{PerUserEmbeddingServerState, ServerRequestRegistration};
+use super::state::{
+    PerUserEmbeddingServerState, ServerHandoffResponseGuard, ServerRequestRegistration,
+};
 use crate::embedding_contract::{CODERANK_DOCUMENT_PREFIX, CODERANK_QUERY_PREFIX};
 use anyhow::{Context, Result, anyhow, bail};
 use codestory_llama_sys::NativeDeviceClass;
@@ -28,16 +30,23 @@ pub(in crate::per_user_embedding) fn serve_embedding_connection(
     state: Arc<PerUserEmbeddingServerState>,
     mut stream: Box<dyn EmbeddingServerStream>,
 ) -> Result<()> {
-    let result = serve_embedding_connection_inner(state, &mut *stream, false);
-    finish_embedding_response_delivery(&*stream, result)
+    let mut handoff_response = None;
+    let result =
+        serve_embedding_connection_inner(state, &mut *stream, false, &mut handoff_response);
+    let result = finish_embedding_response_delivery(&*stream, result);
+    drop(handoff_response);
+    result
 }
 
 pub(in crate::per_user_embedding) fn serve_embedding_connection_at_handler_capacity(
     state: Arc<PerUserEmbeddingServerState>,
     mut stream: Box<dyn EmbeddingServerStream>,
 ) -> Result<()> {
-    let result = serve_embedding_connection_inner(state, &mut *stream, true);
-    finish_embedding_response_delivery(&*stream, result)
+    let mut handoff_response = None;
+    let result = serve_embedding_connection_inner(state, &mut *stream, true, &mut handoff_response);
+    let result = finish_embedding_response_delivery(&*stream, result);
+    drop(handoff_response);
+    result
 }
 
 fn finish_embedding_response_delivery(
@@ -62,6 +71,7 @@ fn serve_embedding_connection_inner(
     state: Arc<PerUserEmbeddingServerState>,
     stream: &mut dyn EmbeddingServerStream,
     handler_capacity_limited: bool,
+    handoff_response: &mut Option<ServerHandoffResponseGuard>,
 ) -> Result<()> {
     let pre_request_guard = (!handler_capacity_limited)
         .then(|| state.try_begin_pre_request())
@@ -165,7 +175,13 @@ fn serve_embedding_connection_inner(
         // Observe is a read-only contract. An incompatible status/doctor
         // process may report the live owner, but it must never transfer
         // authority or make that owner drain.
-        let idle = !observe_only && state.begin_draining_if_idle();
+        let idle = if observe_only {
+            false
+        } else {
+            let (idle, reservation) = state.begin_authenticated_handoff()?;
+            *handoff_response = Some(reservation);
+            idle
+        };
         let error = EmbeddingProtocolError {
             code: if idle {
                 "embedding_server_draining"

@@ -561,7 +561,7 @@ impl ReadOnlyBrowserService {
     ) -> Result<SymbolWorkflowOutcome, ApiError> {
         let operation = match &request.target {
             TargetSelection::Id(_) => "graph",
-            TargetSelection::Query { .. } => "graph_assisted",
+            TargetSelection::Query { .. } => "resolution",
         };
         self.run_public(operation, || {
             self.controller.symbol_workflow(request.clone())
@@ -612,6 +612,17 @@ impl ReadOnlyBrowserService {
 
     pub fn references_context(&self, req: TrailConfigDto) -> Result<TrailContextDto, ApiError> {
         self.run_public("graph", || self.controller.trail_context(req.clone()))
+    }
+
+    pub fn direct_reference_lines(
+        &self,
+        node_id: NodeId,
+        calls_only: bool,
+    ) -> Result<Vec<(String, String, u32, String)>, ApiError> {
+        self.run_public("source_snippet", || {
+            self.controller
+                .direct_reference_lines(node_id.clone(), calls_only)
+        })
     }
 
     pub fn direct_references_graph(&self, req: TrailConfigDto) -> Result<GraphResponse, ApiError> {

@@ -1,0 +1,81 @@
+#!/usr/bin/env node
+const { createHash } = require('node:crypto');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { spawn, spawnSync } = require('node:child_process');
+const { pluginDataDir, resolveCli } = require('../scripts/codestory-mcp.cjs');
+
+const retryMs = 15_000;
+
+function projectRoot() {
+  const git = spawnSync('git', ['rev-parse', '--show-toplevel'], {
+    encoding: 'utf8', timeout: 1_000, windowsHide: true,
+  });
+  return fs.realpathSync(git.status === 0 ? git.stdout.trimEnd() : process.cwd());
+}
+
+function refreshIndex(cli, project) {
+  // Indexing has its own writer lock. Suppress duplicate starts in a burst of lookups.
+  const data = pluginDataDir();
+  if (!data) return;
+  try {
+    const directory = path.join(data, 'lookup-index');
+    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const key = createHash('sha256').update(project).digest('hex');
+    const bucket = Math.floor(Date.now() / retryMs);
+    fs.closeSync(fs.openSync(path.join(directory, `${key}.${bucket}`), 'wx', 0o600));
+    for (const name of fs.readdirSync(directory)) {
+      const match = /^([a-f0-9]{64})\.(\d+)$/u.exec(name);
+      if (match && Number(match[2]) < bucket - 1) {
+        try { fs.unlinkSync(path.join(directory, name)); } catch {}
+      }
+    }
+    const child = spawn(cli, ['index', '--project', project, '--refresh', 'auto'], {
+      cwd: project, detached: true, stdio: 'ignore', windowsHide: true,
+    });
+    child.on('error', () => {});
+    child.unref();
+  } catch {
+    // Read-only host permissions can prevent indexing. The live reply is already delivered.
+  }
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  if (!['find', 'refs', 'read'].includes(args[0])) {
+    process.stdout.write('Usage: cs find TERM... | cs refs NAME | cs read PATH[:LINE|::SYMBOL]...\n');
+    return args.length && !['-h', '--help'].includes(args[0]) ? 2 : 0;
+  }
+  const forwarded = args.includes('--') ? args.slice(1, args.indexOf('--')) : args.slice(1);
+  if (forwarded.some((arg) => /^--(?:project|path|cache-dir)(?:=|$)/u.test(arg))) {
+    throw new Error('Run cs from the target repository. Use codestory-cli for explicit project or cache selection.');
+  }
+  const resolved = await resolveCli({ provision: false });
+  if (!resolved.path) {
+    throw new Error('CodeStory runtime is unavailable. Start a new session with the plugin enabled and let its runtime install.');
+  }
+  const project = projectRoot();
+  const result = spawnSync(resolved.path, [args[0], '--project', project, ...args.slice(1)], {
+    cwd: project, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, windowsHide: true,
+  });
+  if (result.stdout) process.stdout.write(result.stdout);
+  if (result.stderr) process.stderr.write(result.stderr);
+  if (result.error) throw result.error;
+  if (result.status === 0 && (
+    result.stdout.startsWith('no index; text matches only\n')
+    || /^(?!\s).+ \(changed since indexing\)$/mu.test(result.stdout)
+  )) {
+    refreshIndex(resolved.path, project);
+  }
+  return result.status ?? 1;
+}
+
+process.stdout.on('error', (error) => {
+  if (error.code === 'EPIPE') process.exit(0);
+  throw error;
+});
+main().then((code) => { process.exitCode = code; }, (error) => {
+  process.stderr.write(`cs: ${error.message}${os.EOL}`);
+  process.exitCode = 1;
+});

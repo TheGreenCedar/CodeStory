@@ -1,4 +1,5 @@
 use super::*;
+use codestory_contracts::graph::callsite_has_source_receiver_marker;
 
 struct BfsTraversalOptions<'a> {
     edge_filter: &'a [EdgeKind],
@@ -518,6 +519,8 @@ fn get_edges_for_node_limited(
         if edge.kind == EdgeKind::CALL
             && !show_utility_calls
             && super::is_common_unqualified_call_name(&target_symbol)
+            && edge.resolved_target.is_none()
+            && !callsite_has_source_receiver_marker(edge.callsite_identity.as_deref())
         {
             continue;
         }

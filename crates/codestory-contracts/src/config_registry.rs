@@ -62,6 +62,7 @@ pub const LATEST_RELEASE_VERSION_ENV: &str = "CODESTORY_LATEST_RELEASE_VERSION";
 pub const LLM_DOC_EMBED_BATCH_SIZE_ENV: &str = "CODESTORY_LLM_DOC_EMBED_BATCH_SIZE";
 pub const LOG_ENV: &str = "CODESTORY_LOG";
 pub const LOG_CORRELATION_ID_ENV: &str = "CODESTORY_LOG_CORRELATION_ID";
+pub const MCP_RESULT_DISPLAY_ENV: &str = "CODESTORY_MCP_RESULT_DISPLAY";
 pub const NO_TUI_ENV: &str = "CODESTORY_NO_TUI";
 pub const PACKET_CANDIDATE_TRACE_ENV: &str = "CODESTORY_PACKET_CANDIDATE_TRACE";
 pub const PACKET_STEP_TRACE_OUT_ENV: &str = "CODESTORY_PACKET_STEP_TRACE_OUT";
@@ -107,6 +108,12 @@ pub const SEMANTIC_DOC_SCOPE_ENV: &str = "CODESTORY_SEMANTIC_DOC_SCOPE";
 pub const SEMANTIC_STREAM_PENDING_DOCS_ENV: &str = "CODESTORY_SEMANTIC_STREAM_PENDING_DOCS";
 pub const SEMANTIC_STREAM_SORT_WINDOW_BATCHES_ENV: &str =
     "CODESTORY_SEMANTIC_STREAM_SORT_WINDOW_BATCHES";
+pub const SOURCE_CONTEXT_BOUND_RG_ENV: &str = "CODESTORY_SOURCE_CONTEXT_BOUND_RG";
+pub const SOURCE_CONTEXT_CLI_ENV: &str = "CODESTORY_SOURCE_CONTEXT_CLI";
+pub const SOURCE_CONTEXT_FD_ENV: &str = "CODESTORY_SOURCE_CONTEXT_FD";
+pub const SOURCE_CONTEXT_ORIGINAL_PATH_ENV: &str = "CODESTORY_SOURCE_CONTEXT_ORIGINAL_PATH";
+pub const SOURCE_CONTEXT_PIPE_ID_ENV: &str = "CODESTORY_SOURCE_CONTEXT_PIPE_ID";
+pub const SOURCE_CONTEXT_READY_ENV: &str = "CODESTORY_SOURCE_CONTEXT_READY";
 pub const STDIO_CACHE_ROOT_ENV: &str = "CODESTORY_STDIO_CACHE_ROOT";
 pub const STORED_VECTOR_ENCODING_ENV: &str = "CODESTORY_STORED_VECTOR_ENCODING";
 pub const SUMMARY_API_KEY_ENV: &str = "CODESTORY_SUMMARY_API_KEY";
@@ -230,6 +237,8 @@ const CLI_EMBEDDING_SERVER_TRANSPORT: &str =
 const CLI_EXPLORE: &str = "crates/codestory-cli/src/explore.rs";
 const CLI_PREFLIGHT: &str = "crates/codestory-cli/src/app/readiness_commands/preflight.rs";
 const CLI_RUNTIME: &str = "crates/codestory-cli/src/runtime.rs";
+const CLI_SOURCE_CONTEXT_TRANSPORT: &str =
+    "crates/codestory-cli/src/app/source_context/transport.rs";
 const CLI_STDIO_TRANSPORT: &str = "crates/codestory-cli/src/stdio_transport.rs";
 const INDEXER_LIB: &str = "crates/codestory-indexer/src/lib.rs";
 const INDEXER_RESOLUTION: &str = "crates/codestory-indexer/src/resolution/mod.rs";
@@ -457,6 +466,13 @@ pub const ENV_SETTINGS: &[EnvSetting] = &[
         SettingKind::Text,
         SettingAudience::Product,
         "Correlation id stamped on every diagnostic record of this process.",
+    ),
+    setting(
+        MCP_RESULT_DISPLAY_ENV,
+        CLI_CONFIG,
+        SettingKind::Enumerated,
+        SettingAudience::Host,
+        "Process-start MCP display selection; exact `codex-json-text-v1` selects JSON text, and other values keep mirrored results.",
     ),
     setting(
         NO_TUI_ENV,
@@ -758,6 +774,48 @@ pub const ENV_SETTINGS: &[EnvSetting] = &[
         SettingKind::Integer,
         SettingAudience::Product,
         "Batches held in the semantic streaming sort window.",
+    ),
+    setting(
+        SOURCE_CONTEXT_BOUND_RG_ENV,
+        CLI_SOURCE_CONTEXT_TRANSPORT,
+        SettingKind::Path,
+        SettingAudience::Host,
+        "Absolute original rg executable bound after shell startup and verified before invocation.",
+    ),
+    setting(
+        SOURCE_CONTEXT_CLI_ENV,
+        CLI_SOURCE_CONTEXT_TRANSPORT,
+        SettingKind::Path,
+        SettingAudience::Host,
+        "Exact CLI executable supplied to the installed source-context rg shim.",
+    ),
+    setting(
+        SOURCE_CONTEXT_FD_ENV,
+        CLI_SOURCE_CONTEXT_TRANSPORT,
+        SettingKind::Integer,
+        SettingAudience::Host,
+        "Inherited private observation-pipe writer descriptor, checked against its native pipe identity.",
+    ),
+    setting(
+        SOURCE_CONTEXT_ORIGINAL_PATH_ENV,
+        CLI_SOURCE_CONTEXT_TRANSPORT,
+        SettingKind::Text,
+        SettingAudience::Host,
+        "Original PATH list restored when invoking the bound rg executable.",
+    ),
+    setting(
+        SOURCE_CONTEXT_PIPE_ID_ENV,
+        CLI_SOURCE_CONTEXT_TRANSPORT,
+        SettingKind::Text,
+        SettingAudience::Host,
+        "Expected native identity and access mode of the private observation-pipe writer.",
+    ),
+    setting(
+        SOURCE_CONTEXT_READY_ENV,
+        CLI_SOURCE_CONTEXT_TRANSPORT,
+        SettingKind::Boolean,
+        SettingAudience::Host,
+        "Setup-success sentinel used before the capture prelude prepends its rg shim to PATH.",
     ),
     setting(
         STDIO_CACHE_ROOT_ENV,

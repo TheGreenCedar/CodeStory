@@ -86,35 +86,42 @@ pub(crate) fn file_coverage_retryable(reason: FileCoverageReason) -> bool {
 pub(crate) fn coverage_gap_blocks_publication(gap: &FileCoverageDiagnosticDto) -> bool {
     match gap.reason {
         FileCoverageReason::ParserPartial => !gap.verified_source,
-        FileCoverageReason::Malformed => !gap.verified_source || gap.projection_available,
+        FileCoverageReason::Malformed | FileCoverageReason::Binary => {
+            !gap.verified_source || gap.projection_available
+        }
         _ => true,
     }
 }
 
-/// Malformed files have no projection to validate. Recheck their authenticated
-/// source identity at the final commit fence, including same-mtime replacement.
-pub(crate) fn revalidate_malformed_sources(storage: &Store) -> Result<(), ApiError> {
-    let malformed = storage
+/// Stable format/encoding rejections have no projection to validate. Recheck
+/// their raw source identity at the final commit fence, including same-mtime drift.
+pub(crate) fn revalidate_rejected_sources(storage: &Store) -> Result<(), ApiError> {
+    let rejected = storage
         .get_errors(None)
         .map_err(|error| ApiError::internal(format!("Failed to read coverage errors: {error}")))?
         .into_iter()
-        .filter(|error| error.coverage_reason == Some(FileCoverageReason::Malformed))
+        .filter(|error| {
+            matches!(
+                error.coverage_reason,
+                Some(FileCoverageReason::Malformed | FileCoverageReason::Binary)
+            )
+        })
         .filter_map(|error| error.file_id.map(|id| id.0))
         .collect::<HashSet<_>>();
-    if malformed.is_empty() {
+    if rejected.is_empty() {
         return Ok(());
     }
     let files = storage.files().inventory().map_err(|error| {
         ApiError::internal(format!("Failed to read source identities: {error}"))
     })?;
     codestory_workspace::reverify_source_freshness_from_content();
-    for file in files.iter().filter(|file| malformed.contains(&file.id)) {
+    for file in files.iter().filter(|file| rejected.contains(&file.id)) {
         if file.content_hash.is_none()
             || codestory_workspace::stored_file_requires_reindex(&file.path, file)
         {
             return Err(ApiError::new(
                 "source_changed",
-                "Malformed source could not be reverified at publication; the candidate was discarded.",
+                "Rejected source could not be reverified at publication; the candidate was discarded.",
             ));
         }
     }
@@ -546,7 +553,10 @@ impl IndexedFilesAggregation {
                         verified_source,
                         projection_available: file.indexed
                             && verified_source
-                            && reason != FileCoverageReason::Malformed,
+                            && !matches!(
+                                reason,
+                                FileCoverageReason::Malformed | FileCoverageReason::Binary
+                            ),
                     })
             })
             .collect();
