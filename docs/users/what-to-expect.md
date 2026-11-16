@@ -71,11 +71,14 @@ Recovery steps: [Troubleshooting](troubleshooting.md).
 
 ## Benchmarks
 
-In a controlled Codex study, agents used shell lookups on their own when the
-commands appeared in standing instructions. Graded correctness and token use
-were similar to plain Codex. The study did not establish token savings.
+In the `codestory-cli setup codex` trial, Codex used shell lookups on its own.
+On large repositories, raw token use was nearly flat and the setup missed the
+correctness target. It met 72 of 75 requirements, compared with 74 of 75 for
+plain Codex. On small repositories, both groups met all 45 requirements, and the
+setup group used fewer raw tokens in that cohort. General token savings and
+equal correctness across repository sizes remain unestablished.
 
-See the sample sizes, results, and probe timings in
+See the setup results, earlier comparisons, and command timings in
 [Evaluation](../../README.md#evaluation).
 
 Better prompts help every session: [Prompt patterns](prompt-patterns.md).

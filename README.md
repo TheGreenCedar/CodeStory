@@ -137,22 +137,38 @@ Full routing: [docs/README.md](docs/README.md).
 
 ## Evaluation
 
-In a comparison of 36 sessions per arm, Codex (`gpt-6.1-sol`, high reasoning)
-received a shell command and a short note in its standing instructions for the
-lookup arm. Across 12 read-only tasks, Codex chose the lookups on its own and
-averaged 14.1 calls per task. Blind grading found 224 of 225 requirements met
-with lookups and 223 of 225 with plain Codex.
+The trial of `codestory-cli setup codex` compared 12 setup sessions with 12
+earlier plain Codex sessions for each repository size. Codex chose to use the
+lookups on its own.
+
+| Repositories | Lookups per task | Sessions that received source | Graded requirements (setup vs. plain) | Raw tokens vs. plain |
+| --- | ---: | ---: | ---: | ---: |
+| Large | 6.67 | 11/12 | 72/75 vs. 74/75 | −0.03% |
+| Small | 3.50 | 11/12 | 45/45 in both groups | −17.12% |
+
+The setup missed the correctness target on large repositories. The token
+decrease on small repositories applies to that group of sessions. General
+token savings and equal correctness across repository sizes remain unestablished.
+[Setup confirmation](https://github.com/TheGreenCedar/CodeStory/issues/2637#issuecomment-6898340226)
+
+### Earlier comparisons
+
+The earlier comparison used a hand-configured shell command and standing
+instructions, with 36 sessions per arm. Across 12 read-only tasks, Codex
+(`gpt-6.1-sol`, high reasoning) averaged 14.1 lookups per task. Blind grading
+found 224 of 225 requirements met with lookups and 223 of 225 with plain Codex.
 
 | How Codex received the lookups | Sessions | Lookups per task | Raw tokens vs. plain Codex |
 | --- | ---: | ---: | ---: |
-| Shell command and standing instructions | 36 | 14.1 | +3.1% |
+| Hand-configured shell command and standing instructions | 36 | 14.1 | +3.1% |
 | Plugin with the lookup note in a skill | 12 | 0 | +16.6% |
 | Plugin with the skill reworded to lead with lookups | 12 | 1.17 | +31.9% |
 | Plugin on small repositories | 12 | 1.08 | +19.7% |
 
-The +3.1% for the standing-instructions setup was within the study's noise.
-The comparison found similar correctness and token use and did not establish
-token savings. [Standing-instructions study](https://github.com/TheGreenCedar/CodeStory/issues/2637#issuecomment-6889401376)
+The +3.1% raw-token difference was within the study's noise.
+[Standing-instructions study](https://github.com/TheGreenCedar/CodeStory/issues/2637#issuecomment-6889401376)
+
+### Command probes
 
 In command probes on checkouts of about 6,900 to 28,000 files, replies took about
 0.2 to 0.9 seconds. All 20 reference probes included every match from the
