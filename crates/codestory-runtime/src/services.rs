@@ -1527,7 +1527,10 @@ impl ActivationService {
                     (Some(snapshot), Some(lease), _)
                         if snapshot.state == ActivationState::Ready =>
                     {
-                        Some((snapshot.clone(), CandidateLease::Full(Box::new(lease.clone()))))
+                        Some((
+                            snapshot.clone(),
+                            CandidateLease::Full(Box::new(lease.clone())),
+                        ))
                     }
                     (Some(snapshot), _, Some(core_lease))
                         if goal == ActivationGoal::CoreOnly
@@ -2467,7 +2470,9 @@ impl ActivationService {
         }
 
         if goal == ActivationGoal::CoreOnly {
-            let observer_after_core = self.controller.observed_source_epoch_if_armed(&project_root);
+            let observer_after_core = self
+                .controller
+                .observed_source_epoch_if_armed(&project_root);
             let observed_refresh_file_count = refreshed_core
                 .as_ref()
                 .map(|(_, stats, _)| stats.file_count);

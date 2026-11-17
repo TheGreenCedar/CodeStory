@@ -435,4 +435,67 @@ mod core_only_tests {
             }
         }
     }
+
+    #[test]
+    fn core_only_flag_skips_semantic_docs_across_full_and_incremental_and_repairs_when_unset() {
+        let owned = tempfile::tempdir().expect("owned core-only fixture");
+        let project = owned.path().join("project");
+        let cache = owned.path().join("core");
+        fs::create_dir(&project).expect("project");
+        let source = project.join("lib.rs");
+        fs::write(&source, "pub fn original() {}\n").expect("source");
+        let output = owned.path().join("index.json");
+        let command = |refresh, core_only| IndexCommand {
+            project: ProjectArgs {
+                project: project.clone(),
+                cache_dir: Some(cache.clone()),
+            },
+            refresh,
+            format: OutputFormat::Json,
+            output_file: Some(output.clone()),
+            dry_run: false,
+            summarize: false,
+            progress: false,
+            core_only,
+            watch: false,
+        };
+
+        run_index(command(RefreshMode::Full, true)).expect("core-only full index");
+        let full_value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&output).expect("full output")).expect("JSON");
+        assert_eq!(full_value["phase_timings"]["semantic_context_index_ms"], 0);
+
+        run_index(command(RefreshMode::Incremental, true))
+            .expect("unchanged core-only incremental short-circuits");
+        let short_value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&output).expect("short output")).expect("JSON");
+        assert_eq!(
+            short_value["phase_timings"]["incremental_plan_probe"]["outcome"], "short_circuited",
+            "{short_value:#}"
+        );
+
+        fs::write(&source, "pub fn original() {}\npub fn added() {}\n").expect("edit source");
+        run_index(command(RefreshMode::Incremental, true)).expect("core-only incremental index");
+        let inc_value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&output).expect("inc output")).expect("JSON");
+        assert_eq!(inc_value["phase_timings"]["semantic_context_index_ms"], 0);
+        assert_eq!(
+            inc_value["phase_timings"]["incremental_semantic_projection_ms"],
+            0
+        );
+        assert_eq!(
+            inc_value["phase_timings"]["incremental_semantic_scope_ms"],
+            0
+        );
+
+        // Switching back to standard indexing repairs missing semantic docs automatically.
+        run_index(command(RefreshMode::Incremental, false))
+            .expect("standard incremental index repairs semantic docs");
+        let repaired_value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&output).expect("repaired output")).expect("JSON");
+        assert_ne!(
+            repaired_value["phase_timings"]["incremental_plan_probe"]["outcome"], "short_circuited",
+            "standard refresh must not short-circuit a core-only cache: {repaired_value:#}"
+        );
+    }
 }

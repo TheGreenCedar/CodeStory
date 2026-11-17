@@ -172,12 +172,14 @@ output validation. Counts, limits, completeness, errors and preparation behavior
 remain the same. Named calls and family calls use the same declared argument;
 ordinary CLI and HTTP affected responses keep their existing shape.
 
-### Explicit family-v1 surface
+### Explicit family-v1 and lean surfaces
 
 The launcher captures `CODESTORY_MCP_TOOL_SURFACE` once at startup. Absent, empty,
 or `named` preserves the existing named tools; `family-v1` explicitly advertises
-only `call` and `describe`. Other values fail before runtime startup. This is an
-opt-in adapter interface, not an automatic migration of installed grants.
+only `call` and `describe`; `lean` exposes only five compact live-source tools
+(`slice`, `find`, `refs`, `read`, `edit`, total schema size under 2.5 KB) with
+detached `--core-only` auto-refresh. Other values fail before runtime startup.
+This is an opt-in adapter interface, not an automatic migration of installed grants.
 
 `call` accepts a closed `{operation, arguments}` envelope. The canonical inner
 arguments own the sole required absolute `project`. The selected full generated

@@ -25,6 +25,25 @@ Generated `codestory-cli --help` and subcommand help are the source of truth for
 flags. This page groups stable workflows and trust boundaries rather than
 copying every option.
 
+## Live lookups, atomic edits, and context proxy
+
+Generated `--help` owns exact flags. Key live-source and proxy workflows:
+
+```sh
+codestory-cli slice --project <repo> "how does request validation reach runtime?"
+codestory-cli find --project <repo> --file-glob "crates/**" TERM1 TERM2
+codestory-cli refs --project <repo> --file-glob "*.rs" SymbolName
+codestory-cli read --project <repo> path/to/file.rs::Symbol
+codestory-cli edit --project <repo> path/to/file.rs::Symbol --stdin
+codestory-cli index --project <repo> --refresh auto --core-only
+codestory-cli setup codex   # or claude-code, cursor, opencode, antigravity
+codestory-cli run -- codex  # starts loopback proxy + runs wrapped command
+```
+
+`--core-only` skips semantic document materialization and dense-anchor work across
+both `full` and `incremental` refreshes; a subsequent normal `index` automatically
+repairs full semantic docs when needed.
+
 ## Readiness and retrieval
 
 | Situation | Command |

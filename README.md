@@ -26,12 +26,21 @@ stay local by default.
 
 ## What it adds
 
-- **Live code lookups:** find text, locate symbol mentions, and read numbered
-  source with `cs find`, `cs refs`, and `cs read`. Lookups work before indexing.
+- **Live code lookups & atomic edits:** pack multi-file slices with `cs slice`,
+  find text with `cs find`, locate definitions and references with `cs refs`,
+  read bounded files/symbols with `cs read`, and make syntax-validated edits
+  with `cs edit`. Lookups work before indexing and are also available via
+  `CODESTORY_MCP_TOOL_SURFACE=lean`.
+- **Fast structural indexing:** `codestory-cli index --core-only` skips
+  embedding document materialization when only live lookups and the structural
+  graph are needed, with warm `ReadyCoreLease` reuse across lookups.
 - **Repository grounding:** a compact map of the checkout, its languages,
   components, and important paths.
 - **Symbol and impact navigation:** definitions, callers, references, trails,
-  routes, and likely tests without repeated whole-tree scans.
+  routes, co-change siblings, and likely tests without repeated whole-tree scans.
+- **Loopback context proxy:** `codestory-cli proxy` / `codestory-cli run` caps
+  and deduplicates oversized tool outputs over a loopback endpoint while keeping
+  conversation prompt prefixes byte-identical for KV cache reuse.
 - **Broad retrieval:** lexical, semantic, graph, and SCIP evidence combined into
   cited search results and answer packets.
 - **Visible limits:** stale, partial, or incoherent evidence fails closed instead
@@ -41,9 +50,11 @@ stay local by default.
 
 | Host | Start here |
 | --- | --- |
-| Codex | [Set up shell lookups](docs/users/codex.md) |
-| Cursor | [Cursor guide](docs/users/cursor.md) — add the marketplace in Customize |
-| Claude Code | [Set up shell lookups](docs/users/claude-code.md) |
+| Codex | [Set up shell lookups](docs/users/codex.md) (`codestory-cli setup codex`) |
+| Cursor | [Cursor guide](docs/users/cursor.md) (`codestory-cli setup cursor` or Customize plugin) |
+| Claude Code | [Set up shell lookups](docs/users/claude-code.md) (`codestory-cli setup claude-code`) |
+| OpenCode | `codestory-cli setup opencode` ([User guides](docs/users/README.md#pick-your-host)) |
+| Antigravity | `codestory-cli setup antigravity` ([User guides](docs/users/README.md#pick-your-host)) |
 | GitHub Copilot | [Copilot guide](docs/users/copilot.md) |
 
 Capability comparison, day-1 checklist, and shared prompts: [User guides](docs/users/README.md).
@@ -54,10 +65,12 @@ Capability comparison, day-1 checklist, and shared prompts: [User guides](docs/u
 2. Start a fresh agent session in the repository you want to understand.
 3. Ask an ordinary code question.
 
-For Codex and Claude Code, run the setup command after installing the 0.18 CLI.
-It adds the lookup commands to the agent's standing instructions. The agent
-can read current source before the first index exists. This workflow works with
-your existing `PATH` and needs no MCP connection.
+Run `codestory-cli setup <host>` (`codex`, `claude-code`, `cursor`, `opencode`,
+or `antigravity`) after installing the CLI. It installs the standing lookup
+instructions and a `cs` launcher using your existing shell without needing an
+MCP connection. Pre-warm a fast lookup index with `codestory-cli index --core-only`,
+or wrap an agent session through `codestory-cli run` for loopback output
+capping and deduplication.
 
 The optional plugin provides MCP tools for the repository map and broad
 retrieval. Its first relevant call prepares the repository. The first broad
@@ -137,7 +150,30 @@ Full routing: [docs/README.md](docs/README.md).
 
 ## Evaluation
 
-The trial of `codestory-cli setup codex` compared 12 setup sessions with 12
+### Lookup slice, edit, and proxy benchmark (November 2026)
+
+On the 12-task large-repository understanding bank (`gpt-6.1-sol`, medium
+reasoning effort, 36 sessions against `--core-only` read-only caches), adding
+budgeted `cs slice`, syntax-checked `cs edit`, `--file-glob`, and the loopback
+context proxy (`boost-proxy`, via `codestory-cli run`) reached **100%
+completion** with lower weighted token cost than plain Codex:
+
+| Arm (12 large-repo tasks) | Complete tasks | Graded requirements | Mean weighted tokens | Median weighted tokens |
+| --- | ---: | ---: | ---: | ---: |
+| `plain` (ordinary tools) | 10/12 | 73/75 (97.3%) | 64,477 | 61,758 |
+| `boost` (`cs slice`/lookups only) | 9/12 | 72/75 (96.0%) | 65,845 | — |
+| `boost-proxy` (`boost` + loopback proxy) | **12/12** | **75/75 (100.0%)** | **59,177 (-8.2%)** | **53,346 (-13.6%)** |
+
+`boost-proxy` used fewer weighted tokens than `plain` on 8 of 12 large tasks.
+On the 4-task code-editing bank (`write-bank`, high reasoning), all three arms
+passed `4/4` tests; `boost-proxy` saved `-29.4%` weighted tokens on `K04`
+(`26,899` vs `38,101`) while averaging higher mean weighted tokens across all 4
+short edit tasks (`52,414` vs `36,247`). Benchmarks on additional agent hosts
+(`cursor`, `opencode`, `claude-code`, `antigravity`) remain to be collected.
+
+### Earlier shell-lookup baseline
+
+The earlier trial of `codestory-cli setup codex` compared 12 setup sessions with 12
 earlier plain Codex sessions for each repository size. Codex chose to use the
 lookups on its own.
 

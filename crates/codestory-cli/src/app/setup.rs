@@ -23,7 +23,11 @@ pub(super) fn run_setup(cmd: SetupCommand) -> Result<()> {
     let (directory, home_var, file) = match cmd.host {
         SetupHost::Codex => (".codex", "CODEX_HOME", "AGENTS.md"),
         SetupHost::ClaudeCode => (".claude", "CLAUDE_CONFIG_DIR", "CLAUDE.md"),
-        SetupHost::Cursor => (".cursor", "CURSOR_CONFIG_DIR", "rules/codestory-lookups.mdc"),
+        SetupHost::Cursor => (
+            ".cursor",
+            "CURSOR_CONFIG_DIR",
+            "rules/codestory-lookups.mdc",
+        ),
         SetupHost::OpenCode => (".config/opencode", "OPENCODE_CONFIG_DIR", "AGENTS.md"),
         SetupHost::Antigravity => (".gemini/antigravity", "ANTIGRAVITY_HOME", "GEMINI.md"),
     };

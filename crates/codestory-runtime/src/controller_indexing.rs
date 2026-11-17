@@ -7,7 +7,7 @@ use crate::index_freshness::{
 use crate::index_full::{index_full_for_runtime, index_full_for_runtime_with_options};
 use crate::index_incremental::{
     IncrementalPlanProbe, ensure_incremental_refresh_compatible, index_incremental_for_runtime,
-    index_incremental_for_runtime_with_probe, probe_incremental_plan,
+    index_incremental_for_runtime_with_options, probe_incremental_plan,
 };
 use crate::index_timings::IndexingRunSummary;
 #[cfg(test)]
@@ -872,7 +872,7 @@ impl AppController {
                 failed_refresh_diagnostics,
                 skip_semantic_docs,
             ),
-            IndexMode::Incremental => index_incremental_for_runtime_with_probe(
+            IndexMode::Incremental => index_incremental_for_runtime_with_options(
                 &root,
                 &storage_path,
                 &self.events_tx,
@@ -881,6 +881,7 @@ impl AppController {
                 &self.source_index_policy,
                 &annotations_owned,
                 precomputed_probe,
+                skip_semantic_docs,
             ),
         };
 
@@ -1188,12 +1189,13 @@ impl AppController {
         else {
             return Ok(false);
         };
+        match storage.validate_dense_anchor_publication(&publication) {
+            Ok(manifest) if manifest.policy_version == SEMANTIC_POLICY_VERSION => {}
+            _ => return Ok(true),
+        }
         if storage
-            .validate_dense_anchor_publication(&publication)
+            .validate_structural_text_unit_publication(&publication)
             .is_err()
-            || storage
-                .validate_structural_text_unit_publication(&publication)
-                .is_err()
         {
             return Ok(true);
         }

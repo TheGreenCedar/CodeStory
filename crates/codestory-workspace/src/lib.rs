@@ -3076,7 +3076,9 @@ fn cached_canonicalize(path: &Path) -> Option<PathBuf> {
     if !active {
         return path.canonicalize().ok();
     }
-    if let Some(cached) = WALK_CANONICAL_CACHE.with(|cell| cell.borrow().exact_paths.get(path).cloned()) {
+    if let Some(cached) =
+        WALK_CANONICAL_CACHE.with(|cell| cell.borrow().exact_paths.get(path).cloned())
+    {
         return cached;
     }
     if let (Some(parent), Some(file_name)) = (path.parent(), path.file_name())

@@ -458,11 +458,7 @@ pub(super) fn compute_call_resolution(
             } else {
                 pass.policy.call_same_module
             };
-            selected = Some((
-                candidate,
-                confidence,
-                ResolutionStrategy::CallSameModule,
-            ));
+            selected = Some((candidate, confidence, ResolutionStrategy::CallSameModule));
         }
     }
 

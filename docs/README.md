@@ -24,8 +24,9 @@ with portable prompts.
 | Pick a host and install | [User guides](users/README.md) |
 | When to trust agent output | [Trust and readiness](users/trust-and-readiness.md) |
 | Codex setup | [Codex guide](users/codex.md) |
-| Cursor plugin | [Cursor guide](users/cursor.md) |
+| Cursor plugin / setup | [Cursor guide](users/cursor.md) |
 | Claude Code setup | [Claude Code guide](users/claude-code.md) |
+| OpenCode / Antigravity setup | [User guides](users/README.md#other-mcp-hosts) |
 | GitHub Copilot | [Copilot guide](users/copilot.md) |
 | Session blocked or stale output | [Troubleshooting](users/troubleshooting.md) |
 | Power-user CLI repair | [CLI reference](users/cli-reference.md) |

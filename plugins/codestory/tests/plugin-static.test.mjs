@@ -9944,3 +9944,19 @@ test("CODESTORY_MCP_TOOL_SURFACE=lean exposes 5 small lookup/edit tools under 2.
   assert.equal(frames.find((f) => f.id === 3)?.result?.content?.[0]?.text, "ok\n");
   assert.equal(frames.find((f) => f.id === 4)?.result?.content?.[0]?.text, "ok\n");
 });
+
+test("bundled bin/cs launcher routes slice/edit lookups and triggers --core-only auto refresh", async () => {
+  const csSource = await readFile(join(pluginRoot, "bin", "cs"), "utf8");
+  assert.match(csSource, /\['find', 'refs', 'read', 'edit', 'slice'\]/u);
+  assert.match(
+    csSource,
+    /spawn\(cli,\s*\['index', '--project', project, '--refresh', 'auto', '--core-only'\]/u,
+  );
+  const helpResult = spawnSync(process.execPath, [join(pluginRoot, "bin", "cs"), "--help"], {
+    encoding: "utf8",
+    timeout: 5000,
+  });
+  assert.equal(helpResult.status, 0, helpResult.stderr);
+  assert.match(helpResult.stdout, /cs slice QUESTION/u);
+  assert.match(helpResult.stdout, /cs edit PATH::SYMBOL --stdin/u);
+});

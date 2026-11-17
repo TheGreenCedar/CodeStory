@@ -90,6 +90,7 @@ than validating a pathname and later recursing through it.
 - `src/repo_metadata.rs`: bounded identity inspection through isolated `gix`,
   not an unconstrained `git` subprocess
 - `src/atomic_file.rs`: atomic file publication
+- `src/cochange.rs`: git co-change test and fixture sibling lookup
 - `src/owned_deletion.rs`: trusted-root deletion
 
 ## Failure signatures

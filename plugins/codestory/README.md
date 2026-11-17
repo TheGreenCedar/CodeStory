@@ -16,6 +16,7 @@ hooks, and compatibility wiring their clients require.
 | Codex | `.codex-plugin/plugin.json`, legacy `.mcp.json`, hooks, skill | [Codex](../../docs/users/codex.md) |
 | Cursor | Portable core plus `.cursor-plugin/plugin.json`, `mcp.cursor.json`, `rules/`, and `hooks/cursor-hooks.json` | [Cursor](../../docs/users/cursor.md) |
 | Claude Code | `.claude-plugin/plugin.json`, legacy `.mcp.json`, session hooks | [Claude Code](../../docs/users/claude-code.md) |
+| OpenCode / Antigravity | Standalone shell setup via `codestory-cli setup opencode|antigravity` or stdio MCP (`CODESTORY_MCP_TOOL_SURFACE=lean`) | [User guides](../../docs/users/README.md#other-mcp-hosts) |
 | Copilot CLI | `.github/plugin/plugin.json`, session hooks | [Copilot](../../docs/users/copilot.md#copilot-cli) |
 | Copilot editor | Repository instructions | [Copilot editor](../../docs/users/copilot.md#copilot-editor) |
 

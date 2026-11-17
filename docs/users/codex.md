@@ -12,9 +12,11 @@ codestory-cli setup codex
 
 Setup puts a marked note in your Codex `AGENTS.md` and installs a shared
 lookup launcher in your Codex configuration directory. The note gives Codex
-the full invocation for `cs find`, `cs refs`, and `cs read`. The commands use
-your existing shell with no `PATH` edits or MCP connection. Use the launcher
-path printed by setup if you want to run them yourself.
+the full invocation for `cs slice`, `cs refs`, `cs find`, `cs read`, and
+`cs edit`. The commands use your existing shell with no `PATH` edits or MCP
+connection. Use the launcher path printed by setup if you want to run them
+yourself, or run Codex through `codestory-cli run -- codex` to bound and
+deduplicate oversized tool outputs in the loopback proxy.
 
 Start a fresh Codex session in your repository and ask a question about the
 code, such as this one.
@@ -23,9 +25,10 @@ code, such as this one.
 Where is configuration loaded, which modules consume it, and what tests cover that path?
 ```
 
-Lookups return live source before indexing. They can add annotations from an
-existing index when the indexed file matches the current file. To build an
-index yourself, run `codestory-cli index --project .` from the repository.
+Lookups return live source before indexing. They add declarations, 1-hop
+callees, and co-change siblings from an existing index when the indexed file
+matches the current file. To build a fast core-only lookup index yourself, run
+`codestory-cli index --project . --core-only` from the repository.
 
 Setup applies to your Codex user by default. To put the note at a repository's
 Git root, run `codestory-cli setup codex --repo` from inside it. Remove the user
@@ -59,14 +62,16 @@ The `/plugins` UI remains the normal install and refresh path.
 
 The installed CodeStory skill points to the plugin's bundled `bin/cs`.
 From a repository, run it directly or use `node` with its absolute installed
-path. Try `cs refs NAME` for definitions and mentions or
-`cs read PATH::NAME` for numbered source. The command discovers the Git root
-from the current directory. It uses the same cache as the native CLI.
+path. Try `cs slice QUESTION` to pack declarations and 1-hop callees,
+`cs refs NAME` for definitions and mentions, `cs find TERM` for literal search,
+`cs read PATH::NAME` for numbered source, or `cs edit PATH::NAME --stdin` for
+syntax-checked edits. The command discovers the Git root from the current
+directory and uses the same cache as the native CLI.
 
 Once the native runtime is installed, a missing index still gives live text.
-When the host allows cache writes, the launcher requests a background index
-after a missing-index reply or a hit in a changed file. Lookups return before
-the background work finishes.
+When the host allows cache writes, the launcher requests a background
+`index --core-only` refresh after a missing-index reply or a hit in a changed
+file. Lookups return before the background work finishes.
 
 ### Verify the plugin
 

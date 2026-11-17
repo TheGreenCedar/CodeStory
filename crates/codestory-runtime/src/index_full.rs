@@ -1053,6 +1053,7 @@ pub(super) fn index_full_for_runtime_with_options(
         None,
         None,
         cancel_token,
+        skip_semantic_docs,
     ) {
         let _ = staged.discard();
         return Err(error);

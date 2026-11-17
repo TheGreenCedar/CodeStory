@@ -31,7 +31,7 @@ function refreshIndex(cli, project) {
         try { fs.unlinkSync(path.join(directory, name)); } catch {}
       }
     }
-    const child = spawn(cli, ['index', '--project', project, '--refresh', 'auto'], {
+    const child = spawn(cli, ['index', '--project', project, '--refresh', 'auto', '--core-only'], {
       cwd: project, detached: true, stdio: 'ignore', windowsHide: true,
     });
     child.on('error', () => {});

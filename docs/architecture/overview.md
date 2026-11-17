@@ -129,7 +129,8 @@ flowchart LR
 - `codestory-contracts` defines shared graph types, DTOs, events, readiness,
   publication, and language-support contracts.
 - `codestory-workspace` owns discovery, repository identity, refresh planning,
-  atomic files, and owned deletion.
+  git co-change test/fixture coupling (`cochange.rs`), atomic files, and owned
+  deletion.
 - `codestory-store` owns SQLite schema, read snapshots, durable promotion, core
   publication, and persisted graph/search state.
 - `codestory-indexer` parses and extracts graph projections, then resolves
@@ -146,8 +147,11 @@ flowchart LR
   prompt text, task class, obligation, role, carrier, or sufficiency policy. It
   owns no activation, storage, retrieval execution, admission, hydration,
   publication retry, or mutable readiness authority.
-- `codestory-runtime` is the only product orchestration layer.
-- `codestory-cli` parses and renders CLI, HTTP, and stdio adapters.
+- `codestory-runtime` is the only product orchestration layer (including live
+  served lookups/edits in `served_lookup.rs` and `ReadyCoreLease` core-only
+  warm reuse).
+- `codestory-cli` parses and renders CLI, loopback proxy/HTTP (`proxy`, `run`),
+  multi-host `setup`, and stdio adapters.
 - `codestory-bench` measures product paths without defining product behavior.
 
 The intended direction is

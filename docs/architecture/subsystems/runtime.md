@@ -28,7 +28,12 @@ adapter syntax, SQLite mechanics, parsers, or model execution.
 
 ## Main paths
 
-- `src/lib.rs` and `src/services.rs`: project/index services and retained state
+- `src/lib.rs` and `src/services.rs`: project/index services, `ReadyCoreLease`
+  warm lease reuse, and retained state
+- `src/served_lookup.rs`: live working-tree `find`, `refs`, `read`
+  (`DEFAULT_READ_MAX_BYTES = 16_000`, 9,500-byte outlines), tree-sitter-validated
+  `edit`, and budgeted `slice` (`7,500` bytes default) with content-hash-pinned
+  Core enrichment and co-change companion siblings
 - `src/grounding.rs` and `src/support.rs`: grounding and support assembly
 - `src/search/`: runtime search state and graph-native documents
 - `src/agent/`: execution residuals (orchestrator, retrieval-primary, packet
@@ -56,7 +61,11 @@ require query hits and candidate resolution to share one
 `RetrievalPublicationIdentity`, hold the core read and generation leases, and
 revalidate before returning. Indexed-name navigation instead resolves from a
 fresh complete Core publication without attaching search state or pinning
-retrieval; stale or incomplete Core cannot admit it. Publication drift permits
+retrieval; stale or incomplete Core cannot admit it. Core-only indexing (`--core-only`,
+across full and incremental refreshes) skips semantic-document and dense-anchor
+materialization and may reuse a `ReadyCoreLease` when storage identity and
+tracked manifest are unchanged; later normal indexing automatically detects
+missing semantic docs and repairs the full projection. Publication drift permits
 one bounded retry.
 
 Cache rehydrate selects its source's physical core generation after taking the

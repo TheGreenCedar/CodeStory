@@ -98,7 +98,15 @@ pub fn find(
     limit: usize,
     body_lines: Option<usize>,
 ) -> Result<String, ApiError> {
-    find_with_budget(root, storage_path, terms, file_globs, limit, body_lines, None)
+    find_with_budget(
+        root,
+        storage_path,
+        terms,
+        file_globs,
+        limit,
+        body_lines,
+        None,
+    )
 }
 
 /// Like [`find`], with an optional byte cap (`Some(0)` disables byte capping).
@@ -227,18 +235,16 @@ pub fn refs_with_budget_and_globs(
     Ok(with_pinned_index(storage_path, |store| {
         let mut bodies = body_lines.map(|b| Bodies::with_byte_cap(b, effective_max_bytes));
         let mut out = match store {
-            Some(store) => {
-                refs_with_index(
-                    root,
-                    store,
-                    name,
-                    &wanted,
-                    &files,
-                    &all_paths,
-                    limit,
-                    bodies.as_mut(),
-                )
-            }
+            Some(store) => refs_with_index(
+                root,
+                store,
+                name,
+                &wanted,
+                &files,
+                &all_paths,
+                limit,
+                bodies.as_mut(),
+            ),
             None => {
                 let total = files.iter().map(|file| file.hit_lines.len()).sum::<usize>();
                 let mut out = format!("{NO_INDEX}\n{total} references in {} files\n", files.len());
@@ -441,7 +447,21 @@ impl RankedQuery {
             if !is_path_hint && (term.contains("::") || term.contains('.')) {
                 let looks_like_file = matches!(
                     term.rsplit('.').next(),
-                    Some("py" | "go" | "rs" | "ts" | "tsx" | "js" | "jsx" | "json" | "jsonc" | "yaml" | "yml" | "toml" | "md" | "txt")
+                    Some(
+                        "py" | "go"
+                            | "rs"
+                            | "ts"
+                            | "tsx"
+                            | "js"
+                            | "jsx"
+                            | "json"
+                            | "jsonc"
+                            | "yaml"
+                            | "yml"
+                            | "toml"
+                            | "md"
+                            | "txt"
+                    )
                 );
                 if !looks_like_file {
                     for seg in name_segments(term) {
@@ -552,8 +572,7 @@ fn scan_live_tree_with_paths(
         .flatten()
         .collect::<Vec<_>>();
     files.sort_unstable_by(|left, right| {
-        (Reverse(left.matched_terms), &left.path)
-            .cmp(&(Reverse(right.matched_terms), &right.path))
+        (Reverse(left.matched_terms), &left.path).cmp(&(Reverse(right.matched_terms), &right.path))
     });
     Ok((files, all_paths))
 }
@@ -817,10 +836,7 @@ fn match_live_file_ranked(
         return None;
     }
 
-    let mut all_offsets = offsets_by_term
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
+    let mut all_offsets = offsets_by_term.into_iter().flatten().collect::<Vec<_>>();
     all_offsets.sort_unstable();
 
     let mut hit_lines = Vec::new();
@@ -1335,29 +1351,28 @@ fn fallback_used_by(
     nested: &impl Fn(u32, u32) -> bool,
     shown: &impl Fn(&Located) -> bool,
 ) {
-    let try_push =
-        |used: &mut Vec<Located>, seen: &mut HashSet<NodeId>, target: Located| -> bool {
-            if used.len() >= most {
-                return false;
-            }
-            let def_id = target.definition().id;
-            if !seen.insert(def_id)
-                || (Rc::ptr_eq(&target.home, &owner.home) && nested(target.first, target.last))
-                || matches!(
-                    target.definition().kind,
-                    NodeKind::MODULE
-                        | NodeKind::NAMESPACE
-                        | NodeKind::PACKAGE
-                        | NodeKind::FIELD
-                        | NodeKind::ENUM_CONSTANT
-                )
-                || shown(&target)
-            {
-                return false;
-            }
-            used.push(target);
-            true
-        };
+    let try_push = |used: &mut Vec<Located>, seen: &mut HashSet<NodeId>, target: Located| -> bool {
+        if used.len() >= most {
+            return false;
+        }
+        let def_id = target.definition().id;
+        if !seen.insert(def_id)
+            || (Rc::ptr_eq(&target.home, &owner.home) && nested(target.first, target.last))
+            || matches!(
+                target.definition().kind,
+                NodeKind::MODULE
+                    | NodeKind::NAMESPACE
+                    | NodeKind::PACKAGE
+                    | NodeKind::FIELD
+                    | NodeKind::ENUM_CONSTANT
+            )
+            || shown(&target)
+        {
+            return false;
+        }
+        used.push(target);
+        true
+    };
 
     // 1. Follow Certain or Probable outgoing edges that target import binding nodes
     // or unambiguous Probable targets.
@@ -1378,15 +1393,11 @@ fn fallback_used_by(
         }
         let effective = edge.effective_target();
         if is_certain(edge) {
-            if let Some(located) =
-                locate_via_imported_homes(index, &imported_homes, effective)
-            {
+            if let Some(located) = locate_via_imported_homes(index, &imported_homes, effective) {
                 try_push(used, seen, located);
                 continue;
             }
-        } else if edge.callsite_identity.is_some()
-            && edge.confidence.unwrap_or_default() >= 0.62
-        {
+        } else if edge.callsite_identity.is_some() && edge.confidence.unwrap_or_default() >= 0.62 {
             if let Some(located) = index.locate(root, effective) {
                 let short = name_segments(&located.definition().name)
                     .last()
@@ -1406,9 +1417,7 @@ fn fallback_used_by(
                     continue;
                 }
             }
-            if let Some(located) =
-                locate_via_imported_homes(index, &imported_homes, effective)
-            {
+            if let Some(located) = locate_via_imported_homes(index, &imported_homes, effective) {
                 try_push(used, seen, located);
                 continue;
             }
@@ -1422,10 +1431,7 @@ fn fallback_used_by(
         }
         if !matches!(
             edge.kind,
-            EdgeKind::CALL
-                | EdgeKind::TYPE_USAGE
-                | EdgeKind::USAGE
-                | EdgeKind::ANNOTATION_USAGE
+            EdgeKind::CALL | EdgeKind::TYPE_USAGE | EdgeKind::USAGE | EdgeKind::ANNOTATION_USAGE
         ) {
             continue;
         }
@@ -1473,9 +1479,7 @@ fn fallback_used_by(
             let mentioned = body_slice
                 .iter()
                 .any(|line| word_offset(line, short).is_some());
-            if mentioned
-                && let Some((first, last, note)) = declared_range(&home_lines, def)
-            {
+            if mentioned && let Some((first, last, note)) = declared_range(&home_lines, def) {
                 try_push(
                     used,
                     seen,
@@ -1610,7 +1614,9 @@ fn locate_via_imported_homes(
     target_id: NodeId,
 ) -> Option<Located> {
     let target_node = index.store.get_node(target_id).ok()??;
-    let short = name_segments(&target_node.serialized_name).last().copied()?;
+    let short = name_segments(&target_node.serialized_name)
+        .last()
+        .copied()?;
     for home in imported_homes {
         if let Some(located) = locate_unique_in_home(home, short, &|_, _| false) {
             return Some(located);
@@ -2000,11 +2006,7 @@ fn plan_bodies<'a>(
     blocks
 }
 
-fn score_block_with_terms(
-    lines: &[&str],
-    block: &Block<'_>,
-    term_weights: &[WeightedTerm],
-) -> f64 {
+fn score_block_with_terms(lines: &[&str], block: &Block<'_>, term_weights: &[WeightedTerm]) -> f64 {
     let mut score = 0.0_f64;
     let mut matched = vec![false; term_weights.len()];
     for &(first, last) in &block.windows {
@@ -2075,7 +2077,11 @@ fn print_body(
         }
         let mut snippet = String::new();
         if let Some((definition, first, last, note)) = title {
-            let _ = writeln!(snippet, "  == {} {first}-{last}{note}", definition.qualified);
+            let _ = writeln!(
+                snippet,
+                "  == {} {first}-{last}{note}",
+                definition.qualified
+            );
         }
         if gap {
             snippet.push_str("  ...\n");
@@ -2155,7 +2161,12 @@ fn list_bodies<'r, 'c>(
                 (s, idx, block)
             })
             .collect::<Vec<_>>();
-        scored.sort_by(|left, right| right.0.total_cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+        scored.sort_by(|left, right| {
+            right
+                .0
+                .total_cmp(&left.0)
+                .then_with(|| left.1.cmp(&right.1))
+        });
         blocks = scored.into_iter().map(|(_, _, block)| block).collect();
     }
     let mut tail = 0;
@@ -2454,10 +2465,7 @@ fn refs_with_index(
             && !defines(position, line)
             && probable_targets.all(|other| other.id == target.id)
         {
-            return format!(
-                " -> {}:{} (probable)",
-                files[target.file].path, target.line
-            );
+            return format!(" -> {}:{} (probable)", files[target.file].path, target.line);
         }
         String::new()
     };
@@ -2553,7 +2561,13 @@ fn refs_with_index(
         .filter(|candidate| candidate.wanted)
         .collect::<Vec<_>>();
     if rank_files && ordered_wanted.len() > DEFINITION_BODIES {
-        ordered_wanted.sort_by_key(|c| (path_rank_tier(&files[c.file].path), &files[c.file].path, c.line));
+        ordered_wanted.sort_by_key(|c| {
+            (
+                path_rank_tier(&files[c.file].path),
+                &files[c.file].path,
+                c.line,
+            )
+        });
     }
     let body_def_cap = if rank_files {
         DEFINITION_BODIES
@@ -2623,10 +2637,14 @@ fn refs_with_index(
     {
         for candidate in body_candidates {
             if let Some(owner) = index.locate(root, candidate.id) {
-                let targets =
-                    used_by(&mut index, root, &owner, USED_DECLARATIONS, true, |target| {
-                        bodies.shows(target)
-                    });
+                let targets = used_by(
+                    &mut index,
+                    root,
+                    &owner,
+                    USED_DECLARATIONS,
+                    true,
+                    |target| bodies.shows(target),
+                );
                 used.push((candidate.qualified.as_str(), targets));
             }
         }
@@ -3195,12 +3213,7 @@ fn read_selector(
                     .count()
                     >= 2
             {
-                page.outline(
-                    out,
-                    &mut budget,
-                    Some(live.definitions.as_slice()),
-                    false,
-                );
+                page.outline(out, &mut budget, Some(live.definitions.as_slice()), false);
             } else {
                 page.outline(out, &mut budget, None, false);
             }
@@ -3559,13 +3572,14 @@ pub fn edit(
         .strip_suffix("\r\n")
         .or_else(|| replacement.strip_suffix('\n'))
         .unwrap_or(replacement);
-    let mut owned_replacement_lines: Vec<String> = if trimmed_replacement.is_empty() && !replacement.is_empty() {
-        vec![String::new()]
-    } else if trimmed_replacement.is_empty() {
-        Vec::new()
-    } else {
-        trimmed_replacement.lines().map(str::to_string).collect()
-    };
+    let mut owned_replacement_lines: Vec<String> =
+        if trimmed_replacement.is_empty() && !replacement.is_empty() {
+            vec![String::new()]
+        } else if trimmed_replacement.is_empty() {
+            Vec::new()
+        } else {
+            trimmed_replacement.lines().map(str::to_string).collect()
+        };
 
     // Preserve base indentation when replacing an indented declaration (e.g. a
     // class method) with code supplied at column 0.
@@ -3963,10 +3977,15 @@ fn slice_path_tier(path: &str) -> u8 {
     }
 }
 
-fn is_slice_skipped_asset(rel_lower: &str, file_len: u64, wants_tests: bool, terms: &[SliceTerm]) -> bool {
-    let explicitly_named = terms
-        .iter()
-        .any(|t| (t.is_path_hint || t.boost >= 2.0) && t.lower.len() >= 5 && rel_lower.contains(&t.lower));
+fn is_slice_skipped_asset(
+    rel_lower: &str,
+    file_len: u64,
+    wants_tests: bool,
+    terms: &[SliceTerm],
+) -> bool {
+    let explicitly_named = terms.iter().any(|t| {
+        (t.is_path_hint || t.boost >= 2.0) && t.lower.len() >= 5 && rel_lower.contains(&t.lower)
+    });
     if explicitly_named {
         return false;
     }
@@ -4049,7 +4068,10 @@ fn extract_slice_terms(question: &str) -> (Vec<SliceTerm>, bool) {
     let mut push_term = |raw: &str, case_sensitive: bool, boost: f64| {
         let trimmed = raw
             .trim_matches(|c: char| {
-                matches!(c, '`' | '"' | '\'' | '(' | ')' | '[' | ']' | ',' | ';' | ':' | '?' | '!')
+                matches!(
+                    c,
+                    '`' | '"' | '\'' | '(' | ')' | '[' | ']' | ',' | ';' | ':' | '?' | '!'
+                )
             })
             .trim_end_matches("()");
         if trimmed.len() < 2 || trimmed.len() > 120 || trimmed.chars().all(|c| c.is_ascii_digit()) {
@@ -4057,10 +4079,20 @@ fn extract_slice_terms(question: &str) -> (Vec<SliceTerm>, bool) {
         }
         let lower = trimmed.to_ascii_lowercase();
         let is_path_hint = trimmed.contains('/') && !trimmed.starts_with("--");
-        push_one(trimmed, case_sensitive, boost, is_path_hint, &mut terms, &mut seen);
+        push_one(
+            trimmed,
+            case_sensitive,
+            boost,
+            is_path_hint,
+            &mut terms,
+            &mut seen,
+        );
 
         if is_path_hint {
-            for seg in trimmed.split('/').filter(|s| s.len() >= 4 && *s != "src" && *s != "pkg") {
+            for seg in trimmed
+                .split('/')
+                .filter(|s| s.len() >= 4 && *s != "src" && *s != "pkg")
+            {
                 push_one(seg, false, boost * 0.85, false, &mut terms, &mut seen);
             }
         }
@@ -4092,13 +4124,32 @@ fn extract_slice_terms(question: &str) -> (Vec<SliceTerm>, bool) {
         if !is_path_hint && (trimmed.contains("::") || trimmed.contains('.')) {
             let is_file_ext = matches!(
                 lower.rsplit('.').next(),
-                Some("py" | "go" | "rs" | "ts" | "tsx" | "js" | "jsx" | "json" | "jsonc" | "yaml" | "yml" | "toml")
+                Some(
+                    "py" | "go"
+                        | "rs"
+                        | "ts"
+                        | "tsx"
+                        | "js"
+                        | "jsx"
+                        | "json"
+                        | "jsonc"
+                        | "yaml"
+                        | "yml"
+                        | "toml"
+                )
             );
             if !is_file_ext {
                 for seg in name_segments(trimmed) {
                     if seg.len() >= 3 {
                         push_one(seg, true, boost * 0.95, false, &mut terms, &mut seen);
-                        push_one(&seg.to_ascii_lowercase(), false, boost * 0.7, false, &mut terms, &mut seen);
+                        push_one(
+                            &seg.to_ascii_lowercase(),
+                            false,
+                            boost * 0.7,
+                            false,
+                            &mut terms,
+                            &mut seen,
+                        );
                     }
                 }
             }
@@ -4116,7 +4167,14 @@ fn extract_slice_terms(question: &str) -> (Vec<SliceTerm>, bool) {
             push_one(&snake, false, boost * 0.85, false, &mut terms, &mut seen);
             for part in parts {
                 if part.len() >= 3 {
-                    push_one(&part.to_ascii_lowercase(), false, boost * 0.55, false, &mut terms, &mut seen);
+                    push_one(
+                        &part.to_ascii_lowercase(),
+                        false,
+                        boost * 0.55,
+                        false,
+                        &mut terms,
+                        &mut seen,
+                    );
                 }
             }
         }
@@ -4128,7 +4186,14 @@ fn extract_slice_terms(question: &str) -> (Vec<SliceTerm>, bool) {
             }
             for part in trimmed.split('_') {
                 if part.len() >= 3 {
-                    push_one(&part.to_ascii_lowercase(), false, boost * 0.6, false, &mut terms, &mut seen);
+                    push_one(
+                        &part.to_ascii_lowercase(),
+                        false,
+                        boost * 0.6,
+                        false,
+                        &mut terms,
+                        &mut seen,
+                    );
                 }
             }
         }
@@ -4179,10 +4244,14 @@ fn extract_slice_terms(question: &str) -> (Vec<SliceTerm>, bool) {
         let is_path = tok.contains('/') && !tok.starts_with("http");
         let is_snake_or_qualified = tok.contains('_') || tok.contains("::");
         let is_camel = has_upper && has_lower && tok[1..].chars().any(|c| c.is_ascii_uppercase());
-        let is_acronym = tok.len() >= 3 && tok.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit());
+        let is_acronym = tok.len() >= 3
+            && tok
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit());
         if is_flag || is_path || is_snake_or_qualified || is_camel || is_acronym {
             push_term(tok, true, 1.8);
-        } else if (tok.len() >= 4 || (tok.len() == 3 && !is_slice_stopword(&tok.to_ascii_lowercase())))
+        } else if (tok.len() >= 4
+            || (tok.len() == 3 && !is_slice_stopword(&tok.to_ascii_lowercase())))
             && tok.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
         {
             let boost = if tok.len() == 3 {
@@ -4247,7 +4316,8 @@ fn find_slice_term_lines(text: &str, terms: &[SliceTerm]) -> (Vec<u32>, Vec<u32>
     for (line_idx, line) in text.lines().enumerate() {
         line_count = line_idx + 1;
         let trimmed = line.trim_start();
-        let is_comment = trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with('*');
+        let is_comment =
+            trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with('*');
         let mut line_score = 0.0_f64;
         let mut lower_line: Option<String> = None;
         let decl_ident = if !is_comment {
@@ -4267,14 +4337,20 @@ fn find_slice_term_lines(text: &str, terms: &[SliceTerm]) -> (Vec<u32>, Vec<u32>
                     .contains(&term.lower)
             };
             if matched {
-                hits_per_term[idx] = hits_per_term[idx].saturating_add(if is_comment { 0 } else { 1 });
-                let w = if is_comment { term.boost * 0.25 } else { term.boost };
+                hits_per_term[idx] =
+                    hits_per_term[idx].saturating_add(if is_comment { 0 } else { 1 });
+                let w = if is_comment {
+                    term.boost * 0.25
+                } else {
+                    term.boost
+                };
                 line_score += w;
                 if let Some(dident) = decl_ident {
                     if term.boost >= 1.5
                         && (dident == term.text
                             || dident.eq_ignore_ascii_case(&term.lower)
-                            || (term.lower.len() >= 6 && dident.to_ascii_lowercase().contains(&term.lower)))
+                            || (term.lower.len() >= 6
+                                && dident.to_ascii_lowercase().contains(&term.lower)))
                     {
                         exact_decl_on_line = true;
                     } else if term.boost >= 1.2 {
@@ -4314,7 +4390,10 @@ fn find_slice_term_lines(text: &str, terms: &[SliceTerm]) -> (Vec<u32>, Vec<u32>
 
     scored_lines.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     scored_lines.truncate(160);
-    let mut hit_lines = scored_lines.into_iter().map(|(_, ln)| ln).collect::<Vec<_>>();
+    let mut hit_lines = scored_lines
+        .into_iter()
+        .map(|(_, ln)| ln)
+        .collect::<Vec<_>>();
     hit_lines.sort_unstable();
     (hits_per_term, hit_lines, exact_decl_hits, line_count)
 }
@@ -4367,7 +4446,9 @@ fn enclosing_live_range(lines: &[&str], hit_line: u32, max_lines: u32) -> (u32, 
         return (1, count);
     }
     let min_lines = 12.min(count);
-    let idx = (hit_line as usize).saturating_sub(1).min(lines.len().saturating_sub(1));
+    let idx = (hit_line as usize)
+        .saturating_sub(1)
+        .min(lines.len().saturating_sub(1));
     let hit_indent = indent(lines[idx]);
     // Search upward up to 60 lines for the nearest enclosing declaration header.
     let min_up = idx.saturating_sub(60);
@@ -4431,7 +4512,8 @@ fn live_ast_slice_facts(rel_path: &str, text: &str) -> Option<LiveAstSliceFacts>
     }
     let ext = Path::new(rel_path).extension().and_then(|e| e.to_str())?;
     let lang_cfg = codestory_indexer::get_language_for_ext(ext)?;
-    let result = codestory_indexer::index_file(Path::new(rel_path), text, &lang_cfg, None, None).ok()?;
+    let result =
+        codestory_indexer::index_file(Path::new(rel_path), text, &lang_cfg, None, None).ok()?;
     let mut definitions = result
         .nodes
         .iter()
@@ -4459,7 +4541,11 @@ fn live_ast_slice_facts(rel_path: &str, text: &str) -> Option<LiveAstSliceFacts>
         })
         .collect::<Vec<_>>();
     definitions.sort_by(|left, right| {
-        (left.start, Reverse(left.end), &left.name).cmp(&(right.start, Reverse(right.end), &right.name))
+        (left.start, Reverse(left.end), &left.name).cmp(&(
+            right.start,
+            Reverse(right.end),
+            &right.name,
+        ))
     });
     let def_ids: HashSet<NodeId> = definitions.iter().map(|d| d.id).collect();
     let mut same_file_edges: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
@@ -4615,7 +4701,9 @@ fn extract_cross_file_hints(
                 && !mod_name.contains([' ', '{'])
             {
                 push_path_hint(mod_name, base_dir);
-            } else if (trimmed.starts_with("import ") || trimmed.starts_with('"') || trimmed.starts_with("export "))
+            } else if (trimmed.starts_with("import ")
+                || trimmed.starts_with('"')
+                || trimmed.starts_with("export "))
                 && let Some((_, quoted)) = trimmed.split_once('"')
                 && let Some((pkg, _)) = quoted.split_once('"')
                 && pkg.contains('/')
@@ -4634,7 +4722,10 @@ fn extract_cross_file_hints(
                 let mut rest = code;
                 while let Some((_, after)) = rest.split_once(delim) {
                     if let Some((lit, tail)) = after.split_once(delim) {
-                        if (lit.contains('/') || lit.contains('.')) && lit.len() >= 5 && lit.len() <= 120 {
+                        if (lit.contains('/') || lit.contains('.'))
+                            && lit.len() >= 5
+                            && lit.len() <= 120
+                        {
                             push_path_hint(lit, blk_dir);
                         }
                         rest = tail;
@@ -4648,7 +4739,8 @@ fn extract_cross_file_hints(
             while i < bytes.len() {
                 if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
                     let start = i;
-                    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
+                    {
                         i += 1;
                     }
                     let ident = &code[start..i];
@@ -4656,16 +4748,32 @@ fn extract_cross_file_hints(
                     let is_camel = ident.len() >= 6
                         && ident.bytes().next().is_some_and(|b| b.is_ascii_uppercase())
                         && ident.bytes().any(|b| b.is_ascii_lowercase());
-                    let is_snake = ident.len() >= 6 && ident.contains('_') && !ident.starts_with("__");
+                    let is_snake =
+                        ident.len() >= 6 && ident.contains('_') && !ident.starts_with("__");
                     if ident.len() >= 5
                         && (followed_by_call || is_camel || is_snake)
                         && !is_slice_stopword(&ident.to_ascii_lowercase())
                         && !matches!(
                             ident,
-                            "assert" | "format" | "println" | "eprintln" | "super" | "String" | "Option" | "Result" | "append" | "extend" | "clone" | "unwrap" | "filter" | "sorted" | "return"
+                            "assert"
+                                | "format"
+                                | "println"
+                                | "eprintln"
+                                | "super"
+                                | "String"
+                                | "Option"
+                                | "Result"
+                                | "append"
+                                | "extend"
+                                | "clone"
+                                | "unwrap"
+                                | "filter"
+                                | "sorted"
+                                | "return"
                         )
                     {
-                        *symbol_counts.entry(ident.to_string()).or_insert(0) += if followed_by_call { 2 } else { 1 };
+                        *symbol_counts.entry(ident.to_string()).or_insert(0) +=
+                            if followed_by_call { 2 } else { 1 };
                     }
                 } else {
                     i += 1;
@@ -4848,7 +4956,9 @@ pub fn slice(
     max_bytes: Option<usize>,
 ) -> Result<String, ApiError> {
     if question.trim().is_empty() {
-        return Err(ApiError::invalid_argument("slice needs a non-empty question"));
+        return Err(ApiError::invalid_argument(
+            "slice needs a non-empty question",
+        ));
     }
     let budget_bytes = resolve_max_bytes(max_bytes, true).unwrap_or(DEFAULT_MAX_BYTES);
     let (terms, wants_tests) = extract_slice_terms(question);
@@ -4986,7 +5096,11 @@ pub fn slice(
         f.score = score;
     }
 
-    files.sort_unstable_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.path.cmp(&b.path)));
+    files.sort_unstable_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.path.cmp(&b.path))
+    });
 
     // Apply primary language and module-subtree cohesion from top-ranked files
     // so polyglot repositories do not pollute slices with unrelated UI/polyfill noise.
@@ -5002,7 +5116,11 @@ pub fn slice(
         files.iter().find(|f| slice_path_tier(&f.path) == 0)
     };
     if let Some(top_anchor) = anchor {
-        let top_ext = top_anchor.path.rsplit('.').next().map(str::to_ascii_lowercase);
+        let top_ext = top_anchor
+            .path
+            .rsplit('.')
+            .next()
+            .map(str::to_ascii_lowercase);
         let top_dir = top_anchor.path.rsplit_once('/').map(|(d, _)| d.to_string());
         let top_pkg = top_anchor
             .path
@@ -5012,9 +5130,9 @@ pub fn slice(
             .join("/");
         for f in &mut files {
             let f_ext = f.path.rsplit('.').next().map(str::to_ascii_lowercase);
-            let same_dir = top_dir
-                .as_ref()
-                .is_some_and(|d| f.path.starts_with(d) && f.path.as_bytes().get(d.len()) == Some(&b'/'));
+            let same_dir = top_dir.as_ref().is_some_and(|d| {
+                f.path.starts_with(d) && f.path.as_bytes().get(d.len()) == Some(&b'/')
+            });
             if same_dir {
                 f.score *= if wants_tests { 1.45 } else { 1.35 };
             } else if !top_pkg.is_empty() && f.path.starts_with(&top_pkg) {
@@ -5028,7 +5146,11 @@ pub fn slice(
                 f.score *= 0.45;
             }
         }
-        files.sort_unstable_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.path.cmp(&b.path)));
+        files.sort_unstable_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.path.cmp(&b.path))
+        });
     }
 
     // Keep top exact-declaring files + submodular term-diverse seed files (so multi-part prompts hit all subsystems).
@@ -5099,7 +5221,11 @@ pub fn slice(
             break;
         }
         let sl = s_path.to_ascii_lowercase();
-        if !(sl.contains("/specs/") || sl.contains("/testdata/") || sl.contains("/fixtures/") || sl.contains(".golden.")) {
+        if !(sl.contains("/specs/")
+            || sl.contains("/testdata/")
+            || sl.contains("/fixtures/")
+            || sl.contains(".golden."))
+        {
             continue;
         }
         if let Some((dir, _)) = s_path.rsplit_once('/') {
@@ -5109,10 +5235,16 @@ pub fn slice(
                 if added_sibs >= 3 || seed_paths.len() >= 14 {
                     break;
                 }
-                if p.starts_with(&prefix) && !p[prefix.len()..].contains('/') && !seed_paths.contains(p) {
+                if p.starts_with(&prefix)
+                    && !p[prefix.len()..].contains('/')
+                    && !seed_paths.contains(p)
+                {
                     let abs = root.join(p);
                     let meta_len = std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(u64::MAX);
-                    if meta_len > 0 && meta_len <= 16 * 1024 && !is_slice_skipped_asset(&p.to_ascii_lowercase(), meta_len, true, &terms) {
+                    if meta_len > 0
+                        && meta_len <= 16 * 1024
+                        && !is_slice_skipped_asset(&p.to_ascii_lowercase(), meta_len, true, &terms)
+                    {
                         seed_paths.push(p.clone());
                         added_sibs += 1;
                     }
@@ -5121,7 +5253,11 @@ pub fn slice(
         }
     }
     let mut coupled_test_paths = Vec::new();
-    for prod in files.iter().filter(|f| slice_path_tier(&f.path) == 0).take(2) {
+    for prod in files
+        .iter()
+        .filter(|f| slice_path_tier(&f.path) == 0)
+        .take(2)
+    {
         for rel in codestory_workspace::cochange::find_related_tests_and_fixtures_in_paths(
             root,
             &prod.path,
@@ -5200,7 +5336,9 @@ pub fn slice(
             }
             if !title.is_empty() {
                 for (idx, term) in terms.iter().enumerate() {
-                    if title.contains(&term.text) || title.to_ascii_lowercase().contains(&term.lower) {
+                    if title.contains(&term.text)
+                        || title.to_ascii_lowercase().contains(&term.lower)
+                    {
                         base_score += idfs[idx] * 2.4;
                     }
                 }
@@ -5210,11 +5348,12 @@ pub fn slice(
                     base_score *= 0.70;
                 }
             }
-            let effective_tier = if tier == 0 && (title.contains(" test::") || title.contains(" tests::")) {
-                1
-            } else {
-                tier
-            };
+            let effective_tier =
+                if tier == 0 && (title.contains(" test::") || title.contains(" tests::")) {
+                    1
+                } else {
+                    tier
+                };
             if effective_tier == 0 {
                 base_score *= if wants_tests { 1.15 } else { 1.45 };
             } else if effective_tier == 1 {
@@ -5245,7 +5384,8 @@ pub fn slice(
             }
             let rendered = render_slice_block(path, lines, first, last, &title);
             let bytes = rendered.len();
-            let is_whole_small_file = first == 1 && e >= lines.len() && lines.len() <= 80 && bytes <= 2_200;
+            let is_whole_small_file =
+                first == 1 && e >= lines.len() && lines.len() <= 80 && bytes <= 2_200;
             SliceCandidateBlock {
                 path: path.to_string(),
                 first,
@@ -5285,9 +5425,7 @@ pub fn slice(
             let is_coupled = coupled_test_paths.contains(rel_path);
             let hop_bonus = if is_coupled && wants_tests { 1.5 } else { 0.0 };
 
-            let indexed_defs = index
-                .as_mut()
-                .and_then(|idx| idx.serve(&live_file).1);
+            let indexed_defs = index.as_mut().and_then(|idx| idx.serve(&live_file).1);
             let live_ast = if indexed_defs.is_none() {
                 live_ast_slice_facts(rel_path, &text)
             } else {
@@ -5363,9 +5501,7 @@ pub fn slice(
                                 || name_segments(&def.qualified).last() == Some(&t.text.as_str())
                                 || (t.lower.len() >= 6 && def.name.eq_ignore_ascii_case(&t.lower)))
                     });
-                    if exact_name_hit
-                        && let Some((f, l, _)) = declared_range(&lines, def)
-                    {
+                    if exact_name_hit && let Some((f, l, _)) = declared_range(&lines, def) {
                         let span = l + 1 - f;
                         if span <= 85 && seen_small.insert(def.id) {
                             ranges.push((
@@ -5383,7 +5519,12 @@ pub fn slice(
                             let span = l + 1 - f;
                             if (4..=85).contains(&span) {
                                 if seen_small.insert(def.id) {
-                                    ranges.push((leading_doc_comment_start(&lines, f), l, format!(" {}", def.qualified), Some(def.id)));
+                                    ranges.push((
+                                        leading_doc_comment_start(&lines, f),
+                                        l,
+                                        format!(" {}", def.qualified),
+                                        Some(def.id),
+                                    ));
                                 }
                             } else if span < 4 {
                                 let (ef, el) = enclosing_live_range(&lines, hl, 32);
@@ -5394,9 +5535,18 @@ pub fn slice(
                                 if *count_for_def < 5 {
                                     *count_for_def += 1;
                                     let w = window_around(hl, 15, f, l);
-                                    let w0 = if w.0 <= f + 4 { leading_doc_comment_start(&lines, f) } else { w.0 };
+                                    let w0 = if w.0 <= f + 4 {
+                                        leading_doc_comment_start(&lines, f)
+                                    } else {
+                                        w.0
+                                    };
                                     let max_w = if w.0 <= f + 4 { 46 } else { 36 };
-                                    ranges.push((w0, w.1.min(w0 + max_w), format!(" {}", def.qualified), Some(def.id)));
+                                    ranges.push((
+                                        w0,
+                                        w.1.min(w0 + max_w),
+                                        format!(" {}", def.qualified),
+                                        Some(def.id),
+                                    ));
                                 }
                             }
                         }
@@ -5464,47 +5614,59 @@ pub fn slice(
                 && indexed_defs.is_some()
             {
                 let mut seen_target_ids = HashSet::new();
-                let mut push_located = |target: &Located, hop_bonus_val: f64, candidates: &mut Vec<SliceCandidateBlock>| {
-                    let same_file = target.path() == rel_path;
-                    let t_tier = slice_path_tier(target.path());
-                    let t_span = target.last + 1 - target.first;
-                    if (!same_file && t_span < 5) || (!wants_tests && !same_file && t_tier != 0) {
-                        return false;
-                    }
-                    let t_lines = target.home.text.lines().collect::<Vec<_>>();
-                    let t_non_code = line_is_non_code_flags(&t_lines);
-                    let (tf, tl) = if t_span <= 75 {
-                        (leading_doc_comment_start(&t_lines, target.first), target.last)
-                    } else {
-                        let (_, hl, _, _) = find_slice_term_lines(&target.home.text, &terms);
-                        let anchor = hl
-                            .into_iter()
-                            .find(|&line| line >= target.first && line <= target.last)
-                            .unwrap_or(target.first);
-                        let w = window_around(anchor, 14, target.first, target.last);
-                        (w.0, w.1.min(w.0 + 38))
-                    };
-                    let blk = eval_block(
-                        target.path(),
-                        &t_lines,
-                        &t_non_code,
-                        tf,
-                        tl,
-                        format!(" {}", target.definition().qualified),
-                        if same_file { tier } else { t_tier },
-                        if same_file { file_score * 0.9 } else { file_score * 0.6 },
-                        hop_bonus_val,
-                        Some(target.definition().id),
-                    );
-                    let keep = same_file || blk.term_mask.iter().any(|&m| m) || hop_bonus_val >= 0.8;
-                    if keep {
-                        if !same_file {
-                            cross_file_hops_added += 1;
+                let mut push_located =
+                    |target: &Located,
+                     hop_bonus_val: f64,
+                     candidates: &mut Vec<SliceCandidateBlock>| {
+                        let same_file = target.path() == rel_path;
+                        let t_tier = slice_path_tier(target.path());
+                        let t_span = target.last + 1 - target.first;
+                        if (!same_file && t_span < 5) || (!wants_tests && !same_file && t_tier != 0)
+                        {
+                            return false;
                         }
-                        candidates.push(blk);
-                    }
-                    keep
-                };
+                        let t_lines = target.home.text.lines().collect::<Vec<_>>();
+                        let t_non_code = line_is_non_code_flags(&t_lines);
+                        let (tf, tl) = if t_span <= 75 {
+                            (
+                                leading_doc_comment_start(&t_lines, target.first),
+                                target.last,
+                            )
+                        } else {
+                            let (_, hl, _, _) = find_slice_term_lines(&target.home.text, &terms);
+                            let anchor = hl
+                                .into_iter()
+                                .find(|&line| line >= target.first && line <= target.last)
+                                .unwrap_or(target.first);
+                            let w = window_around(anchor, 14, target.first, target.last);
+                            (w.0, w.1.min(w.0 + 38))
+                        };
+                        let blk = eval_block(
+                            target.path(),
+                            &t_lines,
+                            &t_non_code,
+                            tf,
+                            tl,
+                            format!(" {}", target.definition().qualified),
+                            if same_file { tier } else { t_tier },
+                            if same_file {
+                                file_score * 0.9
+                            } else {
+                                file_score * 0.6
+                            },
+                            hop_bonus_val,
+                            Some(target.definition().id),
+                        );
+                        let keep =
+                            same_file || blk.term_mask.iter().any(|&m| m) || hop_bonus_val >= 0.8;
+                        if keep {
+                            if !same_file {
+                                cross_file_hops_added += 1;
+                            }
+                            candidates.push(blk);
+                        }
+                        keep
+                    };
 
                 for &id in &top_def_ids {
                     if !seen_target_ids.insert(id) {
@@ -5523,7 +5685,11 @@ pub fn slice(
                             }
                             let same_file = target.path() == rel_path;
                             let t_span = target.last + 1 - target.first;
-                            if push_located(&target, if same_file { 1.6 } else { 0.95 }, &mut candidates) {
+                            if push_located(
+                                &target,
+                                if same_file { 1.6 } else { 0.95 },
+                                &mut candidates,
+                            ) {
                                 added_for_owner += 1;
                                 indexed_added += 1;
                                 if t_span <= 24 {
@@ -5568,7 +5734,11 @@ pub fn slice(
                                 continue;
                             }
                             if let Some(caller) = idx_ref.locate(root, src_id) {
-                                let bonus = if edge.kind == EdgeKind::OVERRIDE { 1.4 } else { 0.9 };
+                                let bonus = if edge.kind == EdgeKind::OVERRIDE {
+                                    1.4
+                                } else {
+                                    0.9
+                                };
                                 if push_located(&caller, bonus, &mut candidates) {
                                     incoming_added += 1;
                                     indexed_added += 1;
@@ -5676,13 +5846,17 @@ pub fn slice(
                         }
                         let name_hit = (!matched_sym.is_empty()
                             && (def.name == matched_sym || def.qualified.contains(&matched_sym)))
-                            || callee_syms.iter().any(|s| def.name == *s || def.qualified.ends_with(s))
-                            || terms.iter().any(|t| def.name.to_ascii_lowercase().contains(&t.lower));
-                        if name_hit
-                            && let Some((f, l, _)) = declared_range(&lines, def)
-                        {
+                            || callee_syms
+                                .iter()
+                                .any(|s| def.name == *s || def.qualified.ends_with(s))
+                            || terms
+                                .iter()
+                                .any(|t| def.name.to_ascii_lowercase().contains(&t.lower));
+                        if name_hit && let Some((f, l, _)) = declared_range(&lines, def) {
                             let span = l + 1 - f;
-                            if span < 5 && !terms.iter().any(|t| t.boost >= 1.5 && def.name == t.text) {
+                            if span < 5
+                                && !terms.iter().any(|t| t.boost >= 1.5 && def.name == t.text)
+                            {
                                 continue;
                             }
                             let (tf, tl) = if span <= 65 {
@@ -5727,7 +5901,11 @@ pub fn slice(
                         f,
                         l,
                         title,
-                        if is_direct_fixture && wants_tests { 1 } else { hop_tier },
+                        if is_direct_fixture && wants_tests {
+                            1
+                        } else {
+                            hop_tier
+                        },
                         hop_file_score,
                         hop_bonus_val,
                         def_id,
@@ -5787,7 +5965,11 @@ pub fn slice(
                         if term.boost >= 1.5 && idfs[t_idx] >= 2.2 {
                             has_strong_idf_term = true;
                         }
-                        let decay_base = if term.boost >= 1.5 { 0.72_f64 } else { 0.45_f64 };
+                        let decay_base = if term.boost >= 1.5 {
+                            0.72_f64
+                        } else {
+                            0.45_f64
+                        };
                         let decay = decay_base.powi(term_cov[t_idx] as i32);
                         novel_score += idfs[t_idx] * term.boost * decay;
                     }
@@ -5799,8 +5981,13 @@ pub fn slice(
                 {
                     continue;
                 }
-                let repeat_base = if blk.file_score >= top_score * 0.60 { 0.86_f64 } else { 0.68_f64 };
-                novel_score += blk.file_score.min(100.0) * 0.35 * repeat_base.powi(seen_in_file as i32);
+                let repeat_base = if blk.file_score >= top_score * 0.60 {
+                    0.86_f64
+                } else {
+                    0.68_f64
+                };
+                novel_score +=
+                    blk.file_score.min(100.0) * 0.35 * repeat_base.powi(seen_in_file as i32);
                 if blk_len <= 6 && !blk.is_whole_small_file && blk.hop_bonus < 2.5 {
                     let matches_strong_title = terms
                         .iter()
@@ -5884,7 +6071,13 @@ pub fn slice(
 
         chosen.sort_by(|a, b| {
             let tier_key = |t: u8| -> u8 {
-                if wants_tests && t == 1 { 0 } else if wants_tests && t == 0 { 1 } else { t }
+                if wants_tests && t == 1 {
+                    0
+                } else if wants_tests && t == 0 {
+                    1
+                } else {
+                    t
+                }
             };
             tier_key(a.tier)
                 .cmp(&tier_key(b.tier))
@@ -6120,7 +6313,10 @@ class Builder:
             Some(4_096),
         )
         .expect("path-scoped slice should succeed");
-        assert!(scoped.contains("pkg/services/playlist/model.go"), "{scoped}");
+        assert!(
+            scoped.contains("pkg/services/playlist/model.go"),
+            "{scoped}"
+        );
         assert!(
             scoped.contains("pkg/services/playlist/playlistimpl/playlist.go"),
             "{scoped}"

@@ -1475,15 +1475,9 @@ pub(crate) struct ReadCommand {
 pub(crate) struct EditCommand {
     #[command(flatten)]
     pub(crate) project: ProjectArgs,
-    #[arg(
-        value_name = "SELECTOR",
-        help = "path::Symbol, path:LINE or path:A-B."
-    )]
+    #[arg(value_name = "SELECTOR", help = "path::Symbol, path:LINE or path:A-B.")]
     pub(crate) selector: String,
-    #[arg(
-        long,
-        help = "Read the replacement text from standard input."
-    )]
+    #[arg(long, help = "Read the replacement text from standard input.")]
     pub(crate) stdin: bool,
     #[arg(
         long,

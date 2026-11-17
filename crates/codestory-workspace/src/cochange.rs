@@ -412,7 +412,9 @@ fn structural_test_and_fixture_candidates(root: &Path, source_path: &str) -> Vec
         } else {
             format!(
                 "{}/{name}",
-                parent.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/")
+                parent
+                    .to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/")
             )
         }
     };
@@ -522,8 +524,11 @@ fn walk_commit_file_sets(
     let mut out = Vec::new();
     let mut current = Some(head_id);
     let mut visited = 0usize;
-    let required_parts = required_path
-        .map(|path| path.split('/').filter(|p| !p.is_empty()).collect::<Vec<_>>());
+    let required_parts = required_path.map(|path| {
+        path.split('/')
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>()
+    });
 
     while let Some(commit_id) = current {
         if visited >= max_commits {
@@ -586,7 +591,11 @@ fn walk_commit_file_sets(
     out
 }
 
-fn lookup_path_oid(repo: &Repository, tree_id: Option<ObjectId>, parts: &[&str]) -> Option<ObjectId> {
+fn lookup_path_oid(
+    repo: &Repository,
+    tree_id: Option<ObjectId>,
+    parts: &[&str],
+) -> Option<ObjectId> {
     let mut current = tree_id?;
     let hash_kind = repo.object_hash();
     for (index, part) in parts.iter().enumerate() {
@@ -681,7 +690,10 @@ fn read_tree_entries(
     let mut map = HashMap::new();
     for entry in TreeRefIter::from_bytes(&obj.data, repo.object_hash()).flatten() {
         if let Ok(name) = entry.filename.to_str() {
-            map.insert(name.to_string(), (entry.oid.to_owned(), entry.mode.is_tree()));
+            map.insert(
+                name.to_string(),
+                (entry.oid.to_owned(), entry.mode.is_tree()),
+            );
         }
     }
     map

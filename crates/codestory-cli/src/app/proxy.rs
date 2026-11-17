@@ -318,9 +318,7 @@ fn parse_loopback_addr(listen: &str) -> Result<SocketAddr> {
     let trimmed = listen.trim();
     if let Ok(addr) = trimmed.parse::<SocketAddr>() {
         if !addr.ip().is_loopback() {
-            bail!(
-                "refusing non-loopback proxy listen address `{trimmed}` (use 127.0.0.1 or ::1)"
-            );
+            bail!("refusing non-loopback proxy listen address `{trimmed}` (use 127.0.0.1 or ::1)");
         }
         return Ok(addr);
     }
@@ -470,7 +468,9 @@ fn handle_connection(
 
     match result {
         Ok(resp) => stream_upstream_response(&mut stream, &req.method, resp),
-        Err(ureq::Error::Status(_, resp)) => stream_upstream_response(&mut stream, &req.method, resp),
+        Err(ureq::Error::Status(_, resp)) => {
+            stream_upstream_response(&mut stream, &req.method, resp)
+        }
         Err(ureq::Error::Transport(err)) => {
             let payload = serde_json::json!({
                 "error": {
@@ -841,7 +841,11 @@ impl ProxyTransformState {
     }
 }
 
-fn effective_budget_for_call(base_budget: usize, call_id: Option<&str>, targeted_calls: &HashSet<String>) -> usize {
+fn effective_budget_for_call(
+    base_budget: usize,
+    call_id: Option<&str>,
+    targeted_calls: &HashSet<String>,
+) -> usize {
     if base_budget == 0 {
         return 0;
     }
@@ -866,15 +870,32 @@ fn is_targeted_lookup_tool(name: &str, payload_text: &str) -> bool {
         payload_text.to_string()
     };
     let lower = command_text.to_ascii_lowercase();
-    let has_cs_lookup = ["cs slice", "cs read", "cs refs", "cs find", "codestory-cli slice", "codestory-cli read", "codestory-cli refs", "codestory-cli find"]
-        .iter()
-        .any(|pat| lower.contains(pat));
+    let has_cs_lookup = [
+        "cs slice",
+        "cs read",
+        "cs refs",
+        "cs find",
+        "codestory-cli slice",
+        "codestory-cli read",
+        "codestory-cli refs",
+        "codestory-cli find",
+    ]
+    .iter()
+    .any(|pat| lower.contains(pat));
     if !has_cs_lookup {
         return false;
     }
-    !["write-test", "pytest", "go test", "cargo test", "cargo check", "npm test", "git diff"]
-        .iter()
-        .any(|pat| lower.contains(pat))
+    ![
+        "write-test",
+        "pytest",
+        "go test",
+        "cargo test",
+        "cargo check",
+        "npm test",
+        "git diff",
+    ]
+    .iter()
+    .any(|pat| lower.contains(pat))
 }
 
 fn collect_responses_targeted_call_id(item: &Value, targeted_calls: &mut HashSet<String>) {
@@ -885,7 +906,11 @@ fn collect_responses_targeted_call_id(item: &Value, targeted_calls: &mut HashSet
     if item_type != "function_call" && item_type != "custom_tool_call" {
         return;
     }
-    let Some(call_id) = obj.get("call_id").and_then(Value::as_str).filter(|s| !s.is_empty()) else {
+    let Some(call_id) = obj
+        .get("call_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    else {
         return;
     };
     let name = obj.get("name").and_then(Value::as_str).unwrap_or("");
@@ -908,13 +933,25 @@ fn collect_message_targeted_call_ids(msg: &Value, targeted_calls: &mut HashSet<S
     }
     if let Some(Value::Array(tool_calls)) = obj.get("tool_calls") {
         for tc in tool_calls {
-            let Some(tc_obj) = tc.as_object() else { continue };
-            let Some(id) = tc_obj.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()) else {
+            let Some(tc_obj) = tc.as_object() else {
+                continue;
+            };
+            let Some(id) = tc_obj
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            else {
                 continue;
             };
             let func = tc_obj.get("function").and_then(Value::as_object);
-            let name = func.and_then(|f| f.get("name")).and_then(Value::as_str).unwrap_or("");
-            let args = func.and_then(|f| f.get("arguments")).and_then(Value::as_str).unwrap_or("");
+            let name = func
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let args = func
+                .and_then(|f| f.get("arguments"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
             if is_targeted_lookup_tool(name, args) {
                 targeted_calls.insert(id.to_string());
             }
@@ -926,7 +963,11 @@ fn collect_message_targeted_call_ids(msg: &Value, targeted_calls: &mut HashSet<S
             if b.get("type").and_then(Value::as_str) != Some("tool_use") {
                 continue;
             }
-            let Some(id) = b.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()) else {
+            let Some(id) = b
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            else {
                 continue;
             };
             let name = b.get("name").and_then(Value::as_str).unwrap_or("");
@@ -954,7 +995,10 @@ fn transform_responses_item(
     if item_type != "function_call_output" && item_type != "custom_tool_call_output" {
         return;
     }
-    let call_id = obj.get("call_id").and_then(Value::as_str).filter(|id| !id.is_empty());
+    let call_id = obj
+        .get("call_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty());
     let budget = effective_budget_for_call(max_tool_bytes, call_id, targeted_calls);
     let item_key = call_id
         .map(|id| format!("resp:{id}"))
@@ -1235,12 +1279,7 @@ fn compact_tool_output(raw: &str, max_bytes: usize) -> String {
 
     let mut diag_indices = Vec::new();
     let mut diag_used = 0usize;
-    for (idx, line) in lines
-        .iter()
-        .enumerate()
-        .take(tail_start)
-        .skip(head_end)
-    {
+    for (idx, line) in lines.iter().enumerate().take(tail_start).skip(head_end) {
         if is_diagnostic_line(line) && diag_used + line.len() + 12 <= diag_budget {
             diag_used += line.len() + 12;
             diag_indices.push(idx);
@@ -1358,7 +1397,10 @@ fn ceil_char_boundary(text: &str, idx: usize) -> usize {
     pos
 }
 
-fn derive_session_key(obj: &serde_json::Map<String, Value>, headers: &[(String, String)]) -> String {
+fn derive_session_key(
+    obj: &serde_json::Map<String, Value>,
+    headers: &[(String, String)],
+) -> String {
     for key in ["prompt_cache_key", "previous_response_id"] {
         if let Some(val) = obj.get(key).and_then(Value::as_str)
             && !val.is_empty()
@@ -1464,7 +1506,8 @@ mod tests {
         assert!(prefix_turn1.contains("error[E0425]"));
         assert!(prefix_turn1.contains("line 119:"));
 
-        let repeated_small = "Chunk ID: c1\nWall time: 0.01s\nOutput:\n".to_string() + &"same\n".repeat(90);
+        let repeated_small =
+            "Chunk ID: c1\nWall time: 0.01s\nOutput:\n".to_string() + &"same\n".repeat(90);
         let mut turn2 = json!({
             "model": "gpt-6.1-sol",
             "instructions": "You are a coding assistant.",
@@ -1481,7 +1524,8 @@ mod tests {
             "turn 1 prefix item must stay byte-identical on turn 2"
         );
 
-        let repeated_again = "Chunk ID: c2\nWall time: 0.44s\nOutput:\n".to_string() + &"same\n".repeat(90);
+        let repeated_again =
+            "Chunk ID: c2\nWall time: 0.44s\nOutput:\n".to_string() + &"same\n".repeat(90);
         let mut turn3 = json!({
             "model": "gpt-6.1-sol",
             "instructions": "You are a coding assistant.",
@@ -1495,11 +1539,16 @@ mod tests {
         let out3 = state.transform_request_json(&mut turn3, &headers);
         assert_eq!(out3.tool_outputs_deduped, 1);
         assert_eq!(turn3["input"][1]["output"].as_str().unwrap(), prefix_turn1);
-        assert_eq!(turn3["input"][2]["output"].as_str().unwrap(), repeated_small);
-        assert!(turn3["input"][3]["output"]
-            .as_str()
-            .unwrap()
-            .contains("duplicate tool output identical to earlier call resp:call_2"));
+        assert_eq!(
+            turn3["input"][2]["output"].as_str().unwrap(),
+            repeated_small
+        );
+        assert!(
+            turn3["input"][3]["output"]
+                .as_str()
+                .unwrap()
+                .contains("duplicate tool output identical to earlier call resp:call_2")
+        );
     }
 
     #[test]
@@ -1519,10 +1568,12 @@ mod tests {
         });
         let out_anth = state.transform_request_json(&mut anth, &[]);
         assert_eq!(out_anth.tool_outputs_deduped, 1);
-        assert!(anth["messages"][0]["content"][1]["content"]
-            .as_str()
-            .unwrap()
-            .contains("anth:tu_1"));
+        assert!(
+            anth["messages"][0]["content"][1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("anth:tu_1")
+        );
 
         let mut chat = json!({
             "model": "gpt-4o",
@@ -1534,10 +1585,12 @@ mod tests {
         });
         let out_chat = state.transform_request_json(&mut chat, &[]);
         assert_eq!(out_chat.tool_outputs_deduped, 1);
-        assert!(chat["messages"][2]["content"]
-            .as_str()
-            .unwrap()
-            .contains("chat:tc_1"));
+        assert!(
+            chat["messages"][2]["content"]
+                .as_str()
+                .unwrap()
+                .contains("chat:tc_1")
+        );
     }
 
     #[test]
@@ -1586,7 +1639,9 @@ mod tests {
         })
         .expect("spawn proxy");
         let proxy_url = format!("{}/v1/responses", handle.base_url());
-        let big = (0..60).map(|i| format!("row {i:02} diagnostic payload\n")).collect::<String>();
+        let big = (0..60)
+            .map(|i| format!("row {i:02} diagnostic payload\n"))
+            .collect::<String>();
 
         let resp1 = ureq::post(&proxy_url)
             .set("Content-Type", "application/json")
@@ -1642,10 +1697,12 @@ mod tests {
         let recorded = captured_bodies.lock().unwrap();
         assert_eq!(recorded.len(), 2);
         assert_eq!(recorded[0]["input"][1], recorded[1]["input"][1]);
-        assert!(recorded[1]["input"][2]["output"]
-            .as_str()
-            .unwrap()
-            .contains("duplicate tool output"));
+        assert!(
+            recorded[1]["input"][2]["output"]
+                .as_str()
+                .unwrap()
+                .contains("duplicate tool output")
+        );
 
         handle.stop();
         upstream_thread.join().unwrap();
@@ -1655,7 +1712,7 @@ mod tests {
     fn targeted_lookup_calls_receive_double_byte_budget_while_noisy_shell_caps_strictly() {
         let mut state = ProxyTransformState::new(400, false);
         let lookup_out = "x\n".repeat(300); // 600B: > 400B, <= 800B (2x cap)
-        let shell_out = "y\n".repeat(300);  // 600B: > 400B -> gets capped
+        let shell_out = "y\n".repeat(300); // 600B: > 400B -> gets capped
         let mut req = json!({
             "model": "gpt-6.1-sol",
             "input": [

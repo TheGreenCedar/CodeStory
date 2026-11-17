@@ -12,9 +12,10 @@ codestory-cli setup claude-code
 
 Setup puts a marked note in your Claude Code `CLAUDE.md` and installs a shared
 lookup launcher in your Claude Code configuration directory. The note gives
-Claude Code the full invocation for `cs find`, `cs refs`, and `cs read`. The
-commands use your existing shell with no `PATH` edits or MCP connection. Use
-the launcher path printed by setup if you want to run them yourself.
+Claude Code the full invocation for `cs slice`, `cs refs`, `cs find`, `cs read`,
+and `cs edit`. The commands use your existing shell with no `PATH` edits or MCP
+connection. Use the launcher path printed by setup if you want to run them
+yourself.
 
 Start a fresh Claude Code session in your repository and ask a question about
 the code, such as this one.
@@ -23,9 +24,10 @@ the code, such as this one.
 How does the configuration loader reach the runtime, and which tests exercise that path?
 ```
 
-Lookups return live source before indexing. They can add annotations from an
-existing index when the indexed file matches the current file. To build an
-index yourself, run `codestory-cli index --project .` from the repository.
+Lookups return live source before indexing. They add declarations, 1-hop
+callees, and co-change siblings from an existing index when the indexed file
+matches the current file. To build a fast core-only lookup index yourself, run
+`codestory-cli index --project . --core-only` from the repository.
 
 Setup applies to your Claude Code user by default. To put the note at a
 repository's Git root, run `codestory-cli setup claude-code --repo` from inside
@@ -67,9 +69,9 @@ caches installed plugins, so reinstall after changing plugin files.
 ### Shell lookups from the plugin
 
 In Claude Code builds that put the enabled plugin's `bin/` on the shell tool's
-PATH, use `cs find TERM`, `cs refs NAME`, or `cs read PATH::NAME`. The
-installed CodeStory lookups skill also describes how to run the bundled command
-by absolute path. Run it from the repository you want to inspect. The command
+PATH, use `cs slice QUESTION`, `cs refs NAME`, `cs find TERM`, `cs read PATH::NAME`,
+or `cs edit PATH::NAME --stdin`. The installed CodeStory lookups skill also describes
+how to run the bundled command by absolute path. Run it from the repository you want to inspect. The command
 uses the matching native runtime prepared by the plugin's launcher.
 
 ### Configure MCP

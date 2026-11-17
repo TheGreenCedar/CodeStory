@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- `cs slice` packs query-relevant declarations, 1-hop callees, and co-change test or fixture siblings from live files within `--max-bytes` (default 7,500 bytes), falling back cleanly to live tree-sitter AST extraction on unindexed checkouts without whole-tree freshness walks.
+- `cs edit` atomically replaces a declaration or line range (`path::Symbol`, `path:LINE`, `path:A-B`) after tree-sitter syntax validation passes, refusing broken syntax without modifying the file.
+- `cs find` and `cs refs` support `--file-glob` path filters, and `cs read` caps default reads at `16,000` bytes (outlines capped at `9,500` bytes).
+- `codestory-cli index --core-only` skips semantic document and dense-anchor work across both full and incremental refreshes for fast lookup-focused caches, while automatically repairing missing semantic docs if normal indexing runs later.
+- `codestory-cli proxy` and `codestory-cli run` add a loopback HTTP context-budget proxy that caps oversized tool outputs and deduplicates unchanged payloads across turns while preserving prefix bytes for KV cache reuse.
+- `codestory-cli setup` now configures `cursor`, `opencode`, and `antigravity` in addition to `codex` and `claude-code`, and `CODESTORY_MCP_TOOL_SURFACE=lean` exposes a five-tool (`slice`, `find`, `refs`, `read`, `edit`) compact MCP inventory under 2.5 KB.
+- Go member-call and static resolution avoid premature bailout so receiver and imported calls stay connected for local navigation.
 - Lexical search highlights the source line matching the most distinct query terms, instead of stopping at an incidental match near the top of a file.
 - Reading a line deep inside a large function now includes that line in the reply.
 - Packet searches now try up to two names or flags written in backticks as separate search terms.

@@ -71,7 +71,15 @@ Recovery steps: [Troubleshooting](troubleshooting.md).
 
 ## Benchmarks
 
-In the `codestory-cli setup codex` trial, Codex used shell lookups on its own.
+On the November 2026 large-repository bank (`12` tasks, `gpt-6.1-sol`, medium
+reasoning, `--core-only` read-only cache), `cs slice` + lookups paired with
+the `codestory-cli proxy` (`boost-proxy`) reached **12/12 complete** (`75/75`
+requirements) with `-8.2%` mean / `-13.6%` median weighted tokens vs plain Codex
+(`73/75`, `10/12` complete), winning weighted tokens on `8/12` tasks. On the
+4-task `write-bank` suite, all arms passed `4/4`, with `K04` saving `-29.4%`
+while mean tokens on short edits were higher (`52,414` vs `36,247`).
+
+In the earlier `codestory-cli setup codex` trial, Codex used shell lookups on its own.
 On large repositories, raw token use was nearly flat and the setup missed the
 correctness target. It met 72 of 75 requirements, compared with 74 of 75 for
 plain Codex. On small repositories, both groups met all 45 requirements, and the

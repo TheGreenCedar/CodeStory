@@ -78,6 +78,16 @@ family surface; default named tools, aliases and legacy batches are unchanged.
 All evidence, metadata, freshness, ambiguity, coverage and runtime-proof limits
 in this guide apply to the canonical results unchanged.
 
+### Explicit lean surface
+
+An opt-in client or host without shell access may set
+`CODESTORY_MCP_TOOL_SURFACE=lean` before launcher startup. The server then
+exposes only the five compact live-source tools (`slice`, `find`, `refs`, `read`,
+and `edit`), keeping the total advertised tool inventory under 2.5 KB. Calls run
+the matching live-source CLI commands and trigger detached `--core-only`
+background indexing when unindexed or changed files are served. Like all MCP
+calls, each tool requires an explicit absolute `project` root.
+
 ### Display each result payload once
 
 Some hosts expose both `content` and `structuredContent` (or
@@ -347,11 +357,14 @@ for installed use; CLI diagnostics cannot prove the plugin is live in this host.
 ## References
 
 - [Generated MCP syntax](references/generated-mcp-syntax.md): request fields.
+- [Live lookups & edits](references/slice.md): `slice`, [find](references/find.md),
+  [refs](references/refs.md), [read](references/read.md), and [edit](references/edit.md)
+  (CLI `cs` and `CODESTORY_MCP_TOOL_SURFACE=lean`).
 - [Search](references/search.md), [context](references/context.md) and
   [snippets](references/snippet.md): candidate and source operations.
 - [Repository map](references/ground.md), [files](references/files.md),
   [symbols](references/symbol.md), [trails](references/trail.md) and
   [affected](references/affected.md): navigation and scope.
-- [Status contract](references/status-contract.md): readiness diagnostics.
-- [Generated CLI syntax](references/generated-cli-syntax.md): maintainer commands,
-  not MCP calling conventions.
+- [Status contract](references/status-contract.md) and [index](references/index.md):
+  readiness diagnostics and `--core-only` indexing.
+- [Generated CLI syntax](references/generated-cli-syntax.md): CLI command syntax.

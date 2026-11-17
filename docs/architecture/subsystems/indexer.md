@@ -196,6 +196,7 @@ Resolution is a post-flush pass because it depends on the stored graph state:
 - `ResolutionPass` then loads unresolved call, import, and override edges from the store
 - candidate selection prefers structural matches first and can use semantic candidate indexes as a fallback for supported languages
 - incremental runs scope the resolution pass to touched files; full refresh resolves across the full workspace
+- member-call resolution preserves structural receiver/package candidates under the `0.80` certainty filter instead of bailing out early on common wrappers
 
 Go package-call resolution consumes the stored hash of each required `go.mod`
 control and a bounded module-declaration subset. It combines the exact local

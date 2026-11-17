@@ -4,18 +4,22 @@ CodeStory gives a coding agent live source lookups, a local repository map, and
 cited search. Set it up for your host, open a fresh session in your repository,
 and ask a code question.
 
-For Codex and Claude Code, use the CLI setup command for shell lookups. The
-optional plugin adds the repository map and broad search through MCP. On the
-plugin path, the first call downloads the matching runtime when needed. See
+For Codex, Claude Code, Cursor, OpenCode, and Antigravity, use `codestory-cli setup <host>`
+for shell lookups (`slice`, `find`, `refs`, `read`, `edit`). The optional
+plugin adds the repository map and broad search through MCP (or the five-tool
+`CODESTORY_MCP_TOOL_SURFACE=lean` surface). On the plugin path, the first call
+downloads the matching runtime when needed. See
 [First use downloads the runtime](troubleshooting.md#first-use-downloads-the-runtime).
 
 ## Pick your host
 
 | Host | Setup | What is automatic |
 | --- | --- | --- |
-| [Codex](codex.md) | `codestory-cli setup codex` | Lookup note in standing instructions |
-| [Cursor](cursor.md) | Add the marketplace in Customize, then enable MCP once | Rule, hook, skill, and launcher; matching CLI fetched after the first MCP call |
-| [Claude Code](claude-code.md) | `codestory-cli setup claude-code` | Lookup note in standing instructions |
+| [Codex](codex.md) | `codestory-cli setup codex` | `cs` launcher + note in `~/.codex/AGENTS.md` |
+| [Cursor](cursor.md) | `codestory-cli setup cursor`, or Customize plugin | `cs` launcher + rule in `~/.cursor/rules/codestory-lookups.mdc` (or full MCP plugin) |
+| [Claude Code](claude-code.md) | `codestory-cli setup claude-code` | `cs` launcher + note in `~/.claude/CLAUDE.md` |
+| OpenCode | `codestory-cli setup opencode` | `cs` launcher + note in `~/.config/opencode/AGENTS.md` |
+| Antigravity | `codestory-cli setup antigravity` | `cs` launcher + note in `~/.gemini/antigravity/GEMINI.md` |
 | [Copilot CLI](copilot.md#copilot-cli) | Install hooks and configure MCP | Session instructions; preparation after MCP connects |
 | [Copilot editor](copilot.md#copilot-editor) | Add repository instructions and optionally MCP | CodeStory evidence only when MCP is connected |
 
@@ -35,8 +39,15 @@ The Codex and Claude Code guides also cover installing the optional plugin.
 
 ## Other MCP hosts
 
+For **OpenCode** and **Antigravity**, run `codestory-cli setup opencode` or
+`codestory-cli setup antigravity` (add `--repo` to scope the note to the
+repository Git root, or `--remove` to cleanly remove the managed block).
+
 Any host that can launch a stdio MCP server can run the same project-scoped
-runtime. Point the host's MCP configuration at the packaged launcher script:
+runtime. Set `CODESTORY_MCP_TOOL_SURFACE=lean` to expose only the five compact
+live-source tools (`slice`, `find`, `refs`, `read`, `edit`, under 2.5 KB total)
+instead of the full named catalog. Point the host's MCP configuration at the
+packaged launcher script:
 
 ```json
 {

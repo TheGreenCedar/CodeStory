@@ -1,17 +1,23 @@
 ---
 name: codestory-grounding
-description: For codebase questions, use the bundled shell command first. Run cs find TERM, cs refs NAME, or cs read PATH::NAME from the repository. If cs is outside PATH, run node with the absolute path to ../../bin/cs relative to this SKILL.md. Returns numbered live source even without an index. Use MCP for graph and other indexed operations.
+description: For codebase questions and edits, use the bundled shell command first. Run cs slice QUESTION, cs refs NAME, cs find TERM, cs read PATH::NAME, or cs edit PATH::NAME --stdin from the repository. If cs is outside PATH, run node with the absolute path to ../../bin/cs relative to this SKILL.md. Returns numbered live source even without an index. Use MCP (or CODESTORY_MCP_TOOL_SURFACE=lean) when shell execution is unavailable or graph/broad retrieval is needed.
 ---
 
 # CodeStory
 
-Use `cs find TERM` for literal text, `cs refs NAME` for definitions and mentions, or `cs read PATH::NAME` or `cs read PATH:START-END` for numbered source.
-Run `cs` from the repository. When it is outside PATH, pass the absolute path to this plugin's `bin/cs` to `node`. From the directory containing this skill, that path is `../../bin/cs`.
-Use ordinary reads for named files and to fill any gaps. No setup or preliminary call is needed for the shell lookups.
+Use `cs` from the repository first; when it is outside PATH, pass the absolute path to this plugin's `bin/cs` (`../../bin/cs` relative to this file) to `node`. No setup or preliminary call is needed for shell lookups, and every read lookup returns live numbered source even before indexing.
+
+- `cs slice QUESTION` packs query-relevant declarations and 1-hop callees across files within 7,500 bytes (use first for multi-file orientation).
+- `cs refs NAME [--file-glob G]` lists definitions, call/reference sites, and referenced callees (`--no-bodies` for compact matches).
+- `cs find TERM... [--file-glob G]` searches literal text with enclosing declarations (`--file-glob` filters paths).
+- `cs read SELECTOR...` reads small files whole, outlines long files, or reads `path::Symbol`, `path:LINE`, and `path:A-B` slices (`<=16000B`).
+- `cs edit SELECTOR --stdin` validates syntax via tree-sitter and replaces `path::Symbol`, `path:LINE`, or `path:A-B` atomically before verification.
+
+Use ordinary reads for named files and to fill any gaps. When a host exposes `CODESTORY_MCP_TOOL_SURFACE=lean`, the same five tools (`slice`, `find`, `refs`, `read`, `edit`) run directly over MCP with background `--core-only` indexing.
 
 ## Indexed tools
 
-For a broad question spanning several files, experimental `packet` accepts `question` and returns bounded source evidence or explicit gaps. Use targeted tools for missing evidence.
+For a broad question spanning several files when shell `cs` is insufficient, experimental `packet` accepts `question` and returns bounded source evidence or explicit gaps. Use targeted tools for missing evidence.
 
 For diff reviews, `affected` can start from changed ranges instead of whole files; [scope requirements](references/affected.md#explicit-changed-ranges) include source hashes and explicit unresolved cases.
 
