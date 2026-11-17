@@ -675,6 +675,7 @@ struct PreparedFullRefreshSnapshots {
     snapshot_duration: Duration,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_full_refresh_snapshots(
     staged: &mut StagedSnapshot,
     root: &Path,
@@ -682,20 +683,25 @@ fn prepare_full_refresh_snapshots(
     cancel_token: Option<&CancellationToken>,
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
     source_index_policy: &SourceIndexPolicy,
+    skip_semantic_docs: bool,
 ) -> Result<PreparedFullRefreshSnapshots, ApiError> {
     let semantic_started = Instant::now();
-    let semantic_stats = finalize_staged_semantic_docs_for_runtime(
-        staged.store_mut(),
-        Some(root),
-        None,
-        None,
-        source_identity,
-        cancel_token,
-        runtime,
-        SemanticProjectionDocumentSource::SourceFiles {
-            max_file_bytes: source_index_policy.byte_cap,
-        },
-    )?;
+    let semantic_stats = if skip_semantic_docs {
+        SemanticProjectionStats::default()
+    } else {
+        finalize_staged_semantic_docs_for_runtime(
+            staged.store_mut(),
+            Some(root),
+            None,
+            None,
+            source_identity,
+            cancel_token,
+            runtime,
+            SemanticProjectionDocumentSource::SourceFiles {
+                max_file_bytes: source_index_policy.byte_cap,
+            },
+        )?
+    };
     ensure_indexing_active(cancel_token)?;
     let semantic_duration = semantic_started.elapsed();
     let snapshot_started = Instant::now();
@@ -876,6 +882,7 @@ struct PreparedFullRefresh {
     core_refresh_started: Instant,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_full_refresh(
     root: &Path,
     storage_path: &Path,
@@ -884,6 +891,7 @@ fn prepare_full_refresh(
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
     source_index_policy: &SourceIndexPolicy,
     diagnostics: Option<&FailedRefreshDiagnosticSink>,
+    skip_semantic_docs: bool,
 ) -> Result<PreparedFullRefresh, ApiError> {
     let core_refresh_started = Instant::now();
     let live_started = Instant::now();
@@ -949,6 +957,7 @@ fn prepare_full_refresh(
         cancel_token,
         runtime,
         source_index_policy,
+        skip_semantic_docs,
     )?;
     wall_durations.semantic_stage = snapshots.semantic_duration;
     wall_durations.snapshot_stage = snapshots.snapshot_duration;
@@ -981,6 +990,31 @@ pub(super) fn index_full_for_runtime(
     _annotations_owned: &crate::controller_bookmarks::AnnotationsOwned,
     diagnostics: Option<&FailedRefreshDiagnosticSink>,
 ) -> Result<IndexingRunSummary, ApiError> {
+    index_full_for_runtime_with_options(
+        root,
+        storage_path,
+        events_tx,
+        cancel_token,
+        runtime,
+        source_index_policy,
+        _annotations_owned,
+        diagnostics,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn index_full_for_runtime_with_options(
+    root: &Path,
+    storage_path: &Path,
+    events_tx: &Sender<AppEventPayload>,
+    cancel_token: Option<&CancellationToken>,
+    runtime: &codestory_retrieval::SidecarRuntimeConfig,
+    source_index_policy: &SourceIndexPolicy,
+    _annotations_owned: &crate::controller_bookmarks::AnnotationsOwned,
+    diagnostics: Option<&FailedRefreshDiagnosticSink>,
+    skip_semantic_docs: bool,
+) -> Result<IndexingRunSummary, ApiError> {
     let PreparedFullRefresh {
         mut staged,
         live_state,
@@ -998,6 +1032,7 @@ pub(super) fn index_full_for_runtime(
         runtime,
         source_index_policy,
         diagnostics,
+        skip_semantic_docs,
     )?;
     let publication = &live_state.publication;
     let recovering_incomplete_run = live_state.recovering_incomplete_run;

@@ -112,7 +112,7 @@ fn run_index_once(cmd: &IndexCommand) -> Result<()> {
     } else {
         None
     };
-    let mut opened = runtime.ensure_core_open(cmd.refresh)?;
+    let mut opened = runtime.ensure_core_open_with_options(cmd.refresh, cmd.core_only)?;
     if let Some(progress) = progress {
         progress.finish();
     }
@@ -276,6 +276,7 @@ mod tests {
             dry_run: false,
             summarize: false,
             progress: false,
+            core_only: false,
             watch: false,
         };
         run_index(command(RefreshMode::Full)).expect("seed published core through index command");
@@ -348,6 +349,7 @@ mod tests {
             dry_run: false,
             summarize: false,
             progress: false,
+            core_only: false,
             watch: false,
         };
         let error = codestory_runtime::with_available_filesystem_bytes_for_test(0, || {
@@ -390,6 +392,7 @@ mod core_only_tests {
             dry_run: false,
             summarize: false,
             progress: false,
+            core_only: false,
             watch: false,
         };
         assert!(run_index(command(RefreshMode::None)).is_err());

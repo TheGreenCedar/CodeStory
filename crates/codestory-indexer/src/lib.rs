@@ -17592,6 +17592,49 @@ pub fn get_language_for_ext(ext: &str) -> Option<LanguageConfig> {
     language_configs::get_language_for_ext(ext)
 }
 
+/// Validate `source` syntax with the registered Tree-sitter grammar for `ext`.
+/// Returns `Ok(())` when `ext` has no registered grammar or when the parsed
+/// syntax tree has no `ERROR` or `MISSING` nodes, and `Err((line, column))`
+/// (1-based) of the first syntax error otherwise.
+pub fn validate_source_syntax_for_ext(ext: &str, source: &str) -> Result<(), (usize, usize)> {
+    let Some(config) = get_language_for_ext(ext) else {
+        return Ok(());
+    };
+    let mut parser = Parser::new();
+    if parser.set_language(&config.language).is_err() {
+        return Ok(());
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return Err((1, 1));
+    };
+    let root = tree.root_node();
+    if !root.has_error() {
+        return Ok(());
+    }
+    if let Some((line, col)) = first_syntax_error_position(root) {
+        return Err((line, col));
+    }
+    Err((1, 1))
+}
+
+fn first_syntax_error_position(node: tree_sitter::Node<'_>) -> Option<(usize, usize)> {
+    if node.is_error() || node.is_missing() {
+        let pos = node.start_position();
+        return Some((pos.row + 1, pos.column + 1));
+    }
+    if !node.has_error() {
+        return None;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if let Some(found) = first_syntax_error_position(child) {
+            return Some(found);
+        }
+    }
+    let pos = node.start_position();
+    Some((pos.row + 1, pos.column + 1))
+}
+
 /// Generate a stable deterministic id from a canonical graph name.
 pub fn generate_id(name: &str) -> i64 {
     let mut h: u64 = 0xcbf29ce484222325;

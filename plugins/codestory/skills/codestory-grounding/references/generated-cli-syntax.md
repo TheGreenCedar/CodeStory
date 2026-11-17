@@ -9,6 +9,8 @@ Root usage: `codestory-cli <COMMAND>`
 | Command | Usage |
 | --- | --- |
 | `setup` | `codestory-cli setup [OPTIONS] <HOST>` |
+| `proxy` | `codestory-cli proxy [OPTIONS]` |
+| `run` | `codestory-cli run [OPTIONS] <COMMAND>...` |
 | `index` | `codestory-cli index [OPTIONS]` |
 | `ground` | `codestory-cli ground [OPTIONS]` |
 | `report` | `codestory-cli report [OPTIONS]` |
@@ -35,6 +37,8 @@ Root usage: `codestory-cli <COMMAND>`
 | `trace` | `codestory-cli trace [OPTIONS] <--id <NODE_ID>|--query <QUERY>>` |
 | `snippet` | `codestory-cli snippet [OPTIONS] <--id <NODE_ID>|--query <QUERY>>` |
 | `read` | `codestory-cli read [OPTIONS] <SELECTOR>...` |
+| `edit` | `codestory-cli edit [OPTIONS] <SELECTOR>` |
+| `slice` | `codestory-cli slice [OPTIONS] <QUESTION>` |
 | `query` | `codestory-cli query [OPTIONS] <QUERY|--sql <SQL>>` |
 | `explore` | `codestory-cli explore [OPTIONS] <--id <NODE_ID>|--query <QUERY>>` |
 | `files` | `codestory-cli files [OPTIONS]` |

@@ -29,6 +29,7 @@ use std::sync::OnceLock;
 use uuid::Uuid;
 
 pub mod atomic_file;
+pub mod cochange;
 pub mod filesystem_observer;
 pub mod locking;
 pub mod owned_deletion;
@@ -1085,6 +1086,14 @@ impl WorkspaceDiscovery {
         manifest: &WorkspaceManifest,
         max_files: Option<usize>,
     ) -> Result<WorkspaceFileInventory> {
+        with_walk_canonical_cache(|| self.source_inventory_inner_uncached(manifest, max_files))
+    }
+
+    fn source_inventory_inner_uncached(
+        &self,
+        manifest: &WorkspaceManifest,
+        max_files: Option<usize>,
+    ) -> Result<WorkspaceFileInventory> {
         let workspace_root = workspace_root(manifest);
         let (repository_tracked_paths, repository_metadata_issues, repository_tracking_digest) =
             repository_tracked_paths(&manifest.root_dir());
@@ -1415,12 +1424,12 @@ impl WorkspaceDiscovery {
             .cloned()
             .collect::<Vec<_>>();
         let mut go_module_controls = HashSet::new();
-        let canonical_workspace_root = workspace_root.canonicalize().ok();
+        let canonical_workspace_root = cached_canonicalize(&workspace_root);
         for source in go_sources {
             let Some(canonical_root) = canonical_workspace_root.as_ref() else {
                 continue;
             };
-            let Ok(canonical_source) = source.canonicalize() else {
+            let Some(canonical_source) = cached_canonicalize(&source) else {
                 continue;
             };
             let Ok(relative) = canonical_source.strip_prefix(canonical_root) else {
@@ -1736,6 +1745,26 @@ impl WorkspaceDiscovery {
 }
 
 fn build_refresh_outcome_from_inventory(
+    manifest: &WorkspaceManifest,
+    inputs: &RefreshInputs,
+    current_files: Vec<PathBuf>,
+    inventory_outcome: WorkspaceInventoryOutcome,
+    inventory_issues: Vec<WorkspaceInventoryIssue>,
+    inventory_warnings: Vec<WorkspaceInventoryIssue>,
+) -> Result<WorkspaceRefreshOutcome> {
+    with_walk_canonical_cache(|| {
+        build_refresh_outcome_from_inventory_uncached(
+            manifest,
+            inputs,
+            current_files,
+            inventory_outcome,
+            inventory_issues,
+            inventory_warnings,
+        )
+    })
+}
+
+fn build_refresh_outcome_from_inventory_uncached(
     manifest: &WorkspaceManifest,
     inputs: &RefreshInputs,
     current_files: Vec<PathBuf>,
@@ -2636,7 +2665,7 @@ impl ObservedDiscoveryExclusions {
 impl ObservedDiscoveryPath {
     fn observe(path: &Path, is_dir: bool) -> Option<Self> {
         let normalized = normalize_lexical_path(path);
-        let canonical = normalized.canonicalize().ok();
+        let canonical = cached_canonicalize(&normalized);
         let exclusion_lexical = workspace_path_lexical_identity(&normalized).ok()?;
         let exclusion_canonical = canonical
             .as_deref()
@@ -3007,13 +3036,105 @@ fn push_discovered_file(
     }
 }
 
+#[derive(Default)]
+struct WalkCanonicalCache {
+    depth: usize,
+    exact_paths: HashMap<PathBuf, Option<PathBuf>>,
+    dir_entries: HashMap<PathBuf, Option<(PathBuf, HashSet<std::ffi::OsString>)>>,
+}
+
+std::thread_local! {
+    static WALK_CANONICAL_CACHE: std::cell::RefCell<WalkCanonicalCache> =
+        std::cell::RefCell::new(WalkCanonicalCache::default());
+}
+
+struct WalkCanonicalCacheGuard;
+
+impl Drop for WalkCanonicalCacheGuard {
+    fn drop(&mut self) {
+        WALK_CANONICAL_CACHE.with(|cell| {
+            let mut cache = cell.borrow_mut();
+            cache.depth = cache.depth.saturating_sub(1);
+            if cache.depth == 0 {
+                cache.exact_paths.clear();
+                cache.dir_entries.clear();
+            }
+        });
+    }
+}
+
+fn with_walk_canonical_cache<T>(f: impl FnOnce() -> T) -> T {
+    WALK_CANONICAL_CACHE.with(|cell| {
+        cell.borrow_mut().depth += 1;
+    });
+    let _guard = WalkCanonicalCacheGuard;
+    f()
+}
+
+fn cached_canonicalize(path: &Path) -> Option<PathBuf> {
+    let active = WALK_CANONICAL_CACHE.with(|cell| cell.borrow().depth > 0);
+    if !active {
+        return path.canonicalize().ok();
+    }
+    if let Some(cached) = WALK_CANONICAL_CACHE.with(|cell| cell.borrow().exact_paths.get(path).cloned()) {
+        return cached;
+    }
+    if let (Some(parent), Some(file_name)) = (path.parent(), path.file_name())
+        && !parent.as_os_str().is_empty()
+    {
+        let dir_hit = WALK_CANONICAL_CACHE.with(|cell| {
+            let mut cache = cell.borrow_mut();
+            if !cache.dir_entries.contains_key(parent) {
+                let loaded = parent.canonicalize().ok().and_then(|canonical_parent| {
+                    let entries = fs::read_dir(parent).ok()?;
+                    let mut regular_files = HashSet::new();
+                    for entry in entries.flatten() {
+                        if let Ok(ft) = entry.file_type()
+                            && ft.is_file()
+                            && !ft.is_symlink()
+                        {
+                            regular_files.insert(entry.file_name());
+                        }
+                    }
+                    Some((canonical_parent, regular_files))
+                });
+                cache.dir_entries.insert(parent.to_path_buf(), loaded);
+            }
+            cache
+                .dir_entries
+                .get(parent)
+                .and_then(|entry| entry.as_ref())
+                .and_then(|(canonical_parent, regular_files)| {
+                    regular_files
+                        .contains(file_name)
+                        .then(|| canonical_parent.join(file_name))
+                })
+        });
+        if let Some(resolved) = dir_hit {
+            WALK_CANONICAL_CACHE.with(|cell| {
+                cell.borrow_mut()
+                    .exact_paths
+                    .insert(path.to_path_buf(), Some(resolved.clone()));
+            });
+            return Some(resolved);
+        }
+    }
+    let resolved = path.canonicalize().ok();
+    WALK_CANONICAL_CACHE.with(|cell| {
+        cell.borrow_mut()
+            .exact_paths
+            .insert(path.to_path_buf(), resolved.clone());
+    });
+    resolved
+}
+
 fn normalized_compare_key(root: &Path, path: &Path) -> String {
     let absolute = if path.is_absolute() {
         normalize_lexical_path(path)
     } else {
         normalize_lexical_path(&root.join(path))
     };
-    let stable = absolute.canonicalize().unwrap_or(absolute);
+    let stable = cached_canonicalize(&absolute).unwrap_or(absolute);
     normalize_path_key(&stable)
 }
 

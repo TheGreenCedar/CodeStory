@@ -4,7 +4,7 @@ use crate::index_freshness::{
     FreshnessObservation, index_freshness_from_storage_with_policy, open_storage_for_read,
     workspace_member_index_summaries, workspace_member_storage_summaries,
 };
-use crate::index_full::index_full_for_runtime;
+use crate::index_full::{index_full_for_runtime, index_full_for_runtime_with_options};
 use crate::index_incremental::{
     IncrementalPlanProbe, ensure_incremental_refresh_compatible, index_incremental_for_runtime,
     index_incremental_for_runtime_with_probe, probe_incremental_plan,
@@ -743,13 +743,29 @@ impl AppController {
         refresh_runtime_caches: bool,
         cancel_token: Option<&CancellationToken>,
     ) -> Result<IndexingPhaseTimings, ApiError> {
-        self.run_indexing_blocking_inner_with_probe(
+        self.run_indexing_blocking_inner_with_options(
+            mode,
+            refresh_runtime_caches,
+            cancel_token,
+            false,
+        )
+    }
+
+    fn run_indexing_blocking_inner_with_options(
+        &self,
+        mode: IndexMode,
+        refresh_runtime_caches: bool,
+        cancel_token: Option<&CancellationToken>,
+        skip_semantic_docs: bool,
+    ) -> Result<IndexingPhaseTimings, ApiError> {
+        self.run_indexing_blocking_inner_with_probe_and_options(
             mode,
             refresh_runtime_caches,
             cancel_token,
             None,
             None,
             None,
+            skip_semantic_docs,
         )
         .map(|completion| completion.phase_timings)
     }
@@ -762,6 +778,28 @@ impl AppController {
         precomputed_probe: Option<IncrementalPlanProbe>,
         failed_refresh_diagnostics: Option<&crate::index_full::FailedRefreshDiagnosticSink>,
         preacquired_writer: Option<IndexWriterGuard>,
+    ) -> Result<IndexingCompletion, ApiError> {
+        self.run_indexing_blocking_inner_with_probe_and_options(
+            mode,
+            refresh_runtime_caches,
+            cancel_token,
+            precomputed_probe,
+            failed_refresh_diagnostics,
+            preacquired_writer,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_indexing_blocking_inner_with_probe_and_options(
+        &self,
+        mode: IndexMode,
+        refresh_runtime_caches: bool,
+        cancel_token: Option<&CancellationToken>,
+        precomputed_probe: Option<IncrementalPlanProbe>,
+        failed_refresh_diagnostics: Option<&crate::index_full::FailedRefreshDiagnosticSink>,
+        preacquired_writer: Option<IndexWriterGuard>,
+        skip_semantic_docs: bool,
     ) -> Result<IndexingCompletion, ApiError> {
         let (root, storage_path) = {
             let s = self.state.lock();
@@ -823,7 +861,7 @@ impl AppController {
         };
 
         let result = match mode {
-            IndexMode::Full => index_full_for_runtime(
+            IndexMode::Full => index_full_for_runtime_with_options(
                 &root,
                 &storage_path,
                 &self.events_tx,
@@ -832,6 +870,7 @@ impl AppController {
                 &self.source_index_policy,
                 &annotations_owned,
                 failed_refresh_diagnostics,
+                skip_semantic_docs,
             ),
             IndexMode::Incremental => index_incremental_for_runtime_with_probe(
                 &root,
@@ -1296,6 +1335,14 @@ impl AppController {
         mode: IndexMode,
     ) -> Result<IndexingPhaseTimings, ApiError> {
         self.run_indexing_blocking_inner(mode, false, None)
+    }
+
+    pub fn run_indexing_blocking_without_runtime_refresh_with_options(
+        &self,
+        mode: IndexMode,
+        skip_semantic_docs: bool,
+    ) -> Result<IndexingPhaseTimings, ApiError> {
+        self.run_indexing_blocking_inner_with_options(mode, false, None, skip_semantic_docs)
     }
 
     /// Bind project/storage paths for a recovery refresh without opening the

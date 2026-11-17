@@ -83,6 +83,7 @@ mod index_command;
 mod lifecycle;
 mod lookup_commands;
 mod prove_call_path;
+mod proxy;
 mod readiness_commands;
 pub(crate) mod rendering;
 pub(crate) mod resolution;
@@ -209,6 +210,8 @@ async fn run_cli(cli: Cli) -> Result<()> {
     }
     match cli.command {
         Command::Setup(cmd) => setup::run_setup(cmd),
+        Command::Proxy(cmd) => proxy::run_proxy(cmd).await,
+        Command::Run(cmd) => proxy::run_run(cmd).await,
         Command::Index(cmd) => index_command::run_index(cmd),
         Command::Ground(cmd) => ground_smoke::run_ground(cmd),
         Command::Report(cmd) => report::run_report(cmd),
@@ -243,6 +246,8 @@ async fn run_cli(cli: Cli) -> Result<()> {
         Command::Trace(cmd) => source_commands::run_trace(cmd),
         Command::Snippet(cmd) => source_commands::run_snippet(cmd),
         Command::Read(cmd) => lookup_commands::run_read(cmd),
+        Command::Edit(cmd) => lookup_commands::run_edit(cmd),
+        Command::Slice(cmd) => lookup_commands::run_slice(cmd),
         Command::Query(cmd) => source_commands::run_query(cmd),
         Command::Explore(cmd) => explore::run_explore(cmd),
         Command::Files(cmd) => source_commands::run_files(cmd),

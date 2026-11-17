@@ -21,8 +21,11 @@ const LAUNCHER: &str = include_str!("../../../../plugins/codestory/standalone/cs
 
 pub(super) fn run_setup(cmd: SetupCommand) -> Result<()> {
     let (directory, home_var, file) = match cmd.host {
-        SetupHost::AgentsFile => (".codex", "CODEX_HOME", "AGENTS.md"),
-        SetupHost::ClaudeFile => (".claude", "CLAUDE_CONFIG_DIR", "CLAUDE.md"),
+        SetupHost::Codex => (".codex", "CODEX_HOME", "AGENTS.md"),
+        SetupHost::ClaudeCode => (".claude", "CLAUDE_CONFIG_DIR", "CLAUDE.md"),
+        SetupHost::Cursor => (".cursor", "CURSOR_CONFIG_DIR", "rules/codestory-lookups.mdc"),
+        SetupHost::OpenCode => (".config/opencode", "OPENCODE_CONFIG_DIR", "AGENTS.md"),
+        SetupHost::Antigravity => (".gemini/antigravity", "ANTIGRAVITY_HOME", "GEMINI.md"),
     };
     let default_home = env::home_dir().map(|p| p.join(directory));
     let configured = env::var_os(home_var).filter(|value| !value.is_empty());
@@ -31,13 +34,17 @@ pub(super) fn run_setup(cmd: SetupCommand) -> Result<()> {
         .or_else(|| default_home.clone())
         .context("could not resolve the agent's configuration directory")?;
     let host_home = std::path::absolute(host_home)?;
+    let repo_relative_file = match cmd.host {
+        SetupHost::Cursor => ".cursor/rules/codestory-lookups.mdc",
+        _ => file,
+    };
     let instructions = if cmd.repo {
         discover_git_worktree_root(&env::current_dir()?)
             .context("--repo requires a Git working tree")?
+            .join(repo_relative_file)
     } else {
-        host_home.clone()
-    }
-    .join(file);
+        host_home.join(file)
+    };
     let original = read_file(&instructions)?;
     let bytes = original
         .as_ref()
@@ -89,6 +96,9 @@ pub(super) fn run_setup(cmd: SetupCommand) -> Result<()> {
         true,
     )?;
 
+    if let Some(parent) = instructions.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let (range, created_file) = block.unwrap_or((bytes.len()..bytes.len(), original.is_none()));
     let marker = if created_file { CREATED } else { EXISTING };
     let updated = [
@@ -104,17 +114,6 @@ pub(super) fn run_setup(cmd: SetupCommand) -> Result<()> {
 }
 
 fn render_note(invocation: &str) -> String {
-    if let Some((_, body)) = NOTE.split_once("\n\n") {
-        let direct = body
-            .replace("- `cs ", &format!("- `{invocation} "))
-            .replace(
-                "`cs read path::Symbol",
-                &format!("`{invocation} read path::Symbol"),
-            );
-        if direct.len() < 800 {
-            return direct;
-        }
-    }
     let note = NOTE.replace("@COMMAND@", invocation);
     if note.len() < 800 {
         return note;

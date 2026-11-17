@@ -9921,3 +9921,26 @@ test("source hint hook cold launcher returns a no-op without starting runtime", 
   assert.deepEqual(JSON.parse(response.result.content[0].text), {});
   assert.equal(probe.trace.starts, 0, "cold source hints cannot activate a runtime");
 });
+
+test("CODESTORY_MCP_TOOL_SURFACE=lean exposes 5 small lookup/edit tools under 2.5 KB", () => {
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const script = [
+    `const m=require(${JSON.stringify(launcher)});`,
+    `const calls=[];`,
+    `m._test.runLeanMcpServer('/fake/cli',{runCli:(p,args,input)=>{calls.push({p,args,input});return {status:0,stdout:'ok\\n',stderr:''}},onRefresh:()=>{}});`,
+  ].join("");
+  const input = [
+    JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25" } }),
+    JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" }),
+    JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "slice", arguments: { project: repoRoot, question: "lookup slice" } } }),
+    JSON.stringify({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "edit", arguments: { project: repoRoot, selector: "src/lib.rs::foo", replacement: "fn foo() {}" } } }),
+  ].join("\n") + "\n";
+  const res = spawnSync(process.execPath, ["-e", script], { input, encoding: "utf8", timeout: 5000 });
+  assert.equal(res.status, 0, res.stderr);
+  const frames = res.stdout.trim().split(/\r?\n/u).map((l) => JSON.parse(l));
+  const listResult = frames.find((f) => f.id === 2)?.result;
+  assert.deepEqual(listResult.tools.map((t) => t.name), ["slice", "find", "refs", "read", "edit"]);
+  assert.ok(Buffer.byteLength(JSON.stringify(listResult.tools)) < 2500, "lean schema exceeds 2.5 KB");
+  assert.equal(frames.find((f) => f.id === 3)?.result?.content?.[0]?.text, "ok\n");
+  assert.equal(frames.find((f) => f.id === 4)?.result?.content?.[0]?.text, "ok\n");
+});

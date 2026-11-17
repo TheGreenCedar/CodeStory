@@ -111,10 +111,16 @@ fn lookup_setup_round_trips_existing_host_notes() {
     for (host, home_var, filename) in [
         ("codex", "CODEX_HOME", "AGENTS.md"),
         ("claude-code", "CLAUDE_CONFIG_DIR", "CLAUDE.md"),
+        ("cursor", "CURSOR_CONFIG_DIR", "rules/codestory-lookups.mdc"),
+        ("opencode", "OPENCODE_CONFIG_DIR", "AGENTS.md"),
+        ("antigravity", "ANTIGRAVITY_HOME", "GEMINI.md"),
     ] {
         let host_home = home.path().join(host);
-        fs::create_dir(&host_home).expect("host directory");
+        fs::create_dir_all(&host_home).expect("host directory");
         let instructions = host_home.join(filename);
+        if let Some(parent) = instructions.parent() {
+            fs::create_dir_all(parent).expect("instructions parent dir");
+        }
         fs::write(&instructions, original).expect("prior instructions");
         let run = |extra: &[&str]| {
             test_support::cli_command()
@@ -4514,5 +4520,50 @@ fn context_json_reports_deep_trace_by_default() {
         "context --id should fail closed without full sidecars"
     );
     assert_retrieval_failure_output(context);
+}
+
+#[test]
+fn edit_replaces_symbol_and_validates_syntax_via_cli() {
+    let workspace = tempdir().expect("workspace");
+    let cache = tempdir().expect("cache");
+    write_tiny_rust_workspace(workspace.path());
+    index_lookup_fixture(workspace.path(), cache.path());
+
+    let receipt = run_lookup(
+        workspace.path(),
+        cache.path(),
+        &[
+            "edit",
+            "src/lib.rs::AppController::new",
+            "--replacement",
+            "    pub fn new(project_name: impl Into<String>) -> Self {\n        let name = project_name.into();\n        Self { project_name: name }\n    }\n",
+        ],
+    );
+    assert_eq!(
+        receipt,
+        "updated src/lib.rs::AppController::new (lines 8..11); syntax ok\n"
+    );
+    let updated = fs::read_to_string(workspace.path().join("src/lib.rs")).expect("read src/lib.rs");
+    assert!(updated.contains("let name = project_name.into();"));
+
+    let bad = run_cli(
+        workspace.path(),
+        cache.path(),
+        &[
+            "edit",
+            "src/lib.rs::AppController::new",
+            "--replacement",
+            "    pub fn new(project_name: impl Into<String>) -> Self {\n        let broken =\n",
+        ],
+    );
+    assert!(
+        !bad.status.success(),
+        "invalid syntax edit must fail closed"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("src/lib.rs")).expect("read src/lib.rs"),
+        updated,
+        "failed edit must leave file unmodified"
+    );
 }
 mod test_support;

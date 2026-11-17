@@ -42,82 +42,98 @@ pub(super) fn compute_call_resolution(
     if is_python_dotted_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
         && receiver_owner.is_none()
     {
-        let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
-        return Ok(ComputedResolution {
-            update,
-            strategy: None,
-        });
+        return build_unowned_member_call_resolution(
+            pass,
+            candidate_index,
+            *edge_id,
+            target_name,
+            candidate_ids,
+        );
     }
 
     if is_cpp_member_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
         && receiver_owner.is_none()
     {
-        let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
-        return Ok(ComputedResolution {
-            update,
-            strategy: None,
-        });
+        return build_unowned_member_call_resolution(
+            pass,
+            candidate_index,
+            *edge_id,
+            target_name,
+            candidate_ids,
+        );
     }
 
     if is_rust_member_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
         && receiver_owner.is_none()
         && !target_name.contains("::")
     {
-        let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
-        return Ok(ComputedResolution {
-            update,
-            strategy: None,
-        });
+        return build_unowned_member_call_resolution(
+            pass,
+            candidate_index,
+            *edge_id,
+            target_name,
+            candidate_ids,
+        );
     }
 
     if is_js_member_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
         && receiver_owner.is_none()
     {
-        let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
-        return Ok(ComputedResolution {
-            update,
-            strategy: None,
-        });
+        return build_unowned_member_call_resolution(
+            pass,
+            candidate_index,
+            *edge_id,
+            target_name,
+            candidate_ids,
+        );
     }
 
     if is_ts_member_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
         && receiver_owner.is_none()
     {
-        let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
-        return Ok(ComputedResolution {
-            update,
-            strategy: None,
-        });
+        return build_unowned_member_call_resolution(
+            pass,
+            candidate_index,
+            *edge_id,
+            target_name,
+            candidate_ids,
+        );
     }
 
     if is_kotlin_member_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
         && receiver_owner.is_none()
     {
-        let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
-        return Ok(ComputedResolution {
-            update,
-            strategy: None,
-        });
+        return build_unowned_member_call_resolution(
+            pass,
+            candidate_index,
+            *edge_id,
+            target_name,
+            candidate_ids,
+        );
     }
 
     if is_dart_member_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
         && receiver_owner.is_none()
     {
-        let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
-        return Ok(ComputedResolution {
-            update,
-            strategy: None,
-        });
+        return build_unowned_member_call_resolution(
+            pass,
+            candidate_index,
+            *edge_id,
+            target_name,
+            candidate_ids,
+        );
     }
 
     if is_swift_member_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
         && receiver_owner.is_none()
     {
-        let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
-        return Ok(ComputedResolution {
-            update,
-            strategy: None,
-        });
+        return build_unowned_member_call_resolution(
+            pass,
+            candidate_index,
+            *edge_id,
+            target_name,
+            candidate_ids,
+        );
     }
 
     if is_go_selector_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
@@ -165,51 +181,61 @@ pub(super) fn compute_call_resolution(
     if is_go_selector_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
         && receiver_owner.is_none()
     {
-        let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
-        return Ok(ComputedResolution {
-            update,
-            strategy: None,
-        });
+        return build_unowned_member_call_resolution(
+            pass,
+            candidate_index,
+            *edge_id,
+            target_name,
+            candidate_ids,
+        );
     }
 
     if is_java_member_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
         && receiver_owner.is_none()
     {
-        let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
-        return Ok(ComputedResolution {
-            update,
-            strategy: None,
-        });
+        return build_unowned_member_call_resolution(
+            pass,
+            candidate_index,
+            *edge_id,
+            target_name,
+            candidate_ids,
+        );
     }
 
     if is_csharp_member_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
         && receiver_owner.is_none()
     {
-        let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
-        return Ok(ComputedResolution {
-            update,
-            strategy: None,
-        });
+        return build_unowned_member_call_resolution(
+            pass,
+            candidate_index,
+            *edge_id,
+            target_name,
+            candidate_ids,
+        );
     }
 
     if is_ruby_member_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
         && receiver_owner.is_none()
     {
-        let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
-        return Ok(ComputedResolution {
-            update,
-            strategy: None,
-        });
+        return build_unowned_member_call_resolution(
+            pass,
+            candidate_index,
+            *edge_id,
+            target_name,
+            candidate_ids,
+        );
     }
 
     if is_php_member_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
         && receiver_owner.is_none()
     {
-        let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
-        return Ok(ComputedResolution {
-            update,
-            strategy: None,
-        });
+        return build_unowned_member_call_resolution(
+            pass,
+            candidate_index,
+            *edge_id,
+            target_name,
+            candidate_ids,
+        );
     }
 
     // Construction-aware arm (P1b): a `syntax:php-new`-marked CALL resolves
@@ -427,9 +453,14 @@ pub(super) fn compute_call_resolution(
             candidate_ids.push(candidate);
         }
         if !is_common_unqualified && allow_call_candidate(candidate) {
+            let confidence = if is_owner_qualified {
+                pass.policy.call_same_file
+            } else {
+                pass.policy.call_same_module
+            };
             selected = Some((
                 candidate,
-                pass.policy.call_same_module,
+                confidence,
                 ResolutionStrategy::CallSameModule,
             ));
         }
@@ -453,7 +484,7 @@ pub(super) fn compute_call_resolution(
         }
         selected = Some((
             candidate,
-            pass.policy.call_same_module,
+            pass.policy.call_same_file,
             ResolutionStrategy::CallSameModule,
         ));
     }
@@ -579,6 +610,29 @@ pub(super) fn compute_call_resolution(
     let selected_pair = selected.map(|(candidate, confidence, _)| (candidate, confidence));
     let update = build_resolved_edge_update(*edge_id, selected_pair, candidate_ids.as_slice())?;
     Ok(ComputedResolution { update, strategy })
+}
+
+fn build_unowned_member_call_resolution(
+    pass: &ResolutionPass,
+    candidate_index: &CandidateIndex,
+    edge_id: i64,
+    target_name: &str,
+    mut candidate_ids: OrderedCandidateIds,
+) -> Result<ComputedResolution> {
+    if pass.flags.store_candidates && !is_common_unqualified_call_name(target_name) {
+        let prepared = PreparedName::new(target_name.to_string());
+        collect_candidate_pool_from_index(
+            candidate_index,
+            std::slice::from_ref(&prepared),
+            &mut candidate_ids,
+            6,
+        );
+    }
+    let update = build_resolved_edge_update(edge_id, None, candidate_ids.as_slice())?;
+    Ok(ComputedResolution {
+        update,
+        strategy: None,
+    })
 }
 
 fn is_owner_qualified_call_name(name: &str) -> bool {

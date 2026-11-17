@@ -405,6 +405,7 @@ struct ActivationCoordinatorState {
     target: Option<ActivationTarget>,
     current: Option<ActivationSnapshot>,
     ready_lease: Option<ReadyLease>,
+    core_ready_lease: Option<ReadyCoreLease>,
     running: bool,
     goal: ActivationGoal,
     current_cancel: Option<Arc<AtomicBool>>,
@@ -492,12 +493,22 @@ struct ReadyLease {
     source_observer: Option<ObservedSourceEpoch>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReadyCoreLease {
+    configuration_id: String,
+    core_publication: IndexPublicationDto,
+    source: ReadySourceIdentity,
+    source_freshness_memo: codestory_workspace::SourceFreshnessMemo,
+    source_observer: Option<ObservedSourceEpoch>,
+}
+
 /// A read-side identity, never a request to cancel a shared activation worker.
 #[derive(Clone)]
 struct SourceRepairIdentity {
     target: ActivationTarget,
     snapshot: ActivationSnapshot,
     lease: Option<ReadyLease>,
+    core_lease: Option<ReadyCoreLease>,
 }
 
 #[derive(Debug, Clone)]
@@ -839,21 +850,27 @@ impl ActivationService {
             .state
             .lock()
             .expect("activation coordinator poisoned");
-        (state
+        if !state
             .target
             .as_ref()
             .is_some_and(|current| current.matches(&requested))
-            && state
-                .current
-                .as_ref()
-                .is_some_and(|snapshot| snapshot.state == ActivationState::Ready))
-        .then(|| {
+        {
+            return None;
+        }
+        let snapshot = state.current.as_ref()?;
+        if snapshot.state == ActivationState::Ready {
             state
                 .ready_lease
                 .as_ref()
                 .map(|lease| lease.source_freshness_memo.clone())
-        })
-        .flatten()
+        } else if snapshot.capabilities.local_navigation == ActivationCapabilityState::Ready {
+            state
+                .core_ready_lease
+                .as_ref()
+                .map(|lease| lease.source_freshness_memo.clone())
+        } else {
+            None
+        }
     }
 
     /// Return the ready-lease source snapshot when its observer epoch is still
@@ -869,45 +886,51 @@ impl ActivationService {
         storage_path: &Path,
     ) -> Option<IndexFreshnessDto> {
         let requested = ActivationTarget::new(project_root, storage_path);
-        let lease = {
+        let (source, recorded) = {
             let state = self
                 .coordinator
                 .state
                 .lock()
                 .expect("activation coordinator poisoned");
-            (state
+            if !state
                 .target
                 .as_ref()
                 .is_some_and(|current| current.matches(&requested))
-                && state
-                    .current
-                    .as_ref()
-                    .is_some_and(|snapshot| snapshot.state == ActivationState::Ready))
-            .then(|| state.ready_lease.clone())
-            .flatten()?
+            {
+                return None;
+            }
+            let snapshot = state.current.as_ref()?;
+            if snapshot.state == ActivationState::Ready {
+                let lease = state.ready_lease.as_ref()?;
+                (lease.source.clone(), lease.source_observer.clone()?)
+            } else if snapshot.capabilities.local_navigation == ActivationCapabilityState::Ready {
+                let lease = state.core_ready_lease.as_ref()?;
+                (lease.source.clone(), lease.source_observer.clone()?)
+            } else {
+                return None;
+            }
         };
-        if !lease.source.is_admissible_snapshot() {
+        if !source.is_admissible_snapshot() {
             return None;
         }
-        let recorded = lease.source_observer.as_ref()?;
         if self
             .controller
             .observed_source_epoch_if_armed(project_root)
             .as_ref()
-            != Some(recorded)
+            != Some(&recorded)
         {
             return None;
         }
         Some(IndexFreshnessDto {
-            status: lease.source.status,
-            changed_file_count: lease.source.changed_file_count,
-            new_file_count: lease.source.new_file_count,
-            removed_file_count: lease.source.removed_file_count,
-            checked_file_count: lease.source.checked_file_count,
-            indexed_file_count: lease.source.indexed_file_count,
+            status: source.status,
+            changed_file_count: source.changed_file_count,
+            new_file_count: source.new_file_count,
+            removed_file_count: source.removed_file_count,
+            checked_file_count: source.checked_file_count,
+            indexed_file_count: source.indexed_file_count,
             duration_ms: 0,
-            reason: lease.source.gap.clone(),
-            not_checked_cause: lease.source.not_checked_cause,
+            reason: source.gap.clone(),
+            not_checked_cause: source.not_checked_cause,
             samples: Vec::new(),
         })
     }
@@ -942,6 +965,7 @@ impl ActivationService {
             target,
             snapshot,
             lease: state.ready_lease.clone(),
+            core_lease: state.core_ready_lease.clone(),
         })
     }
 
@@ -961,10 +985,12 @@ impl ActivationService {
                 .is_some_and(|target| target.matches(&expected.target))
             || state.current.as_ref() != Some(&expected.snapshot)
             || state.ready_lease != expected.lease
+            || state.core_ready_lease != expected.core_lease
         {
             return false;
         }
         state.ready_lease = None;
+        state.core_ready_lease = None;
         let snapshot = state.current.as_mut().expect("matched source admission");
         snapshot.revision += 1;
         snapshot.capabilities.local_navigation = if snapshot.retained_core_publication.is_some() {
@@ -1003,6 +1029,7 @@ impl ActivationService {
             .expect("activation coordinator poisoned");
         state.current = snapshot;
         state.ready_lease = None;
+        state.core_ready_lease = None;
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -1026,6 +1053,7 @@ impl ActivationService {
             .expect("activation coordinator poisoned");
         state.target = Some(ActivationTarget::new(project_root, storage_path));
         state.ready_lease = None;
+        state.core_ready_lease = None;
         state.current = Some(ActivationSnapshot {
             operation_id: "activation-disk-space-fixture".into(),
             revision: 1,
@@ -1425,6 +1453,11 @@ impl ActivationService {
                 "request cancelled before project activation",
             ));
         }
+        #[derive(Clone)]
+        enum CandidateLease {
+            Full(Box<ReadyLease>),
+            CoreOnly(Box<ReadyCoreLease>),
+        }
         let target = self.target_for_request(project_root, storage_path);
         let (operation_id, activation_cancelled) = loop {
             let ready_candidate = {
@@ -1484,10 +1517,27 @@ impl ActivationService {
                     state.target = Some(target.clone());
                     state.current = None;
                     state.ready_lease = None;
+                    state.core_ready_lease = None;
                 }
-                match (state.current.as_ref(), state.ready_lease.as_ref()) {
-                    (Some(snapshot), Some(lease)) if snapshot.state == ActivationState::Ready => {
-                        Some((snapshot.clone(), lease.clone()))
+                match (
+                    state.current.as_ref(),
+                    state.ready_lease.as_ref(),
+                    state.core_ready_lease.as_ref(),
+                ) {
+                    (Some(snapshot), Some(lease), _)
+                        if snapshot.state == ActivationState::Ready =>
+                    {
+                        Some((snapshot.clone(), CandidateLease::Full(Box::new(lease.clone()))))
+                    }
+                    (Some(snapshot), _, Some(core_lease))
+                        if goal == ActivationGoal::CoreOnly
+                            && snapshot.capabilities.local_navigation
+                                == ActivationCapabilityState::Ready =>
+                    {
+                        Some((
+                            snapshot.clone(),
+                            CandidateLease::CoreOnly(Box::new(core_lease.clone())),
+                        ))
                     }
                     _ => None,
                 }
@@ -1497,7 +1547,12 @@ impl ActivationService {
                 crate::agent::packet_batch::observe_packet_entry_phase(
                     crate::agent::packet_batch::PacketEntryObservationPhase::ActivationReadyProbeStarted,
                 );
-                let probe = self.probe_ready_lease(storage_path, &candidate_lease);
+                let probe = match &candidate_lease {
+                    CandidateLease::Full(lease) => self.probe_ready_lease(storage_path, lease),
+                    CandidateLease::CoreOnly(core_lease) => {
+                        self.probe_core_ready_lease(storage_path, core_lease)
+                    }
+                };
                 crate::agent::packet_batch::observe_packet_entry_phase(
                     crate::agent::packet_batch::PacketEntryObservationPhase::ActivationReadyProbeCompleted,
                 );
@@ -1560,11 +1615,22 @@ impl ActivationService {
                     .as_ref()
                     .is_some_and(|current| current.matches(&target))
                     && state.current.as_ref().is_some_and(|snapshot| {
-                        snapshot.state == ActivationState::Ready
-                            && snapshot.operation_id == candidate_snapshot.operation_id
+                        snapshot.operation_id == candidate_snapshot.operation_id
                             && snapshot.revision == candidate_snapshot.revision
+                            && match &candidate_lease {
+                                CandidateLease::Full(_) => snapshot.state == ActivationState::Ready,
+                                CandidateLease::CoreOnly(_) => {
+                                    snapshot.capabilities.local_navigation
+                                        == ActivationCapabilityState::Ready
+                                }
+                            }
                     })
-                    && state.ready_lease.as_ref() == Some(&candidate_lease);
+                    && match &candidate_lease {
+                        CandidateLease::Full(lease) => state.ready_lease.as_ref() == Some(lease),
+                        CandidateLease::CoreOnly(core_lease) => {
+                            state.core_ready_lease.as_ref() == Some(core_lease)
+                        }
+                    };
                 if !candidate_is_current {
                     drop(state);
                     continue;
@@ -1641,12 +1707,13 @@ impl ActivationService {
                     goal,
                 );
             }
-            if state
-                .current
-                .as_ref()
-                .is_some_and(|snapshot| snapshot.state == ActivationState::Ready)
-                && state.ready_lease.is_some()
-            {
+            if state.current.as_ref().is_some_and(|snapshot| {
+                (snapshot.state == ActivationState::Ready && state.ready_lease.is_some())
+                    || (goal == ActivationGoal::CoreOnly
+                        && snapshot.capabilities.local_navigation
+                            == ActivationCapabilityState::Ready
+                        && state.core_ready_lease.is_some())
+            }) {
                 drop(state);
                 continue;
             }
@@ -1770,6 +1837,27 @@ impl ActivationService {
         }
     }
 
+    fn probe_core_ready_lease(
+        &self,
+        storage_path: &Path,
+        lease: &ReadyCoreLease,
+    ) -> ReadyLeaseProbe {
+        let configuration_matches = self.controller.runtime_configuration_id().ok().as_ref()
+            == Some(&lease.configuration_id);
+        let retained_core_publication =
+            self.retained_core_publication(storage_path).unwrap_or(None);
+        let core_matches = retained_core_publication.as_ref() == Some(&lease.core_publication);
+        let source_matches =
+            self.ready_lease_source_observer_unchanged(lease.source_observer.as_ref());
+        ReadyLeaseProbe {
+            admissible: configuration_matches
+                && lease.source.is_admissible_snapshot()
+                && source_matches
+                && core_matches,
+            retained_core_publication,
+        }
+    }
+
     /// Whether the working tree has stood still since the lease recorded its source snapshot.
     ///
     /// The lease probe is the one readiness gate that never re-scans: it compares stored
@@ -1815,6 +1903,7 @@ impl ActivationService {
             state.current = None;
         }
         state.ready_lease = None;
+        state.core_ready_lease = None;
         let operation_id = if let Some(snapshot) = state.current.as_mut() {
             let replacing_ready = snapshot.state == ActivationState::Ready;
             snapshot.attempt += 1;
@@ -2378,6 +2467,32 @@ impl ActivationService {
         }
 
         if goal == ActivationGoal::CoreOnly {
+            let observer_after_core = self.controller.observed_source_epoch_if_armed(&project_root);
+            let observed_refresh_file_count = refreshed_core
+                .as_ref()
+                .map(|(_, stats, _)| stats.file_count);
+            let refresh_repository_tracking_digest = refreshed_core
+                .as_ref()
+                .and_then(|(_, _, digest)| digest.as_ref());
+            if let Some(observed_freshness) = source_freshness_from_observed_incremental_refresh(
+                source_observer_before_probe.as_ref(),
+                observer_after_core.as_ref(),
+                complete_incremental_source_inventory,
+                observed_refresh_file_count,
+                refresh_repository_tracking_digest,
+            ) && index_freshness_admits_operation(&observed_freshness)
+                && let Ok(configuration_id) = self.controller.runtime_configuration_id()
+                && let Ok(Some(revalidated_core)) = self.retained_core_publication(&storage_path)
+                && revalidated_core == local_publication
+            {
+                operation.set_core_ready_lease(ReadyCoreLease {
+                    configuration_id,
+                    core_publication: revalidated_core,
+                    source: ReadySourceIdentity::from(&observed_freshness),
+                    source_freshness_memo,
+                    source_observer: observer_after_core,
+                });
+            }
             operation.set_capability(false, ActivationCapabilityState::Ready);
             let total_ms =
                 u64::try_from(activation_started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -4008,6 +4123,23 @@ impl ActivationOperation {
         self.service.coordinator.changed.notify_all();
     }
 
+    fn set_core_ready_lease(&self, lease: ReadyCoreLease) {
+        let mut state = self
+            .service
+            .coordinator
+            .state
+            .lock()
+            .expect("activation coordinator poisoned");
+        if state
+            .current
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.operation_id == self.operation_id)
+        {
+            state.core_ready_lease = Some(lease);
+        }
+        self.service.coordinator.changed.notify_all();
+    }
+
     fn set_capability(&self, broad: bool, capability: ActivationCapabilityState) {
         let mut state = self
             .service
@@ -4039,6 +4171,7 @@ impl ActivationOperation {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if error.is_some() {
             state.ready_lease = None;
+            state.core_ready_lease = None;
         }
         let ready_lease_present = state.ready_lease.is_some();
         let core_only = state.goal == ActivationGoal::CoreOnly;
@@ -4305,12 +4438,25 @@ impl IndexService {
         storage_path: PathBuf,
         mode: Option<IndexMode>,
     ) -> Result<(ProjectSummary, Option<IndexingPhaseTimings>), ApiError> {
+        self.refresh_core_index_blocking_with_options(root, storage_path, mode, false)
+    }
+
+    pub fn refresh_core_index_blocking_with_options(
+        &self,
+        root: PathBuf,
+        storage_path: PathBuf,
+        mode: Option<IndexMode>,
+        skip_semantic_docs: bool,
+    ) -> Result<(ProjectSummary, Option<IndexingPhaseTimings>), ApiError> {
         let timings = if let Some(mode) = mode {
             self.controller
                 .bind_project_paths_for_refresh(root.clone(), storage_path.clone())?;
             Some(
                 self.controller
-                    .run_indexing_blocking_without_runtime_refresh(mode)?,
+                    .run_indexing_blocking_without_runtime_refresh_with_options(
+                        mode,
+                        skip_semantic_docs,
+                    )?,
             )
         } else {
             None

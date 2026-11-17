@@ -965,6 +965,54 @@ impl GoResolutionContext {
     }
 }
 
+fn referenced_go_return_packages(
+    storage: &Storage,
+    packages: &HashMap<i64, GoPackageIdentity>,
+) -> HashSet<String> {
+    let mut referenced = HashSet::new();
+    let conn = storage.get_connection();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT file_node_id, callsite_identity
+         FROM edge
+         WHERE kind = ?1 AND callsite_identity LIKE '%go-return-path:%'",
+    ) && let Ok(rows) = stmt.query_map([EdgeKind::CALL as i32], |row| {
+        Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, String>(1)?))
+    }) {
+        for row in rows.flatten() {
+            let (file_id, identity) = row;
+            let Some(path) = receiver_owner_from_callsite(Some(&identity))
+                .and_then(crate::languages::go::GoReturnPath::from_owner_marker)
+            else {
+                continue;
+            };
+            if path.module == "." {
+                if let Some(pkg) = file_id.and_then(|id| packages.get(&id)) {
+                    referenced.insert(pkg.import_path.clone());
+                }
+            } else {
+                for module in path.module.split(',') {
+                    if !module.is_empty() {
+                        referenced.insert(module.to_string());
+                    }
+                }
+            }
+        }
+    }
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT DISTINCT file_node_id
+         FROM node
+         WHERE canonical_id LIKE 'go-value:%' AND file_node_id IS NOT NULL",
+    ) && let Ok(rows) = stmt.query_map([], |row| row.get::<_, i64>(0))
+    {
+        for file_id in rows.flatten() {
+            if let Some(pkg) = packages.get(&file_id) {
+                referenced.insert(pkg.import_path.clone());
+            }
+        }
+    }
+    referenced
+}
+
 fn load_go_return_declarations(
     files: &[codestory_store::FileInfo],
     packages: &HashMap<i64, GoPackageIdentity>,
@@ -972,16 +1020,38 @@ fn load_go_return_declarations(
     storage: &Storage,
 ) -> GoReturnDeclarationCatalogs {
     const MAX_FILES: usize = 4_096;
+    const MAX_SCOPED_FILES: usize = 16_384;
     const MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
     const MAX_TOTAL_BYTES: usize = 32 * 1024 * 1024;
-    let go_files = files
+    const MAX_SCOPED_PACKAGE_BYTES: usize = 16 * 1024 * 1024;
+    const MAX_SCOPED_TOTAL_BYTES: usize = 256 * 1024 * 1024;
+    let mut go_files = files
         .iter()
         .filter(|file| file.language == "go")
         .collect::<Vec<_>>();
-    if go_files.len() > MAX_FILES {
-        return GoReturnDeclarationCatalogs::default();
+    let scoped_large_repo = go_files.len() > MAX_FILES;
+    if scoped_large_repo {
+        let referenced = referenced_go_return_packages(storage, packages);
+        if referenced.is_empty() {
+            return GoReturnDeclarationCatalogs::default();
+        }
+        go_files.retain(|file| {
+            packages
+                .get(&file.id)
+                .is_some_and(|pkg| referenced.contains(&pkg.import_path))
+        });
+        if go_files.len() > MAX_SCOPED_FILES {
+            return GoReturnDeclarationCatalogs::default();
+        }
     }
+    let max_total_bytes = if scoped_large_repo {
+        MAX_SCOPED_TOTAL_BYTES
+    } else {
+        MAX_TOTAL_BYTES
+    };
     let mut total_bytes = 0usize;
+    let mut package_bytes = HashMap::<String, usize>::new();
+    let mut tainted_packages = HashSet::<String>::new();
     let mut pending = Vec::new();
     let mut fields = GoStructFieldCatalog::new();
     let mut fields_complete = true;
@@ -997,23 +1067,62 @@ fn load_go_return_declarations(
         let Some(package) = packages.get(&file.id) else {
             continue;
         };
+        if tainted_packages.contains(&package.import_path) {
+            continue;
+        }
         let Ok(canonical_path) = file.path.canonicalize() else {
+            if scoped_large_repo {
+                tainted_packages.insert(package.import_path.clone());
+                fields_complete = false;
+                continue;
+            }
             return GoReturnDeclarationCatalogs::default();
         };
         if !canonical_path.starts_with(canonical_root) {
+            if scoped_large_repo {
+                tainted_packages.insert(package.import_path.clone());
+                fields_complete = false;
+                continue;
+            }
             return GoReturnDeclarationCatalogs::default();
         }
         let Some(expected_hash) = storage.get_file_content_hash(file.id).ok().flatten() else {
+            if scoped_large_repo {
+                tainted_packages.insert(package.import_path.clone());
+                fields_complete = false;
+                continue;
+            }
             return GoReturnDeclarationCatalogs::default();
         };
         let Some(source) = verified_go_source(&file.path, &expected_hash, MAX_FILE_BYTES) else {
+            if scoped_large_repo {
+                tainted_packages.insert(package.import_path.clone());
+                fields_complete = false;
+                continue;
+            }
             return GoReturnDeclarationCatalogs::default();
         };
         total_bytes = total_bytes.saturating_add(source.len());
-        if total_bytes > MAX_TOTAL_BYTES {
+        if total_bytes > max_total_bytes {
             return GoReturnDeclarationCatalogs::default();
         }
+        if scoped_large_repo {
+            let pkg_total = package_bytes
+                .entry(package.import_path.clone())
+                .or_insert(0);
+            *pkg_total = pkg_total.saturating_add(source.len());
+            if *pkg_total > MAX_SCOPED_PACKAGE_BYTES {
+                tainted_packages.insert(package.import_path.clone());
+                fields_complete = false;
+                continue;
+            }
+        }
         let Some(tree) = parser.parse(&source, None) else {
+            if scoped_large_repo {
+                tainted_packages.insert(package.import_path.clone());
+                fields_complete = false;
+                continue;
+            }
             return GoReturnDeclarationCatalogs::default();
         };
         if let Some(declarations) = file
@@ -1060,6 +1169,9 @@ fn load_go_return_declarations(
         catalogs.fields = fields;
     }
     for (key, mut results, is_test_file) in pending {
+        if tainted_packages.contains(&key.import_path) {
+            continue;
+        }
         let package_types =
             concrete_types.get(&(key.import_path.clone(), key.package_name.clone()));
         if key

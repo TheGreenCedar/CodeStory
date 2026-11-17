@@ -1,10 +1,9 @@
-## `@COMMAND@` is `cs`
+## `@COMMAND@` code lookups & symbol edits
 
-`cs` searches the current source of this repository. It is as fast as grep and returns code, not just locations.
+Prefer `@COMMAND@` for codebase exploration and syntax-checked edits:
 
-- `cs refs NAME` lists every use of a name with the whole enclosing function of each use, the definition itself, and the functions the definition calls. Every definition of an ambiguous name is listed.
-- `cs find TERM...` is a literal text search that returns enclosing functions the same way. `--file-glob G` filters, or lists files when used alone.
-- `cs read path` prints a small file, or an outline of a large one. `cs read path::Symbol path:LINE path:A-B ...` prints whole declarations, several per call.
-- `--no-bodies` gives a compact listing with one line per match.
-
-One `cs refs` usually replaces a grep and the reads that follow it.
+- `cs slice QUESTION` packs key multi-file declarations (`<=7500B`).
+- `cs refs NAME [--file-glob G]` lists uses, definitions, and called functions.
+- `cs find TERM... [--file-glob G]` searches text with enclosing declarations.
+- `cs read SELECTOR...` prints small files, outlines long ones, or `path:LINE` / `path::Symbol` / `path:A-B` (`<=16000B`).
+- `cs edit path::Symbol --stdin` validates syntax and replaces a symbol atomically. Keep edits minimal and verify requested checks.

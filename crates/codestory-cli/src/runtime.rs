@@ -370,13 +370,22 @@ impl RuntimeContext {
 
     /// Refresh or attach the complete Core without inspecting retrieval readiness.
     pub(crate) fn ensure_core_open(&self, refresh: RefreshMode) -> Result<OpenedProject> {
+        self.ensure_core_open_with_options(refresh, false)
+    }
+
+    pub(crate) fn ensure_core_open_with_options(
+        &self,
+        refresh: RefreshMode,
+        skip_semantic_docs: bool,
+    ) -> Result<OpenedProject> {
         let decision = self.resolve_refresh_decision_with_preflight(refresh)?;
         let (summary, phase_timings) = self
             .index
-            .refresh_core_index_blocking(
+            .refresh_core_index_blocking_with_options(
                 self.project_root.clone(),
                 self.storage_path.clone(),
                 decision.effective_mode,
+                skip_semantic_docs,
             )
             .map_err(|error| {
                 let error = match decision.effective_mode {

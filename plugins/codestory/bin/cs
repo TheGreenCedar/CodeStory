@@ -43,8 +43,8 @@ function refreshIndex(cli, project) {
 
 async function main() {
   const args = process.argv.slice(2);
-  if (!['find', 'refs', 'read'].includes(args[0])) {
-    process.stdout.write('Usage: cs find TERM... | cs refs NAME | cs read PATH[:LINE|::SYMBOL]...\n');
+  if (!['find', 'refs', 'read', 'edit', 'slice'].includes(args[0])) {
+    process.stdout.write('Usage: cs find TERM... | cs refs NAME | cs read PATH[:LINE|::SYMBOL]... | cs edit PATH::SYMBOL --stdin | cs slice QUESTION\n');
     return args.length && !['-h', '--help'].includes(args[0]) ? 2 : 0;
   }
   const forwarded = args.includes('--') ? args.slice(1, args.indexOf('--')) : args.slice(1);
@@ -58,6 +58,7 @@ async function main() {
   const project = projectRoot();
   const result = spawnSync(resolved.path, [args[0], '--project', project, ...args.slice(1)], {
     cwd: project, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, windowsHide: true,
+    stdio: args[0] === 'edit' ? ['inherit', 'pipe', 'pipe'] : undefined,
   });
   if (result.stdout) process.stdout.write(result.stdout);
   if (result.stderr) process.stderr.write(result.stderr);

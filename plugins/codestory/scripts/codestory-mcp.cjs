@@ -3921,8 +3921,8 @@ function losslessDiscoveryFrame(text) {
 }
 
 function requireMcpToolSurface() {
-  if (!['named', 'family-v1'].includes(mcpToolSurface)) {
-    throw Object.assign(new Error('mcp_tool_surface_invalid:expected_named_or_family-v1'), {
+  if (!['named', 'family-v1', 'lean'].includes(mcpToolSurface)) {
+    throw Object.assign(new Error('mcp_tool_surface_invalid:expected_named_or_family-v1_or_lean'), {
       code: 'mcp_tool_surface_invalid',
     });
   }
@@ -4642,6 +4642,270 @@ function failOpenInvalidParamsError(id, tool, violations) {
       next_action: 'correct_arguments_from_tools_list',
     },
   );
+}
+
+function leanMcpTools() {
+  const project = { type: 'string' };
+  const ro = { readOnlyHint: true };
+  return [
+    {
+      name: 'slice',
+      description: 'Pack multi-file query-relevant declarations and callees within budget.',
+      inputSchema: {
+        type: 'object',
+        required: ['project', 'question'],
+        properties: {
+          project,
+          question: { type: 'string' },
+          max_bytes: { type: 'integer', minimum: 256 },
+        },
+      },
+      annotations: ro,
+    },
+    {
+      name: 'find',
+      description: 'Search live source by literals, returning ranked enclosing symbols.',
+      inputSchema: {
+        type: 'object',
+        required: ['project'],
+        properties: {
+          project,
+          terms: { type: 'array', items: { type: 'string' } },
+          file_globs: { type: 'array', items: { type: 'string' } },
+          limit: { type: 'integer', minimum: 1 },
+          no_bodies: { type: 'boolean' },
+          max_bytes: { type: 'integer', minimum: 0 },
+        },
+      },
+      annotations: ro,
+    },
+    {
+      name: 'refs',
+      description: 'Find symbol references, definitions, and outgoing uses.',
+      inputSchema: {
+        type: 'object',
+        required: ['project', 'name'],
+        properties: {
+          project,
+          name: { type: 'string' },
+          file_globs: { type: 'array', items: { type: 'string' } },
+          limit: { type: 'integer', minimum: 1 },
+          no_bodies: { type: 'boolean' },
+          max_bytes: { type: 'integer', minimum: 0 },
+        },
+      },
+      annotations: ro,
+    },
+    {
+      name: 'read',
+      description: 'Read outlines or slices via path, path::Sym, path:LINE, or path:A-B.',
+      inputSchema: {
+        type: 'object',
+        required: ['project', 'selectors'],
+        properties: {
+          project,
+          selectors: { type: 'array', items: { type: 'string' } },
+          max_bytes: { type: 'integer', minimum: 0 },
+        },
+      },
+      annotations: ro,
+    },
+    {
+      name: 'edit',
+      description: 'Replace a symbol or line range after syntax validation.',
+      inputSchema: {
+        type: 'object',
+        required: ['project', 'selector', 'replacement'],
+        properties: {
+          project,
+          selector: { type: 'string' },
+          replacement: { type: 'string' },
+        },
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false },
+    },
+  ];
+}
+
+function runLeanMcpServer(cliPath, options = {}) {
+  const tools = leanMcpTools();
+  const refreshLastAt = new Map();
+  const runCli = typeof options.runCli === 'function' ? options.runCli : (project, cliArgs, inputText) => spawnSync(
+    cliPath,
+    cliArgs,
+    {
+      cwd: project,
+      input: inputText,
+      encoding: 'utf8',
+      maxBuffer: 8 * 1024 * 1024,
+      windowsHide: true,
+    },
+  );
+  const triggerRefresh = (project) => {
+    const now = Date.now();
+    const prev = refreshLastAt.get(project) || 0;
+    if (now - prev < 15_000) return;
+    refreshLastAt.set(project, now);
+    if (typeof options.onRefresh === 'function') {
+      options.onRefresh(project);
+      return;
+    }
+    try {
+      const child = spawn(
+        cliPath,
+        ['index', '--project', project, '--refresh', 'auto', '--core-only'],
+        {
+        cwd: project,
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true,
+      });
+      child.unref();
+    } catch {
+      // Read-only permissions must never break lookup delivery.
+    }
+  };
+
+  let negotiatedProtocol = managedCliMcpProtocolVersion;
+  const invokeTool = (toolName, args) => {
+    const project = args?.project;
+    const sel = selectExplicitProject(project);
+    if (!sel.ok) {
+      return { isError: true, content: [{ type: 'text', text: `${sel.code}: ${sel.message}` }] };
+    }
+    const cleanProject = cleanPublicProjectPath(sel.project);
+    let cliArgs;
+    let inputText;
+    if (toolName === 'slice') {
+      if (typeof args.question !== 'string' || !args.question.trim()) {
+        return { isError: true, content: [{ type: 'text', text: 'invalid_argument: question required' }] };
+      }
+      cliArgs = ['slice', '--project', cleanProject];
+      if (Number.isSafeInteger(args.max_bytes) && args.max_bytes >= 256) {
+        cliArgs.push('--max-bytes', String(args.max_bytes));
+      }
+      cliArgs.push('--', args.question);
+    } else if (toolName === 'find') {
+      cliArgs = ['find', '--project', cleanProject];
+      for (const glob of Array.isArray(args.file_globs) ? args.file_globs : []) {
+        cliArgs.push('--file-glob', String(glob));
+      }
+      if (Number.isSafeInteger(args.limit) && args.limit > 0) cliArgs.push('--limit', String(args.limit));
+      if (args.no_bodies === true) cliArgs.push('--no-bodies');
+      if (Number.isSafeInteger(args.max_bytes) && args.max_bytes >= 0) cliArgs.push('--max-bytes', String(args.max_bytes));
+      const terms = Array.isArray(args.terms) ? args.terms.map(String) : [];
+      if (terms.length > 0) cliArgs.push('--', ...terms);
+    } else if (toolName === 'refs') {
+      if (typeof args.name !== 'string' || !args.name.trim()) {
+        return { isError: true, content: [{ type: 'text', text: 'invalid_argument: name required' }] };
+      }
+      cliArgs = ['refs', '--project', cleanProject];
+      for (const glob of Array.isArray(args.file_globs) ? args.file_globs : []) {
+        cliArgs.push('--file-glob', String(glob));
+      }
+      if (Number.isSafeInteger(args.limit) && args.limit > 0) cliArgs.push('--limit', String(args.limit));
+      if (args.no_bodies === true) cliArgs.push('--no-bodies');
+      if (Number.isSafeInteger(args.max_bytes) && args.max_bytes >= 0) cliArgs.push('--max-bytes', String(args.max_bytes));
+      cliArgs.push('--', args.name);
+    } else if (toolName === 'read') {
+      const selectors = Array.isArray(args.selectors) ? args.selectors.map(String) : [];
+      if (selectors.length === 0) {
+        return { isError: true, content: [{ type: 'text', text: 'invalid_argument: selectors required' }] };
+      }
+      cliArgs = ['read', '--project', cleanProject];
+      if (Number.isSafeInteger(args.max_bytes) && args.max_bytes >= 0) {
+        cliArgs.push('--max-bytes', String(args.max_bytes));
+      }
+      cliArgs.push('--', ...selectors);
+    } else if (toolName === 'edit') {
+      if (typeof args.selector !== 'string' || !args.selector.trim() || typeof args.replacement !== 'string') {
+        return { isError: true, content: [{ type: 'text', text: 'invalid_argument: selector and replacement required' }] };
+      }
+      cliArgs = ['edit', '--project', cleanProject, '--stdin', args.selector];
+      inputText = args.replacement;
+    } else {
+      return null;
+    }
+
+    const res = runCli(cleanProject, cliArgs, inputText);
+    if (res.error) {
+      return { isError: true, content: [{ type: 'text', text: `cli_error: ${res.error.message}` }] };
+    }
+    if (res.status !== 0) {
+      const msg = (res.stderr || res.stdout || `exit ${res.status}`).trim();
+      return { isError: true, content: [{ type: 'text', text: msg }] };
+    }
+    const text = res.stdout || '';
+    if (
+      toolName !== 'edit'
+      && (text.startsWith('no index; text matches only\n') || /^(?!\s).+ \(changed since indexing\)$/mu.test(text))
+    ) {
+      triggerRefresh(cleanProject);
+    }
+    return { content: [{ type: 'text', text }] };
+  };
+
+  const handleRequest = (request) => {
+    if (!isPlainObject(request) || request.jsonrpc !== '2.0' || typeof request.method !== 'string') {
+      return jsonrpcError(isPlainObject(request) ? (request.id ?? null) : null, -32600, 'Invalid Request');
+    }
+    if (request.method === 'notifications/initialized') return null;
+    if (request.id === undefined) return null;
+    if (request.method === 'initialize') {
+      const negotiated = negotiateMcpProtocolVersion(request.params?.protocolVersion);
+      negotiatedProtocol = negotiated.negotiated;
+      return jsonrpcResult(request.id, {
+        protocolVersion: negotiatedProtocol,
+        capabilities: { tools: { listChanged: false }, resources: { subscribe: false, listChanged: false } },
+        serverInfo: { name: 'codestory', version: pluginVersion() },
+      });
+    }
+    if (request.method === 'tools/list') {
+      return jsonrpcResult(request.id, { tools });
+    }
+    if (request.method === 'resources/list') {
+      return jsonrpcResult(request.id, { resources: [] });
+    }
+    if (request.method === 'resources/templates/list') {
+      return jsonrpcResult(request.id, { resourceTemplates: [] });
+    }
+    if (request.method === 'prompts/list') {
+      return jsonrpcResult(request.id, { prompts: [] });
+    }
+    if (request.method === 'tools/call') {
+      const name = request.params?.name;
+      const result = invokeTool(name, request.params?.arguments || {});
+      if (!result) return jsonrpcError(request.id, -32602, `unknown tool: ${name || '<missing>'}`);
+      return jsonrpcResult(request.id, result);
+    }
+    return jsonrpcError(request.id, -32601, `method not found: ${request.method}`);
+  };
+
+  let buffer = '';
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', (chunk) => {
+    buffer += chunk;
+    let idx;
+    while ((idx = buffer.indexOf('\n')) >= 0) {
+      const line = buffer.slice(0, idx).trim();
+      buffer = buffer.slice(idx + 1);
+      if (!line) continue;
+      let frame;
+      try {
+        frame = JSON.parse(line);
+      } catch {
+        process.stdout.write(`${JSON.stringify(jsonrpcError(null, -32700, 'Parse error'))}\n`);
+        continue;
+      }
+      if (Array.isArray(frame)) {
+        const replies = frame.map(handleRequest).filter(Boolean);
+        if (replies.length) process.stdout.write(`${JSON.stringify(replies)}\n`);
+      } else {
+        const reply = handleRequest(frame);
+        if (reply) process.stdout.write(`${JSON.stringify(reply)}\n`);
+      }
+    }
+  });
 }
 
 function runFailOpenMcp(status, options = {}) {
@@ -5374,6 +5638,10 @@ async function main() {
   }
   resolved.managedCliRetention = managedCliRetentionReport(resolved, probe);
   rememberLaunch(resolved, runtimeCwd);
+  if (requireMcpToolSurface() === 'lean') {
+    runLeanMcpServer(resolved.path);
+    return;
+  }
   let status = fallbackDiagnostic(resolved, probe, 'runtime_stdio_handoff', {
     projectRoot: null,
     projectRootSource: 'request_argument',
@@ -5549,6 +5817,8 @@ if (require.main === module) {
       releaseManagedCliLock,
       resolveManagedCli,
       runFailOpenMcp,
+      leanMcpTools,
+      runLeanMcpServer,
       sameFilesystemPath,
       shutdownHandoffChild,
       stageExtractedManagedCli,
