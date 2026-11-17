@@ -48,7 +48,7 @@ pub const MAX_STRUCTURAL_UNITS_PER_FILE: usize =
 
 #[derive(Debug, thiserror::Error)]
 pub enum StructuralCollectionError {
-    #[error("structural source is binary or not valid UTF-8")]
+    #[error("structural source is binary or not valid UTF-8 or BOM-marked UTF-16")]
     Binary,
     #[error("{0}")]
     Malformed(String),
@@ -84,23 +84,17 @@ pub fn index_structural_file(path: &Path) -> Result<IntermediateStorage> {
         }
         .into());
     }
-    let source = decode_structural_source(bytes.clone())?;
+    let source = decode_structural_source(&bytes)?;
     let source_content_hash = format!("{:x}", Sha256::digest(&bytes));
     let storage = index_structural_source(path, &source)?;
     finalize_structural_storage(path, &source, &source_content_hash, storage)
 }
 
 pub(crate) fn decode_structural_source(
-    bytes: Vec<u8>,
+    bytes: impl AsRef<[u8]>,
 ) -> std::result::Result<String, StructuralCollectionError> {
-    if bytes.contains(&0)
-        || bytes
-            .iter()
-            .any(|byte| *byte < 0x09 || (*byte > 0x0d && *byte < 0x20 && *byte != 0x1b))
-    {
-        return Err(StructuralCollectionError::Binary);
-    }
-    String::from_utf8(bytes).map_err(|_| StructuralCollectionError::Binary)
+    codestory_contracts::source_text::decode_structural_text(bytes.as_ref())
+        .map_err(|_| StructuralCollectionError::Binary)
 }
 
 pub(crate) fn structural_producer(path: &Path) -> Option<&'static str> {
@@ -482,6 +476,83 @@ mod tests {
         let storage = index_structural_file(&path).expect("index sql");
         assert!(storage.nodes.iter().any(|n| n.kind == NodeKind::CLASS));
         assert_eq!(storage.files[0].language, "sql");
+    }
+
+    #[test]
+    fn structural_bom_utf16_preserves_decoded_spans_and_raw_identity() {
+        let source = "# café 🦀\r\nfunction Invoke-Thing {\r\n  Write-Output 'é🦀'\r\n}\r\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("commands.ps1");
+        let mut hashes = std::collections::HashSet::new();
+        for little in [true, false] {
+            let mut bytes = if little {
+                vec![0xff, 0xfe]
+            } else {
+                vec![0xfe, 0xff]
+            };
+            for unit in source.encode_utf16() {
+                bytes.extend(if little {
+                    unit.to_le_bytes()
+                } else {
+                    unit.to_be_bytes()
+                });
+            }
+            assert_eq!(decode_structural_source(bytes.clone()).unwrap(), source);
+            std::fs::write(&path, &bytes).unwrap();
+            let indexed = index_structural_file(&path).unwrap();
+            let hash = format!("{:x}", Sha256::digest(&bytes));
+            assert!(
+                hashes.insert(hash.clone()),
+                "byte orders have distinct source identity"
+            );
+            assert_eq!(indexed.file_content_hashes[0].content_hash, hash);
+            assert!(!indexed.structural_text_units.is_empty());
+            for unit in &indexed.structural_text_units {
+                assert_eq!(unit.source_content_hash, hash);
+                assert!(
+                    exact_source_range_bytes(
+                        source,
+                        unit.start_line,
+                        unit.start_col,
+                        unit.end_line,
+                        unit.end_col
+                    )
+                    .is_some()
+                );
+            }
+        }
+        for invalid in [
+            vec![0xff, 0xfe, 0x41],       // odd payload
+            vec![0xfe, 0xff, 0xd8, 0x00], // unpaired surrogate
+            vec![0xff, 0xfe, 0x00, 0x00], // decoded NUL
+            vec![0xfe, 0xff, 0x00, 0x01], // decoded binary control
+            vec![0x41, 0x00, 0x42, 0x00], // no BOM
+        ] {
+            assert!(matches!(
+                decode_structural_source(invalid),
+                Err(StructuralCollectionError::Binary)
+            ));
+        }
+    }
+
+    #[test]
+    fn encoded_structural_source_cannot_expand_past_the_source_byte_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("commands.ps1");
+        let text = "界".repeat(MAX_STRUCTURAL_SOURCE_BYTES as usize / 3 + 1);
+        let mut bytes = vec![0xfe, 0xff];
+        for unit in text.encode_utf16() {
+            bytes.extend(unit.to_be_bytes());
+        }
+        assert!((bytes.len() as u64) < MAX_STRUCTURAL_SOURCE_BYTES);
+        std::fs::write(&path, bytes).unwrap();
+        let error = index_structural_file(&path)
+            .err()
+            .expect("oversized source refused");
+        assert!(matches!(
+            error.downcast_ref::<StructuralCollectionError>(),
+            Some(StructuralCollectionError::SourceByteLimit { .. })
+        ));
     }
 
     #[test]

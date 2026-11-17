@@ -53,7 +53,7 @@ pub(crate) fn run_explore(cmd: ExploreCommand) -> Result<()> {
     let profile = resolve_explore_profile(cmd.profile, cmd.depth, cmd.max_nodes);
     let file_filter = cmd.target.file_filter();
     let operation = if cmd.target.query.is_some() {
-        "graph_assisted"
+        "resolution"
     } else {
         "graph"
     };
@@ -1325,6 +1325,7 @@ fn explore_trail_command(
         depth: Some(2),
         direction: Some(args::CliDirection::Both),
         max_nodes: trail.trail.nodes.len().min(u32::MAX as usize) as u32,
+        page: None,
         include_tests: false,
         show_utility_calls: false,
         hide_speculative: false,

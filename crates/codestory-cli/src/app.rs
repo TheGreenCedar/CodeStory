@@ -81,13 +81,17 @@ mod drill;
 mod ground_smoke;
 mod index_command;
 mod lifecycle;
+mod lookup_commands;
 mod prove_call_path;
+mod proxy;
 mod readiness_commands;
 pub(crate) mod rendering;
 pub(crate) mod resolution;
 mod search_command;
 mod server;
+mod setup;
 mod source_commands;
+pub(crate) mod source_context;
 
 #[cfg(test)]
 use agent_context::{
@@ -205,6 +209,9 @@ async fn run_cli(cli: Cli) -> Result<()> {
             .context("install native embedding server transport")?;
     }
     match cli.command {
+        Command::Setup(cmd) => setup::run_setup(cmd),
+        Command::Proxy(cmd) => proxy::run_proxy(cmd).await,
+        Command::Run(cmd) => proxy::run_run(cmd).await,
         Command::Index(cmd) => index_command::run_index(cmd),
         Command::Ground(cmd) => ground_smoke::run_ground(cmd),
         Command::Report(cmd) => report::run_report(cmd),
@@ -220,6 +227,8 @@ async fn run_cli(cli: Cli) -> Result<()> {
         Command::Agent(cmd) => readiness_commands::run_agent(cmd),
         Command::Cache(cmd) => lifecycle::run_cache(cmd),
         Command::Search(cmd) => search_command::run_search(cmd),
+        Command::Find(cmd) => lookup_commands::run_find(cmd),
+        Command::Refs(cmd) => lookup_commands::run_refs(cmd),
         Command::Drill(cmd) => drill::run_drill(cmd),
         Command::DrillSuite(cmd) => drill::run_drill_suite(cmd),
         Command::Symbol(cmd) => source_commands::run_symbol(cmd),
@@ -232,9 +241,13 @@ async fn run_cli(cli: Cli) -> Result<()> {
         ),
         Command::Trail(cmd) => source_commands::run_trail(cmd),
         Command::Callers(cmd) => source_commands::run_callers(cmd),
+        Command::References(cmd) => source_commands::run_references(cmd),
         Command::Callees(cmd) => source_commands::run_callees(cmd),
         Command::Trace(cmd) => source_commands::run_trace(cmd),
         Command::Snippet(cmd) => source_commands::run_snippet(cmd),
+        Command::Read(cmd) => lookup_commands::run_read(cmd),
+        Command::Edit(cmd) => lookup_commands::run_edit(cmd),
+        Command::Slice(cmd) => lookup_commands::run_slice(cmd),
         Command::Query(cmd) => source_commands::run_query(cmd),
         Command::Explore(cmd) => explore::run_explore(cmd),
         Command::Files(cmd) => source_commands::run_files(cmd),
@@ -244,6 +257,8 @@ async fn run_cli(cli: Cli) -> Result<()> {
         Command::GenerateCompletions(cmd) => server::run_generate_completions(cmd),
         Command::Retrieval(cmd) => retrieval::run_retrieval(cmd),
         Command::InternalOwnedDelete(cmd) => lifecycle::run_internal_owned_delete(cmd),
+        Command::InternalSourceContext(cmd) => source_context::run(cmd),
+        Command::InternalSessionContext(cmd) => ground_smoke::run_session_context(cmd),
         Command::InternalDirtyHook(cmd) => dirty_hooks::run_internal_dirty_hook(cmd),
         Command::InternalEmbeddingServer => {
             embedding_server_transport::run_internal_embedding_server()

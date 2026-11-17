@@ -15,20 +15,15 @@ pages, runbooks, and workflows own detailed mechanics.
   before cache repair, readiness work, or verification. When changing setup,
   keep the PowerShell and POSIX implementations behaviorally aligned and run
   the setup self-tests from the testing matrix.
-- Use the canonical CodeStory grounding skill when its MCP tools are visible
-  and the task is repository discovery, relationship tracing, change-impact
-  analysis, or CodeStory retrieval / installed-plugin validation. Skip that
-  loop only for bounded inspection or editing of named files that does not
-  require those operations; naming a file does not by itself forbid CodeStory.
-  Every
-  MCP call must carry the target repository's absolute `project` root. Call
-  the tool that matches the task directly; tool gating owns readiness and
-  managed preparation. Read status only after a call fails to converge. If the
-  MCP tools are not visible, use ordinary source inspection and report the
-  visibility gap. CLI diagnostics do not prove that the packaged plugin MCP is
-  live in the agent host. Qualify CodeStory results as retrieval or
-  installed-plugin evidence, not as live runtime behavior, unless the matching
-  proof tier exists.
+- For agent navigation, debugging, and bounded edits, prefer the lean lookup
+  and edit commands (`cs slice`, `cs refs`, `cs find`, `cs read`, `cs edit`, or
+  `CODESTORY_MCP_TOOL_SURFACE=lean`) before legacy multi-stage `packet` flows.
+  When using full MCP tools, carry the target repository's absolute `project`
+  root, call the matching tool directly, and read status only after a call fails
+  to converge. If MCP tools are not visible, use ordinary source inspection or
+  the `cs` CLI and report any visibility gap. Qualify CodeStory results as
+  retrieval or installed-plugin evidence, not as live runtime behavior, unless
+  the matching proof tier exists.
 - When a linked document path is already known, bound `rg` or search to that
   file. Do not run a broad package or repository search merely to rediscover a
   documented path.
@@ -42,8 +37,9 @@ pages, runbooks, and workflows own detailed mechanics.
 
 - `codestory-contracts`: shared DTOs, graph types, events, grounding and trail
   contracts.
-- `codestory-workspace`: project discovery, inventories, refresh planning, and
-  repository/project identity.
+- `codestory-workspace`: project discovery, inventories, refresh planning,
+  git co-change test/fixture coupling (`cochange.rs`), and repository/project
+  identity.
 - `codestory-indexer`: parsing, extraction, intermediate projections, and
   semantic resolution.
 - `codestory-store`: SQLite source of truth, snapshots, projections, and core
@@ -51,20 +47,22 @@ pages, runbooks, and workflows own detailed mechanics.
 - `codestory-retrieval`: lexical, semantic, and SCIP artifacts; immutable
   sidecar generations; manifests; health; and fail-closed query execution.
 - `codestory-agent`: syntactic retrieval-seed planning and pure
-  repository-derived packet compilation over typed admitted evidence. Only the
-  seed plan may retain the unchanged question; the compiler cannot receive
-  prompt terms, task classes, obligations, roles, carriers, or sufficiency
-  policy. It depends on `codestory-contracts` alone and can never activate,
-  store, execute retrieval, admit or hydrate candidates, retry a publication,
-  or move readiness.
+  repository-derived packet compilation over typed admitted evidence for the
+  legacy/structured `packet` pipeline. Only the seed plan retains the raw
+  question inside `codestory-agent`; it depends on `codestory-contracts` alone
+  and never activates, stores, executes retrieval, admits or hydrates
+  candidates, retries publication, or moves readiness.
 - `codestory-runtime`: the only product orchestration layer. Indexing,
-  grounding, search, packet assembly, and retrieval execution belong here.
-  Retrieval, admission, hydration, retry, and packet assembly belong here;
-  pure seed planning and evidence selection belong in `codestory-agent`.
+  grounding, search, packet assembly, `ReadyCoreLease` core-only activation
+  leases, live served lookups (`slice`, `find`, `refs`, `read`, `edit`), and
+  retrieval execution belong here.
 - `codestory-cli`: command and transport parsing, output rendering, process
-  configuration capture, and managed sidecar lifecycle boundaries. Do not move
-  product orchestration into adapters.
-- `plugins/codestory`: host hooks, the packaged launcher, MCP routing, and the
+  configuration capture, multi-host `setup` (`codex`, `claude-code`, `cursor`,
+  `opencode`, `antigravity`), loopback context-budget HTTP proxying (`proxy`,
+  `run`), and managed sidecar lifecycle boundaries. Do not move product
+  orchestration into adapters.
+- `plugins/codestory`: host hooks, the packaged launcher, standalone `cs`
+  wrappers, MCP routing (including `CODESTORY_MCP_TOOL_SURFACE=lean`), and the
   canonical agent skill. Plugin routing selects a project per request and
   reaches product behavior through the version-matched CLI.
 - `codestory-bench`: measurement and benchmark support only; it does not own
@@ -109,6 +107,25 @@ adapter to compensate for incorrect upstream state.
 - Cleanup may remove only resources proven CodeStory-owned by a current token,
   lease, manifest, generation, or proof marker. Do not perform broad Docker,
   process, port, or user-cache cleanup.
+- `find`, `refs`, and `read` serve live working-tree bytes only inside explicit
+  byte budgets (`DEFAULT_MAX_BYTES` for `find`/`refs`/`slice`,
+  `DEFAULT_READ_MAX_BYTES` for `read`). They attach index facts to a file only
+  when the bytes just read hash to that file's `content_hash` in the pinned
+  complete publication; any other file is marked as live/approximate. They
+  never activate, refresh, or walk the tree for freshness.
+- `slice` packs query-relevant declarations and 1-hop callees from live files
+  within `--max-bytes`, using the pinned complete index when valid or fast
+  single-file tree-sitter AST extraction and 1-hop live import/callee discovery
+  when unindexed, without mutating caches or running whole-tree freshness checks.
+- `CoreOnly` activation may mint and reuse a `ReadyCoreLease` across warm
+  core-only checks when the storage identity and tracked manifest are unchanged,
+  eliminating redundant full-tree freshness walks.
+- `edit` replaces a declaration or range (`path::Symbol`, `path:LINE`,
+  `path:A-B`) atomically only after tree-sitter syntax validation passes.
+- `proxy` and `run` bind strictly to loopback (`127.0.0.1` or `::1`), cap and
+  deduplicate oversized tool outputs using tiered budgets and `(item_key,
+  raw_sha256)` memoization so prompt prefixes remain byte-identical across turns
+  for upstream KV cache reuse.
 - Agent-facing packet/search/context must fail closed on stale or partial
   publications, ambiguous migration, changed runtime identity, non-`full`
   sidecars, dead required infrastructure, or missing required accelerator/embed

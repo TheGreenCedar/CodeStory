@@ -4,10 +4,10 @@ use crate::index_freshness::{
     FreshnessObservation, index_freshness_from_storage_with_policy, open_storage_for_read,
     workspace_member_index_summaries, workspace_member_storage_summaries,
 };
-use crate::index_full::index_full_for_runtime;
+use crate::index_full::{index_full_for_runtime, index_full_for_runtime_with_options};
 use crate::index_incremental::{
     IncrementalPlanProbe, ensure_incremental_refresh_compatible, index_incremental_for_runtime,
-    index_incremental_for_runtime_with_probe, probe_incremental_plan,
+    index_incremental_for_runtime_with_options, probe_incremental_plan,
 };
 use crate::index_timings::IndexingRunSummary;
 #[cfg(test)]
@@ -68,11 +68,12 @@ struct IndexingCompletion {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-type MidIndexingTestHook = Option<std::sync::Arc<dyn Fn(&Path) + Send + Sync>>;
+type MidIndexingTestHook = std::sync::Arc<dyn Fn(&Path) + Send + Sync>;
 
 #[cfg(any(test, feature = "test-support"))]
-static MID_INDEXING_TEST_HOOK: std::sync::RwLock<MidIndexingTestHook> =
-    std::sync::RwLock::new(None);
+static MID_INDEXING_TEST_HOOKS: std::sync::LazyLock<
+    std::sync::RwLock<std::collections::HashMap<PathBuf, MidIndexingTestHook>>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
 
 /// Run `hook` while an indexing worker owns the writer lock with
 /// `is_indexing` set, so a test can hold a refresh genuinely in flight while
@@ -80,18 +81,31 @@ static MID_INDEXING_TEST_HOOK: std::sync::RwLock<MidIndexingTestHook> =
 /// shared test binary only parks the run it armed for.
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
-pub fn set_mid_indexing_test_hook(hook: MidIndexingTestHook) {
-    *MID_INDEXING_TEST_HOOK
+pub fn set_mid_indexing_test_hook(
+    storage_path: &Path,
+    hook: Option<MidIndexingTestHook>,
+) -> Result<(), &'static str> {
+    let mut hooks = MID_INDEXING_TEST_HOOKS
         .write()
-        .expect("mid-indexing test hook lock") = hook;
+        .expect("mid-indexing test hook lock");
+    if let Some(hook) = hook {
+        if hooks.contains_key(storage_path) {
+            return Err("mid-indexing test hook already registered for storage path");
+        }
+        hooks.insert(storage_path.to_path_buf(), hook);
+    } else {
+        hooks.remove(storage_path);
+    }
+    Ok(())
 }
 
 #[cfg(any(test, feature = "test-support"))]
 fn run_mid_indexing_test_hook(storage_path: &Path) {
-    let hook = MID_INDEXING_TEST_HOOK
+    let hook = MID_INDEXING_TEST_HOOKS
         .read()
         .expect("mid-indexing test hook lock")
-        .clone();
+        .get(storage_path)
+        .cloned();
     if let Some(hook) = hook {
         hook(storage_path);
     }
@@ -99,6 +113,85 @@ fn run_mid_indexing_test_hook(storage_path: &Path) {
 
 #[cfg(not(any(test, feature = "test-support")))]
 fn run_mid_indexing_test_hook(_storage_path: &Path) {}
+
+#[cfg(test)]
+mod mid_indexing_hook_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn mid_indexing_hook_cleanup_preserves_other_storage_paths() {
+        let fixture = tempfile::tempdir().expect("owned hook paths");
+        let path_a = fixture.path().join("a.db");
+        let path_b = fixture.path().join("b.db");
+        let entered_a = Arc::new(AtomicUsize::new(0));
+        let observed_a = Arc::clone(&entered_a);
+        let expected_a = path_a.clone();
+        set_mid_indexing_test_hook(
+            &path_a,
+            Some(Arc::new(move |path| {
+                if path == expected_a.as_path() {
+                    observed_a.fetch_add(1, Ordering::SeqCst);
+                }
+            })),
+        )
+        .expect("register A");
+
+        let entered_b = Arc::new(AtomicUsize::new(0));
+        let observed_b = Arc::clone(&entered_b);
+        let expected_b = path_b.clone();
+        set_mid_indexing_test_hook(
+            &path_b,
+            Some(Arc::new(move |path| {
+                if path == expected_b.as_path() {
+                    observed_b.fetch_add(1, Ordering::SeqCst);
+                }
+            })),
+        )
+        .expect("register B");
+        set_mid_indexing_test_hook(&path_b, None).expect("remove B");
+
+        run_mid_indexing_test_hook(&path_a);
+        run_mid_indexing_test_hook(&path_b);
+        set_mid_indexing_test_hook(&path_a, None).expect("remove A");
+        assert_eq!(
+            entered_a.load(Ordering::SeqCst),
+            1,
+            "arming and dropping B must not remove A before its entry"
+        );
+        assert_eq!(entered_b.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn duplicate_mid_indexing_hook_keeps_the_owner_and_registry_usable() {
+        let fixture = tempfile::tempdir().expect("owned hook path");
+        let path = fixture.path().join("core.db");
+        let entries = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&entries);
+        set_mid_indexing_test_hook(
+            &path,
+            Some(Arc::new(move |_| {
+                observed.fetch_add(1, Ordering::SeqCst);
+            })),
+        )
+        .expect("register owner");
+
+        let duplicate = set_mid_indexing_test_hook(&path, Some(Arc::new(|_| {})));
+        run_mid_indexing_test_hook(&path);
+        set_mid_indexing_test_hook(&path, None).expect("remove owner after rejected registration");
+
+        assert!(
+            duplicate.is_err(),
+            "duplicate registration must be rejected"
+        );
+        assert_eq!(
+            entries.load(Ordering::SeqCst),
+            1,
+            "original owner must remain"
+        );
+    }
+}
 
 /// Extension for the spawned-process writer-hold marker: while
 /// `<storage>.index-writer-hold` exists, a run that already owns the writer
@@ -650,13 +743,29 @@ impl AppController {
         refresh_runtime_caches: bool,
         cancel_token: Option<&CancellationToken>,
     ) -> Result<IndexingPhaseTimings, ApiError> {
-        self.run_indexing_blocking_inner_with_probe(
+        self.run_indexing_blocking_inner_with_options(
+            mode,
+            refresh_runtime_caches,
+            cancel_token,
+            false,
+        )
+    }
+
+    fn run_indexing_blocking_inner_with_options(
+        &self,
+        mode: IndexMode,
+        refresh_runtime_caches: bool,
+        cancel_token: Option<&CancellationToken>,
+        skip_semantic_docs: bool,
+    ) -> Result<IndexingPhaseTimings, ApiError> {
+        self.run_indexing_blocking_inner_with_probe_and_options(
             mode,
             refresh_runtime_caches,
             cancel_token,
             None,
             None,
             None,
+            skip_semantic_docs,
         )
         .map(|completion| completion.phase_timings)
     }
@@ -669,6 +778,28 @@ impl AppController {
         precomputed_probe: Option<IncrementalPlanProbe>,
         failed_refresh_diagnostics: Option<&crate::index_full::FailedRefreshDiagnosticSink>,
         preacquired_writer: Option<IndexWriterGuard>,
+    ) -> Result<IndexingCompletion, ApiError> {
+        self.run_indexing_blocking_inner_with_probe_and_options(
+            mode,
+            refresh_runtime_caches,
+            cancel_token,
+            precomputed_probe,
+            failed_refresh_diagnostics,
+            preacquired_writer,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_indexing_blocking_inner_with_probe_and_options(
+        &self,
+        mode: IndexMode,
+        refresh_runtime_caches: bool,
+        cancel_token: Option<&CancellationToken>,
+        precomputed_probe: Option<IncrementalPlanProbe>,
+        failed_refresh_diagnostics: Option<&crate::index_full::FailedRefreshDiagnosticSink>,
+        preacquired_writer: Option<IndexWriterGuard>,
+        skip_semantic_docs: bool,
     ) -> Result<IndexingCompletion, ApiError> {
         let (root, storage_path) = {
             let s = self.state.lock();
@@ -730,7 +861,7 @@ impl AppController {
         };
 
         let result = match mode {
-            IndexMode::Full => index_full_for_runtime(
+            IndexMode::Full => index_full_for_runtime_with_options(
                 &root,
                 &storage_path,
                 &self.events_tx,
@@ -739,8 +870,9 @@ impl AppController {
                 &self.source_index_policy,
                 &annotations_owned,
                 failed_refresh_diagnostics,
+                skip_semantic_docs,
             ),
-            IndexMode::Incremental => index_incremental_for_runtime_with_probe(
+            IndexMode::Incremental => index_incremental_for_runtime_with_options(
                 &root,
                 &storage_path,
                 &self.events_tx,
@@ -749,6 +881,7 @@ impl AppController {
                 &self.source_index_policy,
                 &annotations_owned,
                 precomputed_probe,
+                skip_semantic_docs,
             ),
         };
 
@@ -1056,12 +1189,13 @@ impl AppController {
         else {
             return Ok(false);
         };
+        match storage.validate_dense_anchor_publication(&publication) {
+            Ok(manifest) if manifest.policy_version == SEMANTIC_POLICY_VERSION => {}
+            _ => return Ok(true),
+        }
         if storage
-            .validate_dense_anchor_publication(&publication)
+            .validate_structural_text_unit_publication(&publication)
             .is_err()
-            || storage
-                .validate_structural_text_unit_publication(&publication)
-                .is_err()
         {
             return Ok(true);
         }
@@ -1203,6 +1337,14 @@ impl AppController {
         mode: IndexMode,
     ) -> Result<IndexingPhaseTimings, ApiError> {
         self.run_indexing_blocking_inner(mode, false, None)
+    }
+
+    pub fn run_indexing_blocking_without_runtime_refresh_with_options(
+        &self,
+        mode: IndexMode,
+        skip_semantic_docs: bool,
+    ) -> Result<IndexingPhaseTimings, ApiError> {
+        self.run_indexing_blocking_inner_with_options(mode, false, None, skip_semantic_docs)
     }
 
     /// Bind project/storage paths for a recovery refresh without opening the
@@ -1502,13 +1644,16 @@ impl AppController {
             let storage = Store::open(&storage_path)
                 .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))?;
             let docs = storage
-                .get_all_llm_symbol_docs()
+                .get_symbol_search_docs_batch_after(None, usize::MAX)
                 .map_err(|e| ApiError::internal(format!("Failed to load symbol docs: {e}")))?;
             let current_summaries = storage
                 .get_all_current_symbol_summaries()
                 .map_err(|e| ApiError::internal(format!("Failed to load symbol summaries: {e}")))?;
             for doc in docs {
-                if current_summaries.contains_key(&doc.node_id) {
+                if current_summaries
+                    .get(&doc.node_id)
+                    .is_some_and(|summary| summary.model == model)
+                {
                     reused = reused.saturating_add(1);
                     continue;
                 }

@@ -47,7 +47,7 @@ pub(super) fn test_server_state_with_clock(
         authority: test_snapshot().authority,
         connections: AtomicUsize::new(0),
         pre_request_connections: AtomicUsize::new(0),
-        admission_gate: Mutex::new(()),
+        admission_gate: Mutex::default(),
         request_admission: Arc::new(ServerRequestAdmission::default()),
         active: Mutex::new(std::collections::BTreeMap::new()),
         cancellations: Mutex::new(std::collections::BTreeMap::new()),

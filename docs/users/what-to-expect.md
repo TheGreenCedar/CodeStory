@@ -35,6 +35,8 @@ what each claim does *not* mean:
 
 ## Repo size and freshness
 
+- **Shell lookups** read the current files even on an unindexed checkout. An
+  index can add symbol names and source ranges when it matches the file.
 - **First index** on a large checkout can take minutes; the agent retries the
   intended CodeStory call while preparation runs.
 - **First broad search in a process** also initializes the embedded model. Later
@@ -67,12 +69,24 @@ Plain-language trust boundaries and good vs blocked sessions:
 
 Recovery steps: [Troubleshooting](troubleshooting.md).
 
-## Benchmarks are not your repo
+## Benchmarks
 
-Public holdout suites measure token and time reduction on **pinned OSS packages**
-under controlled tasks. They do not guarantee the same numbers in your checkout.
+On the November 2026 large-repository bank (`12` tasks, `gpt-6.1-sol`, medium
+reasoning, `--core-only` read-only cache), `cs slice` + lookups paired with
+the `codestory-cli proxy` (`boost-proxy`) reached **12/12 complete** (`75/75`
+requirements) with `-8.2%` mean / `-13.6%` median weighted tokens vs plain Codex
+(`73/75`, `10/12` complete), winning weighted tokens on `8/12` tasks. On the
+4-task `write-bank` suite, all arms passed `4/4`, with `K04` saving `-29.4%`
+while mean tokens on short edits were higher (`52,414` vs `36,247`).
 
-What the holdout proves and does not prove:
-[Evaluation scope in the README](../../README.md#evaluation).
+In the earlier `codestory-cli setup codex` trial, Codex used shell lookups on its own.
+On large repositories, raw token use was nearly flat and the setup missed the
+correctness target. It met 72 of 75 requirements, compared with 74 of 75 for
+plain Codex. On small repositories, both groups met all 45 requirements, and the
+setup group used fewer raw tokens in that cohort. General token savings and
+equal correctness across repository sizes remain unestablished.
+
+See the setup results, earlier comparisons, and command timings in
+[Evaluation](../../README.md#evaluation).
 
 Better prompts help every session: [Prompt patterns](prompt-patterns.md).

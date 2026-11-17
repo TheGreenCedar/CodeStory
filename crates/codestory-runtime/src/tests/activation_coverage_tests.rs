@@ -16,16 +16,45 @@ use std::fs;
 use tempfile::tempdir;
 
 #[test]
-fn malformed_source_publication_preserves_bytes_without_projection_authority() {
+fn verified_incomplete_source_publication_preserves_bytes_without_projection_authority() {
     let _env = hybrid_test_env();
-    for (name, malformed, valid) in [
+    for (name, incomplete, valid, reason) in [
         (
             "settings.yml",
-            "options: [\n",
-            "options:\n  enabled: true\n",
+            b"options: [\n".as_slice(),
+            b"options:\n  enabled: true\n".as_slice(),
+            FileCoverageReason::Malformed,
         ),
-        ("settings.json", "{\"options\":", "{\"options\": true}\n"),
-        ("settings.toml", "options = [\n", "options = true\n"),
+        (
+            "settings.json",
+            b"{\"options\":".as_slice(),
+            b"{\"options\": true}\n".as_slice(),
+            FileCoverageReason::Malformed,
+        ),
+        (
+            "settings.toml",
+            b"options = [\n".as_slice(),
+            b"options = true\n".as_slice(),
+            FileCoverageReason::Malformed,
+        ),
+        (
+            "legacy.css",
+            b"/* \xe9viter \xe9crasement */\n.test { margin: 1 rem; }\n".as_slice(),
+            b".test { margin: 1rem; }\n".as_slice(),
+            FileCoverageReason::Binary,
+        ),
+        (
+            "nul.css",
+            b".test { color: red; }\0\n".as_slice(),
+            b".test { color: red; }\n".as_slice(),
+            FileCoverageReason::Binary,
+        ),
+        (
+            "invalid-bom.css",
+            b"\xff\xfe\x00\xd8".as_slice(),
+            b".test { color: blue; }\n".as_slice(),
+            FileCoverageReason::Binary,
+        ),
     ] {
         let workspace = tempdir().unwrap();
         let cache = tempdir().unwrap();
@@ -40,8 +69,11 @@ fn malformed_source_publication_preserves_bytes_without_projection_authority() {
             )
             .unwrap();
 
-        // Cold, repair, and regression to malformed all use the same source policy.
-        for (index, source) in [malformed, valid, malformed].into_iter().enumerate() {
+        // Cold, repair, rejection, and recovery use the same verified-source policy.
+        for (index, source) in [incomplete, valid, incomplete, valid]
+            .into_iter()
+            .enumerate()
+        {
             fs::write(&source_path, source).unwrap();
             let mode = if index == 0 {
                 IndexMode::Full
@@ -50,9 +82,9 @@ fn malformed_source_publication_preserves_bytes_without_projection_authority() {
             };
             controller
                 .run_indexing_blocking_without_runtime_refresh(mode)
-                .expect("verified malformed source must not prevent publication");
+                .expect("verified rejected structural source must not prevent publication");
             let storage = Store::open_read_only(&storage_path).unwrap();
-            assert_eq!(fs::read_to_string(&source_path).unwrap(), source);
+            assert_eq!(fs::read(&source_path).unwrap(), source);
             assert!(
                 storage
                     .get_nodes()
@@ -67,7 +99,7 @@ fn malformed_source_publication_preserves_bytes_without_projection_authority() {
             use sha2::{Digest, Sha256};
             assert_eq!(
                 observed.content_hash.as_deref(),
-                Some(format!("{:x}", Sha256::digest(source.as_bytes())).as_str()),
+                Some(format!("{:x}", Sha256::digest(source)).as_str()),
                 "source digest must survive {name}"
             );
             assert!(
@@ -75,10 +107,10 @@ fn malformed_source_publication_preserves_bytes_without_projection_authority() {
                 "unchanged source must not be rescheduled"
             );
             let gaps = crate::stored_file_coverage_diagnostics(workspace.path(), &storage).unwrap();
-            if source == malformed {
+            if source == incomplete {
                 assert!(!file.complete);
                 assert!(gaps.iter().any(|gap| gap.path == name
-                    && gap.reason == FileCoverageReason::Malformed
+                    && gap.reason == reason
                     && gap.verified_source
                     && !gap.projection_available
                     && !gap.retryable));
@@ -90,7 +122,7 @@ fn malformed_source_publication_preserves_bytes_without_projection_authority() {
                         |row| row.get(0),
                     )
                     .unwrap();
-                assert_eq!(nodes, 0, "malformed source retained graph nodes");
+                assert_eq!(nodes, 0, "rejected source retained graph nodes");
                 for table in ["symbol_search_doc", "dense_anchor_input"] {
                     let count: i64 = connection
                         .query_row(
@@ -99,7 +131,7 @@ fn malformed_source_publication_preserves_bytes_without_projection_authority() {
                             |row| row.get(0),
                         )
                         .unwrap();
-                    assert_eq!(count, 0, "malformed source retained {table}");
+                    assert_eq!(count, 0, "rejected source retained {table}");
                 }
                 assert!(
                     !storage
@@ -108,6 +140,19 @@ fn malformed_source_publication_preserves_bytes_without_projection_authority() {
                         .contains(&file.id)
                 );
                 assert_eq!(storage.proof_resolution_fact_count().unwrap(), 0);
+                if reason == FileCoverageReason::Binary {
+                    assert!(
+                        matches!(
+                            crate::search_evidence::verified_file_checked(
+                                &storage,
+                                Some(workspace.path()),
+                                &file,
+                            ),
+                            Err(crate::search_evidence::VerifiedFileError::Unavailable)
+                        ),
+                        "opaque identity must not authorize exact indexed text"
+                    );
+                }
             } else {
                 assert!(file.complete);
                 assert!(gaps.iter().all(|gap| gap.path != name));
@@ -128,9 +173,9 @@ fn malformed_source_publication_preserves_bytes_without_projection_authority() {
                     limit: Some(10),
                 })
                 .unwrap();
-            if source == malformed {
+            if source == incomplete {
                 assert!(public_files.coverage_gaps.iter().any(|gap| gap.path == name
-                    && gap.reason == FileCoverageReason::Malformed
+                    && gap.reason == reason
                     && gap.verified_source
                     && !gap.projection_available));
             }
@@ -200,7 +245,9 @@ fn malformed_source_publication_rejects_drift_and_preserves_previous_on_faults()
     for mode in [IndexMode::Full, IndexMode::Incremental] {
         for scenario in [
             "drift",
+            "binary_drift",
             "unreadable",
+            "binary_unreadable",
             "cancel",
             "publish_failure",
             "search_cancel",
@@ -211,9 +258,25 @@ fn malformed_source_publication_rejects_drift_and_preserves_previous_on_faults()
             }
             let workspace = tempdir().unwrap();
             let cache = tempdir().unwrap();
-            let source = workspace.path().join("settings.yml");
+            let binary = matches!(scenario, "binary_drift" | "binary_unreadable");
+            let source = workspace
+                .path()
+                .join(if binary { "legacy.css" } else { "settings.yml" });
+            let (valid, rejected, changed) = if binary {
+                (
+                    b".test { color: red; }\n".as_slice(),
+                    b"/* \xe9 */ .old { color: red; }\n".as_slice(),
+                    b"/* \xe9 */ .new { color: red; }\n".as_slice(),
+                )
+            } else {
+                (
+                    b"options: true\n".as_slice(),
+                    b"options: [\n".as_slice(),
+                    b"options: {\n".as_slice(),
+                )
+            };
             let storage_path = cache.path().join("codestory.db");
-            fs::write(&source, "options: true\n").unwrap();
+            fs::write(&source, valid).unwrap();
             let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
             controller
                 .open_project_summary_with_storage_path(
@@ -226,12 +289,23 @@ fn malformed_source_publication_rejects_drift_and_preserves_previous_on_faults()
                 .unwrap();
             let previous = Store::database_index_publication(&storage_path).unwrap();
             let previous_structure = super::structural_live_identity(&storage_path);
-            fs::write(&source, "options: [\n").unwrap();
+            fs::write(&source, rejected).unwrap();
+            let modified = fs::metadata(&source).unwrap().modified().unwrap();
             let token = CancellationToken::new();
-            if matches!(scenario, "drift" | "unreadable") {
+            if matches!(
+                scenario,
+                "drift" | "binary_drift" | "unreadable" | "binary_unreadable"
+            ) {
                 crate::arm_source_policy_before_revalidate_hook(move || {
-                    if scenario == "drift" {
-                        fs::write(&source, "options: {\n").unwrap();
+                    if matches!(scenario, "drift" | "binary_drift") {
+                        assert_eq!(rejected.len(), changed.len());
+                        fs::write(&source, changed).unwrap();
+                        fs::File::options()
+                            .write(true)
+                            .open(&source)
+                            .unwrap()
+                            .set_times(fs::FileTimes::new().set_modified(modified))
+                            .unwrap();
                     } else {
                         fs::remove_file(&source).unwrap();
                         fs::create_dir(&source).unwrap();

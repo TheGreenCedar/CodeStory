@@ -6,7 +6,23 @@ Marketplace](https://cursor.com/marketplace). Searching that catalog for
 **codestory** will not find it.
 
 Add this repository as a marketplace in Customize, then install **codestory**
-from it.
+from it, or install shell lookups directly with `codestory-cli setup cursor`.
+
+## Set up shell lookups
+
+With the CLI installed, run:
+
+```sh
+codestory-cli setup cursor
+```
+
+This writes the shared launcher under `~/.cursor/cs` and installs a managed
+standing rule at `~/.cursor/rules/codestory-lookups.mdc` (or at
+`.cursor/rules/codestory-lookups.mdc` inside your Git root with `--repo`) so
+Cursor agent sessions use `cs slice`, `cs refs`, `cs find`, `cs read`, and
+`cs edit` without requiring MCP. Pre-warm a fast core-only index with
+`codestory-cli index --project . --core-only`. Remove the rule later with
+`codestory-cli setup cursor --remove`.
 
 ## Requirements
 

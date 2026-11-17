@@ -25,6 +25,7 @@ project's immutable config and never rereads or mutates process environment.
 
 - `src/args.rs` and `src/app.rs`: CLI schema, dispatch, and lifecycle commands
 - `src/app/drill.rs` and `src/app/source_commands.rs`: drill and source-navigation command owners
+- `src/app/lookup_commands.rs`, `src/app/setup.rs`, and `src/app/proxy.rs`: live lookups (`find`, `refs`, `read`, `edit`, `slice`), multi-host `setup` (`codex`, `claude-code`, `cursor`, `opencode`, `antigravity`), and the loopback context-budget proxy (`proxy`, `run`)
 - `src/app/diagnostics.rs`, `src/app/resolution.rs`, and `src/app/rendering.rs`: readiness, target resolution, and stable output mapping
 - `src/app/artifacts.rs` and `src/app/server.rs`: bounded artifact writes and transport startup
 - `src/main.rs` and `src/native_launcher.rs`: stable public launcher and atomic
@@ -120,9 +121,12 @@ their bounded local refresh and managed retrieval preparation. Request
 validation happens first, and every stdio request supplies an absolute project.
 Hook state never routes the runtime.
 
-HTTP remains read-only and loopback-bound by default. `packet` remains the broad
-evidence workflow; exact graph primitives and `context` do not create a second
-packet/search implementation.
+HTTP remains read-only and loopback-bound by default. `proxy` and `run` also bind
+strictly to loopback (`127.0.0.1` or `::1`) and cap or deduplicate oversized
+tool outputs by `(item_key, raw_sha256)` while preserving prompt prefix bytes for
+KV cache reuse. `packet` remains the broad evidence workflow; exact graph
+primitives, live `cs` lookups (`find`, `refs`, `read`, `edit`, `slice`), and
+`context` do not create a second packet/search implementation.
 
 ## Extension rules
 

@@ -59,23 +59,23 @@ occurrence element=FUNCTION:sameInRow@15 kind=DEFINITION span=15:1-19:2
 occurrence element=FUNCTION:stringOut@11 kind=DEFINITION span=11:1-13:2
 occurrence element=FUNCTION:turn@32 kind=DEFINITION span=32:1-34:2
 occurrence element=MODULE:./random.sh@1 kind=DEFINITION span=1:8-1:19
-occurrence element=UNKNOWN:echo@18 kind=DEFINITION span=18:3-18:7
-occurrence element=UNKNOWN:echo@29 kind=DEFINITION span=29:3-29:7
-occurrence element=UNKNOWN:echo@39 kind=DEFINITION span=39:5-39:9
-occurrence element=UNKNOWN:echo@4 kind=DEFINITION span=4:3-4:7
-occurrence element=UNKNOWN:main@55 kind=DEFINITION span=55:1-55:5
-occurrence element=UNKNOWN:makeMove@33 kind=DEFINITION span=33:3-33:11
-occurrence element=UNKNOWN:minMax@42 kind=DEFINITION span=42:3-42:9
-occurrence element=UNKNOWN:minMax@48 kind=DEFINITION span=48:3-48:9
-occurrence element=UNKNOWN:numberIn@46 kind=DEFINITION span=46:3-46:11
-occurrence element=UNKNOWN:printf@12 kind=DEFINITION span=12:3-12:9
-occurrence element=UNKNOWN:printf@8 kind=DEFINITION span=8:3-8:9
-occurrence element=UNKNOWN:return@26 kind=DEFINITION span=26:5-26:11
-occurrence element=UNKNOWN:return@40 kind=DEFINITION span=40:5-40:11
-occurrence element=UNKNOWN:run@52 kind=DEFINITION span=52:3-52:6
-occurrence element=UNKNOWN:sameInRow@28 kind=DEFINITION span=28:3-28:12
-occurrence element=UNKNOWN:source@1 kind=DEFINITION span=1:1-1:7
-occurrence element=UNKNOWN:stringOut@47 kind=DEFINITION span=47:3-47:12
+occurrence element=UNKNOWN:echo@18 kind=REFERENCE span=18:3-18:7
+occurrence element=UNKNOWN:echo@29 kind=REFERENCE span=29:3-29:7
+occurrence element=UNKNOWN:echo@39 kind=REFERENCE span=39:5-39:9
+occurrence element=UNKNOWN:echo@4 kind=REFERENCE span=4:3-4:7
+occurrence element=UNKNOWN:main@55 kind=REFERENCE span=55:1-55:5
+occurrence element=UNKNOWN:makeMove@33 kind=REFERENCE span=33:3-33:11
+occurrence element=UNKNOWN:minMax@42 kind=REFERENCE span=42:3-42:9
+occurrence element=UNKNOWN:minMax@48 kind=REFERENCE span=48:3-48:9
+occurrence element=UNKNOWN:numberIn@46 kind=REFERENCE span=46:3-46:11
+occurrence element=UNKNOWN:printf@12 kind=REFERENCE span=12:3-12:9
+occurrence element=UNKNOWN:printf@8 kind=REFERENCE span=8:3-8:9
+occurrence element=UNKNOWN:return@26 kind=REFERENCE span=26:5-26:11
+occurrence element=UNKNOWN:return@40 kind=REFERENCE span=40:5-40:11
+occurrence element=UNKNOWN:run@52 kind=REFERENCE span=52:3-52:6
+occurrence element=UNKNOWN:sameInRow@28 kind=REFERENCE span=28:3-28:12
+occurrence element=UNKNOWN:source@1 kind=REFERENCE span=1:1-1:7
+occurrence element=UNKNOWN:stringOut@47 kind=REFERENCE span=47:3-47:12
 occurrence element=VARIABLE:amount@17 kind=DEFINITION span=17:3-17:14
 occurrence element=VARIABLE:col@23 kind=DEFINITION span=23:3-23:11
 occurrence element=VARIABLE:depth@37 kind=DEFINITION span=37:3-37:13
@@ -88,13 +88,13 @@ access node=VARIABLE:depth@37 kind=Public
 access node=VARIABLE:row@22 kind=Public
 access node=VARIABLE:token@16 kind=Public
 access node=VARIABLE:token@24 kind=Public
-callable_state CallableProjectionState { file_id: 3699121416828224428, symbol_key: "13:main", node_id: NodeId(-3635321003423131788), signature_hash: -4671339478033693080, normalized_signature: Some("shape:6083604196958491942"), body_hash: 760610733551956591, start_line: 51, end_line: 53 }
-callable_state CallableProjectionState { file_id: 3699121416828224428, symbol_key: "13:makeMove", node_id: NodeId(-2515598397687256798), signature_hash: 5173406897340347930, normalized_signature: Some("shape:-1235026875210414673"), body_hash: 9149177360853350432, start_line: 21, end_line: 30 }
-callable_state CallableProjectionState { file_id: 3699121416828224428, symbol_key: "13:minMax", node_id: NodeId(7081801660925780151), signature_hash: -8051465974728078519, normalized_signature: Some("shape:-9198897625861577702"), body_hash: 6006497835269164092, start_line: 36, end_line: 43 }
-callable_state CallableProjectionState { file_id: 3699121416828224428, symbol_key: "13:numberIn", node_id: NodeId(-5905922039771045421), signature_hash: 2477812878330356949, normalized_signature: Some("shape:-7083630050789299289"), body_hash: 5561877708812231360, start_line: 3, end_line: 5 }
-callable_state CallableProjectionState { file_id: 3699121416828224428, symbol_key: "13:numberOut", node_id: NodeId(-7934113418855399154), signature_hash: -1579019679195996938, normalized_signature: Some("shape:4534084180875376373"), body_hash: -5825159797702543837, start_line: 7, end_line: 9 }
-callable_state CallableProjectionState { file_id: 3699121416828224428, symbol_key: "13:run", node_id: NodeId(690218248480803604), signature_hash: 5222842858713591688, normalized_signature: Some("shape:8445692896744983391"), body_hash: -8886277489832578549, start_line: 45, end_line: 49 }
-callable_state CallableProjectionState { file_id: 3699121416828224428, symbol_key: "13:sameInRow", node_id: NodeId(5861375836366715686), signature_hash: 954397003606297678, normalized_signature: Some("shape:-8036842316825594099"), body_hash: 1566588196809705519, start_line: 15, end_line: 19 }
-callable_state CallableProjectionState { file_id: 3699121416828224428, symbol_key: "13:stringOut", node_id: NodeId(-4261065684697691790), signature_hash: -5818630870471287222, normalized_signature: Some("shape:8953728298715117053"), body_hash: -1270341848088446665, start_line: 11, end_line: 13 }
-callable_state CallableProjectionState { file_id: 3699121416828224428, symbol_key: "13:turn", node_id: NodeId(-8531347618660569562), signature_hash: -3321651350975386290, normalized_signature: Some("shape:-4838422319707821228"), body_hash: -2554722678388236973, start_line: 32, end_line: 34 }
-callable_state CallableProjectionState { file_id: 3699121416828224428, symbol_key: "__file_structural__", node_id: NodeId(3699121416828224428), signature_hash: 6443036107887619124, normalized_signature: None, body_hash: 2836811500587000585, start_line: 1, end_line: 55 }
+callable_state CallableProjectionState { file_id: 3699121416828224428, symbol_key: "13:main", node_id: NodeId(-3635321003423131788), signature_hash: -4671339478033693080, normalized_signature: Some("shape:8776717482363731359"), body_hash: -978600297527185914, start_line: 51, end_line: 53 }
+callable_state CallableProjectionState { file_id: 3699121416828224428, symbol_key: "13:makeMove", node_id: NodeId(-2515598397687256798), signature_hash: 5173406897340347930, normalized_signature: Some("shape:-6325782002747327334"), body_hash: -7614963099497588239, start_line: 21, end_line: 30 }
+callable_state CallableProjectionState { file_id: 3699121416828224428, symbol_key: "13:minMax", node_id: NodeId(7081801660925780151), signature_hash: -8051465974728078519, normalized_signature: Some("shape:-7823543524571502035"), body_hash: -9158651581704624285, start_line: 36, end_line: 43 }
+callable_state CallableProjectionState { file_id: 3699121416828224428, symbol_key: "13:numberIn", node_id: NodeId(-5905922039771045421), signature_hash: 2477812878330356949, normalized_signature: Some("shape:7695757795386358094"), body_hash: 5610220325666710185, start_line: 3, end_line: 5 }
+callable_state CallableProjectionState { file_id: 3699121416828224428, symbol_key: "13:numberOut", node_id: NodeId(-7934113418855399154), signature_hash: -1579019679195996938, normalized_signature: Some("shape:-3318626659619911908"), body_hash: 3169094683327465450, start_line: 7, end_line: 9 }
+callable_state CallableProjectionState { file_id: 3699121416828224428, symbol_key: "13:run", node_id: NodeId(690218248480803604), signature_hash: 5222842858713591688, normalized_signature: Some("shape:1904233827863886978"), body_hash: -5185338171116989202, start_line: 45, end_line: 49 }
+callable_state CallableProjectionState { file_id: 3699121416828224428, symbol_key: "13:sameInRow", node_id: NodeId(5861375836366715686), signature_hash: 954397003606297678, normalized_signature: Some("shape:3706235695314267414"), body_hash: 3492904525860396660, start_line: 15, end_line: 19 }
+callable_state CallableProjectionState { file_id: 3699121416828224428, symbol_key: "13:stringOut", node_id: NodeId(-4261065684697691790), signature_hash: -5818630870471287222, normalized_signature: Some("shape:-1026235084144466780"), body_hash: -2545340791142693954, start_line: 11, end_line: 13 }
+callable_state CallableProjectionState { file_id: 3699121416828224428, symbol_key: "13:turn", node_id: NodeId(-8531347618660569562), signature_hash: -3321651350975386290, normalized_signature: Some("shape:5131341064834769259"), body_hash: 935032814976498964, start_line: 32, end_line: 34 }
+callable_state CallableProjectionState { file_id: 3699121416828224428, symbol_key: "__file_structural__", node_id: NodeId(3699121416828224428), signature_hash: 3073471215195954698, normalized_signature: None, body_hash: 961995773058874477, start_line: 1, end_line: 55 }

@@ -55,7 +55,14 @@ fn default_navigation_surface_rejects_proof_before_project_activation() {
         let tools = assert_success_envelope(&listed, json!("list"))["tools"]
             .as_array()
             .expect("tools array");
-        assert_eq!(tools.len(), 20);
+        assert_eq!(tools.len(), 21);
+        assert_eq!(
+            tools
+                .iter()
+                .filter(|tool| tool["name"] == "source_context_hook")
+                .count(),
+            1
+        );
         assert!(!tools.iter().any(|tool| matches!(
             tool["name"].as_str(),
             Some("verify_indexed_direct_calls" | "prove_call_path")
@@ -212,7 +219,14 @@ fn public_v3_negotiates_revision_native_evidence_discovery() {
         let tools = assert_success_envelope(&listed, json!("list"))["tools"]
             .as_array()
             .expect("tools array");
-        assert_eq!(tools.len(), 20);
+        assert_eq!(tools.len(), 21);
+        assert_eq!(
+            tools
+                .iter()
+                .filter(|tool| tool["name"] == "source_context_hook")
+                .count(),
+            1
+        );
         for route in ["packet", "context", "search"] {
             assert_eq!(
                 tools.iter().filter(|tool| tool["name"] == route).count(),
@@ -1230,6 +1244,71 @@ fn assert_tool_preparing(response: &Value, id: Value) -> Value {
     content
 }
 
+/// Complete only the same preparing operation, preserving the original tool arguments.
+fn complete_preparing_tool_request(
+    server: &mut StdioServer,
+    mut request: Value,
+    mut response: Value,
+) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while tool_result_code(&response).as_deref() == Some("codestory_preparing") {
+        let preparing = assert_tool_preparing(&response, request["id"].clone());
+        let operation_id = preparing["resume_operation_id"].clone();
+        let attempt = preparing["resume_operation_attempt"].clone();
+        let next = &preparing["minimum_next"];
+        let mut arguments = request["params"]["arguments"].clone();
+        if arguments.get("resume_operation_id").is_some() {
+            assert_eq!(arguments["resume_operation_id"], operation_id, "{response}");
+            assert_eq!(arguments["resume_operation_attempt"], attempt, "{response}");
+        }
+        arguments["resume_operation_id"] = operation_id.clone();
+        arguments["resume_operation_attempt"] = attempt.clone();
+        assert_eq!(next["arguments"], arguments, "{response}");
+        assert_eq!(
+            next["request_meta"],
+            json!({
+                "codestory_operation_id":operation_id,
+                "codestory_operation_attempt":attempt,
+            }),
+            "{response}"
+        );
+        request["params"]["arguments"] = next["arguments"].clone();
+        let meta = request["params"]
+            .as_object_mut()
+            .expect("params")
+            .entry("_meta")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .expect("meta");
+        meta.extend(
+            next["request_meta"]
+                .as_object()
+                .expect("resume meta")
+                .clone(),
+        );
+        assert!(
+            Instant::now() < deadline,
+            "exact operation never completed: {response}"
+        );
+        thread::sleep(
+            Duration::from_millis(next["after_ms"].as_u64().expect("retry delay"))
+                .min(deadline.saturating_duration_since(Instant::now())),
+        );
+        write_stdio_request(server, &request);
+        response = loop {
+            let frame = read_json(server);
+            assert!(
+                Instant::now() < deadline,
+                "resume exceeded overall deadline: {frame}"
+            );
+            if frame.get("id") == request.get("id") {
+                break frame;
+            }
+        };
+    }
+    response
+}
+
 fn assert_tool_preparing_or_unavailable(response: &Value, id: Value) -> Value {
     if tool_result_code(response).as_deref() == Some("codestory_preparing") {
         assert_tool_preparing(response, id)
@@ -1897,7 +1976,7 @@ fn project_resource_uri(base_uri: &str, project: &Path) -> String {
 
 fn assert_tool_safety_metadata(tool: &Value) {
     let name = tool["name"].as_str().expect("tool name");
-    let observational = name == "status";
+    let observational = matches!(name, "status" | "source_context_hook");
     let safety = tool
         .pointer("/_meta/com.thegreencedar.codestory~1safety")
         .unwrap_or_else(|| panic!("{name} should include namespaced safety metadata: {tool}"));
@@ -3036,6 +3115,7 @@ fn tool_catalog_keeps_stable_product_tool_names() {
             "search",
             "shortest_path",
             "snippet",
+            "source_context_hook",
             "status",
             "symbol",
             "symbols",
@@ -4463,15 +4543,14 @@ fn snippet_id_reads_return_source_stale_when_indexed_bytes_change() {
         "the stale-source error must not carry bytes the index never saw: {resource_error:#}"
     );
 
-    let tool_response = send_json(
-        &mut server,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "snippet-stale-tool",
-            "method": "tools/call",
-            "params": {"name": "snippet", "arguments": {"id": node_id}}
-        }),
-    );
+    let tool_request = json!({
+        "jsonrpc": "2.0",
+        "id": "snippet-stale-tool",
+        "method": "tools/call",
+        "params": {"name": "snippet", "arguments": {"id": node_id}}
+    });
+    let tool_response = send_json(&mut server, tool_request.clone());
+    let tool_response = complete_preparing_tool_request(&mut server, tool_request, tool_response);
     // The snippet tool is a source-backed read: managed activation detects
     // the drift, waits for the refresh, and republishes. The pinned id from
     // the previous generation then no longer resolves, so the exact refusal
@@ -6802,9 +6881,8 @@ fn wait_for_streamed_response(
     }
 }
 
-/// A request armed with a progress token must surface the peer-wait stage
-/// message while the activation is parked on the peer's writer lock.
-fn wait_for_peer_wait_progress(rx: &std::sync::mpsc::Receiver<Value>, id: &str) -> Vec<Value> {
+/// Observe the peer-wait stage through in-flight progress or an exact preparing reply.
+fn wait_for_peer_wait_evidence(rx: &std::sync::mpsc::Receiver<Value>, id: &str) -> Vec<Value> {
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut seen = Vec::new();
     loop {
@@ -6813,7 +6891,15 @@ fn wait_for_peer_wait_progress(rx: &std::sync::mpsc::Receiver<Value>, id: &str) 
             .recv_timeout(remaining.max(Duration::from_millis(1)))
             .unwrap_or_else(|_| panic!("no frames observed for {id} while waiting for the peer"));
         if frame.get("id") == Some(&json!(id)) {
-            panic!("request {id} answered before reaching the peer-writer wait: {frame}");
+            let preparing = assert_tool_preparing(&frame, json!(id));
+            assert_eq!(
+                preparing["operation"]["stage"],
+                json!("waiting_for_peer_writer"),
+                "{frame}"
+            );
+            assert!(preparing.get("snippet").is_none(), "{frame}");
+            seen.push(frame);
+            return seen;
         }
         let is_wait_stage = frame.get("method") == Some(&json!("notifications/progress"))
             && frame.pointer("/params/message").and_then(Value::as_str)
@@ -6928,19 +7014,18 @@ fn two_stdio_processes_peer_writer_wait_adopts_the_peer_publication() {
 
     let snippet_server = spawn_stdio_server(&fixture);
     let packet_server = spawn_stdio_server(&fixture);
-    let (snippet_rx, snippet_thread) = stream_stdio_request(
-        snippet_server,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "peer-wait-snippet",
-            "method": "tools/call",
-            "params": {
-                "name": "snippet",
-                "arguments": {"id": symbol_id},
-                "_meta": {"progressToken": "peer-snippet-progress"}
-            }
-        }),
-    );
+    let snippet_request = json!({
+        "jsonrpc": "2.0",
+        "id": "peer-wait-snippet",
+        "method": "tools/call",
+        "params": {
+            "name": "snippet",
+            "arguments": {"id": symbol_id},
+            "_meta": {"progressToken": "peer-snippet-progress"}
+        }
+    });
+    let (snippet_rx, snippet_thread) =
+        stream_stdio_request(snippet_server, snippet_request.clone());
     let (packet_rx, packet_thread) = stream_stdio_request(
         packet_server,
         json!({
@@ -6958,23 +7043,33 @@ fn two_stdio_processes_peer_writer_wait_adopts_the_peer_publication() {
         }),
     );
 
-    // Both calls must be parked inside the peer-writer wait — progress
-    // reporting proves the stage — with no response on the wire while the
-    // peer still holds the writer.
-    wait_for_peer_wait_progress(&snippet_rx, "peer-wait-snippet");
-    wait_for_peer_wait_progress(&packet_rx, "peer-wait-packet");
+    // A source-backed call may yield preparing; packet still waits in flight.
+    // Either the progress frame or preparing operation must name the peer stage.
+    let snippet_wait = wait_for_peer_wait_evidence(&snippet_rx, "peer-wait-snippet");
+    let mut snippet_preparing = snippet_wait
+        .into_iter()
+        .find(|frame| frame.get("id") == Some(&json!("peer-wait-snippet")));
+    wait_for_peer_wait_evidence(&packet_rx, "peer-wait-packet");
     thread::sleep(Duration::from_millis(500));
-    for (rx, id) in [
-        (&snippet_rx, "peer-wait-snippet"),
-        (&packet_rx, "peer-wait-packet"),
-    ] {
-        while let Ok(frame) = rx.try_recv() {
-            assert_ne!(
-                frame.get("id"),
-                Some(&json!(id)),
-                "request {id} answered while the peer still held the writer: {frame}"
+    while let Ok(frame) = snippet_rx.try_recv() {
+        if frame.get("id") == Some(&json!("peer-wait-snippet")) {
+            let preparing = assert_tool_preparing(&frame, json!("peer-wait-snippet"));
+            assert_eq!(
+                preparing["operation"]["stage"],
+                json!("waiting_for_peer_writer")
+            );
+            assert!(
+                snippet_preparing.replace(frame).is_none(),
+                "duplicate terminal response"
             );
         }
+    }
+    while let Ok(frame) = packet_rx.try_recv() {
+        assert_ne!(
+            frame.get("id"),
+            Some(&json!("peer-wait-packet")),
+            "packet answered while peer still held writer: {frame}"
+        );
     }
 
     fs::remove_file(&hold_marker_path).expect("release the parked peer refresh");
@@ -6990,11 +7085,14 @@ stderr:
         String::from_utf8_lossy(&peer_output.stderr)
     );
 
-    let (snippet_response, _) =
-        wait_for_streamed_response(&snippet_rx, "peer-wait-snippet", Duration::from_secs(120));
+    let snippet_response = snippet_preparing.unwrap_or_else(|| {
+        wait_for_streamed_response(&snippet_rx, "peer-wait-snippet", Duration::from_secs(120)).0
+    });
     let (packet_response, _) =
         wait_for_streamed_response(&packet_rx, "peer-wait-packet", Duration::from_secs(120));
-    let _snippet_server = snippet_thread.join().expect("join snippet request");
+    let mut snippet_server = snippet_thread.join().expect("join snippet request");
+    let snippet_response =
+        complete_preparing_tool_request(&mut snippet_server, snippet_request, snippet_response);
     let _packet_server = packet_thread.join().expect("join packet request");
 
     // Exactly one new complete generation exists — the peer's — and both
@@ -7378,20 +7476,22 @@ fn two_stdio_processes_peer_writer_death_lets_the_waiter_publish() {
     );
 
     let snippet_server = spawn_stdio_server(&fixture);
-    let (snippet_rx, snippet_thread) = stream_stdio_request(
-        snippet_server,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "peer-death-snippet",
-            "method": "tools/call",
-            "params": {
-                "name": "snippet",
-                "arguments": {"id": symbol_id},
-                "_meta": {"progressToken": "peer-death-progress"}
-            }
-        }),
-    );
-    wait_for_peer_wait_progress(&snippet_rx, "peer-death-snippet");
+    let snippet_request = json!({
+        "jsonrpc": "2.0",
+        "id": "peer-death-snippet",
+        "method": "tools/call",
+        "params": {
+            "name": "snippet",
+            "arguments": {"id": symbol_id},
+            "_meta": {"progressToken": "peer-death-progress"}
+        }
+    });
+    let (snippet_rx, snippet_thread) =
+        stream_stdio_request(snippet_server, snippet_request.clone());
+    let snippet_wait = wait_for_peer_wait_evidence(&snippet_rx, "peer-death-snippet");
+    let snippet_preparing = snippet_wait
+        .into_iter()
+        .find(|frame| frame.get("id") == Some(&json!("peer-death-snippet")));
 
     // Kill the owner without publishing: the OS releases the writer lock and
     // the parked waiter takes over — where the still-armed marker parks it
@@ -7429,9 +7529,12 @@ fn two_stdio_processes_peer_writer_death_lets_the_waiter_publish() {
     );
 
     fs::remove_file(&hold_marker_path).expect("release the parked waiter");
-    let (snippet_response, _) =
-        wait_for_streamed_response(&snippet_rx, "peer-death-snippet", Duration::from_secs(120));
-    let _snippet_server = snippet_thread.join().expect("join snippet request");
+    let snippet_response = snippet_preparing.unwrap_or_else(|| {
+        wait_for_streamed_response(&snippet_rx, "peer-death-snippet", Duration::from_secs(120)).0
+    });
+    let mut snippet_server = snippet_thread.join().expect("join snippet request");
+    let snippet_response =
+        complete_preparing_tool_request(&mut snippet_server, snippet_request, snippet_response);
     assert_tool_success(&snippet_response, json!("peer-death-snippet"));
     let snippet_result = assert_success_envelope(&snippet_response, json!("peer-death-snippet"));
     assert_eq!(

@@ -154,8 +154,10 @@ file/hash/graph projection and are removed with the file. Migration creates no
 identity for legacy projections. The existing schema compatibility fence
 requires one full rebuild for an older Core; later same-schema revision
 mismatches select only affected files through normal refresh planning. Python
-and Rust require this identity, including files with no callables. Status and
-doctor only observe incompatible or outdated state, and failed or cancelled
+and Rust require this identity, including files with no callables. Indexed,
+hash-verified parser-partial files with no file-level error can retain producer
+identity without becoming complete; cache reuse still requires a complete file.
+Status and doctor only observe incompatible or outdated state, and failed or cancelled
 staged work leaves the previous published generation available.
 
 Legacy promotion journals record candidate and rollback structural identities.
@@ -316,6 +318,14 @@ legacy confidence uses the shared certain threshold only when certainty is absen
 All other edges retain deterministic edge-ID order. This ordering does not change
 edge certainty, perform resolution, or establish runtime call behavior.
 Unknown or speculative targets remain visible when capacity permits.
+
+Default utility filtering hides unresolved, unqualified common-name calls.
+A retained resolution or an exact producer-owned receiver/member syntax marker
+keeps the source CALL visible. Resolution normalization still runs first;
+visibility neither selects a target nor increases certainty. The contracts
+reader recognizes the persisted marker vocabulary, checked against the live
+language registry and Ruby's manual producer. Explicit utility display keeps
+its existing override.
 
 When an edge cap truncates a fetch, BFS still drains its existing bounded queue
 up to the node cap. It skips further expansion once the global edge budget is

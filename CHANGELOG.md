@@ -2,6 +2,119 @@
 
 ## Unreleased
 
+- `cs slice` packs query-relevant declarations, 1-hop callees, and co-change test or fixture siblings from live files within `--max-bytes` (default 7,500 bytes), falling back cleanly to live tree-sitter AST extraction on unindexed checkouts without whole-tree freshness walks.
+- `cs edit` atomically replaces a declaration or line range (`path::Symbol`, `path:LINE`, `path:A-B`) after tree-sitter syntax validation passes, refusing broken syntax without modifying the file.
+- `cs find` and `cs refs` support `--file-glob` path filters, and `cs read` caps default reads at `16,000` bytes (outlines capped at `9,500` bytes).
+- `codestory-cli index --core-only` skips semantic document and dense-anchor work across both full and incremental refreshes for fast lookup-focused caches, while automatically repairing missing semantic docs if normal indexing runs later.
+- `codestory-cli proxy` and `codestory-cli run` add a loopback HTTP context-budget proxy that caps oversized tool outputs and deduplicates unchanged payloads across turns while preserving prefix bytes for KV cache reuse.
+- `codestory-cli setup` now configures `cursor`, `opencode`, and `antigravity` in addition to `codex` and `claude-code`, and `CODESTORY_MCP_TOOL_SURFACE=lean` exposes a five-tool (`slice`, `find`, `refs`, `read`, `edit`) compact MCP inventory under 2.5 KB.
+- Go member-call and static resolution avoid premature bailout so receiver and imported calls stay connected for local navigation.
+- Lexical search highlights the source line matching the most distinct query terms, instead of stopping at an incidental match near the top of a file.
+- Reading a line deep inside a large function now includes that line in the reply.
+- Packet searches now try up to two names or flags written in backticks as separate search terms.
+
+- `codestory-cli setup codex` and `codestory-cli setup claude-code` add live shell lookups to a fresh agent session through its standing instructions. Setup supports user or repository scope and can remove its own note. The shell lookups work with your existing `PATH` and need no MCP connection.
+
+- `find`, `refs` and `read` answer from current source, including files that changed or were never indexed. `find` and `refs` group matches by file and include enclosing declarations within a line budget when the file matches the index. `refs` also lists definitions and the declarations they reference. Use `--no-bodies` for a compact listing. `read` accepts several `path::Symbol`, `path:LINE` or `path:A-B` selectors in one call. With a bare path, it prints a small file whole or outlines a large one.
+
+- `callers` and `references` print source lines grouped by the calling symbol.
+
+- CodeStory MCP packet follow-ups can return requested source pages when the reply cannot also fit newly retrieved context. The reply identifies source it could not return.
+
+- Graceful embedding-server version handoffs keep their retry response alive until delivery finishes or fails.
+
+- Indexing handles chained receiver calls in C#, Swift and Dart without interrupting repository preparation. Existing indexes refresh their cached call records automatically.
+
+- An experimental Codex post-tool hook can add verified Python, Rust and Go source context after ordinary searches without rewriting or rerunning commands.
+
+- Experimental packets can prefer fuller function excerpts while keeping omitted context explicit. Returned file context preserves its matched source.
+
+- Experimental packet requests can return complete small files and related declaration source within their existing output limits, and follow-up requests can open offered file context. Exact symbol and range requests keep their requested scope.
+
+- Experimental packets search one slash-prefixed reference separately, while retaining the full question and any explicit targets.
+
+- Go reference navigation connects proven struct-field reads to their declarations, including named field paths across files in the same module package. These references remain distinct from calls, and existing Go indexes refresh automatically.
+
+- Go symbol lookup includes named struct fields and keeps their owner relationships distinct, including grouped declarations. Existing Go indexes refresh automatically.
+
+- Symbol-name lookup returns the same matches when a repository moves, without matching unrelated declarations through its checkout path.
+
+- Change-impact analysis accepts exact changed source ranges and reports verified owners and unresolved ranges, helping callers avoid treating every declaration in a changed file as edited.
+
+- Exact-symbol searches, source snippets and name-based relationship lookups wait up to 1.5 seconds for setup to finish before returning resume instructions, so brief setup can complete in the original call.
+
+- Function-body snippets can return long indexed functions without falling back to a single source line when the body fits the source limit.
+
+- Go symbol search finds package variables, including wrapped handlers. Existing Go indexes refresh automatically.
+
+- Call navigation keeps receiver calls such as `api.remove()` and resolved repository calls visible when their names match common utility functions.
+
+- JavaScript and TypeScript navigation recognizes functions stored in named object properties and keeps calls attached to the right source body, including scripts embedded in templates.
+
+- JavaScript and TypeScript source links stay stable across cached indexing and template refreshes. Existing indexes refresh automatically. Old links are rejected rather than silently redirected; bookmarks move only when source evidence supports the match, and unmatched bookmarks keep their notes.
+
+- Python navigation avoids links to methods that class code replaces or removes, and leaves object types unresolved when they depend only on a conditionally defined factory.
+
+- Packets leave more room for source evidence by skipping indexed whole files that cannot fit the response, while retaining navigation and clear limits.
+
+- Go reference navigation includes statically resolved function and method values, including handlers passed to registration functions. These references stay distinct from calls, and existing Go indexes refresh automatically.
+
+- Optional Codex source context can append bounded, verified Python and Rust declarations and Go functions and methods after numbered searches when the executor's non-interactive zsh/login contract is explicit or declared at startup. Unknown callers retain their ordinary path, and pipelines keep the original search output.
+
+- Indexing avoids repeated sorting, metadata preparation and symbol-description work while preserving published records and digests.
+
+- Indexing avoids duplicate proof seal checks while retaining source and graph verification.
+
+- Repository indexing avoids repeated import lookups while preserving per-file resolution.
+
+- Go indexing avoids redundant scope lookups while preserving variable shadowing and call resolution.
+
+- Failed indexing reports repeat less run metadata while retaining every progress and cancellation detail.
+
+- Full repository reindexing avoids redundant file lookups before rebuilding the index.
+
+- Bash call navigation handles commands inside prefix assignments without interrupting indexing or losing links between repeated calls on the same line. Existing Bash indexes rebuild on their next refresh.
+
+- Repository navigation stays available when a structural file has unsupported text bytes, while that file keeps explicit incomplete coverage and no source projection.
+
+- Rust struct and enum source excerpts include their fields, variants and outer attributes. Navigation keeps precise name locations, and existing Rust indexes rebuild on their next refresh.
+
+- Rust struct and enum search documents retain their declaration and comment text when source excerpts expand to include attributes and fields.
+
+- Symbol search finds declarations even when frequent call sites share the same name.
+
+- Codex can discover the grounding skill automatically again. Shared Claude Code/Codex startup hooks remain disabled.
+
+- MCP affected results offer an optional lossless shared-field layout for impacted symbols; the default record array stays unchanged.
+
+- Grounding maps stop treating known decorator and inherited-type references as local declarations. Existing parser indexes rebuild once on their next refresh.
+
+- Explicit symbol-summary generation works on current indexes and refreshes summaries when the selected model changes.
+
+- Claude Code and Codex no longer run the automatic session-start hook. CodeStory tools and the grounding skill remain available on request.
+
+- Grounding maps show production package layouts before repeating roots from the same subsystem.
+
+- Symbol search recognizes generic type definitions and keeps them ahead of incidental same-name matches.
+
+- Symbol search keeps qualified method definitions visible for unqualified names, ahead of incidental references and configuration labels.
+
+- Symbol search finds JavaScript and TypeScript classes and functions through verified named public exports, while keeping their original names and source locations. Export/import witness locations explain the match; unsupported or ambiguous bindings remain explicit.
+
+- TypeScript and TSX files parse type-only star exports, allowing independent named exports beside them to remain searchable. Type-only exports do not become value aliases.
+
+- Source-backed search and navigation stay available after indexing unchanged, partially parsed Rust or Python files, while coverage continues to report the parsing gap.
+
+- Structural source indexing and retrieval accept BOM-marked UTF-16 text, including PowerShell files, while keeping source verification tied to the original bytes. Contained aliases with supported file types remain indexable when an unsupported filename is discovered first.
+
+- Agent guidance can display caller results once when whole-number JSON formatting differs, preserving original text and metadata.
+
+- Symbol-name navigation uses the current Core index without preparing search, so symbol details, callers and trails remain available without broad retrieval.
+
+- Symbol search ranks standalone Go type declarations ahead of incidental matches with the same name, making definitions easier to find among configuration labels and references.
+
+- The plugin includes the `cs` shell command for live text, references, and numbered source. Run it from the target repository.
+
 ## 0.18.0
 
 - Packets reuse one repository identity snapshot while selecting a response, avoiding repeated Git status scans within the same request.

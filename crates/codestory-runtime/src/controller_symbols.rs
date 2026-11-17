@@ -16,7 +16,7 @@ use codestory_contracts::api::{
 };
 use codestory_contracts::compilation::INTERIM_MAX_ADMITTED_CANDIDATES;
 use codestory_contracts::graph::Node as GraphNode;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 /// Identity-index result that can be considered before a packet candidate is
@@ -312,56 +312,23 @@ impl AppController {
         deduped
     }
 
-    /// Resolve DB/index-backed symbol candidates for read commands.
-    ///
-    /// This intentionally bypasses mandatory sidecar product search so symbol,
-    /// snippet, trail, and graph-query target resolution can work from an
-    /// already-open indexed store. Explicit `search --repo-text off` composes
-    /// this resolver as its complete-core lane. Ordinary search and packet
-    /// evidence still use the sidecar-primary paths.
+    /// Resolve indexed names from the pinned Core without attaching search state.
+    /// Ordinary search and packet evidence retain their sidecar-primary paths.
     pub fn resolve_indexed_symbol_candidates(
         &self,
         query: &str,
         max_results: usize,
     ) -> Result<Vec<SearchHit>, ApiError> {
-        self.ensure_search_state()?;
-        let storage = self.open_storage_read_only()?;
-        let (matches, node_names) = {
-            let mut s = self.state.lock();
-            let engine = s.search_engine.as_mut().ok_or_else(|| {
-                ApiError::invalid_argument("Search engine not initialized. Open a project first.")
-            })?;
-            let matches = engine.search_symbol_with_scores(query);
-            let node_names = node_names_for_ids(&s.node_names, matches.iter().map(|(id, _)| *id));
-            (matches, node_names)
-        };
-
-        let mut hits = matches
-            .into_iter()
-            .map(|(id, score)| Self::build_search_hit(&storage, &node_names, id, score))
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .flatten()
-            .map(|mut hit| {
-                decorate_lexical_search_hit_evidence(&mut hit);
-                hit
-            })
-            .collect::<Vec<_>>();
-        let project_root = self.require_project_root().ok();
-        hits.sort_by(|left, right| {
-            compare_search_hits_with_project_root(project_root.as_deref(), query, left, right, None)
-        });
-        hits.truncate(max_results.clamp(1, 50));
-        Ok(hits)
+        self.resolve_core_symbol_candidates(query, max_results)
     }
 
     /// Resolve symbols from the immutable core projection only.
     ///
     /// This deliberately avoids `ensure_search_state`: that path attaches the
     /// persisted search generation and therefore acquires its catalog lock.
-    /// An explicit `repo_text=off` query owns no retrieval or search-generation
-    /// dependency, so it streams canonical identities from the already-pinned
-    /// core and applies the same in-memory fuzzy matcher directly.
+    /// Indexed-name navigation and explicit `repo_text=off` search own no
+    /// retrieval dependency, so they stream canonical identities from the pinned
+    /// Core and apply the same in-memory fuzzy matcher directly.
     pub(crate) fn resolve_core_symbol_candidates(
         &self,
         query: &str,
@@ -369,7 +336,7 @@ impl AppController {
     ) -> Result<Vec<SearchHit>, ApiError> {
         let storage = self.open_storage_read_only()?;
         let project_root = self.require_project_root()?;
-        let absolute_file_query = Path::new(query.trim()).is_absolute();
+        let absolute_query = Path::new(query.trim()).is_absolute();
         let expected_rows = storage
             .get_canonical_search_symbol_count()
             .map_err(|error| {
@@ -396,22 +363,32 @@ impl AppController {
             after_node_id = batch.last().map(|entry| entry.node_id);
             stream_rows = stream_rows.saturating_add(batch.len());
             for entry in batch {
-                let display_name =
-                    if entry.node_kind == Some(codestory_contracts::graph::NodeKind::FILE as i64) {
-                        let path = Path::new(&entry.display_name);
-                        match codestory_workspace::workspace_relative_path(&project_root, path) {
-                            // Preserve an explicit absolute FILE lookup, but keep
-                            // checkout-root spelling out of ordinary fuzzy search.
-                            Some(_) if absolute_file_query => entry.display_name.clone(),
-                            Some(relative) => relative.to_string_lossy().replace('\\', "/"),
-                            None if path.is_absolute() => continue,
-                            None => entry.display_name.clone(),
-                        }
-                    } else {
-                        entry.display_name
-                    };
-                node_names.insert(entry.node_id, display_name.clone());
-                symbols.push((entry.node_id, display_name));
+                if !crate::search::engine::symbol_kind_is_searchable(entry.node_kind) {
+                    continue;
+                }
+                let is_file =
+                    entry.node_kind == Some(codestory_contracts::graph::NodeKind::FILE as i64);
+                let path = Path::new(&entry.display_name);
+                let scoring_name = if is_file || path.is_absolute() {
+                    match codestory_workspace::workspace_relative_path(&project_root, path) {
+                        Some(_) if absolute_query => entry.display_name.clone(),
+                        Some(relative) => relative.to_string_lossy().replace('\\', "/"),
+                        None if path.is_absolute() => continue,
+                        None => entry.display_name.clone(),
+                    }
+                } else {
+                    entry.display_name.clone()
+                };
+                // File-owned qualified names can start with the absolute FILE
+                // identity too. Match and rank without that checkout prefix,
+                // while keeping non-FILE canonical labels unchanged in results.
+                let display_name = if is_file {
+                    scoring_name.clone()
+                } else {
+                    entry.display_name
+                };
+                node_names.insert(entry.node_id, display_name);
+                symbols.push((entry.node_id, scoring_name));
             }
         }
         if stream_rows != expected_rows as usize {
@@ -420,17 +397,17 @@ impl AppController {
             )));
         }
         let matches = search_core_symbol_names_with_scores(&symbols, query);
-        let names = node_names_for_ids(&node_names, matches.iter().map(|(id, _)| *id));
+        let matched_ids: HashSet<_> = matches.iter().map(|(id, _)| *id).collect();
+        let names = symbols
+            .into_iter()
+            .filter(|(id, _)| matched_ids.contains(id))
+            .collect();
         let mut hits = matches
             .into_iter()
             .map(|(id, score)| Self::build_search_hit(&storage, &names, id, score))
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
             .flatten()
-            .map(|mut hit| {
-                decorate_lexical_search_hit_evidence(&mut hit);
-                hit
-            })
             .collect::<Vec<_>>();
         hits.sort_by(|left, right| {
             compare_search_hits_with_project_root(
@@ -442,6 +419,18 @@ impl AppController {
             )
         });
         hits.truncate(max_results.clamp(1, 50));
+        for hit in &mut hits {
+            if let Some(display_name) = hit
+                .node_id
+                .0
+                .parse::<i64>()
+                .ok()
+                .and_then(|id| node_names.get(&codestory_contracts::graph::NodeId(id)))
+            {
+                hit.display_name.clone_from(display_name);
+            }
+            decorate_lexical_search_hit_evidence(hit);
+        }
         Ok(hits)
     }
 
@@ -807,6 +796,96 @@ impl AppController {
                 .then(left.end_col.cmp(&right.end_col))
         });
         Ok(occurrences)
+    }
+
+    pub(crate) fn direct_reference_lines(
+        &self,
+        target: NodeId,
+        calls_only: bool,
+    ) -> Result<Vec<(String, String, u32, String)>, ApiError> {
+        use codestory_contracts::graph::{
+            EdgeKind, OccurrenceKind, ResolutionCertainty, TrailCallerScope,
+        };
+
+        let target = target.to_core()?;
+        let storage = self.open_storage_read_only()?;
+        let root = self.require_project_root()?;
+        let failure = |error: codestory_store::StorageError| ApiError::internal(error.to_string());
+        let filter = if calls_only {
+            &[EdgeKind::CALL][..]
+        } else {
+            &[]
+        };
+        let edges = storage
+            .get_incoming_edges_for_node_id(
+                target,
+                filter,
+                TrailCallerScope::IncludeTestsAndBenches,
+                true,
+            )
+            .map_err(failure)?;
+        let mut sites = BTreeMap::<_, BTreeSet<_>>::new();
+        for edge in edges {
+            if edge.effective_target() != target
+                || matches!(edge.certainty, Some(ResolutionCertainty::Uncertain))
+            {
+                continue;
+            }
+            let caller = storage
+                .get_node(edge.effective_source())
+                .map_err(failure)?
+                .ok_or_else(|| ApiError::internal("Reference owner is missing"))?;
+            let label = node_display_name(&caller);
+            let mut found_occurrence = false;
+            for occurrence in storage
+                .get_occurrences_for_element(edge.id.0)
+                .map_err(failure)?
+            {
+                if matches!(
+                    occurrence.kind,
+                    OccurrenceKind::REFERENCE | OccurrenceKind::MACRO_REFERENCE
+                ) {
+                    let location = occurrence.location;
+                    sites
+                        .entry(location.file_node_id.0)
+                        .or_default()
+                        .insert((location.start_line, label.clone()));
+                    found_occurrence = true;
+                }
+            }
+            if !found_occurrence && let (Some(file), Some(line)) = (edge.file_node_id, edge.line) {
+                sites.entry(file.0).or_default().insert((line, label));
+            }
+        }
+        let mut result = Vec::new();
+        for (file, sites) in sites {
+            let file = storage
+                .get_file_by_id(file)
+                .map_err(failure)?
+                .ok_or_else(|| ApiError::internal("Reference file is missing"))?;
+            let source =
+                crate::search_evidence::verified_file_checked(&storage, Some(&root), &file)
+                    .map_err(|_| {
+                        ApiError::new(
+                            "source_unavailable",
+                            "Reference source no longer matches the index",
+                        )
+                    })?;
+            let path = codestory_workspace::workspace_relative_path(&root, &source.path)
+                .ok_or_else(|| ApiError::internal("Reference file is outside the project"))?
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            let lines: Vec<_> = source.content.lines().collect();
+            for (line, label) in sites {
+                let code = line
+                    .checked_sub(1)
+                    .and_then(|index| lines.get(index as usize))
+                    .ok_or_else(|| ApiError::internal("Reference line is missing"))?;
+                result.push((label, path.clone(), line, code.trim_start().to_string()));
+            }
+        }
+        result.sort();
+        Ok(result)
     }
 
     pub fn edge_occurrences(

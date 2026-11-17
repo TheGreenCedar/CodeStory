@@ -370,13 +370,22 @@ impl RuntimeContext {
 
     /// Refresh or attach the complete Core without inspecting retrieval readiness.
     pub(crate) fn ensure_core_open(&self, refresh: RefreshMode) -> Result<OpenedProject> {
+        self.ensure_core_open_with_options(refresh, false)
+    }
+
+    pub(crate) fn ensure_core_open_with_options(
+        &self,
+        refresh: RefreshMode,
+        skip_semantic_docs: bool,
+    ) -> Result<OpenedProject> {
         let decision = self.resolve_refresh_decision_with_preflight(refresh)?;
         let (summary, phase_timings) = self
             .index
-            .refresh_core_index_blocking(
+            .refresh_core_index_blocking_with_options(
                 self.project_root.clone(),
                 self.storage_path.clone(),
                 decision.effective_mode,
+                skip_semantic_docs,
             )
             .map_err(|error| {
                 let error = match decision.effective_mode {
@@ -830,6 +839,43 @@ fn resolve_target_with(
         }
         Err(error) => Err(map_api_error(error)),
     }
+}
+
+/// Existing-core hook observation: capture ordinary config without repository
+/// inspection, readiness, or any retrieval transport attachment.
+pub(crate) fn passive_session_map(project: &Path) -> Result<codestory_runtime::SessionMapSnapshot> {
+    if !project.is_absolute() {
+        bail!("Session context requires an absolute project path");
+    }
+    let root = canonicalize_project_root(project)?;
+    let startup = crate::config::process_startup_config();
+    if let Some(message) = crate::config::sensitive_project_root_message(&root, &startup) {
+        bail!("{message}");
+    }
+    let config = crate::config::load_config_with_startup(&root, &startup)
+        .map_err(|e| map_api_error(e.into_api_error()))?;
+    let process_cache = canonicalize_configuration_path(
+        startup
+            .stdio_cache_root
+            .as_deref()
+            .unwrap_or_else(|| startup.sidecar_defaults.cache_root()),
+    )?;
+    let cache = cache_root_for_project_in(&root, config.cache_dir.as_deref(), &process_cache)?;
+    let storage = canonicalize_configuration_path(&cache.join("codestory.db"))?;
+    let sidecar = RuntimeRetrievalConfig::for_project_profile_with_process_defaults(
+        None,
+        RuntimeRetrievalProfile::Local,
+        None,
+        &startup.sidecar_defaults.with_cache_root(process_cache),
+        &config.runtime_overrides(),
+    );
+    Runtime::new_with_process_config(RuntimeProcessConfig::new_with_retrieval_config(
+        sidecar,
+        startup.source_index_policy,
+    ))
+    .grounding_service()
+    .passive_session_map_at(root, storage)
+    .map_err(map_api_error)
 }
 
 /// Canonicalize a project argument before deriving cache identity.
@@ -1634,6 +1680,7 @@ mod tests {
             canonicalize_configuration_path(&second_cache).expect("second cache identity");
         assert_ne!(first_cache, second_cache);
         let startup = |cache_root: &Path| crate::config::CliStartupConfig {
+            mcp_result_display: Default::default(),
             user_home: None,
             allow_sensitive_project_root: false,
             project_network_config_allowed: true,
@@ -1720,6 +1767,7 @@ mod tests {
         let cache = temp.path().join("cache");
         fs::create_dir_all(&project).expect("create project");
         let startup = crate::config::CliStartupConfig {
+            mcp_result_display: Default::default(),
             user_home: None,
             allow_sensitive_project_root: false,
             project_network_config_allowed: false,
@@ -1764,6 +1812,7 @@ mod tests {
             codestory_retrieval::SidecarRuntimeDefaults::default(),
         );
         let startup = |byte_cap| crate::config::CliStartupConfig {
+            mcp_result_display: Default::default(),
             user_home: None,
             allow_sensitive_project_root: false,
             project_network_config_allowed: false,
@@ -1803,6 +1852,7 @@ mod tests {
         fs::create_dir_all(&project).expect("create project");
         fs::create_dir_all(&cache).expect("create cache");
         let startup = crate::config::CliStartupConfig {
+            mcp_result_display: Default::default(),
             user_home: None,
             allow_sensitive_project_root: false,
             project_network_config_allowed: true,
@@ -2220,6 +2270,7 @@ mod tests {
         fs::create_dir_all(&project).expect("create project");
         symlink(&project, &alias).expect("create project alias");
         let startup = crate::config::CliStartupConfig {
+            mcp_result_display: Default::default(),
             user_home: None,
             allow_sensitive_project_root: false,
             project_network_config_allowed: true,

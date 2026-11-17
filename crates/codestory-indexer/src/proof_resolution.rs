@@ -9,7 +9,9 @@ use crate::cache::{
 };
 use crate::source_content_hash;
 use anyhow::{Context, Result, anyhow};
-use codestory_contracts::graph::{Edge, EdgeId, EdgeKind, Node, NodeId, NodeKind};
+use codestory_contracts::graph::{
+    Edge, EdgeId, EdgeKind, Node, NodeId, NodeKind, is_script_property_callable_canonical_id,
+};
 use codestory_contracts::proof_resolution::{
     CallResolutionFact, CalleeForm, DependencyFileHash, EXACT_CALL_RESOLUTION_ALGORITHM,
     ExactCallsite, ExactCallsiteCorrelationFailure, ExactSyntaxCallsiteCorrelationInput, FileId,
@@ -31,6 +33,8 @@ use tree_sitter::{Node as TsNode, Parser, Tree};
 thread_local! {
     static RUST_RESOLUTION_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static GO_RESOLUTION_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GO_BINDING_ANCESTRY_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GO_DECLARED_NAME_ANCESTRY_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PYTHON_RESOLUTION_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static C_CPP_RESOLUTION_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static RUBY_PHP_RESOLUTION_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -256,10 +260,10 @@ const C_ADAPTER_VERSION: &str = "reference-v2";
 const CPP_ADAPTER_VERSION: &str = "reference-v5";
 const RUBY_ADAPTER_VERSION: &str = "reference-v5";
 const PHP_ADAPTER_VERSION: &str = "reference-v4";
-const CSHARP_ADAPTER_VERSION: &str = "reference-v2";
-const SWIFT_ADAPTER_VERSION: &str = "reference-v3";
-const DART_ADAPTER_VERSION: &str = "reference-v2";
-const BASH_ADAPTER_VERSION: &str = "reference-v2";
+const CSHARP_ADAPTER_VERSION: &str = "reference-v3";
+const SWIFT_ADAPTER_VERSION: &str = "reference-v4";
+const DART_ADAPTER_VERSION: &str = "reference-v3";
+const BASH_ADAPTER_VERSION: &str = "reference-v3";
 const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 28;
 const INSTALLED_ADAPTERS: &[(&str, &str)] = &[
     ("bash", BASH_ADAPTER_VERSION),
@@ -595,6 +599,8 @@ pub(crate) fn collect_call_resolution_inputs(
                 |index| index.cached_classes(),
             ),
             direct_exports,
+            public_exports: is_javascript_language(language)
+                .then(|| crate::public_exports::collect(tree, source, nodes)),
             export_poison_all,
             poisoned_export_names,
             rust_modules: rust_index
@@ -1052,12 +1058,13 @@ impl<'a, 'tree> BashResolutionProducer<'a, 'tree> {
                 }
             }
         }
+        let mut pending_call = None;
         if node.kind() == "command"
             && let Some(callee) = bash_command_callee(node)
             && let Some(raw_target) = node_text(callee, self.source).map(str::to_string)
         {
             let literal = bash_literal_command_name(callee, &raw_target);
-            self.calls.push(IndexedBashCall {
+            pending_call = Some(IndexedBashCall {
                 callee,
                 form: if literal.is_some() {
                     CalleeForm::Identifier
@@ -1074,7 +1081,20 @@ impl<'a, 'tree> BashResolutionProducer<'a, 'tree> {
         let direct_program_child = node.kind() == "program";
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
+            // Prefix assignments can contain commands before this command's
+            // callee. Emit at its source position, not at the parent's entry;
+            // a dynamic callee still precedes commands nested within its span.
+            if pending_call
+                .as_ref()
+                .is_some_and(|call| call.callee.start_byte() <= child.start_byte())
+            {
+                self.calls
+                    .push(pending_call.take().expect("pending Bash call"));
+            }
             self.visit(child, child_caller, direct_program_child);
+        }
+        if let Some(call) = pending_call {
+            self.calls.push(call);
         }
     }
 
@@ -4334,23 +4354,33 @@ fn c_cpp_source_role(path: &Path) -> CachedCCppSourceRole {
 }
 
 fn c_cpp_sort_calls_by_span(calls: &mut Vec<IndexedCCppCall<'_>>) {
+    sort_calls_by_span(
+        calls,
+        |call| (call.callee.start_byte(), call.callee.end_byte()),
+        count_c_cpp_resolution_work,
+    );
+}
+
+// Tree preorder is not callee order: the member in factory().run() follows
+// the nested receiver's callee. Sort whole records after collecting bindings,
+// before building span lookups. Stable byte passes retain equal-span records.
+fn sort_calls_by_span<T>(
+    calls: &mut Vec<T>,
+    span: impl Fn(&T) -> (usize, usize),
+    count_work: fn(usize),
+) {
     for end_byte_first in [true, false] {
         for shift in (0..usize::BITS).step_by(8) {
-            let mut buckets = (0..=u8::MAX)
-                .map(|_| Vec::new())
-                .collect::<Vec<Vec<IndexedCCppCall<'_>>>>();
+            let mut buckets = (0..=u8::MAX).map(|_| Vec::new()).collect::<Vec<Vec<T>>>();
             for call in std::mem::take(calls) {
-                count_c_cpp_resolution_work(1);
-                let coordinate = if end_byte_first {
-                    call.callee.end_byte()
-                } else {
-                    call.callee.start_byte()
-                };
+                count_work(1);
+                let (start, end) = span(&call);
+                let coordinate = if end_byte_first { end } else { start };
                 let bucket = (coordinate >> shift) & usize::from(u8::MAX);
                 buckets[bucket].push(call);
             }
             for bucket in buckets {
-                count_c_cpp_resolution_work(bucket.len());
+                count_work(bucket.len());
                 calls.extend(bucket);
             }
         }
@@ -4767,6 +4797,12 @@ impl<'tree> JavaKotlinResolutionIndex<'tree> {
             result
                 .calls
                 .sort_by_key(|call| (call.callee.start_byte(), call.callee.end_byte()));
+        } else {
+            sort_calls_by_span(
+                &mut result.calls,
+                |call| (call.callee.start_byte(), call.callee.end_byte()),
+                count_java_kotlin_resolution_work,
+            );
         }
         for (index, call) in result.calls.iter().enumerate() {
             count_java_kotlin_resolution_work(1);
@@ -7596,6 +7632,29 @@ fn go_prepare_binding_decisions(
     let mut intervals = Vec::<GoBindingInterval>::new();
     walk_nodes(root, &mut |node| {
         count_go_resolution_work(1);
+        // Other kinds cannot add bindings. Returning from this callback still
+        // lets walk_nodes visit their descendants, including nested declarations.
+        if !matches!(
+            node.kind(),
+            "function_declaration"
+                | "method_declaration"
+                | "parameter_declaration"
+                | "variadic_parameter_declaration"
+                | "short_var_declaration"
+                | "assignment_statement"
+                | "var_spec"
+                | "const_spec"
+                | "type_spec"
+                | "range_clause"
+                | "receive_statement"
+                | "type_switch_guard"
+                | "type_switch_statement"
+                | "unary_expression"
+        ) {
+            return;
+        }
+        #[cfg(test)]
+        GO_BINDING_ANCESTRY_LOOKUPS.with(|work| work.set(work.get().saturating_add(1)));
         let Some(callable) = go_enclosing_callable(node, returned_closures) else {
             return;
         };
@@ -7624,6 +7683,8 @@ fn go_prepare_binding_decisions(
             }
             return;
         }
+        #[cfg(test)]
+        GO_BINDING_ANCESTRY_LOOKUPS.with(|work| work.set(work.get().saturating_add(1)));
         let Some((scope_id, scope_start, scope_end, depth)) = go_binding_scope(node, callable)
         else {
             return;
@@ -7941,9 +8002,6 @@ fn go_callables_declaring_name(
 ) -> HashSet<usize> {
     let mut result = HashSet::new();
     walk_nodes(root, &mut |node| {
-        let Some(callable) = go_enclosing_callable(node, returned_closures) else {
-            return;
-        };
         let declared = match node.kind() {
             "parameter_declaration" | "variadic_parameter_declaration" => {
                 let boundary = node
@@ -7987,7 +8045,12 @@ fn go_callables_declaring_name(
                 .any(|name| name == wanted),
             _ => false,
         };
-        if declared {
+        if !declared {
+            return;
+        }
+        #[cfg(test)]
+        GO_DECLARED_NAME_ANCESTRY_LOOKUPS.with(|work| work.set(work.get().saturating_add(1)));
+        if let Some(callable) = go_enclosing_callable(node, returned_closures) {
             result.insert(callable.id());
         }
     });
@@ -9986,7 +10049,12 @@ impl<'tree> JavascriptResolutionIndex<'tree> {
         {
             if let Some(line) = node.start_line {
                 let name = graph_leaf_name(&node.serialized_name).to_string();
-                if matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD) {
+                if matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                    && !node
+                        .canonical_id
+                        .as_deref()
+                        .is_some_and(is_script_property_callable_canonical_id)
+                {
                     callable_nodes
                         .entry((line, name.clone()))
                         .or_default()
@@ -14703,6 +14771,17 @@ pub fn rematerialize_proof_resolution_projection_with_progress(
         }
         records.push(record);
     }
+    crate::public_exports::rematerialize(
+        store,
+        publication,
+        &records
+            .iter()
+            .map(|record| crate::public_exports::Source {
+                path: record.path.as_path(),
+                file: &record.file,
+            })
+            .collect::<Vec<_>>(),
+    )?;
     progress_observer(progress);
     let mut linear_records = Vec::new();
     let mut records = records
@@ -21167,6 +21246,7 @@ mod ruby_php_complexity_tests {
                 top_level_declarations: declarations,
                 inherent_methods: Vec::new(),
                 classes: Vec::new(),
+                public_exports: None,
                 direct_exports: Vec::new(),
                 export_poison_all: false,
                 poisoned_export_names: Vec::new(),
@@ -21463,6 +21543,7 @@ mod rust_complexity_tests {
                 top_level_declarations: declarations,
                 inherent_methods: methods,
                 classes: Vec::new(),
+                public_exports: None,
                 direct_exports: Vec::new(),
                 export_poison_all: false,
                 poisoned_export_names: Vec::new(),
@@ -21755,6 +21836,89 @@ mod java_kotlin_complexity_tests {
     use codestory_workspace::{BuildMode, RefreshInfo};
     use std::fs;
     use tree_sitter::Parser;
+
+    #[test]
+    fn nominal_span_ordering_preserves_equal_spans_and_counts_every_pass() {
+        let original = vec![((8, 20), 0), ((2, 9), 1), ((8, 12), 2), ((8, 12), 3)];
+        let mut calls = original.clone();
+        reset_java_kotlin_resolution_work();
+        sort_calls_by_span(&mut calls, |call| call.0, count_java_kotlin_resolution_work);
+        assert_eq!(
+            calls,
+            vec![original[1], original[2], original[3], original[0]]
+        );
+        assert_eq!(
+            java_kotlin_resolution_work(),
+            calls.len() * 4 * std::mem::size_of::<usize>()
+        );
+    }
+
+    #[test]
+    fn nominal_nested_receiver_order_work_is_linear_and_counted() {
+        for (language, path, source) in [
+            (
+                "csharp",
+                Path::new("Calls.cs"),
+                "class C { void caller() { factory().run(); } }",
+            ),
+            (
+                "swift",
+                Path::new("Sources/App/Calls.swift"),
+                "func caller() { queue.global().async { target() } }",
+            ),
+            (
+                "dart",
+                Path::new("lib/calls.dart"),
+                "void caller() { factory().run(); other().run(); }",
+            ),
+        ] {
+            let grammar = match language {
+                "csharp" => tree_sitter_c_sharp::LANGUAGE.into(),
+                "swift" => tree_sitter_swift::LANGUAGE.into(),
+                "dart" => tree_sitter_dart_orchard::LANGUAGE.into(),
+                _ => unreachable!(),
+            };
+            let mut parser = Parser::new();
+            parser.set_language(&grammar).unwrap();
+            let tree = parser.parse(source, None).unwrap();
+            let index =
+                JavaKotlinResolutionIndex::build(&tree, source, path, language, NodeId(1), &[]);
+            assert!(
+                index.calls.len() >= 2,
+                "{language}: real nested receiver calls"
+            );
+            let spans = index
+                .calls
+                .iter()
+                .map(|call| (call.callee.start_byte(), call.callee.end_byte()))
+                .collect::<Vec<_>>();
+            assert!(spans.windows(2).all(|pair| pair[0] <= pair[1]));
+            let mut measured = Vec::new();
+            for copies in [64, 128] {
+                let mut rows = spans
+                    .iter()
+                    .copied()
+                    .cycle()
+                    .take(copies * spans.len())
+                    .collect::<Vec<_>>();
+                rows.reverse();
+                reset_java_kotlin_resolution_work();
+                sort_calls_by_span(&mut rows, |span| *span, count_java_kotlin_resolution_work);
+                let work = java_kotlin_resolution_work();
+                assert_eq!(
+                    work,
+                    rows.len() * 4 * std::mem::size_of::<usize>(),
+                    "{language}: nonzero counted radix work"
+                );
+                measured.push(work);
+            }
+            assert_eq!(
+                measured[1],
+                2 * measured[0],
+                "{language}: doubled nested-call sorting work"
+            );
+        }
+    }
 
     #[test]
     fn overlapping_resolution_work_measurements_are_isolated() {
@@ -22214,6 +22378,164 @@ mod go_complexity_tests {
     use super::*;
     use tree_sitter::Parser;
 
+    #[test]
+    fn go_binding_ancestry_ignores_noncontributing_expression_nodes() {
+        let measure = |depth: usize| {
+            // Calls precede the changing expression. Fixed-width padding also
+            // keeps declaration spans stable; only the real source hash differs.
+            let source = format!(
+                concat!(
+                    "package proof\n",
+                    "type Worker struct{{}}\n",
+                    "func (w *Worker) Run() {{}}\n",
+                    "func shadow() {{ var new int; _ = new }}\n",
+                    "func caller() {{\n",
+                    "  worker := &Worker{{}}\n",
+                    "  worker.Run()\n",
+                    "  {{ worker := 0; worker.Run() }}\n",
+                    "  worker.Run()\n",
+                    "  _ = {}{}0{}{}\n",
+                    "}}\n",
+                ),
+                " ".repeat(64 - depth),
+                "(".repeat(depth),
+                ")".repeat(depth),
+                " ".repeat(64 - depth),
+            );
+            let config = crate::get_language_for_ext("go").expect("Go config");
+            let mut parser = Parser::new();
+            parser.set_language(&config.language).expect("Go grammar");
+            let tree = parser.parse(&source, None).expect("Go syntax tree");
+            assert!(!tree.root_node().has_error());
+            GO_BINDING_ANCESTRY_LOOKUPS.with(|work| work.set(0));
+            GO_DECLARED_NAME_ANCESTRY_LOOKUPS.with(|work| work.set(0));
+            let index = GoResolutionIndex::build(&tree, &source, NodeId(1), &[]);
+            let lookups = GO_BINDING_ANCESTRY_LOOKUPS.with(std::cell::Cell::get);
+            let declared_lookups = GO_DECLARED_NAME_ANCESTRY_LOOKUPS.with(std::cell::Cell::get);
+            eprintln!("GO_BINDING_ANCESTRY_LOOKUPS {depth} {lookups}");
+            eprintln!("GO_DECLARED_NAME_ANCESTRY_LOOKUPS {depth} {declared_lookups}");
+            assert_eq!(index.calls.len(), 3, "fixture must retain three calls");
+            let mut callable_spans = HashMap::new();
+            walk_nodes(tree.root_node(), &mut |node| {
+                if matches!(node.kind(), "function_declaration" | "method_declaration") {
+                    callable_spans.insert(node.id(), (node.start_byte(), node.end_byte()));
+                }
+            });
+            let closures = GoReturnedClosureIndex::prepare(tree.root_node());
+            let owners = go_callables_declaring_name(tree.root_node(), &source, "new", &closures);
+            let mut cursor = tree.root_node().walk();
+            let shadow = tree
+                .root_node()
+                .named_children(&mut cursor)
+                .find(|node| {
+                    node.child_by_field_name("name")
+                        .and_then(|name| node_text(name, &source))
+                        == Some("shadow")
+                })
+                .expect("named shadow owner");
+            assert_eq!(owners, HashSet::from([shadow.id()]));
+            let absent =
+                go_callables_declaring_name(tree.root_node(), &source, "never_declared", &closures);
+            assert!(absent.is_empty());
+            let owner_spans = owners
+                .iter()
+                .map(|id| callable_spans[id])
+                .collect::<Vec<_>>();
+            let mut bindings = index
+                .binding_decisions
+                .iter()
+                .map(|((callable, byte, name), decision)| {
+                    let receiver = match decision {
+                        GoBindingDecision::Blocked => None,
+                        GoBindingDecision::Receiver(binding) => Some((
+                            binding.owner_name.clone(),
+                            binding.pointer,
+                            binding.constructor,
+                            binding.constructor_uses_builtin_new,
+                            binding.imported,
+                            binding.implicit,
+                        )),
+                    };
+                    (callable_spans[callable], *byte, name.clone(), receiver)
+                })
+                .collect::<Vec<_>>();
+            bindings.sort();
+            assert_eq!(bindings.len(), 3);
+            assert_eq!(
+                bindings
+                    .iter()
+                    .map(|binding| binding.3.is_some())
+                    .collect::<Vec<_>>(),
+                vec![true, false, true],
+                "local shadow must block only the middle receiver call"
+            );
+            for receiver in bindings.iter().filter_map(|binding| binding.3.as_ref()) {
+                assert_eq!(
+                    receiver,
+                    &("Worker".to_string(), true, true, false, false, false)
+                );
+            }
+            let source_hash = source_content_hash(source.as_bytes());
+            let (_, mut calls, file) = crate::index_file_with_resolution_inputs(
+                Path::new("binding_ancestry.go"),
+                &source,
+                &source_hash,
+                &config,
+                None,
+                None,
+            )
+            .expect("complete fixture extraction");
+            let mut file = file.expect("cached Go file inputs");
+            assert!(file.complete && file.lookup_input_complete);
+            assert_eq!(calls.len(), 3);
+            // Retain each fixture's actual records for exact RED/GREEN review.
+            eprintln!(
+                "GO_BINDING_ANCESTRY_FIXTURE {depth} {}",
+                serde_json::to_string(&(&bindings, &calls, &file, &owner_spans, &absent))
+                    .expect("fixture records")
+            );
+            assert_eq!(file.source_sha256, source_hash);
+            file.source_sha256.clear();
+            for call in &mut calls {
+                assert_eq!(call.callsite.source_sha256, source_hash);
+                call.callsite.source_sha256.clear();
+            }
+            (
+                lookups,
+                bindings,
+                calls,
+                file,
+                source_hash,
+                declared_lookups,
+            )
+        };
+        let shallow = measure(0);
+        let nested = measure(64);
+        assert_ne!(
+            shallow.4, nested.4,
+            "source identities must remain distinct"
+        );
+        assert_eq!(shallow.1, nested.1, "complete binding decisions changed");
+        assert_eq!(
+            shallow.2, nested.2,
+            "cached calls changed beyond source hash"
+        );
+        assert_eq!(
+            shallow.3, nested.3,
+            "cached file changed beyond source hash"
+        );
+        assert!(shallow.0 > 0, "first-pass ancestry work must be measured");
+        assert_eq!(
+            shallow.0, nested.0,
+            "irrelevant parentheses added first-pass ancestry lookups"
+        );
+        assert!(shallow.5 > 0, "declaring-name ancestry must be measured");
+        assert_eq!(
+            shallow.5, nested.5,
+            "irrelevant parentheses added declaring-name ancestry"
+        );
+    }
+
     fn go_source(count: usize) -> String {
         let mut source = String::from(
             "package proof\ntype Worker struct{}\nfunc (w *Worker) Run() {}\nfunc caller() {\n",
@@ -22321,6 +22643,7 @@ mod go_complexity_tests {
                     }],
                     inherent_methods: Vec::new(),
                     classes: Vec::new(),
+                    public_exports: None,
                     direct_exports: Vec::new(),
                     export_poison_all: false,
                     poisoned_export_names: Vec::new(),
@@ -22472,6 +22795,7 @@ mod python_complexity_tests {
                     instance_method_names: Vec::new(),
                     java_scope: None,
                 }],
+                public_exports: None,
                 direct_exports: Vec::new(),
                 export_poison_all: false,
                 poisoned_export_names: Vec::new(),

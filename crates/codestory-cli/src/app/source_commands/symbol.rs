@@ -25,7 +25,7 @@ pub(in crate::app) fn run_symbol(cmd: SymbolCommand) -> Result<()> {
 
     let file_filter = cmd.target.file_filter();
     let operation = if cmd.target.query.is_some() {
-        "graph_assisted"
+        "resolution"
     } else {
         "graph"
     };
@@ -92,7 +92,7 @@ pub(in crate::app) fn run_symbol_workflow(
 
     let file_filter = cmd.target.file_filter();
     let operation_name = if cmd.target.query.is_some() {
-        "graph_assisted"
+        "resolution"
     } else {
         "graph"
     };

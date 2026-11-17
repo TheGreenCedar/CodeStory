@@ -70,10 +70,18 @@ pub(super) fn mark_extraction_revision_mismatches(
     store: &Store,
     stored_files: &mut [codestory_contracts::workspace::StoredFileState],
 ) -> Result<(), ApiError> {
-    for language in ["python", "rust"] {
-        if let Some(revision) = codestory_indexer::current_file_extraction_revision(language) {
+    let languages = store
+        .get_files()
+        .map_err(|error| {
+            ApiError::internal(format!("Failed to read extraction languages: {error}"))
+        })?
+        .into_iter()
+        .map(|file| file.language)
+        .collect::<std::collections::BTreeSet<_>>();
+    for language in languages {
+        if let Some(revision) = codestory_indexer::current_file_extraction_revision(&language) {
             let outdated = store
-                .files_with_extraction_revision_mismatch(language, revision)
+                .files_with_extraction_revision_mismatch(&language, revision)
                 .map_err(|error| {
                     ApiError::internal(format!("Failed to read extraction identities: {error}"))
                 })?
@@ -125,11 +133,13 @@ fn reuse_completed_search_state(
         SEARCH_SYMBOL_STREAM_BATCH_SIZE,
         cancel_token,
         |batch| {
-            engine.extend_symbol_projection(
-                batch
-                    .into_iter()
-                    .map(|entry| (entry.node_id, entry.display_name)),
-            );
+            engine.extend_symbol_projection_with_eligibility(batch.into_iter().map(|entry| {
+                (
+                    entry.node_id,
+                    entry.display_name,
+                    search::engine::symbol_kind_is_searchable(entry.node_kind),
+                )
+            }));
             Ok(())
         },
     )?;
@@ -199,7 +209,10 @@ pub(super) fn build_persisted_search_state_from_canonical_symbols(
     loop {
         let batch_started = Instant::now();
         let batch = storage
-            .get_canonical_search_symbol_batch_after(after_node_id, SEARCH_SYMBOL_STREAM_BATCH_SIZE)
+            .get_canonical_search_symbol_detail_batch_after(
+                after_node_id,
+                SEARCH_SYMBOL_STREAM_BATCH_SIZE,
+            )
             .map_err(|error| {
                 ApiError::internal(format!(
                     "Failed to stream canonical search symbols: {error}"
@@ -216,12 +229,18 @@ pub(super) fn build_persisted_search_state_from_canonical_symbols(
             .into_iter()
             .map(|entry| {
                 node_names.insert(entry.node_id, entry.display_name.clone());
-                (entry.node_id, entry.display_name)
+                (
+                    entry.node_id,
+                    entry.display_name,
+                    search::engine::symbol_kind_is_searchable(entry.node_kind),
+                )
             })
             .collect::<Vec<_>>();
-        symbol_session.add_nodes(symbols).map_err(|error| {
-            ApiError::internal(format!("Failed to index search nodes: {error}"))
-        })?;
+        symbol_session
+            .add_nodes_with_eligibility(symbols)
+            .map_err(|error| {
+                ApiError::internal(format!("Failed to index search nodes: {error}"))
+            })?;
         #[cfg(test)]
         publication_test_checkpoint(PublicationTestBoundary::SearchSymbolPage, cancel_token)?;
         if is_indexing_cancelled(cancel_token) {
@@ -503,6 +522,46 @@ mod extraction_identity_tests {
                 line_count: 1,
                 file_role: FileRole::Source,
             },
+            FileInfo {
+                id: 4,
+                path: PathBuf::from("entry.ts"),
+                language: "typescript".into(),
+                modification_time: 0,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: FileRole::Source,
+            },
+            FileInfo {
+                id: 5,
+                path: PathBuf::from("entry.tsx"),
+                language: "tsx".into(),
+                modification_time: 0,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: FileRole::Source,
+            },
+            FileInfo {
+                id: 6,
+                path: PathBuf::from("entry.js"),
+                language: "javascript".into(),
+                modification_time: 0,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: FileRole::Source,
+            },
+            FileInfo {
+                id: 7,
+                path: PathBuf::from("page.html"),
+                language: "html".into(),
+                modification_time: 0,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: FileRole::Source,
+            },
         ];
         let hashes = [
             FileContentHash {
@@ -516,6 +575,22 @@ mod extraction_identity_tests {
             FileContentHash {
                 file_id: 3,
                 content_hash: "c".repeat(64),
+            },
+            FileContentHash {
+                file_id: 4,
+                content_hash: "e".repeat(64),
+            },
+            FileContentHash {
+                file_id: 5,
+                content_hash: "f".repeat(64),
+            },
+            FileContentHash {
+                file_id: 6,
+                content_hash: "a".repeat(64),
+            },
+            FileContentHash {
+                file_id: 7,
+                content_hash: "b".repeat(64),
             },
         ];
         let flush = |store: &mut Store, identities: &[FileExtractionIdentity]| {
@@ -547,7 +622,7 @@ mod extraction_identity_tests {
                 .collect::<HashSet<_>>()
         };
         flush(&mut store, &[]);
-        assert_eq!(retry_ids(&store), HashSet::from([1, 2]));
+        assert_eq!(retry_ids(&store), HashSet::from([1, 2, 3, 4, 5, 6]));
         let identities = [
             FileExtractionIdentity {
                 file_id: 1,
@@ -565,7 +640,54 @@ mod extraction_identity_tests {
                     .unwrap()
                     .to_string(),
             },
+            FileExtractionIdentity {
+                file_id: 3,
+                language: "go".into(),
+                source_content_hash: hashes[2].content_hash.clone(),
+                extraction_revision: codestory_indexer::current_file_extraction_revision("go")
+                    .unwrap()
+                    .into(),
+            },
+            FileExtractionIdentity {
+                file_id: 4,
+                language: "typescript".into(),
+                source_content_hash: hashes[3].content_hash.clone(),
+                extraction_revision: codestory_indexer::current_file_extraction_revision(
+                    "typescript",
+                )
+                .unwrap()
+                .into(),
+            },
+            FileExtractionIdentity {
+                file_id: 5,
+                language: "tsx".into(),
+                source_content_hash: hashes[4].content_hash.clone(),
+                extraction_revision: codestory_indexer::current_file_extraction_revision("tsx")
+                    .unwrap()
+                    .into(),
+            },
+            FileExtractionIdentity {
+                file_id: 6,
+                language: "javascript".into(),
+                source_content_hash: hashes[5].content_hash.clone(),
+                extraction_revision: codestory_indexer::current_file_extraction_revision(
+                    "javascript",
+                )
+                .unwrap()
+                .into(),
+            },
         ];
+        flush(&mut store, &identities);
+        assert!(retry_ids(&store).is_empty());
+        let mut previous = identities.clone();
+        for identity in &mut previous {
+            if matches!(identity.file_id, 4 | 5 | 6) {
+                identity.extraction_revision =
+                    "canonical-reference-occurrences-v1;explicit-named-public-exports-v2".into();
+            }
+        }
+        flush(&mut store, &previous);
+        assert_eq!(retry_ids(&store), HashSet::from([4, 5, 6]));
         flush(&mut store, &identities);
         assert!(retry_ids(&store).is_empty());
         store
@@ -585,5 +707,92 @@ mod extraction_identity_tests {
             )
             .unwrap();
         assert_eq!(retry_ids(&store), HashSet::from([2]));
+    }
+
+    #[test]
+    fn real_template_extraction_identity_requeues_unchanged_sources_without_a_refresh_loop() {
+        for (extension, source) in [
+            (
+                "vue",
+                "<template><button /></template>\n<script>\nfunction run() { helper(); }\nfunction helper() {}\n</script>\n",
+            ),
+            (
+                "svelte",
+                "<script>\nfunction run() { helper(); }\nfunction helper() {}\n</script>\n<button />\n",
+            ),
+            (
+                "astro",
+                "---\nfunction run() { helper(); }\nfunction helper() {}\n---\n<button />\n",
+            ),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join(format!("Page.{extension}"));
+            std::fs::write(&path, source).unwrap();
+            let mut store = Store::new_in_memory().unwrap();
+            let indexer = codestory_indexer::WorkspaceIndexer::new(root.path().to_path_buf());
+            let reindex = |store: &mut Store| {
+                indexer
+                    .run_incremental(
+                        store,
+                        &codestory_workspace::RefreshInfo {
+                            mode: codestory_workspace::BuildMode::Incremental,
+                            files_to_index: vec![path.clone()],
+                            files_to_remove: vec![],
+                            existing_file_ids: HashMap::new(),
+                        },
+                        &codestory_contracts::events::EventBus::new(),
+                        None,
+                    )
+                    .unwrap();
+            };
+            reindex(&mut store);
+            let file = store
+                .get_file_by_path(&path)
+                .unwrap()
+                .expect("real template indexed");
+            let revision = codestory_indexer::current_file_extraction_revision(&file.language)
+                .expect("admitted template surface has an extraction revision");
+            assert!(
+                store
+                    .file_extraction_identity_matches(file.id, &file.language, revision)
+                    .unwrap(),
+                "{extension}: actual template publication must stamp current extraction identity"
+            );
+            let retries = |store: &Store| {
+                workspace_refresh_inputs(store)
+                    .unwrap()
+                    .stored_files
+                    .into_iter()
+                    .filter(|file| file.retry_required)
+                    .map(|file| file.id)
+                    .collect::<HashSet<_>>()
+            };
+            assert!(
+                retries(&store).is_empty(),
+                "{extension}: current source must start clean"
+            );
+            for mutation in [
+                "DELETE FROM file_extraction_identity",
+                "UPDATE file_extraction_identity SET extraction_revision = 'legacy-template-extraction'",
+            ] {
+                store.get_connection().execute_batch(mutation).unwrap();
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+                assert_eq!(
+                    retries(&store),
+                    HashSet::from([file.id]),
+                    "{extension}: unchanged template with missing/old extraction identity must be selected for refresh"
+                );
+                reindex(&mut store);
+                assert!(
+                    store
+                        .file_extraction_identity_matches(file.id, &file.language, revision)
+                        .unwrap()
+                );
+                assert!(
+                    retries(&store).is_empty(),
+                    "{extension}: successful unchanged reindex must clear extraction retry"
+                );
+            }
+        }
     }
 }

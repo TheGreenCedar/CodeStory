@@ -60,8 +60,33 @@ test("attributed visible test modules must carry their own cfg(test) guard", () 
 
     assert.equal(isOutOfLineTestSource(testSource), true);
 
+    // A different explicit source is not an owner of affected.rs, even when
+    // its test-only cfg expression is outside this checker's narrow syntax.
+    fs.writeFileSync(
+      path.join(sourceRoot, "source_context.rs"),
+      '#[cfg(all(test, unix))]\n#[path = "source_context_tests.rs"]\nmod tests;\n',
+    );
+    fs.writeFileSync(path.join(sourceRoot, "source_context_tests.rs"), "");
+    assert.equal(isOutOfLineTestSource(testSource), true);
+
     fs.writeFileSync(owner, '#[path = "tests/affected.rs"]\npub(crate) mod tests;\n');
     assert.equal(isOutOfLineTestSource(testSource), false);
+
+    fs.writeFileSync(owner, '#[cfg(test)]\n#[path = "tests/affected.rs"]\npub(crate) mod tests;\n');
+    const outside = path.join(root, "outside");
+    fs.mkdirSync(outside);
+    const alias = path.join(outside, "alias.rs");
+    fs.linkSync(testSource, alias);
+    const originalIdentity = fs.statSync(testSource, { bigint: true });
+    const aliasIdentity = fs.statSync(alias, { bigint: true });
+    assert.equal(aliasIdentity.dev, originalIdentity.dev);
+    assert.equal(aliasIdentity.ino, originalIdentity.ino);
+    fs.writeFileSync(
+      path.join(sourceRoot, "unguarded_alias.rs"),
+      '#[path = "../../outside/alias.rs"]\nmod tests;\n',
+    );
+    assert.equal(isOutOfLineTestSource(testSource), false);
+
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

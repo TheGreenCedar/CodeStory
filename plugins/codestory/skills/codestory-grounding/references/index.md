@@ -51,6 +51,16 @@ Vulkan acceleration.
 Agent packet/search readiness requires `retrieval_mode=full`; see
 [status-contract.md](status-contract.md) and [retrieval-rollout.md](retrieval-rollout.md).
 
+## Fast Core-Only Mode (`--core-only`)
+
+Pass `--core-only` with `index` (across `auto`, `full`, or `incremental`
+refreshes) when preparing a workspace solely for fast live lookups (`slice`,
+`find`, `refs`, `read`) and symbol/graph navigation without semantic document
+materialization or dense-anchor projection. Background warm-up from `cs` and the
+`lean` MCP surface runs `index --refresh auto --core-only` automatically.
+Running a normal `index` without `--core-only` later automatically detects the
+missing semantic docs and repairs the full projection.
+
 ## Output
 
 Markdown returns a compact index summary. JSON exposes the same data for tools:

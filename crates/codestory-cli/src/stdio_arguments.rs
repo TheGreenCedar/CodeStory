@@ -1329,7 +1329,7 @@ mod tests {
             ),
             (
                 "affected",
-                json!({"project": "/repo", "paths": ["src/lib.rs"], "depth": 2}),
+                json!({"project": "/repo", "paths": ["src/lib.rs"], "depth": 2, "symbol_layout": "shared-fields-v1"}),
             ),
             ("symbol", json!({"project": "/repo", "query": "run"})),
             (

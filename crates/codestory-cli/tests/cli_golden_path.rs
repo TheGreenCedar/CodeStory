@@ -75,6 +75,1196 @@ pub fn schedule_index(project_path: &str) -> usize {
     .expect("write runtime.rs");
 }
 
+#[test]
+fn callers_text_shows_only_direct_call_sites() {
+    let workspace = tempdir().expect("workspace");
+    let cache = tempdir().expect("cache");
+    write_tiny_rust_workspace(workspace.path());
+    run_cli_json(
+        workspace.path(),
+        cache.path(),
+        &["index", "--refresh", "full", "--format", "json"],
+    );
+
+    let output = run_cli(
+        workspace.path(),
+        cache.path(),
+        &["callers", "--query", "normalize_project"],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).expect("text response");
+    assert_eq!(
+        text.trim_end(),
+        "open_project
+src/lib.rs:24: runtime::normalize_project(project_name)"
+    );
+}
+
+#[test]
+fn lookup_setup_round_trips_existing_host_notes() {
+    let home = tempdir().expect("scratch home");
+    let original = b"# Existing notes\r\n\r\nKeep this text without a trailing newline";
+    for (host, home_var, filename) in [
+        ("codex", "CODEX_HOME", "AGENTS.md"),
+        ("claude-code", "CLAUDE_CONFIG_DIR", "CLAUDE.md"),
+        ("cursor", "CURSOR_CONFIG_DIR", "rules/codestory-lookups.mdc"),
+        ("opencode", "OPENCODE_CONFIG_DIR", "AGENTS.md"),
+        ("antigravity", "ANTIGRAVITY_HOME", "GEMINI.md"),
+    ] {
+        let host_home = home.path().join(host);
+        fs::create_dir_all(&host_home).expect("host directory");
+        let instructions = host_home.join(filename);
+        if let Some(parent) = instructions.parent() {
+            fs::create_dir_all(parent).expect("instructions parent dir");
+        }
+        fs::write(&instructions, original).expect("prior instructions");
+        let run = |extra: &[&str]| {
+            test_support::cli_command()
+                .env("HOME", home.path())
+                .env("USERPROFILE", home.path())
+                .env(home_var, &host_home)
+                .args(["setup", host])
+                .args(extra)
+                .output()
+                .expect("run setup")
+        };
+        let first = run(&[]);
+        assert!(
+            first.status.success(),
+            "{}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        let installed = fs::read(&instructions).expect("installed instructions");
+        assert!(installed.starts_with(original));
+        assert!(installed.windows(12).any(|bytes| bytes == b"cs refs NAME"));
+        assert!(run(&[]).status.success());
+        assert_eq!(fs::read(&instructions).expect("repeat install"), installed);
+        assert!(run(&["--remove"]).status.success());
+        assert_eq!(
+            fs::read(&instructions).expect("restored instructions"),
+            original
+        );
+
+        fs::write(&instructions, b"<!-- codestory-lookups:start -->\n").expect("incomplete block");
+        assert!(
+            !run(&[]).status.success(),
+            "an incomplete block was overwritten"
+        );
+        assert_eq!(
+            fs::read(&instructions).expect("untouched incomplete block"),
+            b"<!-- codestory-lookups:start -->\n"
+        );
+    }
+}
+
+#[test]
+fn lookup_setup_repo_note_is_owned_until_removed() {
+    let home = tempdir().expect("scratch home");
+    let repo = tempdir().expect("scratch checkout");
+    run_git(repo.path(), &["init", "-q"]);
+    let nested = repo.path().join("nested");
+    fs::create_dir(&nested).expect("nested directory");
+    let run = |extra: &[&str]| {
+        test_support::cli_command()
+            .env("HOME", home.path())
+            .env("USERPROFILE", home.path())
+            .env("CODEX_HOME", home.path().join(".codex"))
+            .current_dir(&nested)
+            .args(["setup", "codex", "--repo"])
+            .args(extra)
+            .output()
+            .expect("run repo setup")
+    };
+    let root_note = repo.path().join("AGENTS.md");
+    let first = run(&[]);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(root_note.is_file());
+    assert!(!nested.join("AGENTS.md").exists());
+    assert!(!home.path().join(".codex/AGENTS.md").exists());
+    assert!(run(&["--remove"]).status.success());
+    assert!(!root_note.exists());
+}
+
+/// Run a lookup that must succeed and return its reply.
+fn run_lookup(workspace: &Path, cache_dir: &Path, args: &[&str]) -> String {
+    let output = run_cli(workspace, cache_dir, args);
+    assert!(
+        output.status.success(),
+        "lookup failed: {:?}\nstdout:\n{}\nstderr:\n{}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("text reply")
+}
+
+fn index_lookup_fixture(workspace: &Path, cache_dir: &Path) {
+    run_cli_json(
+        workspace,
+        cache_dir,
+        &["index", "--refresh", "full", "--format", "json"],
+    );
+}
+
+/// Two methods share the name `apply`; one call is split over lines, one
+/// lives in a test file, and `apply_all` / `reapply` only contain the name.
+fn write_shared_name_workspace(root: &Path) {
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"[package]
+name = "shared-name-fixture"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "src/lib.rs"
+"#,
+    )
+    .expect("write Cargo.toml");
+    let src = root.join("src");
+    fs::create_dir_all(&src).expect("create src dir");
+    fs::write(
+        src.join("lib.rs"),
+        r#"pub mod audit;
+pub mod ledger;
+
+use ledger::Ledger;
+
+pub fn settle(amount: u32) -> u32 {
+    let ledger = Ledger::default();
+    ledger
+        .apply(amount)
+}
+
+pub fn apply_all(amounts: &[u32]) -> u32 {
+    amounts.iter().map(|amount| settle(*amount)).sum()
+}
+"#,
+    )
+    .expect("write lib.rs");
+    fs::write(
+        src.join("ledger.rs"),
+        r#"#[derive(Default)]
+pub struct Ledger {
+    pub total: u32,
+}
+
+impl Ledger {
+    pub fn apply(&self, amount: u32) -> u32 {
+        self.total + amount
+    }
+}
+"#,
+    )
+    .expect("write ledger.rs");
+    fs::write(
+        src.join("audit.rs"),
+        r#"pub struct Audit;
+
+impl Audit {
+    pub fn apply(&self, note: &str) -> usize {
+        note.len()
+    }
+
+    pub fn reapply(&self, note: &str) -> usize {
+        self.apply(note) * 2
+    }
+}
+"#,
+    )
+    .expect("write audit.rs");
+    let tests = root.join("tests");
+    fs::create_dir_all(&tests).expect("create tests dir");
+    fs::write(
+        tests.join("ledger_test.rs"),
+        r#"use shared_name_fixture::ledger::Ledger;
+
+#[test]
+fn applies_in_tests() {
+    assert_eq!(Ledger::default().apply(2), 2);
+}
+"#,
+    )
+    .expect("write ledger_test.rs");
+}
+
+#[test]
+fn find_and_refs_answer_from_live_text_without_an_index() {
+    let workspace = tempdir().expect("workspace");
+    let cache = tempdir().expect("cache");
+    write_tiny_rust_workspace(workspace.path());
+    let lookup = |args: &[&str]| run_lookup(workspace.path(), cache.path(), args);
+
+    assert_eq!(
+        lookup(&["find", "schedule_index", "normalize_project", "--no-bodies"]),
+        "no index; text matches only
+4 matches in 2 files
+src/lib.rs
+  24 runtime::normalize_project(project_name)
+  28 runtime::schedule_index(project_path)
+src/runtime.rs
+  1 pub fn normalize_project(project_name: &str) -> String {
+  5 pub fn schedule_index(project_path: &str) -> usize {
+"
+    );
+    assert_eq!(
+        lookup(&["find", "--file-glob", "lib.rs"]),
+        "1 files\nsrc/lib.rs\n"
+    );
+    // A glob narrows the search; past the limit every remaining hit is counted.
+    assert_eq!(
+        lookup(&[
+            "find",
+            "project",
+            "--file-glob",
+            "runtime.rs",
+            "--limit",
+            "2",
+            "--no-bodies",
+        ]),
+        "no index; text matches only
+4 matches in 1 files
+src/runtime.rs
+  1 pub fn normalize_project(project_name: &str) -> String {
+  2 format!(\"workspace:{project_name}\")
+src/runtime.rs: 2 more
+"
+    );
+
+    assert_eq!(
+        lookup(&["refs", "open_project", "--no-bodies"]),
+        "no index; text matches only
+5 references in 2 files
+src/lib.rs
+  14 pub fn open_project(&self) -> String {
+  15 open_project(&self.project_name)
+  19 run_indexing(&self.open_project())
+  23 pub fn open_project(project_name: &str) -> String {
+src/runtime.rs
+  6 super::open_project(project_path).len()
+"
+    );
+    // Whole words only: `project` is never more than part of a name here.
+    assert_eq!(
+        lookup(&["refs", "project"]),
+        "no index; text matches only\n0 references in 0 files\n"
+    );
+    // Without an index a body is the few lines around a hit, never a `==`
+    // declaration; hits close together share one window.
+    assert_eq!(
+        lookup(&["refs", "run_indexing"]),
+        "no index; text matches only
+3 references in 1 files
+src/lib.rs
+  15:         open_project(&self.project_name)
+  16:     }
+  17:
+  18>     pub fn run_indexing(&self) -> usize {
+  19>         run_indexing(&self.open_project())
+  20:     }
+  21: }
+  22:
+  ...
+  24:     runtime::normalize_project(project_name)
+  25: }
+  26:
+  27> pub fn run_indexing(project_path: &str) -> usize {
+  28:     runtime::schedule_index(project_path)
+  29: }
+"
+    );
+
+    assert_eq!(
+        lookup(&["read", "src/runtime.rs::schedule_index", "src/lib.rs:1-3"]),
+        "== src/runtime.rs:5-7 schedule_index (not from index; approximate)
+5: pub fn schedule_index(project_path: &str) -> usize {
+6:     super::open_project(project_path).len()
+7: }
+== src/lib.rs:1-3
+1: pub mod runtime;
+2:
+3: pub struct AppController {
+"
+    );
+
+    assert_eq!(
+        fs::read_dir(cache.path()).expect("list cache dir").count(),
+        0,
+        "a lookup must not create cache state"
+    );
+}
+
+#[test]
+fn refs_lists_every_whole_word_hit_with_enclosing_symbols() {
+    let workspace = tempdir().expect("workspace");
+    let cache = tempdir().expect("cache");
+    write_shared_name_workspace(workspace.path());
+    index_lookup_fixture(workspace.path(), cache.path());
+    let lookup = |args: &[&str]| run_lookup(workspace.path(), cache.path(), args);
+
+    // Both definitions are listed instead of an ambiguity error. The call
+    // split over lines is found on the line that names it, the call in the
+    // test file is listed, and `apply_all` / `reapply` are not mentions.
+    assert_eq!(
+        lookup(&["refs", "apply", "--no-bodies"]),
+        "apply: 2 definition(s)
+  src/audit.rs:4 method Audit::apply
+  src/ledger.rs:7 method Ledger::apply
+3 references in 3 files
+src/audit.rs
+  4 [Audit::apply] pub fn apply(&self, note: &str) -> usize {
+  9 [Audit::reapply] self.apply(note) * 2 -> src/audit.rs:4
+src/ledger.rs
+  7 [Ledger::apply] pub fn apply(&self, amount: u32) -> u32 {
+src/lib.rs
+  9 [settle] .apply(amount) -> src/ledger.rs:7
+tests/ledger_test.rs
+  5 [applies_in_tests] assert_eq!(Ledger::default().apply(2), 2);
+"
+    );
+
+    // A qualifier keeps the unresolved hits and drops only what the index
+    // resolved to the other definition, and says how many it dropped.
+    assert_eq!(
+        lookup(&["refs", "Ledger::apply", "--no-bodies"]),
+        "Ledger::apply: 1 definition(s)
+  src/ledger.rs:7 method Ledger::apply
+2 references in 2 files
+src/ledger.rs
+  7 [Ledger::apply] pub fn apply(&self, amount: u32) -> u32 {
+src/lib.rs
+  9 [settle] .apply(amount)
+tests/ledger_test.rs
+  5 [applies_in_tests] assert_eq!(Ledger::default().apply(2), 2);
+2 hit(s) omitted: the index resolved them to other definitions of apply
+"
+    );
+    assert!(lookup(&["refs", "Audit.apply", "--no-bodies"]).starts_with(
+        "Audit.apply: 1 definition(s)
+  src/audit.rs:4 method Audit::apply
+2 references in 2 files
+"
+    ));
+
+    // Past the limit nothing is dropped silently, and the definitions are
+    // still found in files the listing no longer reaches.
+    assert_eq!(
+        lookup(&["refs", "apply", "--limit", "2", "--no-bodies"]),
+        "apply: 2 definition(s)
+  src/audit.rs:4 method Audit::apply
+  src/ledger.rs:7 method Ledger::apply
+3 references in 3 files
+src/audit.rs
+  4 [Audit::apply] pub fn apply(&self, note: &str) -> usize {
+  9 [Audit::reapply] self.apply(note) * 2 -> src/audit.rs:4
+src/ledger.rs: 1 more
+src/lib.rs: 1 more
+tests/ledger_test.rs: 1 more
+"
+    );
+
+    // By default each definition leads with its declaration, and every other
+    // mention is marked inside the declaration that holds it.
+    assert_eq!(
+        lookup(&["refs", "apply"]),
+        "apply: 2 definition(s)
+  src/audit.rs:4 method Audit::apply
+  == Audit::apply 4-6
+  4>     pub fn apply(&self, note: &str) -> usize {
+  5:         note.len()
+  6:     }
+  src/ledger.rs:7 method Ledger::apply
+  == Ledger::apply 7-9
+  7>     pub fn apply(&self, amount: u32) -> u32 {
+  8:         self.total + amount
+  9:     }
+3 references in 3 files
+src/audit.rs
+  == Audit::reapply 8-10
+  8:     pub fn reapply(&self, note: &str) -> usize {
+  9>         self.apply(note) * 2 -> src/audit.rs:4
+  10:     }
+src/lib.rs
+  == settle 6-10
+  6: pub fn settle(amount: u32) -> u32 {
+  7:     let ledger = Ledger::default();
+  8:     ledger
+  9>         .apply(amount) -> src/ledger.rs:7
+  10: }
+tests/ledger_test.rs
+  == applies_in_tests 3-6
+  3: #[test]
+  4: fn applies_in_tests() {
+  5>     assert_eq!(Ledger::default().apply(2), 2);
+  6: }
+"
+    );
+}
+
+#[test]
+fn lookups_verify_only_the_files_they_serve() {
+    let workspace = tempdir().expect("workspace");
+    let cache = tempdir().expect("cache");
+    write_tiny_rust_workspace(workspace.path());
+    index_lookup_fixture(workspace.path(), cache.path());
+    let published = cache_file_snapshots(cache.path());
+    let process_state = cache_file_snapshots(&test_support::test_state_root());
+    let lookup = |args: &[&str]| run_lookup(workspace.path(), cache.path(), args);
+
+    let indexed = "open_project: 2 definition(s)
+  src/lib.rs:14 method AppController::open_project
+  src/lib.rs:23 function open_project
+3 references in 2 files
+src/lib.rs
+  14 [AppController::open_project] pub fn open_project(&self) -> String {
+  15 [AppController::open_project] open_project(&self.project_name) -> src/lib.rs:23
+  19 [AppController::run_indexing] run_indexing(&self.open_project()) -> src/lib.rs:14
+  23 [open_project] pub fn open_project(project_name: &str) -> String {
+src/runtime.rs
+  6 [schedule_index] super::open_project(project_path).len()
+";
+    assert_eq!(lookup(&["refs", "open_project", "--no-bodies"]), indexed);
+
+    // Shift every line of one hit file and add a file the index never saw.
+    let lib = workspace.path().join("src/lib.rs");
+    let original = fs::read_to_string(&lib).expect("read lib.rs");
+    fs::write(&lib, format!("// moved down\n// by two lines\n{original}")).expect("edit lib.rs");
+    fs::write(
+        workspace.path().join("src/extra.rs"),
+        "pub fn reopen() -> String {\n    crate::open_project(\"again\")\n}\n",
+    )
+    .expect("write extra.rs");
+
+    // The changed file is served from its live bytes: new line numbers, no
+    // index facts, and a mark. The untouched file keeps its symbols.
+    let listing = r#"src/extra.rs (not indexed)
+  2 crate::open_project("again")
+src/lib.rs (changed since indexing)
+  16 pub fn open_project(&self) -> String {
+  17 open_project(&self.project_name)
+  21 run_indexing(&self.open_project())
+  25 pub fn open_project(project_name: &str) -> String {
+src/runtime.rs
+  6 [schedule_index] super::open_project(project_path).len()
+"#;
+    assert_eq!(
+        lookup(&["refs", "open_project", "--no-bodies"]),
+        format!("open_project: 0 definition(s)\n6 references in 3 files\n{listing}")
+    );
+    assert_eq!(
+        lookup(&["find", "open_project", "--no-bodies"]),
+        format!("6 matches in 3 files\n{listing}")
+    );
+    // Bodies are live text too, and read nothing the listing did not.
+    assert!(lookup(&["refs", "open_project"]).contains(
+        "src/extra.rs (not indexed)
+  1: pub fn reopen() -> String {
+  2>     crate::open_project(\"again\")
+  3: }
+src/lib.rs (changed since indexing)
+  13:         }
+"
+    ));
+
+    // Verification is by content, not by timestamp: the same bytes written
+    // again are the bytes the index describes.
+    fs::write(&lib, original).expect("restore lib.rs");
+    fs::remove_file(workspace.path().join("src/extra.rs")).expect("remove extra.rs");
+    assert_eq!(lookup(&["refs", "open_project", "--no-bodies"]), indexed);
+
+    assert_eq!(
+        cache_file_snapshots(cache.path()),
+        published,
+        "lookups must not refresh, activate, or write the project cache"
+    );
+    assert_eq!(
+        cache_file_snapshots(&test_support::test_state_root()),
+        process_state,
+        "lookups must not write process cache state"
+    );
+}
+
+#[test]
+fn read_returns_complete_declarations_for_many_selectors() {
+    let workspace = tempdir().expect("workspace");
+    let cache = tempdir().expect("cache");
+    write_tiny_rust_workspace(workspace.path());
+    let notes = (1..=305)
+        .map(|line| format!("note {line}\n"))
+        .collect::<String>();
+    fs::write(workspace.path().join("notes.txt"), notes).expect("write notes.txt");
+    index_lookup_fixture(workspace.path(), cache.path());
+    let lookup = |args: &[&str]| run_lookup(workspace.path(), cache.path(), args);
+
+    // One call, every selector form; a bad selector gets its own line.
+    assert_eq!(
+        lookup(&[
+            "read",
+            "src/lib.rs::AppController::open_project",
+            "src/lib.rs::AppController.run_indexing",
+            "src/runtime.rs:6",
+            "src/lib.rs:23-25",
+            "src/missing.rs::anything",
+            "src/lib.rs::absent",
+            "nonsense",
+            "src/lib.rs::",
+        ]),
+        "== src/lib.rs:14-16 AppController::open_project
+14:     pub fn open_project(&self) -> String {
+15:         open_project(&self.project_name)
+16:     }
+uses:
+  src/lib.rs:23-25 function open_project
+== src/lib.rs:18-20 AppController::run_indexing
+18:     pub fn run_indexing(&self) -> usize {
+19:         run_indexing(&self.open_project())
+20:     }
+uses:
+  src/lib.rs:27-29 function run_indexing
+== src/runtime.rs:5-7 schedule_index
+5: pub fn schedule_index(project_path: &str) -> usize {
+6:     super::open_project(project_path).len()
+7: }
+== src/lib.rs:23-25
+23: pub fn open_project(project_name: &str) -> String {
+24:     runtime::normalize_project(project_name)
+25: }
+== src/missing.rs::anything: no file src/missing.rs
+== src/lib.rs::absent: no symbol absent in src/lib.rs; definitions there: AppController, \
+AppController::new, AppController::open_project, AppController::run_indexing, open_project, \
+run_indexing
+== nonsense: no file nonsense
+== src/lib.rs::: expected path, path::Symbol, path:LINE or path:A-B
+"
+    );
+
+    // A long range is cut at 300 lines and names the range that continues.
+    let long = lookup(&["read", "notes.txt:1-305"]);
+    assert!(
+        long.starts_with("== notes.txt:1-305\n1: note 1\n"),
+        "{long}"
+    );
+    assert!(
+        long.ends_with("300: note 300\n... 5 more lines; read notes.txt:301-305\n"),
+        "{long}"
+    );
+
+    // After an edit the index no longer describes the file, so the range is
+    // approximated from the live text and says so.
+    let runtime = workspace.path().join("src/runtime.rs");
+    let original = fs::read_to_string(&runtime).expect("read runtime.rs");
+    fs::write(&runtime, format!("// shifted\n{original}")).expect("edit runtime.rs");
+    assert_eq!(
+        lookup(&["read", "src/runtime.rs::schedule_index", "src/runtime.rs:3"]),
+        "== src/runtime.rs:6-8 schedule_index (not from index; approximate)
+6: pub fn schedule_index(project_path: &str) -> usize {
+7:     super::open_project(project_path).len()
+8: }
+== src/runtime.rs:1-8 (not from index; approximate)
+1: // shifted
+2: pub fn normalize_project(project_name: &str) -> String {
+3:     format!(\"workspace:{project_name}\")
+4: }
+5:
+6: pub fn schedule_index(project_path: &str) -> usize {
+7:     super::open_project(project_path).len()
+8: }
+"
+    );
+}
+
+#[test]
+fn read_includes_anchor_in_long_indexed_declaration() {
+    let workspace = tempdir().expect("workspace");
+    let cache = tempdir().expect("cache");
+    write_tiny_rust_workspace(workspace.path());
+    let source = format!(
+        "\npub fn long_declaration() -> u32 {{\n{}    42\n}}\n",
+        "    // body\n".repeat(640)
+    );
+    fs::write(workspace.path().join("src/lib.rs"), source).expect("write long declaration");
+    index_lookup_fixture(workspace.path(), cache.path());
+    let lookup = |selector| run_lookup(workspace.path(), cache.path(), &["read", selector]);
+
+    let symbol = lookup("src/lib.rs::long_declaration");
+    assert!(symbol.starts_with("== src/lib.rs:2-644 long_declaration\n2: pub fn long_declaration"));
+    assert!(symbol.ends_with("301:     // body\n... 343 more lines; read src/lib.rs:302-644\n"));
+    assert_eq!(lookup("src/lib.rs:301"), symbol);
+
+    let boundary = lookup("src/lib.rs:302");
+    assert!(boundary.lines().any(|row| row == "302:     // body"));
+    assert!(boundary.ends_with("589:     // body\n... 55 more lines; read src/lib.rs:590-644\n"));
+
+    let late = lookup("src/lib.rs:643");
+    let header = late.lines().next().expect("declaration header");
+    assert!(header.ends_with(" long_declaration"), "{header}");
+    assert!(
+        late.lines().any(|row| row == "643:     42"),
+        "line selector omitted line 643 from {header}"
+    );
+}
+
+/// `tally` is defined once, called twice from `twice`, imported outside any
+/// declaration, and called three times from `render`, which is 170 lines long.
+fn write_body_workspace(root: &Path) {
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"[package]
+name = "body-fixture"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "src/lib.rs"
+"#,
+    )
+    .expect("write Cargo.toml");
+    let src = root.join("src");
+    fs::create_dir_all(&src).expect("create src dir");
+    fs::write(
+        src.join("lib.rs"),
+        r#"pub mod report;
+
+pub fn tally(values: &[u32]) -> u32 {
+    values.iter().sum()
+}
+
+pub fn twice(values: &[u32]) -> u32 {
+    let first = tally(values);
+    let second = tally(values);
+    first + second
+}
+"#,
+    )
+    .expect("write lib.rs");
+    let mut report = String::from(
+        "use crate::tally;\n\npub fn render(values: &[u32]) -> String {\n    let mut out = String::new();\n    let mut total = tally(values);\n",
+    );
+    for line in 6..=170 {
+        report.push_str(&match line {
+            9 | 170 => "    total += tally(values);\n".to_owned(),
+            _ => format!("    out.push_str(\"row {line}\");\n"),
+        });
+    }
+    report.push_str("    format!(\"{out}{total}\")\n}\n");
+    fs::write(src.join("report.rs"), report).expect("write report.rs");
+}
+
+#[test]
+fn refs_and_find_carry_enclosing_declarations_within_budget() {
+    let workspace = tempdir().expect("workspace");
+    let cache = tempdir().expect("cache");
+    write_body_workspace(workspace.path());
+    index_lookup_fixture(workspace.path(), cache.path());
+    let lookup = |args: &[&str]| run_lookup(workspace.path(), cache.path(), args);
+    let rows = |lines: std::ops::RangeInclusive<u32>| {
+        lines
+            .map(|line| format!("  {line}:     out.push_str(\"row {line}\");\n"))
+            .collect::<String>()
+    };
+
+    // The definition's declaration comes first and is not repeated below.
+    // `twice` is printed once for its two hits. `render` is too long to print
+    // whole: a window around each hit, the two near hits sharing one. The
+    // import has no enclosing declaration, so it gets plain context.
+    let definition = "tally: 1 definition(s)
+  src/lib.rs:3 function tally
+  == tally 3-5
+  3> pub fn tally(values: &[u32]) -> u32 {
+  4:     values.iter().sum()
+  5: }
+6 references in 2 files
+src/lib.rs
+  == twice 7-11
+  7: pub fn twice(values: &[u32]) -> u32 {
+  8>     let first = tally(values);
+  9>     let second = tally(values);
+  10:     first + second
+  11: }
+";
+    let near_hits = format!(
+        "src/report.rs
+  1> use crate::tally;
+  2:
+  3: pub fn render(values: &[u32]) -> String {{
+  4:     let mut out = String::new();
+  == render 3-172
+  3: pub fn render(values: &[u32]) -> String {{
+  4:     let mut out = String::new();
+  5>     let mut total = tally(values);
+{}  9>     total += tally(values);
+{}",
+        rows(6..=8),
+        rows(10..=21)
+    );
+    assert_eq!(
+        lookup(&["refs", "tally"]),
+        format!(
+            "{definition}{near_hits}  ...
+{}  170>     total += tally(values);
+  171:     format!(\"{{out}}{{total}}\")
+  172: }}
+",
+            rows(158..=169)
+        )
+    );
+
+    // A body that does not fit the budget leaves its hit as a one-line row,
+    // and the reply says how to read what it left out.
+    assert_eq!(
+        lookup(&["refs", "tally", "--body-lines", "34"]),
+        format!(
+            "{definition}{near_hits}  170 [render] total += tally(values);
+more: read <path>::<Symbol> or <path>:A-B
+"
+        )
+    );
+
+    // `find` shows hits the same way; the declaring line is one more hit.
+    assert_eq!(
+        lookup(&["find", "tally", "--file-glob", "lib.rs"]),
+        "3 matches in 1 files
+src/lib.rs
+  == tally 3-5
+  3> pub fn tally(values: &[u32]) -> u32 {
+  4:     values.iter().sum()
+  5: }
+  == twice 7-11
+  7: pub fn twice(values: &[u32]) -> u32 {
+  8>     let first = tally(values);
+  9>     let second = tally(values);
+  10:     first + second
+  11: }
+"
+    );
+
+    // The index no longer describes a changed file, so its hits get three
+    // lines of live context each way and no declaration.
+    let report = workspace.path().join("src/report.rs");
+    let original = fs::read_to_string(&report).expect("read report.rs");
+    fs::write(&report, format!("// moved\n{original}")).expect("edit report.rs");
+    assert_eq!(
+        lookup(&["refs", "tally"]),
+        format!(
+            "{definition}src/report.rs (changed since indexing)
+  1: // moved
+  2> use crate::tally;
+  3:
+  4: pub fn render(values: &[u32]) -> String {{
+  5:     let mut out = String::new();
+  6>     let mut total = tally(values);
+  7:     out.push_str(\"row 6\");
+  8:     out.push_str(\"row 7\");
+  9:     out.push_str(\"row 8\");
+  10>     total += tally(values);
+  11:     out.push_str(\"row 10\");
+  12:     out.push_str(\"row 11\");
+  13:     out.push_str(\"row 12\");
+  ...
+  168:     out.push_str(\"row 167\");
+  169:     out.push_str(\"row 168\");
+  170:     out.push_str(\"row 169\");
+  171>     total += tally(values);
+  172:     format!(\"{{out}}{{total}}\")
+  173: }}
+"
+        )
+    );
+}
+
+#[test]
+fn read_bare_path_prints_small_files_and_outlines_large_ones() {
+    let workspace = tempdir().expect("workspace");
+    let cache = tempdir().expect("cache");
+    write_tiny_rust_workspace(workspace.path());
+    let mut long = String::from(
+        "pub struct Counter {
+    pub total: u32,
+}
+
+impl Counter {
+    pub fn bump(&mut self) -> u32 {
+        self.total += 1;
+        self.total
+    }
+}
+
+async fn outer() -> u32 {
+    fn inner() -> u32 {
+        1
+    }
+    let local = {
+        inner()
+    };
+    local
+}
+
+pub fn long() -> u32 {
+    let mut count = 0;
+",
+    );
+    long.push_str(&"    count += 1;\n".repeat(400));
+    long.push_str("    count\n}\n");
+    let long_path = workspace.path().join("src/long.rs");
+    fs::write(&long_path, &long).expect("write long.rs");
+    let notes = |lines: u32| {
+        (1..=lines)
+            .map(|line| format!("note {line}\n"))
+            .collect::<String>()
+    };
+    fs::write(workspace.path().join("notes.txt"), notes(305)).expect("write notes.txt");
+    fs::write(workspace.path().join("log.txt"), notes(405)).expect("write log.txt");
+    index_lookup_fixture(workspace.path(), cache.path());
+    let lookup = |args: &[&str]| run_lookup(workspace.path(), cache.path(), args);
+
+    // A short file is printed whole. A long one is outlined from the index,
+    // nested declarations indented, in the same call.
+    assert_eq!(
+        lookup(&["read", "src/runtime.rs", "src/long.rs"]),
+        "== src/runtime.rs:1-7
+1: pub fn normalize_project(project_name: &str) -> String {
+2:     format!(\"workspace:{project_name}\")
+3: }
+4:
+5: pub fn schedule_index(project_path: &str) -> usize {
+6:     super::open_project(project_path).len()
+7: }
+== src/long.rs (425 lines; outline)
+1-3 struct Counter
+  2-2 field Counter::total
+6-9 method Counter::bump
+12-20 function outer
+  13-15 function inner
+22-425 function long
+read src/long.rs::<Symbol> or src/long.rs:A-B for bodies
+"
+    );
+
+    // Once the file changes the outline is the lines that start a declaration
+    // and open a block, and says so. Neither outline lists a local binding.
+    fs::write(&long_path, format!("// shifted\n{long}")).expect("edit long.rs");
+    assert_eq!(
+        lookup(&["read", "src/long.rs"]),
+        "== src/long.rs (426 lines; outline) (not from index; approximate)
+2-4 pub struct Counter {
+6-11 impl Counter {
+  7-10 pub fn bump(&mut self) -> u32 {
+13-21 async fn outer() -> u32 {
+  14-16 fn inner() -> u32 {
+23-426 pub fn long() -> u32 {
+read src/long.rs::<Symbol> or src/long.rs:A-B for bodies
+"
+    );
+
+    // A file of up to 400 lines is printed whole, past the 300 lines a range
+    // is cut at.
+    let whole = lookup(&["read", "notes.txt"]);
+    assert!(
+        whole.starts_with("== notes.txt:1-305\n1: note 1\n"),
+        "{whole}"
+    );
+    assert!(whole.ends_with("304: note 304\n305: note 305\n"), "{whole}");
+
+    // A long file with nothing to outline is read from the top.
+    let plain = lookup(&["read", "log.txt"]);
+    assert!(
+        plain.starts_with("== log.txt:1-405\n1: note 1\n"),
+        "{plain}"
+    );
+    assert!(
+        plain.ends_with("300: note 300\n... 105 more lines; read log.txt:301-405\n"),
+        "{plain}"
+    );
+}
+
+/// `build` calls four functions, one on each line: `Plan::scale` in another
+/// file, `short_step`, `long_step`, which is 89 lines long, and `retry`,
+/// which calls `build` back. Four methods are named `run`; each calls `tick`.
+fn write_uses_workspace(root: &Path) {
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"[package]
+name = "uses-fixture"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "src/lib.rs"
+"#,
+    )
+    .expect("write Cargo.toml");
+    let src = root.join("src");
+    fs::create_dir_all(&src).expect("create src dir");
+    let mut lib = String::from(
+        "pub mod jobs;
+pub mod plan;
+
+use plan::Plan;
+
+pub fn build(seed: u32) -> u32 {
+    let plan = Plan::default();
+    let scaled = plan.scale(seed);
+    let first = short_step(scaled);
+    let second = long_step(first);
+    retry(second)
+}
+
+pub fn retry(value: u32) -> u32 {
+    if value > 10 { build(value - 10) } else { value }
+}
+
+pub fn short_step(value: u32) -> u32 {
+    value + 1
+}
+
+pub fn long_step(value: u32) -> u32 {
+    let mut total = value;
+",
+    );
+    lib.push_str(&"    total += 1;\n".repeat(85));
+    lib.push_str("    total\n}\n");
+    fs::write(src.join("lib.rs"), lib).expect("write lib.rs");
+    fs::write(
+        src.join("plan.rs"),
+        "#[derive(Default)]
+pub struct Plan {
+    pub factor: u32,
+}
+
+impl Plan {
+    pub fn scale(&self, seed: u32) -> u32 {
+        seed * self.factor
+    }
+}
+",
+    )
+    .expect("write plan.rs");
+    let mut jobs = String::from("fn tick() -> u32 {\n    1\n}\n");
+    for name in ["A", "B", "C", "D"] {
+        jobs.push_str(&format!(
+            "\npub struct {name};\n\nimpl {name} {{\n    pub fn run(&self) -> u32 {{\n        tick()\n    }}\n}}\n"
+        ));
+    }
+    fs::write(src.join("jobs.rs"), jobs).expect("write jobs.rs");
+}
+
+#[test]
+fn refs_carries_the_declarations_its_definition_uses() {
+    let workspace = tempdir().expect("workspace");
+    let cache = tempdir().expect("cache");
+    write_uses_workspace(workspace.path());
+    index_lookup_fixture(workspace.path(), cache.path());
+    let lookup = |args: &[&str]| run_lookup(workspace.path(), cache.path(), args);
+
+    // After the references come the declarations `build` uses, in order of
+    // first use. A short one is printed whole under its file and a long one
+    // is a row that says where to read it. `retry` is already printed as a
+    // reference, so it is not repeated.
+    let definition = "build: 1 definition(s)
+  src/lib.rs:6 function build
+  == build 6-12
+  6> pub fn build(seed: u32) -> u32 {
+  7:     let plan = Plan::default();
+  8:     let scaled = plan.scale(seed);
+  9:     let first = short_step(scaled);
+  10:     let second = long_step(first);
+  11:     retry(second)
+  12: }
+1 references in 1 files
+src/lib.rs
+";
+    let retry = "  == retry 14-16
+  14: pub fn retry(value: u32) -> u32 {
+  15>     if value > 10 { build(value - 10) } else { value }
+  16: }
+build uses:
+";
+    let scale = "src/plan.rs
+  == Plan::scale 7-9
+  7:     pub fn scale(&self, seed: u32) -> u32 {
+  8:         seed * self.factor
+  9:     }
+";
+    let short_step = "src/lib.rs
+  == short_step 18-20
+  18: pub fn short_step(value: u32) -> u32 {
+  19:     value + 1
+  20: }
+";
+    let long_step = "  src/lib.rs:22-110 function long_step\n";
+    assert_eq!(
+        lookup(&["refs", "build"]),
+        format!("{definition}{retry}{scale}{short_step}{long_step}")
+    );
+
+    // The one-line listing stays as it was.
+    assert_eq!(
+        lookup(&["refs", "build", "--no-bodies"]),
+        "build: 1 definition(s)
+  src/lib.rs:6 function build
+1 references in 1 files
+src/lib.rs
+  6 [build] pub fn build(seed: u32) -> u32 {
+  15 [retry] if value > 10 { build(value - 10) } else { value }
+"
+    );
+
+    // The definition comes first. A used declaration that what is left does
+    // not cover becomes a row, and the reply says once how to read what it
+    // left out.
+    let rows = "  src/lib.rs:18-20 function short_step\n  src/lib.rs:22-110 function long_step\n";
+    let more = "more: read <path>::<Symbol> or <path>:A-B\n";
+    assert_eq!(
+        lookup(&["refs", "build", "--body-lines", "16"]),
+        format!("{definition}{retry}{scale}{rows}{more}")
+    );
+    // The references may spend 60% of what the definition left when the used
+    // declarations want the rest: three of five lines do not cover `retry`,
+    // and the lines it could not spend go to `Plan::scale`.
+    assert_eq!(
+        lookup(&["refs", "build", "--body-lines", "13"]),
+        format!(
+            "{definition}  15 [retry] if value > 10 {{ build(value - 10) }} else {{ value }}
+build uses:
+{scale}{rows}  src/lib.rs:14-16 function retry
+{more}"
+        )
+    );
+
+    // More than three definitions get no bodies, so nothing follows what
+    // they use; a qualifier that leaves one of them does.
+    let ambiguous = lookup(&["refs", "run"]);
+    assert!(
+        ambiguous.starts_with("run: 4 definition(s)\n"),
+        "{ambiguous}"
+    );
+    assert!(!ambiguous.contains("uses:"), "{ambiguous}");
+    let qualified = lookup(&["refs", "A::run"]);
+    assert!(
+        qualified.ends_with(
+            "A::run uses:
+src/jobs.rs
+  == tick 1-3
+  1: fn tick() -> u32 {
+  2:     1
+  3: }
+"
+        ),
+        "{qualified}"
+    );
+
+    // The index no longer describes a changed file, so nothing in it is
+    // named as used.
+    let plan = workspace.path().join("src/plan.rs");
+    let original = fs::read_to_string(&plan).expect("read plan.rs");
+    fs::write(&plan, format!("// moved\n{original}")).expect("edit plan.rs");
+    assert_eq!(
+        lookup(&["refs", "build"]),
+        format!("{definition}{retry}{short_step}{long_step}")
+    );
+}
+
+#[test]
+fn read_lists_the_declarations_a_symbol_uses() {
+    let workspace = tempdir().expect("workspace");
+    let cache = tempdir().expect("cache");
+    write_uses_workspace(workspace.path());
+    index_lookup_fixture(workspace.path(), cache.path());
+    let lookup = |args: &[&str]| run_lookup(workspace.path(), cache.path(), args);
+
+    // A declaration read by symbol or by line is followed by where the
+    // declarations it uses are, in order of first use. `retry` uses only
+    // `build`, which this reply has already printed. A range and a bare path
+    // get no such rows.
+    let build = "== src/lib.rs:6-12 build
+6: pub fn build(seed: u32) -> u32 {
+7:     let plan = Plan::default();
+8:     let scaled = plan.scale(seed);
+9:     let first = short_step(scaled);
+10:     let second = long_step(first);
+11:     retry(second)
+12: }
+";
+    let local_uses = "  src/lib.rs:18-20 function short_step
+  src/lib.rs:22-110 function long_step
+  src/lib.rs:14-16 function retry
+";
+    assert_eq!(
+        lookup(&[
+            "read",
+            "src/lib.rs::build",
+            "src/lib.rs:15",
+            "src/lib.rs:14-16",
+            "src/plan.rs",
+        ]),
+        format!(
+            "{build}uses:
+  src/plan.rs:7-9 method Plan::scale
+{local_uses}== src/lib.rs:14-16 retry
+14: pub fn retry(value: u32) -> u32 {{
+15:     if value > 10 {{ build(value - 10) }} else {{ value }}
+16: }}
+== src/lib.rs:14-16
+14: pub fn retry(value: u32) -> u32 {{
+15:     if value > 10 {{ build(value - 10) }} else {{ value }}
+16: }}
+== src/plan.rs:1-10
+1: #[derive(Default)]
+2: pub struct Plan {{
+3:     pub factor: u32,
+4: }}
+5:
+6: impl Plan {{
+7:     pub fn scale(&self, seed: u32) -> u32 {{
+8:         seed * self.factor
+9:     }}
+10: }}
+"
+        )
+    );
+    assert_eq!(
+        lookup(&["read", "src/lib.rs:15"]),
+        "== src/lib.rs:14-16 retry
+14: pub fn retry(value: u32) -> u32 {
+15:     if value > 10 { build(value - 10) } else { value }
+16: }
+uses:
+  src/lib.rs:6-12 function build
+"
+    );
+
+    // Nothing in a file that changed since indexing is named as used.
+    let plan = workspace.path().join("src/plan.rs");
+    let original = fs::read_to_string(&plan).expect("read plan.rs");
+    fs::write(&plan, format!("// moved\n{original}")).expect("edit plan.rs");
+    assert_eq!(
+        lookup(&["read", "src/lib.rs::build"]),
+        format!("{build}uses:\n{local_uses}")
+    );
+
+    // A declaration approximated from a changed file has no index facts to
+    // follow.
+    let lib = workspace.path().join("src/lib.rs");
+    let original = fs::read_to_string(&lib).expect("read lib.rs");
+    fs::write(&lib, format!("// moved\n{original}")).expect("edit lib.rs");
+    assert_eq!(
+        lookup(&["read", "src/lib.rs::retry"]),
+        "== src/lib.rs:15-17 retry (not from index; approximate)
+15: pub fn retry(value: u32) -> u32 {
+16:     if value > 10 { build(value - 10) } else { value }
+17: }
+"
+    );
+}
+
 fn write_docker_compose_fixture(root: &Path) {
     let docker = root.join("docker");
     fs::create_dir_all(&docker).expect("create docker dir");
@@ -1875,7 +3065,7 @@ fn assert_exact_search_uses_core_without_full_sidecars(
 
 #[cfg(unix)]
 #[test]
-fn exact_search_reads_the_immutable_core_when_the_search_catalog_is_unwritable() {
+fn core_navigation_reads_the_immutable_core_when_the_search_catalog_is_unwritable() {
     let workspace = tempdir().expect("workspace dir");
     let cache_dir = tempdir().expect("cache dir");
     write_tiny_rust_workspace(workspace.path());
@@ -1912,6 +3102,25 @@ fn exact_search_reads_the_immutable_core_when_the_search_catalog_is_unwritable()
         ],
     );
 
+    let named_outputs = ["symbol", "callers"].map(|command| {
+        (
+            command,
+            run_cli(
+                workspace.path(),
+                cache_dir.path(),
+                &[
+                    command,
+                    "--query",
+                    "AppController",
+                    "--refresh",
+                    "none",
+                    "--format",
+                    "json",
+                ],
+            ),
+        )
+    });
+
     fs::set_permissions(&catalog_lock, fs::Permissions::from_mode(0o600))
         .expect("restore search catalog lock permissions");
     assert!(
@@ -1931,10 +3140,30 @@ fn exact_search_reads_the_immutable_core_when_the_search_catalog_is_unwritable()
             })),
         "core-only exact search should return source evidence: {search:#}"
     );
+    for (command, named) in named_outputs {
+        assert!(
+            named.status.success(),
+            "{command} by indexed name must not initialize retrieval or attach search: stdout={} stderr={}",
+            String::from_utf8_lossy(&named.stdout),
+            String::from_utf8_lossy(&named.stderr)
+        );
+        let named: Value =
+            serde_json::from_slice(&named.stdout).expect("parse name-selected navigation");
+        if command == "symbol" {
+            assert_eq!(named["symbol"]["node"]["display_name"], "AppController");
+        } else {
+            assert!(
+                named["trail"]["trail"]["nodes"]
+                    .as_array()
+                    .is_some_and(|nodes| nodes.iter().any(|node| node["label"] == "AppController")),
+                "{named:#}"
+            );
+        }
+    }
     assert_eq!(
         cache_file_snapshots(cache_dir.path()),
         before,
-        "core-only exact search must not mutate cache bytes or mtimes"
+        "Core navigation must not mutate cache bytes or mtimes"
     );
 }
 
@@ -3291,5 +4520,50 @@ fn context_json_reports_deep_trace_by_default() {
         "context --id should fail closed without full sidecars"
     );
     assert_retrieval_failure_output(context);
+}
+
+#[test]
+fn edit_replaces_symbol_and_validates_syntax_via_cli() {
+    let workspace = tempdir().expect("workspace");
+    let cache = tempdir().expect("cache");
+    write_tiny_rust_workspace(workspace.path());
+    index_lookup_fixture(workspace.path(), cache.path());
+
+    let receipt = run_lookup(
+        workspace.path(),
+        cache.path(),
+        &[
+            "edit",
+            "src/lib.rs::AppController::new",
+            "--replacement",
+            "    pub fn new(project_name: impl Into<String>) -> Self {\n        let name = project_name.into();\n        Self { project_name: name }\n    }\n",
+        ],
+    );
+    assert_eq!(
+        receipt,
+        "updated src/lib.rs::AppController::new (lines 8..11); syntax ok\n"
+    );
+    let updated = fs::read_to_string(workspace.path().join("src/lib.rs")).expect("read src/lib.rs");
+    assert!(updated.contains("let name = project_name.into();"));
+
+    let bad = run_cli(
+        workspace.path(),
+        cache.path(),
+        &[
+            "edit",
+            "src/lib.rs::AppController::new",
+            "--replacement",
+            "    pub fn new(project_name: impl Into<String>) -> Self {\n        let broken =\n",
+        ],
+    );
+    assert!(
+        !bad.status.success(),
+        "invalid syntax edit must fail closed"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("src/lib.rs")).expect("read src/lib.rs"),
+        updated,
+        "failed edit must leave file unmodified"
+    );
 }
 mod test_support;
