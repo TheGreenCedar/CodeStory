@@ -506,16 +506,27 @@ test("exact-candidate cost rates fail before package or repository work", () => 
     () => benchmarkHarness.exactCandidateCostRates({}),
     /requires positive CODESTORY_BENCH_INPUT_COST_PER_MTOK.*before package authentication or repository materialization/i,
   );
+  const basicRates = {
+    CODESTORY_BENCH_INPUT_COST_PER_MTOK: "4",
+    CODESTORY_BENCH_OUTPUT_COST_PER_MTOK: "20",
+  };
+  assert.throws(
+    () => benchmarkHarness.exactCandidateCostRates(basicRates),
+    /requires explicit CODESTORY_BENCH_CACHED_INPUT_COST_PER_MTOK.*before package authentication/i,
+  );
   assert.deepEqual(
     benchmarkHarness.exactCandidateCostRates({
-      CODESTORY_BENCH_INPUT_COST_PER_MTOK: "4",
-      CODESTORY_BENCH_OUTPUT_COST_PER_MTOK: "20",
+      ...basicRates,
+      CODESTORY_BENCH_CACHED_INPUT_COST_PER_MTOK: "0",
+      CODESTORY_BENCH_CACHE_WRITE_INPUT_COST_PER_MTOK: "0",
     }),
     {
       currency: "USD",
       model: "gpt-5.6-sol",
       input_per_mtok: 4,
       output_per_mtok: 20,
+      cached_input_per_mtok: 0,
+      cache_write_input_per_mtok: 0,
       source: "configured_environment",
     },
   );
@@ -1173,6 +1184,14 @@ test("exact-candidate acceptance closes the complete causal threshold matrix", (
   assert.equal(accepted.pass, true, JSON.stringify(accepted));
   assert.equal(accepted.expected_runs, 162);
   assert.equal(accepted.completed_runs, 162);
+  const incompleteAccounting = exactCandidateRows();
+  const incompleteRow = incompleteAccounting.find((row) => row.arm === "candidate_0_18");
+  incompleteRow.usage.total_tokens = null;
+  incompleteRow.estimated_cost_usd = null;
+  const incomplete = benchmarkHarness.exactCandidateAcceptance(incompleteAccounting, exactLifecycle());
+  assert.equal(incomplete.pass, false);
+  assert.equal(incomplete.resource_totals.tokens.candidate_0_18, null);
+  assert.equal(incomplete.resource_totals.cost.candidate_0_18, null);
 
   const failedCommandTelemetry = exactCandidateRows();
   failedCommandTelemetry[0].transcript_analysis.interaction_turns.failed_tool_actions = 1;
@@ -4515,6 +4534,7 @@ test("shard aggregation binds canary, contract, accounting, and host-class laten
       shardCount: 2,
       runner: "codex",
       model: "gpt-5.6-sol",
+      costRates: { model: "gpt-5.6-sol", input_per_mtok: 2, output_per_mtok: 10, cached_input_per_mtok: 0.1 },
       sandbox: "read-only",
       taskSuite: null,
       maxSourceReadsAfterPacket: 0,
@@ -4541,6 +4561,9 @@ test("shard aggregation binds canary, contract, accounting, and host-class laten
       canary: run.task.id === canaryTask.id,
       status: "pass",
       wall_ms: 10,
+      stdout_path: path.join(root, `${run.task.id}.stdout.jsonl`),
+      usage: { input_tokens: 100, output_tokens: 10, cached_input_tokens: 20, cache_write_input_tokens: 0 },
+      estimated_cost_usd: 0.03,
       benchmark_contract: benchmarkContractForRun(opts, run),
       codestory_harness_prelude: {
         packet_sufficiency: { obligation_accounting: emptyAccounting },
@@ -4563,6 +4586,8 @@ test("shard aggregation binds canary, contract, accounting, and host-class laten
           CLEAN_SHARD_ATTESTATION,
         );
         const summary = summaryMutator({
+          model: opts.model,
+          cost_rates: opts.costRates,
           publishable: false,
           expected_rows: shardRows.length,
           completed_rows: shardRows.length,
@@ -4588,6 +4613,32 @@ test("shard aggregation binds canary, contract, accounting, and host-class laten
     let aggregate = JSON.parse(await readFile(path.join(opts.outDir, "summary.json"), "utf8"));
     assert.equal(aggregate.latency_pooling_eligible, true);
     assert.equal(aggregate.pooled_latency_summary.length, 2);
+    assert.deepEqual(aggregate.cost_rates, opts.costRates);
+    assert.equal(aggregate.cost_accounting.arms.with_codestory.estimated_cost_usd, 0.000524);
+    await Promise.all(rows.map((row) => writeFile(
+      row.stdout_path, JSON.stringify({ type: "turn.completed", usage: row.usage }) + "\n",
+    )));
+    const reanalyze = async () => {
+      const replay = spawnSync(process.execPath, [
+        fileURLToPath(new URL("../codestory-agent-ab-benchmark.mjs", import.meta.url)), "--reanalyze-dir", opts.outDir,
+      ], { encoding: "utf8" });
+      assert.equal(replay.status, 0, replay.stderr);
+      return JSON.parse(await readFile(path.join(opts.outDir, "reanalyzed-summary.json"), "utf8"));
+    };
+    const priced = await reanalyze();
+    assert.equal(priced.cost_accounting.arms.with_codestory.estimated_cost_usd, 0.000524);
+    await writeFile(path.join(opts.outDir, "summary.json"), JSON.stringify({ ...aggregate, model: "other" }));
+    const unpriced = await reanalyze();
+    assert.equal(unpriced.cost_accounting.arms.with_codestory.tokens_spent.total_tokens, 220);
+    assert.equal(unpriced.cost_accounting.arms.with_codestory.estimated_cost_usd, null);
+    const changedQuote = await writeShards(rows, (summary, index) => index === 1
+      ? { ...summary, cost_rates: { ...summary.cost_rates, cached_input_per_mtok: 1 } }
+      : summary);
+    await assert.rejects(
+      () => aggregateShardRuns({ ...opts, aggregateShards: changedQuote }, tasks),
+      /model or cost rates do not match/,
+    );
+    shardDirs = await writeShards();
     const shardOneRows = rows.filter((row) => taskShardIndex(row.task_id, 2) === 1);
     const shardOnePreparation = tasksForShard(tasks, 2, 1).map((task) =>
       pipelinePreparation(task.repo)
@@ -6724,6 +6775,9 @@ test("usage receipts count each billed request and reconcile duplicate Codex tot
   assert.equal(benchmarkHarness.extractUsage([first, { ...retry, payload: {
     ...retry.payload, thread_token_usage: undefined,
   } }]).total_tokens, 84);
+  assert.equal(benchmarkHarness.extractUsage([
+    first, { type: "turn.completed", usage: total },
+  ]).total_tokens, null);
   assert.equal(benchmarkHarness.extractUsage([retry, { ...retry, payload: {
     ...retry.payload, usage: { ...b, cached_input_tokens: 13 },
   } }]).total_tokens, null);
@@ -6744,6 +6798,13 @@ test("usage totals support legacy Codex receipts without treating missing bucket
   assert.equal(usage.cache_write_input_tokens, null);
   assert.equal(benchmarkHarness.extractUsage([
     first, legacy({ input_tokens: 2, output_tokens: 3 }, b),
+  ]).total_tokens, null);
+
+  const recordedCache = { ...a, cached_input_tokens: 3, cache_write_input_tokens: 1 };
+  assert.equal(benchmarkHarness.extractUsage([
+    legacy(recordedCache, recordedCache),
+    legacy({ input_tokens: 1 }, { input_tokens: 9, output_tokens: 2 }),
+    legacy({ input_tokens: 1 }, { input_tokens: 10, output_tokens: 2, cached_input_tokens: 2, cache_write_input_tokens: 0 }),
   ]).total_tokens, null);
 
   const started = { type: "turn.started" };
@@ -6802,6 +6863,51 @@ test("usage reanalysis prices only observed token buckets at recorded rates", as
     CODESTORY_BENCH_INPUT_COST_PER_MTOK: "2", CODESTORY_BENCH_OUTPUT_COST_PER_MTOK: "10",
     CODESTORY_BENCH_CACHED_INPUT_COST_PER_MTOK: "0.1", CODESTORY_BENCH_CACHE_WRITE_INPUT_COST_PER_MTOK: "2.5",
   }).cache_write_input_per_mtok, 2.5);
+});
+
+test("usage scorer withholds savings for missing transcripts and unmatched schedules", async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "codestory-scored-usage-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const rows = ["without_codestory", "with_codestory"].flatMap((arm) => [1, 2].map((repeat) => ({
+    arm, repeat, repo: "fixture", task_id: "t", status: "pass", wall_ms: 3,
+    stdout_path: path.join(dir, `${arm}-${repeat}.jsonl`),
+    usage: { total_tokens: 11 }, estimated_cost_usd: 0.0001,
+    resource_accounting: { usage: { total_tokens: 11 }, estimated_cost_usd: 0.0001 },
+    codestory_harness_prelude: { packet_sufficiency: { obligation_accounting: emptyPacketObligationAccounting() } },
+  })));
+  const completed = JSON.stringify({ type: "turn.completed", usage: {
+    input_tokens: 100, output_tokens: 10, cached_input_tokens: 0, cache_write_input_tokens: 0,
+  } }) + "\n";
+  const measure = async () => {
+    const measured = spawnSync(process.execPath, [
+      fileURLToPath(new URL("../codestory-agent-ab-score.mjs", import.meta.url)), "--reanalyze-dir", dir,
+    ], { encoding: "utf8" });
+    assert.equal(measured.status, 0, measured.stderr);
+    return measured.stdout;
+  };
+  const comparisonMetric = /^METRIC (?:\w+_ratio|agent_ab_gap(?:_all_in)?|with(?:out)?_total_(?:tokens|estimated_cost_usd))=/m;
+  const saved = path.join(dir, "summary.json");
+  await writeFile(saved, JSON.stringify({
+    expected_rows: 4,
+    cost_rates: { input_per_mtok: 2, output_per_mtok: 10 },
+  }));
+  await writeFile(path.join(dir, "runs.jsonl"), rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
+  await Promise.all(rows.slice(0, 3).map((row) => writeFile(row.stdout_path, completed)));
+
+  assert.doesNotMatch(await measure(), comparisonMetric);
+  let records = (await readFile(path.join(dir, "reanalyzed-runs.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+  assert.equal(records[3].usage.total_tokens, null);
+  assert.equal(records[3].estimated_cost_usd, null);
+  assert.equal(records[3].resource_accounting.usage.total_tokens, null);
+  assert.equal(records[3].resource_accounting.estimated_cost_usd, null);
+
+  await writeFile(rows[3].stdout_path, JSON.stringify({ type: "turn.started" }) + "\n");
+  assert.doesNotMatch(await measure(), comparisonMetric);
+  await writeFile(rows[3].stdout_path, completed);
+  assert.match(await measure(), /METRIC total_token_ratio=1(?:\n|$)/);
+
+  await writeFile(saved, JSON.stringify({ expected_rows: 6 }));
+  assert.doesNotMatch(await measure(), comparisonMetric);
 });
 
 test("summarizes A/B cost accounting totals and ratios", () => {
@@ -6934,7 +7040,7 @@ test("renders ineligible comparative wall time without losing other accounting",
     markdown,
     /\| all_in_wall_ms \| ineligible \| ineligible \| ineligible \| ineligible \|/,
   );
-  assert.match(markdown, /\| total_tokens \|  \| 100 \|  \|  \|/);
+  assert.match(markdown, /\| total_tokens \|  \|  \|  \|  \|/);
   assert.match(markdown, /\| tool_calls \| 2 \| 4 \| -2 \| 0\.5 \|/);
 });
 
@@ -8436,6 +8542,7 @@ test("publishable shard aggregation rejects incomplete, failed, and low-quality 
         path.join(directory, "summary.json"),
         `${JSON.stringify({
           publishable: true,
+          model: opts.model,
           comparative_publishable: true,
           comparative_failure: null,
           expected_rows: 3,

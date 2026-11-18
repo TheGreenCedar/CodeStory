@@ -181,8 +181,11 @@ input and `CODESTORY_BENCH_OUTPUT_COST_PER_MTOK` for output. Set
 `CODESTORY_BENCH_CACHE_WRITE_INPUT_COST_PER_MTOK` for cache writes when those
 buckets contain tokens. Use rates that apply to the run's model and service.
 An unknown token count or rate for a used bucket leaves the estimate unavailable.
-Arm summaries show observed totals and withhold comparisons when either arm has
-missing token or cost evidence.
+Arm summaries show observed totals and withhold token or cost comparisons when
+the paired schedule or its measurements are incomplete. Exact-candidate mode
+requires all four rates before package or repository preparation. Shard
+receipts bind the model and pricing schedule, which aggregation and reanalysis
+carry forward.
 
 For the `without_codestory` arm, the harness mechanically runs a strictly
 no-CodeStory local-context prelude before starting the nested agent. It derives
@@ -224,6 +227,8 @@ medians.
 commands, CodeStory commands, shell searches, file-read commands, web searches,
 post-packet reads, quality pass counts, packet-first pass counts,
 packet-manifest quality pass counts, partial packet counts, and ratios.
+A missing transcript, usage count, or scheduled pair leaves the token ratios
+and composite scores unavailable.
 The score wrapper streams the lower-level benchmark progress while still
 capturing stdout/stderr for failure reporting, and it forwards
 `--prepare-codestory-timeout-ms` to the benchmark so long CodeStory cache
