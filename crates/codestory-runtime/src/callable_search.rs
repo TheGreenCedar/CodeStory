@@ -387,7 +387,7 @@ pub(super) fn repair_pinned_generation(
         &publication.run_id,
         None,
         |writer| populate(writer, snapshot.storage(), root, max_file_bytes, &cancelled),
-        &cancelled,
+        cancelled,
     )?;
     let result = (|| {
         if cancelled()
@@ -495,7 +495,7 @@ fn prepare_generation_inner(
                 }
                 Ok(())
             },
-            &cancelled,
+            cancelled,
         );
         match result {
             Ok(()) => return Ok(()),
@@ -516,7 +516,7 @@ fn prepare_generation_inner(
         &publication.run_id,
         None,
         |writer| populate(writer, store, root, max_file_bytes, &cancelled),
-        &cancelled,
+        cancelled,
     ) {
         check_cancel(&cancelled)?;
         tracing::warn!(%error, "callable index was not published");
