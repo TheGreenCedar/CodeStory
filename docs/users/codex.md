@@ -5,6 +5,14 @@ grounding skill, lightweight repository hooks, and a version-matched native
 CLI. Repository questions route through one multi-project MCP process; every
 tool call still names its repository explicitly.
 
+## Set up shell lookups
+
+With the 0.18 CLI installed, run `codestory-cli setup codex` and open a fresh
+session. Setup prints the callable launcher path and records it in the Codex
+instructions. Run the launcher from your repository. Use `--repo` to scope
+instructions to the current Git root and `--remove` at the same scope to remove
+the note. The plugin below adds MCP and broader repository navigation.
+
 ## Requirements
 
 - One of the [supported platform and accelerator combinations](README.md#platform-summary);

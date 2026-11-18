@@ -111,6 +111,31 @@ pub(super) fn index_incremental_for_runtime_with_probe(
     annotations_owned: &crate::controller_bookmarks::AnnotationsOwned,
     precomputed_probe: Option<IncrementalPlanProbe>,
 ) -> Result<IndexingRunSummary, ApiError> {
+    index_incremental_for_runtime_with_options(
+        root,
+        storage_path,
+        events_tx,
+        cancel_token,
+        runtime,
+        source_index_policy,
+        annotations_owned,
+        precomputed_probe,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn index_incremental_for_runtime_with_options(
+    root: &Path,
+    storage_path: &Path,
+    events_tx: &Sender<AppEventPayload>,
+    cancel_token: Option<&CancellationToken>,
+    runtime: &codestory_retrieval::SidecarRuntimeConfig,
+    source_index_policy: &SourceIndexPolicy,
+    annotations_owned: &crate::controller_bookmarks::AnnotationsOwned,
+    precomputed_probe: Option<IncrementalPlanProbe>,
+    skip_semantic_docs: bool,
+) -> Result<IndexingRunSummary, ApiError> {
     run_incremental_indexing_common(
         root,
         storage_path,
@@ -120,6 +145,7 @@ pub(super) fn index_incremental_for_runtime_with_probe(
         source_index_policy,
         annotations_owned,
         precomputed_probe,
+        skip_semantic_docs,
     )
 }
 
@@ -577,11 +603,12 @@ fn source_policy_exclusions_unchanged(
 ///
 /// Every early return names the reason so the S7 delta-apply decision can see
 /// why an unchanged workspace still paid for a republication.
-fn evaluate_incremental_plan_probe(
+fn evaluate_incremental_plan_probe_with_options(
     root: &Path,
     storage_path: &Path,
     source_index_policy: &SourceIndexPolicy,
     probe: &mut IncrementalPlanProbe,
+    skip_semantic_docs: bool,
 ) -> IncrementalPlanProbeOutcomeDto {
     macro_rules! probe_unavailable {
         ($stage:ident) => {{
@@ -653,33 +680,35 @@ fn evaluate_incremental_plan_probe(
     if !source_policy_exclusions_unchanged(&stored_exclusions, &policy_refresh.policy_exclusions) {
         return IncrementalPlanProbeOutcomeDto::PolicyExclusionsChanged;
     }
-    match storage.get_dense_anchor_publication_manifest() {
-        Ok(Some(_)) => {}
-        Ok(None) => return IncrementalPlanProbeOutcomeDto::DenseAnchorManifestMissing,
-        Err(_) => probe_unavailable!(DenseAnchor),
-    }
-    // Use the same strict validation the readiness probe
-    // (`complete_core_requires_publication_repair`) applies. Accepting a weaker
-    // condition here makes anchor-count, digest, per-row source-identity, and
-    // mixed-policy drift unrepairable through the incremental path.
-    let dense_anchor_policy_version = match storage.validate_dense_anchor_publication(&publication)
-    {
-        Ok(manifest) => manifest.policy_version,
-        Err(_) => return IncrementalPlanProbeOutcomeDto::DenseAnchorPublicationStale,
-    };
-    // Mirror `effective_incremental_file_scope`: stored semantic docs built
-    // under a previous contract expand an empty scope into a full repair, so
-    // that repair must never be skipped.
-    if dense_anchor_policy_version != SEMANTIC_POLICY_VERSION {
-        return IncrementalPlanProbeOutcomeDto::SemanticDocContractDrift;
-    }
-    match storage.has_symbol_search_doc_contract_mismatch(
-        LLM_SYMBOL_DOC_SCHEMA_VERSION,
-        SEMANTIC_POLICY_VERSION,
-    ) {
-        Ok(false) => {}
-        Ok(true) => return IncrementalPlanProbeOutcomeDto::SemanticDocContractDrift,
-        Err(_) => probe_unavailable!(DocContract),
+    if !skip_semantic_docs {
+        match storage.get_dense_anchor_publication_manifest() {
+            Ok(Some(_)) => {}
+            Ok(None) => return IncrementalPlanProbeOutcomeDto::DenseAnchorManifestMissing,
+            Err(_) => probe_unavailable!(DenseAnchor),
+        }
+        // Use the same strict validation the readiness probe
+        // (`complete_core_requires_publication_repair`) applies. Accepting a weaker
+        // condition here makes anchor-count, digest, per-row source-identity, and
+        // mixed-policy drift unrepairable through the incremental path.
+        let dense_anchor_policy_version =
+            match storage.validate_dense_anchor_publication(&publication) {
+                Ok(manifest) => manifest.policy_version,
+                Err(_) => return IncrementalPlanProbeOutcomeDto::DenseAnchorPublicationStale,
+            };
+        // Mirror `effective_incremental_file_scope`: stored semantic docs built
+        // under a previous contract expand an empty scope into a full repair, so
+        // that repair must never be skipped.
+        if dense_anchor_policy_version != SEMANTIC_POLICY_VERSION {
+            return IncrementalPlanProbeOutcomeDto::SemanticDocContractDrift;
+        }
+        match storage.has_symbol_search_doc_contract_mismatch(
+            LLM_SYMBOL_DOC_SCHEMA_VERSION,
+            SEMANTIC_POLICY_VERSION,
+        ) {
+            Ok(false) => {}
+            Ok(true) => return IncrementalPlanProbeOutcomeDto::SemanticDocContractDrift,
+            Err(_) => probe_unavailable!(DocContract),
+        }
     }
     let Ok(search_path) = search_index_path_for_publication(storage_path, Some(&publication))
     else {
@@ -704,6 +733,15 @@ pub(super) fn probe_incremental_plan(
     storage_path: &Path,
     source_index_policy: &SourceIndexPolicy,
 ) -> IncrementalPlanProbe {
+    probe_incremental_plan_with_options(root, storage_path, source_index_policy, false)
+}
+
+pub(super) fn probe_incremental_plan_with_options(
+    root: &Path,
+    storage_path: &Path,
+    source_index_policy: &SourceIndexPolicy,
+    skip_semantic_docs: bool,
+) -> IncrementalPlanProbe {
     let started = Instant::now();
     let live_database_file_bytes = codestory_store::resolve_core_database_path(storage_path)
         .ok()
@@ -724,8 +762,13 @@ pub(super) fn probe_incremental_plan(
         repository_tracking_digest: None,
         scheduled_paths: Vec::new(),
     };
-    probe.outcome =
-        evaluate_incremental_plan_probe(root, storage_path, source_index_policy, &mut probe);
+    probe.outcome = evaluate_incremental_plan_probe_with_options(
+        root,
+        storage_path,
+        source_index_policy,
+        &mut probe,
+        skip_semantic_docs,
+    );
     probe.probe_ms = clamp_u128_to_u32(started.elapsed().as_millis());
     probe
 }
@@ -1202,6 +1245,7 @@ enum IncrementalRefreshPreparation {
     Prepared(Box<PreparedIncrementalRefresh>),
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_incremental_refresh(
     root: &Path,
     storage_path: &Path,
@@ -1210,14 +1254,21 @@ fn prepare_incremental_refresh(
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
     source_index_policy: &SourceIndexPolicy,
     precomputed_probe: Option<IncrementalPlanProbe>,
+    skip_semantic_docs: bool,
 ) -> Result<IncrementalRefreshPreparation, ApiError> {
     let mut wall = IncrementalCoreWallDurations::default();
     let mut derived_timings = IncrementalDerivedStageTimings::default();
     let discovery_started = Instant::now();
     ensure_incremental_refresh_compatible(root, storage_path)?;
     ensure_indexing_active(cancel_token)?;
-    let mut probe = precomputed_probe
-        .unwrap_or_else(|| probe_incremental_plan(root, storage_path, source_index_policy));
+    let mut probe = precomputed_probe.unwrap_or_else(|| {
+        probe_incremental_plan_with_options(
+            root,
+            storage_path,
+            source_index_policy,
+            skip_semantic_docs,
+        )
+    });
     // Cancellation raised during the probe still cancels the request, so a
     // short-circuit never reports success for an abandoned refresh.
     ensure_indexing_active(cancel_token)?;
@@ -1249,7 +1300,9 @@ fn prepare_incremental_refresh(
     // complete contract here. Any missing, stale, mixed-policy, or unreadable
     // projection is rebuilt as one set instead of carrying invalid rows into a
     // newly published generation.
-    let rebuild_complete_dense_anchor_set = {
+    let rebuild_complete_dense_anchor_set = if skip_semantic_docs {
+        false
+    } else {
         let staged_store = preparation.staged_mut().store_mut();
         let dense_projection_stale = previous_publication.as_ref().is_none_or(|previous| {
             staged_store
@@ -1450,22 +1503,25 @@ fn prepare_incremental_refresh(
     }
     derived_timings.proof_projection_ms = clamp_u128_to_u32(proof_started.elapsed().as_millis());
     let semantic_scope_started = Instant::now();
-    let semantic_refresh_scope = incremental_semantic_refresh_scope(
-        preparation.staged_mut(),
-        root,
-        &execution_plan,
-        &semantic_plan,
-    )?;
+    let semantic_refresh_scope = if skip_semantic_docs {
+        HashSet::new()
+    } else {
+        incremental_semantic_refresh_scope(
+            preparation.staged_mut(),
+            root,
+            &execution_plan,
+            &semantic_plan,
+        )?
+    };
     derived_timings.semantic_scope_ms =
         clamp_u128_to_u32(semantic_scope_started.elapsed().as_millis());
     let semantic_projection_started = Instant::now();
-    let reused_dense_anchor_projection =
-        !stats.graph_projection_changed && !rebuild_complete_dense_anchor_set;
-    let semantic_stats = if reused_dense_anchor_projection {
+    let reused_dense_anchor_projection = !skip_semantic_docs
+        && !stats.graph_projection_changed
+        && !rebuild_complete_dense_anchor_set;
+    let semantic_stats = if skip_semantic_docs || reused_dense_anchor_projection {
         // Callable, structural, and file fences proved the semantic projection
-        // unchanged. The publication stage still rebinds the complete dense
-        // anchor manifest to the new core identity; rebuilding selection and
-        // graph context for every repository node cannot change any document.
+        // unchanged (or `--core-only` explicitly skipped semantic docs).
         SemanticProjectionStats::default()
     } else {
         finalize_staged_semantic_docs_for_runtime(
@@ -1573,6 +1629,7 @@ fn run_incremental_indexing_common(
     source_index_policy: &SourceIndexPolicy,
     _annotations_owned: &crate::controller_bookmarks::AnnotationsOwned,
     precomputed_probe: Option<IncrementalPlanProbe>,
+    skip_semantic_docs: bool,
 ) -> Result<IndexingRunSummary, ApiError> {
     let core_started = Instant::now();
     let prepared = prepare_incremental_refresh(
@@ -1583,6 +1640,7 @@ fn run_incremental_indexing_common(
         runtime,
         source_index_policy,
         precomputed_probe,
+        skip_semantic_docs,
     )?;
     let prepared = match prepared {
         IncrementalRefreshPreparation::Unchanged { probe, wall } => {
@@ -1633,6 +1691,7 @@ fn run_incremental_indexing_common(
             .flatten(),
         source_identity_file_ids.as_deref(),
         cancel_token,
+        skip_semantic_docs,
     ) {
         let _ = staged.discard();
         return Err(error);
@@ -1640,7 +1699,8 @@ fn run_incremental_indexing_common(
     derived_timings.publication_identity_ms =
         clamp_u128_to_u32(publication_identity_started.elapsed().as_millis());
     let search_generation_started = Instant::now();
-    if !index_stats.graph_projection_changed
+    if !skip_semantic_docs
+        && !index_stats.graph_projection_changed
         && let Some(previous) = previous_publication.as_ref()
     {
         materialize_equivalent_search_generation(storage_path, previous, &publication)?;

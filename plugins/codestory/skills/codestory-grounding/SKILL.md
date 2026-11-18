@@ -1,6 +1,6 @@
 ---
 name: codestory-grounding
-description: Use when discovering repository structure, tracing relationships, analyzing change impact, or validating CodeStory retrieval or an installed plugin through the CodeStory plugin MCP. Skip only for bounded inspection or editing of named files that does not require those operations.
+description: Look up live source, trace repository relationships, analyze change impact, or validate the installed CodeStory plugin. Use the bundled cs command or the project-scoped MCP tools.
 ---
 
 # CodeStory Grounding
@@ -12,6 +12,14 @@ edits during a review.
 
 Pass an absolute `project` root on every call. Keep project, source and
 publication identities attached when combining results across repositories.
+
+## Live source lookups
+
+From the repository, use `cs find TERM` for literal text, `cs refs NAME` for definitions and mentions, and `cs read PATH:START-END` for numbered source. Batch known names, `path::Symbol` or `path:LINE` selectors in `refs`. When `cs` is outside `PATH`, run `node` with the absolute path to `../../bin/cs` relative to this skill. Ordinary source reads can fill any gap.
+
+Call bindings come from the pinned index. Both endpoint files match the recorded bytes, but imports or factories elsewhere may have changed. Treat an omitted binding as unknown.
+
+For `CODESTORY_MCP_TOOL_SURFACE=lean`, the inventory has only `find`, `refs`, and `read`. Every call takes an absolute `project`. An opt-in `family-v1` client uses `call({operation, arguments})` and `describe({operation, project})`. Use the catalog the host exposes.
 
 ## Code-mode tools and results
 

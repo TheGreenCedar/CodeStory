@@ -35,6 +35,16 @@ what each claim does *not* mean:
 
 ## Repo size and freshness
 
+- **Shell lookups** read the current files even on an unindexed checkout. An
+  index can add symbol names and source ranges when it matches the file.
+  To check several known symbols together, pass them to one command, such as
+  `cs refs api.go::Start worker.go::Run`. Call links come from the pinned index.
+  CodeStory checks the source at both ends. A factory or import in a third file
+  may have changed since indexing. For a rename, use `cs find NAME` to inspect
+  other mentions and run the project’s normal checks.
+  When declaration bodies would push later matches out of the byte budget,
+  `find` and single-name `refs` switch to a compact location list. Pass
+  `--no-bodies` to request that list directly, then `read` the relevant sites.
 - **First index** on a large checkout can take minutes; the agent retries the
   intended CodeStory call while preparation runs.
 - **First broad search in a process** also initializes the embedded model. Later
@@ -67,12 +77,16 @@ Plain-language trust boundaries and good vs blocked sessions:
 
 Recovery steps: [Troubleshooting](troubleshooting.md).
 
-## Benchmarks are not your repo
+## Benchmarks
 
-Public holdout suites measure token and time reduction on **pinned OSS packages**
-under controlled tasks. They do not guarantee the same numbers in your checkout.
+In the `codestory-cli setup codex` trial, Codex used shell lookups on its own.
+On large repositories, raw token use was nearly flat and the setup missed the
+correctness target. It met 72 of 75 requirements, compared with 74 of 75 for
+plain Codex. On small repositories, both groups met all 45 requirements, and the
+setup group used fewer raw tokens in that cohort. General token savings and
+equal correctness across repository sizes remain unestablished.
 
-What the holdout proves and does not prove:
-[Evaluation scope in the README](../../README.md#evaluation).
+See the setup results, earlier comparisons, and command timings in
+[Evaluation](../../README.md#evaluation).
 
 Better prompts help every session: [Prompt patterns](prompt-patterns.md).

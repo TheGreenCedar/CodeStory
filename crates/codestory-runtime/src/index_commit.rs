@@ -220,6 +220,8 @@ pub(super) fn rematerialize_staged_proof_resolution_projection(
     Ok(())
 }
 
+const CORE_ONLY_SEMANTIC_POLICY_VERSION: &str = "core_only";
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn stage_core_publication_identity(
     staged: &mut StagedSnapshot,
@@ -231,16 +233,34 @@ pub(super) fn stage_core_publication_identity(
     graph_equivalent_predecessor: Option<&IndexPublicationRecord>,
     source_identity_file_ids: Option<&[i64]>,
     cancel_token: Option<&CancellationToken>,
+    skip_semantic_docs: bool,
 ) -> Result<(), ApiError> {
     ensure_indexing_active(cancel_token)?;
     #[cfg(test)]
     publication_test_checkpoint(PublicationTestBoundary::Identity, cancel_token)?;
-    let rebound = graph_equivalent_predecessor
+    let semantic_policy_version = if skip_semantic_docs {
+        // Both refresh modes can carry forward documents from the prior generation.
+        let store = staged.store_mut();
+        store
+            .clear_dense_anchor_inputs()
+            .and_then(|_| store.clear_symbol_search_docs())
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to clear staged semantic projection: {error}"
+                ))
+            })?;
+        CORE_ONLY_SEMANTIC_POLICY_VERSION
+    } else {
+        SEMANTIC_POLICY_VERSION
+    };
+    let rebound = (!skip_semantic_docs)
+        .then_some(graph_equivalent_predecessor)
+        .flatten()
         .map(|previous| {
             staged.rebind_inherited_dense_anchor_generation(
                 previous,
                 publication,
-                SEMANTIC_POLICY_VERSION,
+                semantic_policy_version,
             )
         })
         .transpose()
@@ -254,7 +274,7 @@ pub(super) fn stage_core_publication_identity(
     if !rebound {
         staged
             .store_mut()
-            .publish_dense_anchor_generation(publication, SEMANTIC_POLICY_VERSION)
+            .publish_dense_anchor_generation(publication, semantic_policy_version)
             .map_err(|error| {
                 ApiError::internal(format!(
                     "Failed to publish complete dense anchor inputs: {error}"

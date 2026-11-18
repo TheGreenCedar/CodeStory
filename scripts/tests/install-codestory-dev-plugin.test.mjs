@@ -218,6 +218,10 @@ test("CodeStoryDev installer stages and refreshes an exact receipt while preserv
     assert.equal(first.plugin_version, version);
     assert.equal(first.target, contract.sourceBuildTarget());
     assert.equal(first.cli.sha256, digest(await readFile(value.cli)));
+    assert.deepEqual(
+      await readFile(path.join(first.installed_plugin_root, "bin", "cs")),
+      await readFile(path.join(value.options.pluginSource, "bin", "cs")),
+    );
     assert.equal(await readFile(path.join(value.pluginData, "sentinel"), "utf8"), "keep");
     assert.equal(first.plugin_data_preserved, true);
     assert.equal(

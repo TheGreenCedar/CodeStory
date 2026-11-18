@@ -4,10 +4,10 @@ use crate::index_freshness::{
     FreshnessObservation, index_freshness_from_storage_with_policy, open_storage_for_read,
     workspace_member_index_summaries, workspace_member_storage_summaries,
 };
-use crate::index_full::index_full_for_runtime;
+use crate::index_full::{index_full_for_runtime, index_full_for_runtime_with_options};
 use crate::index_incremental::{
     IncrementalPlanProbe, ensure_incremental_refresh_compatible, index_incremental_for_runtime,
-    index_incremental_for_runtime_with_probe, probe_incremental_plan,
+    index_incremental_for_runtime_with_options, probe_incremental_plan,
 };
 use crate::index_timings::IndexingRunSummary;
 #[cfg(test)]
@@ -657,10 +657,12 @@ impl AppController {
             None,
             None,
             None,
+            false,
         )
         .map(|completion| completion.phase_timings)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_indexing_blocking_inner_with_probe(
         &self,
         mode: IndexMode,
@@ -669,6 +671,7 @@ impl AppController {
         precomputed_probe: Option<IncrementalPlanProbe>,
         failed_refresh_diagnostics: Option<&crate::index_full::FailedRefreshDiagnosticSink>,
         preacquired_writer: Option<IndexWriterGuard>,
+        skip_semantic_docs: bool,
     ) -> Result<IndexingCompletion, ApiError> {
         let (root, storage_path) = {
             let s = self.state.lock();
@@ -730,7 +733,7 @@ impl AppController {
         };
 
         let result = match mode {
-            IndexMode::Full => index_full_for_runtime(
+            IndexMode::Full => index_full_for_runtime_with_options(
                 &root,
                 &storage_path,
                 &self.events_tx,
@@ -739,8 +742,9 @@ impl AppController {
                 &self.source_index_policy,
                 &annotations_owned,
                 failed_refresh_diagnostics,
+                skip_semantic_docs,
             ),
-            IndexMode::Incremental => index_incremental_for_runtime_with_probe(
+            IndexMode::Incremental => index_incremental_for_runtime_with_options(
                 &root,
                 &storage_path,
                 &self.events_tx,
@@ -749,6 +753,7 @@ impl AppController {
                 &self.source_index_policy,
                 &annotations_owned,
                 precomputed_probe,
+                skip_semantic_docs,
             ),
         };
 
@@ -1056,12 +1061,13 @@ impl AppController {
         else {
             return Ok(false);
         };
+        match storage.validate_dense_anchor_publication(&publication) {
+            Ok(manifest) if manifest.policy_version == SEMANTIC_POLICY_VERSION => {}
+            _ => return Ok(true),
+        }
         if storage
-            .validate_dense_anchor_publication(&publication)
+            .validate_structural_text_unit_publication(&publication)
             .is_err()
-            || storage
-                .validate_structural_text_unit_publication(&publication)
-                .is_err()
         {
             return Ok(true);
         }
@@ -1137,6 +1143,7 @@ impl AppController {
             precomputed_probe,
             failed_refresh_diagnostics,
             Some(writer_guard),
+            false,
         )?;
         let storage_path = self.require_storage_path()?;
         let storage = Store::open_read_only(&storage_path).map_err(|error| {
@@ -1203,6 +1210,23 @@ impl AppController {
         mode: IndexMode,
     ) -> Result<IndexingPhaseTimings, ApiError> {
         self.run_indexing_blocking_inner(mode, false, None)
+    }
+
+    pub fn run_indexing_blocking_without_runtime_refresh_with_options(
+        &self,
+        mode: IndexMode,
+        skip_semantic_docs: bool,
+    ) -> Result<IndexingPhaseTimings, ApiError> {
+        self.run_indexing_blocking_inner_with_probe(
+            mode,
+            false,
+            None,
+            None,
+            None,
+            None,
+            skip_semantic_docs,
+        )
+        .map(|completion| completion.phase_timings)
     }
 
     /// Bind project/storage paths for a recovery refresh without opening the

@@ -127,6 +127,7 @@ fn index_watch_rejects_output_file_inside_project_tree() {
         dry_run: false,
         summarize: false,
         progress: false,
+        core_only: false,
         watch: true,
     };
 

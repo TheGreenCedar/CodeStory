@@ -5,6 +5,13 @@ contract. Configure MCP separately unless your plugin setup already wires the
 shipped adapter. Hooks record repository state and teach routing; MCP supplies
 the repository evidence.
 
+## Set up shell lookups
+
+With the 0.18 CLI installed, run `codestory-cli setup claude-code` and open a
+fresh session. It writes the launcher path to the configured `CLAUDE.md`. Use
+`--repo` for the current Git root and `--remove` at the same scope to remove
+the note. The separate plugin and MCP setup below adds indexed navigation.
+
 ## Install the plugin
 
 From a terminal:
