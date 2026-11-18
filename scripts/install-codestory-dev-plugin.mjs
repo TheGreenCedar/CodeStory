@@ -326,7 +326,8 @@ function stageCandidate({
       preserveTimestamps: true,
     });
     const binDir = path.join(candidate, "bin");
-    fs.mkdirSync(binDir, { mode: 0o755 });
+    fs.mkdirSync(binDir, { recursive: true, mode: 0o755 });
+    directDirectory(binDir, "codestory_dev_candidate_bin");
     const destination = path.join(binDir, cli.name);
     fs.copyFileSync(cli.path, destination, fs.constants.COPYFILE_EXCL);
     if ((platform || process.platform) !== "win32") fs.chmodSync(destination, 0o755);
