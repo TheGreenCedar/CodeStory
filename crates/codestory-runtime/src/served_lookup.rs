@@ -188,9 +188,7 @@ pub fn find_bounded(
         }
         let total = files.iter().map(|file| file.hit_lines.len()).sum::<usize>();
         let _ = writeln!(out, "{total} matches in {} files", files.len());
-        let mut bodies = body_lines.map(Bodies::new);
-        list_hits(&mut out, &files, limit, index.as_mut(), bodies.as_mut());
-        finish_bodies(&mut out, bodies);
+        let out = render_hit_listing(out, &files, limit, index.as_mut(), body_lines, max_bytes);
         lookup_reply(out, max_bytes, index.as_ref(), &[])
     }))
 }
@@ -246,27 +244,16 @@ pub fn refs_batch(
         )?;
         return Ok(with_pinned_index(storage_path, |store| {
             let mut index = store.map(|store| Index::scoped(store, scope.as_ref()));
-            let mut bodies = body_lines.map(Bodies::new);
-            let mut out = match &mut index {
+            let out = match &mut index {
                 Some(index) => refs_with_index(
-                    root,
-                    index,
-                    name,
-                    &wanted,
-                    &files,
-                    limit,
-                    bodies.as_mut(),
-                    max_bytes,
+                    root, index, name, &wanted, &files, limit, body_lines, max_bytes,
                 ),
                 None => {
                     let total = files.iter().map(|file| file.hit_lines.len()).sum::<usize>();
-                    let mut out =
-                        format!("{NO_INDEX}\n{total} references in {} files\n", files.len());
-                    list_hits(&mut out, &files, limit, None, bodies.as_mut());
-                    out
+                    let out = format!("{NO_INDEX}\n{total} references in {} files\n", files.len());
+                    render_hit_listing(out, &files, limit, None, body_lines, max_bytes)
                 }
             };
-            finish_bodies(&mut out, bodies);
             lookup_reply(out, max_bytes, index.as_ref(), &[])
         }));
     }
@@ -1717,6 +1704,45 @@ fn list_hits(
     }
 }
 
+fn render_hit_listing(
+    heading: String,
+    files: &[LiveFile],
+    limit: usize,
+    mut index: Option<&mut Index<'_>>,
+    body_lines: Option<usize>,
+    max_bytes: usize,
+) -> String {
+    prefer_hit_locations(body_lines, max_bytes, |body_lines| {
+        let mut out = heading.clone();
+        let mut bodies = body_lines.map(Bodies::new);
+        list_hits(
+            &mut out,
+            files,
+            limit,
+            index.as_deref_mut(),
+            bodies.as_mut(),
+        );
+        finish_bodies(&mut out, bodies);
+        out
+    })
+}
+
+fn prefer_hit_locations(
+    body_lines: Option<usize>,
+    max_bytes: usize,
+    mut render: impl FnMut(Option<usize>) -> String,
+) -> String {
+    let full = render(body_lines);
+    if body_lines.is_none() || max_bytes == 0 || full.len() <= max_bytes {
+        return full;
+    }
+    let mut compact = render(None);
+    if compact.len().saturating_add(MORE_BODIES.len()) <= max_bytes {
+        compact.push_str(MORE_BODIES);
+    }
+    compact
+}
+
 // ---------------------------------------------------------------------------
 // Bodies
 // ---------------------------------------------------------------------------
@@ -1798,10 +1824,12 @@ impl Bodies {
     }
 }
 
+const MORE_BODIES: &str = "more: read <path>::<Symbol> or <path>:A-B\n";
+
 /// Say how to read the bodies that did not fit.
 fn finish_bodies(out: &mut String, bodies: Option<Bodies>) {
     if bodies.is_some_and(|bodies| bodies.overflowed) {
-        out.push_str("more: read <path>::<Symbol> or <path>:A-B\n");
+        out.push_str(MORE_BODIES);
     }
 }
 
@@ -2111,7 +2139,7 @@ fn refs_with_index(
     wanted: &[&str],
     files: &[LiveFile],
     limit: usize,
-    mut bodies: Option<&mut Bodies>,
+    body_lines: Option<usize>,
     max_bytes: usize,
 ) -> String {
     let store = index.store;
@@ -2280,32 +2308,36 @@ fn refs_with_index(
         reference_files += usize::from(count > 0);
     }
 
-    let mut out = format!("{name}: {reported} definition(s)");
-    if searched < files.len() {
-        let _ = write!(
-            out,
-            " in the first {searched} of {} files with hits",
-            files.len()
-        );
-    }
-    out.push('\n');
-    // Hit lines already shown, marked, inside a definition printed up here.
-    let mut above = HashMap::<usize, Vec<(u32, u32)>>::new();
-    for candidate in candidates
-        .iter()
-        .filter(|candidate| candidate.wanted)
-        .take(limit)
-    {
-        let file = &files[candidate.file];
-        let _ = writeln!(
-            out,
-            "  {}:{} {} {}",
-            file.path,
-            candidate.line,
-            kind_label(candidate.kind),
-            candidate.qualified
-        );
-        if reported <= DEFINITION_BODIES
+    // Both layouts use the same admitted references and the cached file observations.
+    prefer_hit_locations(body_lines, max_bytes, |body_lines| {
+        let mut body_state = body_lines.map(Bodies::new);
+        let mut bodies = body_state.as_mut();
+        let mut out = format!("{name}: {reported} definition(s)");
+        if searched < files.len() {
+            let _ = write!(
+                out,
+                " in the first {searched} of {} files with hits",
+                files.len()
+            );
+        }
+        out.push('\n');
+        // Hit lines already shown, marked, inside a definition printed up here.
+        let mut above = HashMap::<usize, Vec<(u32, u32)>>::new();
+        for candidate in candidates
+            .iter()
+            .filter(|candidate| candidate.wanted)
+            .take(limit)
+        {
+            let file = &files[candidate.file];
+            let _ = writeln!(
+                out,
+                "  {}:{} {} {}",
+                file.path,
+                candidate.line,
+                kind_label(candidate.kind),
+                candidate.qualified
+            );
+            if reported <= DEFINITION_BODIES
             && let Some(bodies) = bodies.as_deref_mut()
             && let Some(definitions) = index.serve(file).1
             && let Some(definition) = definitions
@@ -2316,133 +2348,134 @@ fn refs_with_index(
                 shown
                     .iter()
                     .any(|(first, last)| *first <= definition.start && definition.end <= *last)
-            })
-        {
-            let hits = file
-                .hit_lines
-                .iter()
-                .filter(|line| !omitted(candidate.file, **line))
-                .map(|line| (*line, note(candidate.file, *line)))
-                .collect::<Vec<_>>();
-            above
-                .entry(candidate.file)
-                .or_default()
-                .extend(definition_body(
-                    &mut out,
-                    bodies,
-                    file,
-                    &definitions,
-                    (definition, candidate.line),
-                    &hits,
-                ));
-        }
-    }
-    if reported > limit {
-        let _ = writeln!(out, "  ... {} more definitions", reported - limit);
-    }
-    // What each definition uses is printed after the references. Both spend
-    // what the definitions left of the budget: the references their share of
-    // it, and more when the used declarations do not want all of the rest.
-    let mut used = Vec::new();
-    let mut reserved = 0;
-    if reported <= DEFINITION_BODIES
-        && let Some(bodies) = bodies.as_deref_mut()
-    {
-        for candidate in candidates
-            .iter()
-            .filter(|candidate| candidate.wanted)
-            .take(limit)
-        {
-            if let Some(owner) = index.locate(root, candidate.id) {
-                let targets = used_by(index, root, &owner, USED_DECLARATIONS, |target| {
-                    bodies.shows(target)
-                });
-                used.push((candidate.qualified.as_str(), targets));
+            }) {
+                let hits = file
+                    .hit_lines
+                    .iter()
+                    .filter(|line| !omitted(candidate.file, **line))
+                    .map(|line| (*line, note(candidate.file, *line)))
+                    .collect::<Vec<_>>();
+                above
+                    .entry(candidate.file)
+                    .or_default()
+                    .extend(definition_body(
+                        &mut out,
+                        bodies,
+                        file,
+                        &definitions,
+                        (definition, candidate.line),
+                        &hits,
+                    ));
             }
         }
-        let wanted = used
-            .iter()
-            .flat_map(|(_, targets)| targets)
-            .filter(|target| target.last - target.first < WHOLE_USED_LINES)
-            .map(|target| (target.last - target.first) as usize + 2)
-            .sum::<usize>();
-        reserved = wanted.min(bodies.budget - bodies.budget * REFERENCE_SHARE / 100);
-        bodies.budget -= reserved;
-    }
-    let summary_start = out.len();
-    let _ = writeln!(out, "{references} references in {reference_files} files");
-    let summary = summary_start..out.len();
-
-    let hidden = |position: usize, line: u32| {
-        omitted(position, line)
-            || above.get(&position).is_some_and(|shown| {
-                shown
-                    .iter()
-                    .any(|(first, last)| (*first..=*last).contains(&line))
-            })
-    };
-    let mut remaining = limit;
-    for (file, position, index_only) in &listing {
-        let served = if remaining > 0 {
-            index.serve(file)
-        } else {
-            ("", None)
-        };
-        let mut rows = Vec::new();
-        let mut total = index_only.map_or(0, |file| file.kept.len());
-        if let Some(position) = *position {
-            total += files[position]
-                .hit_lines
+        if reported > limit {
+            let _ = writeln!(out, "  ... {} more definitions", reported - limit);
+        }
+        // What each definition uses is printed after the references. Both spend
+        // what the definitions left of the budget: the references their share of
+        // it, and more when the used declarations do not want all of the rest.
+        let mut used = Vec::new();
+        let mut reserved = 0;
+        if reported <= DEFINITION_BODIES
+            && let Some(bodies) = bodies.as_deref_mut()
+        {
+            for candidate in candidates
                 .iter()
-                .filter(|line| !hidden(position, **line))
-                .count();
-            for (line, code) in &files[position].kept {
-                if !hidden(position, *line) {
-                    rows.push(Row {
-                        line: *line,
-                        code,
-                        note: note(position, *line),
+                .filter(|candidate| candidate.wanted)
+                .take(limit)
+            {
+                if let Some(owner) = index.locate(root, candidate.id) {
+                    let targets = used_by(index, root, &owner, USED_DECLARATIONS, |target| {
+                        bodies.shows(target)
                     });
+                    used.push((candidate.qualified.as_str(), targets));
                 }
             }
+            let wanted = used
+                .iter()
+                .flat_map(|(_, targets)| targets)
+                .filter(|target| target.last - target.first < WHOLE_USED_LINES)
+                .map(|target| (target.last - target.first) as usize + 2)
+                .sum::<usize>();
+            reserved = wanted.min(bodies.budget - bodies.budget * REFERENCE_SHARE / 100);
+            bodies.budget -= reserved;
         }
-        if let Some(index_only) = index_only {
-            rows.extend(index_only.kept.iter().map(|(line, code)| Row {
-                line: *line,
-                code,
-                note: " (via index)".to_owned(),
-            }));
-            rows.sort_by_key(|row| row.line);
+        let summary_start = out.len();
+        let _ = writeln!(out, "{references} references in {reference_files} files");
+        let summary = summary_start..out.len();
+
+        let hidden = |position: usize, line: u32| {
+            omitted(position, line)
+                || above.get(&position).is_some_and(|shown| {
+                    shown
+                        .iter()
+                        .any(|(first, last)| (*first..=*last).contains(&line))
+                })
+        };
+        let mut remaining = limit;
+        for (file, position, index_only) in &listing {
+            let served = if remaining > 0 {
+                index.serve(file)
+            } else {
+                ("", None)
+            };
+            let mut rows = Vec::new();
+            let mut total = index_only.map_or(0, |file| file.kept.len());
+            if let Some(position) = *position {
+                total += files[position]
+                    .hit_lines
+                    .iter()
+                    .filter(|line| !hidden(position, **line))
+                    .count();
+                for (line, code) in &files[position].kept {
+                    if !hidden(position, *line) {
+                        rows.push(Row {
+                            line: *line,
+                            code,
+                            note: note(position, *line),
+                        });
+                    }
+                }
+            }
+            if let Some(index_only) = index_only {
+                rows.extend(index_only.kept.iter().map(|(line, code)| Row {
+                    line: *line,
+                    code,
+                    note: " (via index)".to_owned(),
+                }));
+                rows.sort_by_key(|row| row.line);
+            }
+            list_file(
+                &mut out,
+                &mut remaining,
+                file,
+                served,
+                &rows,
+                total - rows.len(),
+                bodies.as_deref_mut(),
+            );
         }
-        list_file(
-            &mut out,
-            &mut remaining,
-            file,
-            served,
-            &rows,
-            total - rows.len(),
-            bodies.as_deref_mut(),
-        );
-    }
-    if omitted_hits > 0 {
-        let _ = writeln!(
-            out,
-            "{omitted_hits} hit(s) omitted: the pinned index resolved them to other definitions of {last}"
-        );
-    }
-    if let Some(bodies) = bodies {
-        bodies.budget += reserved;
-        for (owner, targets) in &used {
-            list_used(&mut out, bodies, owner, targets);
+        if omitted_hits > 0 {
+            let _ = writeln!(
+                out,
+                "{omitted_hits} hit(s) omitted: the pinned index resolved them to other definitions of {last}"
+            );
         }
-    }
-    if max_bytes != 0 && out.len() > max_bytes {
-        let heading = out.find('\n').map_or(0, |end| end + 1);
-        let count = out[summary.clone()].to_owned();
-        out.replace_range(summary, "");
-        out.insert_str(heading, &count);
-    }
-    out
+        if let Some(bodies) = bodies {
+            bodies.budget += reserved;
+            for (owner, targets) in &used {
+                list_used(&mut out, bodies, owner, targets);
+            }
+        }
+        if max_bytes != 0 && out.len() > max_bytes {
+            let heading = out.find('\n').map_or(0, |end| end + 1);
+            let count = out[summary.clone()].to_owned();
+            out.replace_range(summary, "");
+            out.insert_str(heading, &count);
+        }
+        finish_bodies(&mut out, body_state);
+        out
+    })
 }
 
 /// A plain variable declared inside a callable is not a definition worth a

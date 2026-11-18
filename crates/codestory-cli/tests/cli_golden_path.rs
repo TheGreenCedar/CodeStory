@@ -1144,6 +1144,50 @@ pub fn twice(values: &[u32]) -> u32 {
 }
 
 #[test]
+fn lookup_byte_budget_prefers_locations_to_optional_bodies() {
+    let workspace = tempdir().expect("workspace");
+    let cache = tempdir().expect("cache");
+    let root = workspace.path();
+    write_body_workspace(root);
+    fs::write(
+        root.join("src/z_last.rs"),
+        "pub fn last(values: &[u32]) -> u32 { crate::tally(values) }\n",
+    )
+    .unwrap();
+    fs::write(root.join("z_skip.txt"), "tally\n").unwrap();
+    let check = || {
+        for command in ["find", "refs"] {
+            let lookup = |extra: &[&str]| {
+                let mut args = vec![command, "tally", "--file-glob", "*.rs"];
+                args.extend_from_slice(extra);
+                run_lookup(root, cache.path(), &args)
+            };
+            let compact = lookup(&["--no-bodies", "--max-bytes", "0"]);
+            let enriched = lookup(&["--max-bytes", "0"]);
+            let cap = compact.len().to_string();
+            assert!(compact.contains("src/z_last.rs"), "{compact}");
+            assert!(!compact.contains("z_skip.txt"), "{compact}");
+            assert!(
+                enriched.find("src/z_last.rs").unwrap() > compact.len(),
+                "{enriched}"
+            );
+            assert_eq!(lookup(&["--max-bytes", &cap]), compact);
+            assert_eq!(lookup(&["--no-bodies", "--max-bytes", &cap]), compact);
+            let with_remainder = lookup(&["--max-bytes", &(compact.len() + 48).to_string()]);
+            assert!(with_remainder.starts_with(&compact), "{with_remainder}");
+            assert!(with_remainder.contains("more: read"), "{with_remainder}");
+            assert_eq!(
+                lookup(&["--max-bytes", &enriched.len().to_string()]),
+                enriched
+            );
+        }
+    };
+    check();
+    index_lookup_fixture(root, cache.path());
+    check();
+}
+
+#[test]
 fn refs_and_find_carry_enclosing_declarations_within_budget() {
     let workspace = tempdir().expect("workspace");
     let cache = tempdir().expect("cache");
