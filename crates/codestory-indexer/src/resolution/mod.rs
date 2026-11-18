@@ -1450,7 +1450,7 @@ impl ResolutionPass {
         let declaration = method?;
         let expected = format!("{owner}.{method_name}");
         let mut matches = candidates
-            .owner_member_candidate_offsets(&owner, method_name)
+            .owner_member_candidate_offsets(owner, method_name)
             .into_iter()
             .filter_map(|offset| candidates.nodes.get(offset))
             .filter(|node| {
