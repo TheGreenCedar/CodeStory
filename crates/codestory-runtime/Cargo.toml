@@ -22,6 +22,7 @@ codestory-retrieval = { workspace = true }
 codestory-store = { workspace = true }
 codestory-workspace = { workspace = true }
 crossbeam-channel = { workspace = true }
+ignore = { workspace = true }
 nucleo-matcher = { workspace = true }
 parking_lot = { workspace = true }
 rayon = { workspace = true }

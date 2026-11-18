@@ -2174,10 +2174,9 @@ impl WorkspaceIndexer {
             let resolver =
                 prepared_resolver.expect("graph changes prepared the resolution context");
             let resolution_scope = if go_return_inputs_changed {
-                // Factory signatures and module ownership can change without a
-                // caller source byte changing. Reset and recompute this narrow
-                // call class repository-wide.
-                let mut invalidated = resolver.invalidate_go_return_method_resolutions(storage)?;
+                // Receiver declarations, factory signatures and module ownership
+                // can change while caller bytes stay put.
+                let mut invalidated = resolver.invalidate_go_method_resolutions(storage)?;
                 if go_module_control_changed {
                     invalidated = invalidated.saturating_add(
                         resolver.invalidate_go_package_function_resolutions(storage)?,
@@ -4342,6 +4341,8 @@ pub fn current_file_extraction_revision(language: &str) -> Option<&'static str> 
     match language {
         "python" => Some(languages::python::CALLABLE_DECLARATION_REVISION),
         "rust" => Some(languages::rust::CALLABLE_DECLARATION_REVISION),
+        "go" => Some(languages::go::CALL_BINDING_REVISION),
+        "dart" => Some("dart-library-call-bindings-v2"),
         _ => None,
     }
 }
@@ -9239,7 +9240,10 @@ fn append_manual_receiver_call_edges(
         // for them, so a second spec for an already-claimed callsite can never
         // mint a competing resolved edge — the marker lands on the existing
         // edge instead and resolution stays with the resolution pass.
-        if binding_marker.is_some() || spec.owner_module.is_some() {
+        if binding_marker
+            .is_some_and(|marker| marker != languages::go::TYPED_RECEIVER_CALLSITE_MARKER)
+            || spec.owner_module.is_some()
+        {
             let owner_module = spec.owner_module.as_deref();
             // A class-anchored spec's callsite lives in a constructor body,
             // where the rule file's self-placeholder is never attributed to a

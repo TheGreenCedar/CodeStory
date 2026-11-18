@@ -191,6 +191,7 @@ mod search_state_cache;
 mod search_terms;
 mod semantic_projection;
 mod semantic_republish;
+pub mod served_lookup;
 mod snippets;
 #[cfg(feature = "v3-evidence-separation-support")]
 #[doc(hidden)]

@@ -93,6 +93,22 @@ const MAX_METADATA_TREE_ENTRIES: usize = 100_000;
 const MAX_REWRITE_BLOB_BYTES: u64 = 1_000_000;
 const MAX_REWRITE_SIMILARITY_PERMUTATIONS: usize = 1_000;
 
+/// Find the nearest Git worktree containing an existing directory.
+pub fn discover_git_worktree_root(start: &Path) -> Result<PathBuf> {
+    let start = canonical_existing(start).context("resolve the starting directory")?;
+    for ancestor in start.ancestors() {
+        let dot_git = ancestor.join(".git");
+        match fs::symlink_metadata(&dot_git) {
+            Ok(_) => return Ok(MetadataRoots::resolve(ancestor)?.root),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspect {}", dot_git.display()));
+            }
+        }
+    }
+    bail!("current directory is outside a Git working tree")
+}
+
 /// One problem that prevented a complete repository metadata observation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositoryMetadataIssue {

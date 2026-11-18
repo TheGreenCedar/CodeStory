@@ -34,9 +34,7 @@ pub(super) fn invalidate_go_package_function_resolutions(
     )?)
 }
 
-pub(super) fn invalidate_go_return_method_resolutions(
-    conn: &rusqlite::Connection,
-) -> Result<usize> {
+pub(super) fn invalidate_go_method_resolutions(conn: &rusqlite::Connection) -> Result<usize> {
     Ok(conn.execute(
         "UPDATE edge
          SET resolved_target_node_id = NULL,
@@ -50,14 +48,24 @@ pub(super) fn invalidate_go_return_method_resolutions(
                OR certainty IS NOT NULL
                OR candidate_target_node_ids IS NOT NULL
            )
-           AND instr('|' || callsite_identity || '|', ?2) > 0",
+           AND (instr('|' || callsite_identity || '|', ?2) > 0
+                OR instr('|' || callsite_identity || '|', ?6) > 0)
+           AND instr('|' || callsite_identity || '|', ?3) > 0
+           AND instr('|' || callsite_identity || '|', ?4) = 0
+           AND instr('|' || callsite_identity || '|', ?5) = 0",
         params![
             EdgeKind::CALL as i32,
+            format!("|{}|", crate::languages::go::MEMBER_CALLSITE_MARKER),
+            format!("|{}", crate::RECEIVER_OWNER_CALLSITE_PREFIX),
             format!(
-                "|{}{}",
-                crate::RECEIVER_OWNER_CALLSITE_PREFIX,
-                crate::languages::go::RETURN_PATH_OWNER_PREFIX
-            )
+                "|{}|",
+                crate::languages::go::PACKAGE_FUNCTION_CALLSITE_MARKER
+            ),
+            format!(
+                "|{}",
+                crate::languages::go::PACKAGE_FUNCTION_IMPORT_SET_PREFIX
+            ),
+            format!("|{}|", crate::languages::go::TYPED_RECEIVER_CALLSITE_MARKER),
         ],
     )?)
 }

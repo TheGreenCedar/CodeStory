@@ -3189,15 +3189,15 @@ func outerParamStillWorks(workflow Workflow) {
         "Run",
     );
     assert_ordinary_call_census(
-        "go factory receiver stays unresolved",
+        "go local factory's declared return binds the receiver",
         &nodes,
         &edges,
         "factoryOnly",
         "Run",
         1,
     );
-    assert_no_resolved_call_to_method_owner(
-        "go factory receiver stays unresolved",
+    assert_resolved_call_to_method_owner(
+        "go local factory's declared return binds the receiver",
         &nodes,
         &edges,
         "factoryOnly",
@@ -3205,15 +3205,15 @@ func outerParamStillWorks(workflow Workflow) {
         "Run",
     );
     assert_ordinary_call_census(
-        "go reassigned factory receiver invalidates stale owner",
+        "go reassigned receiver follows its local factory's return",
         &nodes,
         &edges,
         "reassignedFactory",
         "Run",
         1,
     );
-    assert_no_resolved_call_to_method_owner(
-        "go reassigned factory receiver invalidates stale owner",
+    assert_resolved_call_to_method_owner(
+        "go reassigned receiver follows its local factory's return",
         &nodes,
         &edges,
         "reassignedFactory",
@@ -21192,6 +21192,95 @@ fn test_go_factory_return_concrete_type_matrix() -> anyhow::Result<()> {
 }
 
 #[test]
+fn test_go_receiver_graph_uses_declarations_in_the_local_package() -> anyhow::Result<()> {
+    let (nodes, edges) = index_files(&[
+        (
+            "worker.go",
+            r#"package worker
+type Worker struct{}
+func (*Worker) Finish() {}
+type Embedded struct { Worker }
+type Shadowed struct { Worker; Finish func() }
+type Other struct{}
+func (Other) Finish() {}
+type Competing struct { Worker; Other }
+"#,
+        ),
+        (
+            "dispatch_test.go",
+            r#"package worker
+type Alias = Worker
+func makeWorker() (*Alias, error) { return nil, nil }
+func Typed(x *Worker) { x.Finish() }
+func Aliased(x *Alias) { x.Finish() }
+func EmbeddedCall(x *Embedded) { x.Finish() }
+func Tuple() { x, _ := makeWorker(); x.Finish() }
+func ThroughField(x *Shadowed) { x.Finish() }
+func Ambiguous(x *Competing) { x.Finish() }
+func LocalType() { type Worker struct { Finish func() }; x := Worker{}; x.Finish() }
+func Generic[Worker interface{ Finish() }](x Worker) { x.Finish() }
+"#,
+        ),
+        (
+            "worker_test.go",
+            r#"package worker_test
+type Embedded struct{}
+func (*Embedded) Finish() {}
+"#,
+        ),
+    ])?;
+    let method = nodes
+        .iter()
+        .find(|node| node.kind == NodeKind::METHOD && node.serialized_name == "Worker.Finish")
+        .expect("declared method")
+        .id;
+    for caller in ["Typed", "Aliased", "EmbeddedCall", "Tuple"] {
+        let call = one_go_call(&nodes, &edges, caller, "Finish");
+        assert_eq!(call.resolved_target, Some(method), "{caller}: {call:#?}");
+        assert_eq!(
+            call.certainty,
+            Some(ResolutionCertainty::Certain),
+            "{caller}"
+        );
+    }
+    for caller in ["ThroughField", "Ambiguous", "LocalType", "Generic"] {
+        let call = one_go_call(&nodes, &edges, caller, "Finish");
+        assert_eq!(call.resolved_target, None, "{caller}: {call:#?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_dart_same_directory_does_not_prove_the_receiver_library() -> anyhow::Result<()> {
+    let (nodes, edges) = index_files(&[
+        (
+            "controller.dart",
+            "import 'base.dart';\nclass Worker extends Base {}\nvoid dispatch(Worker worker) { worker.render(); }\n",
+        ),
+        ("base.dart", "class Base { void render() {} }\n"),
+        ("decoy.dart", "class Worker { void render() {} }\n"),
+    ])?;
+    assert_ordinary_call_census(
+        "Dart inherited member",
+        &nodes,
+        &edges,
+        "dispatch",
+        "render",
+        1,
+    );
+    assert_no_resolved_call_to_method_owner_in_file(
+        "a separate library's Worker is never an inherited member",
+        &nodes,
+        &edges,
+        "dispatch",
+        "Worker",
+        "render",
+        "decoy.dart",
+    );
+    Ok(())
+}
+
+#[test]
 fn test_go_factory_return_declarations_isolate_external_test_package() -> anyhow::Result<()> {
     let (nodes, edges) = index_files(&[
         ("go.mod", "module example.com/m\n"),
@@ -21741,6 +21830,44 @@ impl GoFactoryReturnRefreshFixture {
         );
         Ok(())
     }
+}
+
+#[test]
+fn test_go_imported_alias_refresh_recomputes_unchanged_typed_caller() -> anyhow::Result<()> {
+    let mut fixture = GoFactoryReturnRefreshFixture::new()?;
+    fs::write(
+        &fixture.factory_path,
+        "package worker\ntype Receiver = Alpha\n",
+    )?;
+    fs::write(
+        &fixture.caller_path,
+        "package app\nimport lib \"example.com/refresh/worker\"\nfunc Caller(receiver *lib.Receiver) { receiver.Finish() }\n",
+    )?;
+    fixture.refresh(
+        vec![fixture.factory_path.clone(), fixture.caller_path.clone()],
+        vec![],
+    )?;
+    fixture.assert_initial_alpha("source-bound imported alias")?;
+    fs::write(
+        &fixture.factory_path,
+        "package worker\ntype Receiver = Bravo\n",
+    )?;
+    fixture.refresh(vec![fixture.factory_path.clone()], vec![])?;
+    let nodes = fixture.storage.get_nodes()?;
+    let edges = fixture.storage.get_edges()?;
+    assert_resolved_call_to_method_owner(
+        "rebound imported alias",
+        &nodes,
+        &edges,
+        "Caller",
+        "Bravo",
+        "Finish",
+    );
+    assert_eq!(
+        one_go_call(&nodes, &edges, "Caller", "Finish").certainty,
+        Some(ResolutionCertainty::Certain)
+    );
+    Ok(())
 }
 
 #[test]

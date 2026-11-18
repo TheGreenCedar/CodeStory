@@ -72,9 +72,11 @@ use crate::{
 
 /// Callsite marker written onto edges produced from Go selector-call syntax.
 pub(crate) const MEMBER_CALLSITE_MARKER: &str = "syntax:go-selector-call";
+pub(crate) const TYPED_RECEIVER_CALLSITE_MARKER: &str = "syntax:go-typed-receiver";
 pub(crate) const PACKAGE_FUNCTION_CALLSITE_MARKER: &str = "syntax:go-package-function";
 pub(crate) const PACKAGE_FUNCTION_IMPORT_SET_PREFIX: &str = "syntax:go-package-function:";
 pub(crate) const RETURN_PATH_OWNER_PREFIX: &str = "go-return-path:";
+pub(crate) const CALL_BINDING_REVISION: &str = "go-package-call-bindings-v8";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GoReturnPath {
@@ -412,6 +414,7 @@ pub(crate) fn receiver_call_specs(tree: &Tree, source: &str) -> Vec<ManualReceiv
             return_imports: &package_imports,
             file_scope_names: &file_scope_names,
             callable_name_visibility: go_callable_name_visibility(callable, source),
+            type_origins: go_type_origins(callable, source),
         };
         let mut local_binding_callsites = HashSet::new();
         collect_go_local_composite_receiver_call_specs(
@@ -438,7 +441,7 @@ pub(crate) fn receiver_call_specs(tree: &Tree, source: &str) -> Vec<ManualReceiv
             .iter()
             .map(|(receiver_name, (owner_name, _))| (receiver_name.clone(), owner_name.clone()))
             .collect::<HashMap<_, _>>();
-        receiver_types.extend(collect_go_parameter_types(callable, source));
+        receiver_types.extend(collect_go_parameter_types(callable, &resolution_context));
         if receiver_types.is_empty() {
             return;
         }
@@ -469,6 +472,9 @@ pub(crate) fn receiver_call_specs(tree: &Tree, source: &str) -> Vec<ManualReceiv
             if let Some(module_name) = receiver_modules.get(&spec.receiver_name) {
                 spec.owner_module = Some(module_name.clone());
             }
+            if !spec.receiver_name.contains('.') {
+                spec.binding_marker = Some(TYPED_RECEIVER_CALLSITE_MARKER.to_owned());
+            }
         }
         edges.extend(parameter_specs);
     });
@@ -487,6 +493,7 @@ struct GoCallableResolutionContext<'a> {
     return_imports: &'a GoPackageImports,
     file_scope_names: &'a HashSet<String>,
     callable_name_visibility: GoNameVisibilityIndex,
+    type_origins: GoNameVisibilityIndex,
 }
 
 #[derive(Default)]
@@ -500,6 +507,14 @@ struct GoNameVisibilityPoint {
 }
 
 impl GoNameVisibilityIndex {
+    fn retain_type(
+        &self,
+        owner: OptionalReceiverOwnerBinding,
+        origin: usize,
+    ) -> OptionalReceiverOwnerBinding {
+        owner.filter(|(name, module)| module.is_some() || !self.is_visible(name, origin))
+    }
+
     fn is_visible(&self, name: &str, at_byte: usize) -> bool {
         let Some(points) = self.names.get(name) else {
             return false;
@@ -668,6 +683,11 @@ fn collect_go_local_composite_receiver_call_specs(
                                 })
                             })
                     };
+                    let origin = right
+                        .get(index)
+                        .or_else(|| right.first())
+                        .map_or(node.start_byte(), |value| value.start_byte());
+                    let owner = context.type_origins.retain_type(owner, origin);
                     if top_level_binding {
                         if let Some(path) = owner
                             .as_ref()
@@ -706,6 +726,9 @@ fn collect_go_local_composite_receiver_call_specs(
                     .and_then(|raw_type| {
                         go_receiver_owner_from_type(raw_type, context.import_bindings)
                     });
+                let owner = context
+                    .type_origins
+                    .retain_type(owner, type_node.start_byte());
                 let mut cursor = node.walk();
                 for name_node in node
                     .named_children(&mut cursor)
@@ -1363,6 +1386,48 @@ fn go_callable_name_visibility(callable: TsNode<'_>, source: &str) -> GoNameVisi
             spans.entry(name).or_default().push((start_byte, end_byte));
         }
     });
+    go_name_visibility_from_spans(spans)
+}
+
+/// A local type or type parameter must not bind to a same-spelling package type.
+fn go_type_origins(callable: TsNode<'_>, source: &str) -> GoNameVisibilityIndex {
+    let mut spans = HashMap::<String, Vec<(usize, usize)>>::new();
+    walk_tree_nodes(callable, &mut |node| {
+        count_go_navigation_resolution_work(1);
+        let (start, end) = match node.kind() {
+            "type_spec" | "type_alias" => {
+                let Some(end) = go_navigation_binding_scope(node, callable) else {
+                    return;
+                };
+                (node.start_byte(), end)
+            }
+            "type_parameter_declaration" => {
+                let Some(list) = node.parent() else {
+                    return;
+                };
+                let Some(declaration) = list.parent() else {
+                    return;
+                };
+                if declaration.child_by_field_name("type_parameters") != Some(list) {
+                    return;
+                }
+                (declaration.start_byte(), declaration.end_byte())
+            }
+            _ => return,
+        };
+        let mut cursor = node.walk();
+        for name in node.children_by_field_name("name", &mut cursor) {
+            if let Some(name) = trimmed_node_text(name, source) {
+                spans.entry(name).or_default().push((start, end));
+            }
+        }
+    });
+    go_name_visibility_from_spans(spans)
+}
+
+fn go_name_visibility_from_spans(
+    spans: HashMap<String, Vec<(usize, usize)>>,
+) -> GoNameVisibilityIndex {
     let names = spans
         .into_iter()
         .map(|(name, mut spans)| {
@@ -1781,7 +1846,11 @@ fn go_module_directive_path(token: &str) -> Option<String> {
     Some(value.to_string())
 }
 
-fn collect_go_parameter_types(callable: TsNode<'_>, source: &str) -> HashMap<String, String> {
+fn collect_go_parameter_types(
+    callable: TsNode<'_>,
+    context: &GoCallableResolutionContext<'_>,
+) -> HashMap<String, String> {
+    let source = context.source;
     let mut receiver_types = HashMap::new();
     let Some(parameters) = callable.child_by_field_name("parameters") else {
         return receiver_types;
@@ -1799,7 +1868,10 @@ fn collect_go_parameter_types(callable: TsNode<'_>, source: &str) -> HashMap<Str
         let Some(raw_type) = trimmed_node_text(type_node, source) else {
             return;
         };
-        let Some(owner_name) = normalize_go_type_surface(&raw_type) else {
+        let Some((owner_name, _)) = context.type_origins.retain_type(
+            go_receiver_owner_from_type(&raw_type, context.import_bindings),
+            type_node.start_byte(),
+        ) else {
             return;
         };
         let mut cursor = node.walk();
@@ -1883,10 +1955,91 @@ pub(crate) struct GoReturnDeclaration {
     pub results: Vec<Option<String>>,
 }
 
+#[derive(Debug)]
+pub(crate) struct GoMethodOwnerShape {
+    pub owner: String,
+    pub field_names: HashSet<String>,
+    pub local_alias: Option<String>,
+    pub sole_local_embed: Option<String>,
+}
+
+/// The source shapes used to follow a local type alias or a sole embedded type.
+pub(crate) fn go_method_owner_shapes(tree: &Tree, source: &str) -> Vec<GoMethodOwnerShape> {
+    let mut shapes = Vec::new();
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    for declaration in root
+        .named_children(&mut cursor)
+        .filter(|node| node.kind() == "type_declaration")
+    {
+        let mut cursor = declaration.walk();
+        for spec in declaration
+            .named_children(&mut cursor)
+            .filter(|node| matches!(node.kind(), "type_spec" | "type_alias"))
+        {
+            let Some(owner) = spec
+                .child_by_field_name("name")
+                .and_then(|name| trimmed_node_text(name, source))
+            else {
+                continue;
+            };
+            let mut shape = GoMethodOwnerShape {
+                owner,
+                field_names: HashSet::new(),
+                local_alias: None,
+                sole_local_embed: None,
+            };
+            if spec.child_by_field_name("type_parameters").is_none()
+                && let Some(ty) = spec.child_by_field_name("type")
+            {
+                if spec.kind() == "type_alias" && ty.kind() == "type_identifier" {
+                    shape.local_alias = trimmed_node_text(ty, source);
+                } else if spec.kind() == "type_spec" && ty.kind() == "struct_type" {
+                    let mut cursor = ty.walk();
+                    if let Some(list) = ty
+                        .named_children(&mut cursor)
+                        .find(|node| node.kind() == "field_declaration_list")
+                    {
+                        let mut cursor = list.walk();
+                        let mut embedded = 0;
+                        for field in list
+                            .named_children(&mut cursor)
+                            .filter(|node| node.kind() == "field_declaration")
+                        {
+                            let mut cursor = field.walk();
+                            let mut names =
+                                field.children_by_field_name("name", &mut cursor).peekable();
+                            if names.peek().is_some() {
+                                shape.field_names.extend(
+                                    names.filter_map(|name| trimmed_node_text(name, source)),
+                                );
+                            } else {
+                                embedded += 1;
+                                shape.sole_local_embed = field
+                                    .child_by_field_name("type")
+                                    .filter(|ty| ty.kind() == "type_identifier")
+                                    .and_then(|ty| trimmed_node_text(ty, source));
+                            }
+                        }
+                        if embedded != 1 {
+                            shape.sole_local_embed = None;
+                        }
+                    }
+                }
+            }
+            shapes.push(shape);
+        }
+    }
+    shapes
+}
+
 pub(crate) fn go_concrete_return_types(tree: &Tree, source: &str) -> HashSet<String> {
     let mut concrete_types = HashSet::new();
     walk_tree_nodes(tree.root_node(), &mut |node| {
         if node.kind() != "type_spec" || node.child_by_field_name("type_parameters").is_some() {
+            return;
+        }
+        if node.parent().and_then(|declaration| declaration.parent()) != Some(tree.root_node()) {
             return;
         }
         let Some(type_node) = node.child_by_field_name("type") else {
@@ -1925,9 +2078,17 @@ pub(crate) fn go_return_declarations(tree: &Tree, source: &str) -> Vec<GoReturnD
         else {
             return;
         };
-        let owner = node
-            .child_by_field_name("receiver")
-            .and_then(|receiver| go_receiver_owner_name(receiver, source));
+        let owner = if node.kind() == "method_declaration" {
+            let Some(owner) = node
+                .child_by_field_name("receiver")
+                .and_then(|receiver| go_declared_receiver_owner_name(receiver, source))
+            else {
+                return;
+            };
+            Some(owner)
+        } else {
+            None
+        };
         let results = node
             .child_by_field_name("result")
             .map(|result| go_declared_result_owners(result, source))

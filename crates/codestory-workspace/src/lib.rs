@@ -47,8 +47,8 @@ mod repository_identity;
 mod test_git;
 pub use repo_metadata::{
     RepositoryChange, RepositoryChangeKind, RepositoryChangeScope, RepositoryMetadata,
-    RepositoryMetadataIssue, RepositoryTrackingDigest, observe_repository_tracking_digest,
-    read_repository_changes, read_repository_metadata,
+    RepositoryMetadataIssue, RepositoryTrackingDigest, discover_git_worktree_root,
+    observe_repository_tracking_digest, read_repository_changes, read_repository_metadata,
 };
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
