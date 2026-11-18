@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Whole-file lexical search points to the line that best matches the query, so a header mentioning one term is less likely to hide the relevant source.
+
 ## 0.18.0
 
 - Packets reuse one repository identity snapshot while selecting a response, avoiding repeated Git status scans within the same request.

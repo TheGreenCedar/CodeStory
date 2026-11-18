@@ -2549,26 +2549,10 @@ fn search_lexical_index_on_connection_excluding(
                     &candidate.normalized_content,
                 ))
         {
-            let (target, matched_line, source_excerpt) = if candidate.document.source
-                == LexicalDocumentSource::LexicalSource
-                && scope.payload == LexicalHitPayload::Full
-            {
-                let content = read_admitted_source_content(
-                    connection,
-                    candidate.row_id,
-                    representation,
-                    cancelled,
-                )?;
-                lexical_source_target(
-                    &candidate.document.path,
-                    &content,
-                    &tokens,
-                    token_match.content_weight > 0.0,
-                )
-            } else {
-                (None, None, None)
-            };
-            hits.push(LexicalHit {
+            let source = (candidate.document.source == LexicalDocumentSource::LexicalSource
+                && scope.payload == LexicalHitPayload::Full)
+                .then_some((candidate.row_id, token_match.content_weight > 0.0));
+            let hit = LexicalHit {
                 score: lexical_policy_score(
                     scope.lexical_policy,
                     lexical_sublane_score(sublane_ranks, query_shape),
@@ -2582,29 +2566,65 @@ fn search_lexical_index_on_connection_excluding(
                 source: candidate.document.source,
                 node_id: candidate.document.node_id,
                 symbol_name: candidate.document.symbol_name,
-                start_line: candidate.document.start_line.or(matched_line),
-                target,
-                source_excerpt,
+                start_line: candidate.document.start_line,
+                target: None,
+                source_excerpt: None,
                 call_neighborhood: candidate.document.call_neighborhood,
-            });
+            };
+            hits.push((hit, source));
         }
     }
     if cancelled() {
         bail!("lexical search cancelled");
     }
-    hits.sort_by(|left, right| {
-        right
-            .score
-            .partial_cmp(&left.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| left.path.cmp(&right.path))
-            .then_with(|| lexical_source_rank(left.source).cmp(&lexical_source_rank(right.source)))
-            .then_with(|| left.node_id.cmp(&right.node_id))
-            .then_with(|| left.symbol_name.cmp(&right.symbol_name))
-            .then_with(|| left.start_line.cmp(&right.start_line))
+    hits.sort_by(|(left, _), (right, _)| compare_lexical_hit_rank(left, right));
+    // For ranking, location breaks ties only within the same result key. Include
+    // the whole cutoff tie so a derived line cannot change which rows were eligible.
+    let location_limit = hits.get(limit - 1).map_or(hits.len(), |(cutoff, _)| {
+        hits.partition_point(|(hit, _)| compare_lexical_hit_rank(hit, cutoff).is_le())
     });
+    let mut source_query = None;
+    for (index, (hit, source)) in hits.iter_mut().enumerate() {
+        let Some((row_id, content_matched)) = source else {
+            continue;
+        };
+        // Preserve fail-closed validation of every admitted body. The passage scan
+        // itself can be skipped for candidates that cannot enter the reply.
+        let content = read_admitted_source_content(connection, *row_id, representation, cancelled)?;
+        if index < location_limit {
+            let (target, matched_line, source_excerpt) = lexical_source_target(
+                &hit.path,
+                &content,
+                source_query.get_or_insert_with(|| LexicalSourceQuery::new(&tokens)),
+                *content_matched,
+                cancelled,
+            )?;
+            hit.target = target;
+            hit.start_line = hit.start_line.or(matched_line);
+            hit.source_excerpt = source_excerpt;
+        }
+    }
+    if cancelled() {
+        bail!("lexical search cancelled");
+    }
+    for tied in hits[..location_limit]
+        .chunk_by_mut(|(left, _), (right, _)| compare_lexical_hit_rank(left, right).is_eq())
+    {
+        tied.sort_by_key(|(hit, _)| hit.start_line);
+    }
     hits.truncate(limit);
-    Ok(hits)
+    Ok(hits.into_iter().map(|(hit, _)| hit).collect())
+}
+
+fn compare_lexical_hit_rank(left: &LexicalHit, right: &LexicalHit) -> std::cmp::Ordering {
+    right
+        .score
+        .partial_cmp(&left.score)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| left.path.cmp(&right.path))
+        .then_with(|| lexical_source_rank(left.source).cmp(&lexical_source_rank(right.source)))
+        .then_with(|| left.node_id.cmp(&right.node_id))
+        .then_with(|| left.symbol_name.cmp(&right.symbol_name))
 }
 
 fn lexical_source_rank(source: LexicalDocumentSource) -> u8 {
@@ -5571,92 +5591,148 @@ fn decode_lexical_content(
     String::from_utf8(bytes).context("decoded lexical content is not UTF-8")
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LexicalSourceToken {
-    normalized: String,
-    start_byte: usize,
-    end_byte: usize,
+struct LexicalSourceMatch {
+    token: std::ops::Range<usize>,
+    line_start: usize,
+    line_number: usize,
 }
 
-fn lexical_source_match(value: &str, query_tokens: &[String]) -> Option<LexicalSourceToken> {
-    let mut characters = value.char_indices().peekable();
+struct LexicalSourceQuery<'a> {
+    slots: HashMap<&'a str, usize>,
+    prefix_lengths: Vec<usize>,
+}
+
+impl<'a> LexicalSourceQuery<'a> {
+    fn new(tokens: &'a [String]) -> Self {
+        let mut slots = HashMap::with_capacity(tokens.len());
+        for token in tokens {
+            let next_slot = slots.len();
+            slots.entry(token.as_str()).or_insert(next_slot);
+        }
+        let mut prefix_lengths: Vec<_> = slots.keys().map(|token| token.len()).collect();
+        prefix_lengths.sort_unstable();
+        prefix_lengths.dedup();
+        Self {
+            slots,
+            prefix_lengths,
+        }
+    }
+}
+
+fn lexical_source_match(
+    value: &str,
+    query: &LexicalSourceQuery<'_>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Option<LexicalSourceMatch>> {
+    let Some(&max_query_bytes) = query.prefix_lengths.last() else {
+        return Ok(None);
+    };
+    let mut characters = value
+        .char_indices()
+        .chain(std::iter::once((value.len(), '\n')))
+        .peekable();
     let mut current = String::new();
-    let mut start_byte = None;
+    let mut token_start = 0;
     let mut previous: Option<char> = None;
+    let mut line_start = 0;
+    let mut line_number = 1;
+    let mut line_anchor = None;
+    let mut anchor_is_exact = false;
+    let mut line_score = (0, 0);
+    let mut best = None;
+    let mut best_score = (0, 0);
+    let perfect_score = (query.slots.len(), query.slots.len());
+    // A line number marks each term's match without clearing the vector per line.
+    let mut seen_terms = vec![(0, false); query.slots.len()];
+    let mut next_cancel_check = 0;
 
     while let Some((byte_index, character)) = characters.next() {
+        if byte_index >= next_cancel_check {
+            if cancelled() {
+                bail!("lexical search cancelled");
+            }
+            next_cancel_check = byte_index.saturating_add(16 * 1_024);
+        }
         let next = characters.peek().map(|(_, character)| *character);
         let camel_boundary = character.is_uppercase()
             && previous.is_some_and(|value| value.is_lowercase() || value.is_numeric())
             || character.is_uppercase()
                 && previous.is_some_and(|value| value.is_uppercase())
                 && next.is_some_and(|value| value.is_lowercase());
-        if camel_boundary && !current.is_empty() {
-            let token = LexicalSourceToken {
-                normalized: std::mem::take(&mut current),
-                start_byte: start_byte.take().expect("non-empty token has a start"),
-                end_byte: byte_index,
-            };
-            if query_tokens
-                .iter()
-                .any(|query| token.normalized.starts_with(query))
-            {
-                return Some(token);
+        let alphanumeric = character.is_alphanumeric();
+        if !current.is_empty() && (camel_boundary || !alphanumeric) {
+            for &length in &query.prefix_lengths {
+                if length > current.len() {
+                    break;
+                }
+                let Some(&slot) = current
+                    .get(..length)
+                    .and_then(|prefix| query.slots.get(prefix))
+                else {
+                    continue;
+                };
+                let exact = length == current.len();
+                if line_anchor.is_none() || (exact && !anchor_is_exact) {
+                    line_anchor = Some(token_start..byte_index);
+                    anchor_is_exact = exact;
+                }
+                let seen = &mut seen_terms[slot];
+                if seen.0 != line_number {
+                    line_score.0 += 1;
+                    *seen = (line_number, false);
+                }
+                if exact && !seen.1 {
+                    line_score.1 += 1;
+                    seen.1 = true;
+                }
             }
+            current.clear();
         }
-        if character.is_alphanumeric() {
-            start_byte.get_or_insert(byte_index);
-            current.extend(character.to_lowercase());
-        } else if !current.is_empty() {
-            let token = LexicalSourceToken {
-                normalized: std::mem::take(&mut current),
-                start_byte: start_byte.take().expect("non-empty token has a start"),
-                end_byte: byte_index,
-            };
-            if query_tokens
-                .iter()
-                .any(|query| token.normalized.starts_with(query))
-            {
-                return Some(token);
+        if character == '\n' || line_score == perfect_score {
+            if line_score > best_score {
+                best_score = line_score;
+                best = line_anchor.take().map(|token| LexicalSourceMatch {
+                    token,
+                    line_start,
+                    line_number,
+                });
+            }
+            if line_score == perfect_score {
+                break;
+            }
+            line_anchor = None;
+            anchor_is_exact = false;
+            line_score = (0, 0);
+            line_start = byte_index + 1;
+            line_number += 1;
+        }
+        if alphanumeric {
+            if current.is_empty() {
+                token_start = byte_index;
+            }
+            // One character past the longest query distinguishes prefix matches from exact ones.
+            if current.len() <= max_query_bytes {
+                current.extend(character.to_lowercase());
             }
         }
         previous = Some(character);
     }
-    if !current.is_empty() {
-        let token = LexicalSourceToken {
-            normalized: current,
-            start_byte: start_byte.expect("non-empty token has a start"),
-            end_byte: value.len(),
-        };
-        if query_tokens
-            .iter()
-            .any(|query| token.normalized.starts_with(query))
-        {
-            return Some(token);
-        }
-    }
-    None
+    Ok(best)
 }
 
 fn lexical_source_target(
     file_path: &str,
     content: &str,
-    query_tokens: &[String],
+    query: &LexicalSourceQuery<'_>,
     content_matched: bool,
-) -> (Option<SearchTargetDto>, Option<u32>, Option<String>) {
-    if content_matched && let Some(matched) = lexical_source_match(content, query_tokens) {
-        let start_line = content[..matched.start_byte]
-            .bytes()
-            .filter(|byte| *byte == b'\n')
-            .count()
-            .saturating_add(1) as u32;
-        let line_start = content[..matched.start_byte]
-            .rfind('\n')
-            .map_or(0, |index| index + 1);
-        let line_end = content[matched.end_byte..]
-            .find('\n')
-            .map_or(content.len(), |index| matched.end_byte + index);
-        let excerpt_prefix = content[line_start..matched.start_byte]
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(Option<SearchTargetDto>, Option<u32>, Option<String>)> {
+    if content_matched
+        && let Some(matched) = lexical_source_match(content, query, cancelled)?
+        && let Ok(start_byte) = u32::try_from(matched.token.start)
+        && let Ok(end_byte) = u32::try_from(matched.token.end)
+    {
+        let excerpt_prefix = content[matched.line_start..matched.token.start]
             .chars()
             .rev()
             .take(192)
@@ -5664,50 +5740,33 @@ fn lexical_source_target(
             .into_iter()
             .rev()
             .collect::<String>();
-        let excerpt_match = content[matched.start_byte..matched.end_byte]
+        let excerpt_match = content[matched.token.clone()]
             .chars()
             .take(128)
             .collect::<String>();
-        let excerpt_suffix = content[matched.end_byte..line_end]
+        let excerpt_suffix = content[matched.token.end..]
             .chars()
+            .take_while(|character| *character != '\n')
             .take(192)
             .collect::<String>();
-        let Ok(start_byte) = u32::try_from(matched.start_byte) else {
-            return (
-                Some(SearchTargetDto::File {
-                    file_path: file_path.to_string(),
-                }),
-                None,
-                None,
-            );
-        };
-        let Ok(end_byte) = u32::try_from(matched.end_byte) else {
-            return (
-                Some(SearchTargetDto::File {
-                    file_path: file_path.to_string(),
-                }),
-                None,
-                None,
-            );
-        };
-        return (
+        return Ok((
             Some(SearchTargetDto::FileRange {
                 file_path: file_path.to_string(),
                 start_byte,
                 end_byte,
             }),
-            Some(start_line),
+            Some(matched.line_number as u32),
             Some(format!("{excerpt_prefix}{excerpt_match}{excerpt_suffix}")),
-        );
+        ));
     }
 
-    (
+    Ok((
         Some(SearchTargetDto::File {
             file_path: file_path.to_string(),
         }),
         None,
         None,
-    )
+    ))
 }
 
 fn fts_document_frequency(connection: &Connection, token: &str) -> Result<usize> {
@@ -8639,6 +8698,215 @@ mod tests {
     }
 
     #[test]
+    fn whole_file_search_points_to_the_best_matching_line() {
+        let cases = [
+            (
+                "src/lantern.rs",
+                "lantern relay",
+                "// lantern overview\nfn lantern_relay() {}\n",
+                2,
+                "lantern",
+            ),
+            (
+                "src/orchard.rs",
+                "caféParcel",
+                "// café parceled\r\nlet _π = caféParcel",
+                2,
+                "café",
+            ),
+            (
+                "src/transom.rs",
+                "transom_latch",
+                "// latch overview\nfn transom_latch() {}\n",
+                2,
+                "transom",
+            ),
+            (
+                "src/amber.rs",
+                "amber amber map",
+                "// amber amber amber\nfn amber_map() {}\n",
+                2,
+                "amber",
+            ),
+            (
+                "src/panel.rs",
+                "panel weave",
+                "// panel weave\nfn panel_weave() {}\n",
+                1,
+                "panel",
+            ),
+            (
+                "src/prefix.rs",
+                "spindle",
+                "fn spindlewood() {}\nfn spindletop() {}",
+                1,
+                "spindlewood",
+            ),
+            (
+                "src/overlap.rs",
+                "arch archway",
+                "// arch detail\nlet ağö = archway();\n",
+                2,
+                "archway",
+            ),
+        ];
+        let data = TempDir::new().expect("data");
+        let prepared = prepared_documents(
+            cases
+                .iter()
+                .map(|(path, _, source, _, _)| source_document(path, source))
+                .collect(),
+        );
+        build_prepared_lexical_shard(
+            data.path(),
+            "locations",
+            &prepared,
+            "input",
+            None,
+            || Ok(()),
+        )
+        .expect("build lexical shard");
+        let shard = shard_dir_for(data.path(), "locations");
+
+        for (path, query, source, line, anchor) in cases {
+            let hits = search_lexical_index(&shard, "input", query, 1).expect("search");
+            let hit = hits.first().expect("matching file");
+            assert_eq!(hit.path, path, "{query}");
+            assert_eq!(hit.start_line, Some(line), "{query}");
+            let mut lines = source.split('\n');
+            let line_start: usize = lines
+                .by_ref()
+                .take(line as usize - 1)
+                .map(|s| s.len() + 1)
+                .sum();
+            let excerpt = lines.next().expect("expected source line");
+            assert_eq!(hit.source_excerpt.as_deref(), Some(excerpt), "{query}");
+            let start = line_start + excerpt.find(anchor).expect("expected source anchor");
+            assert_eq!(
+                hit.target,
+                Some(SearchTargetDto::FileRange {
+                    file_path: path.to_string(),
+                    start_byte: start as u32,
+                    end_byte: (start + anchor.len()) as u32,
+                }),
+                "{query}",
+            );
+        }
+        assert!(
+            search_lexical_index(&shard, "input", "unmatchedquartz", 1)
+                .expect("search with no match")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn whole_file_search_anchors_a_wide_line_on_the_exact_token() {
+        let data = TempDir::new().expect("data");
+        let source = format!(
+            "const spindlewood = 1; {}const spindle = a;\n",
+            "a += value; ".repeat(25)
+        );
+        let path = "src/wide.js";
+        let prepared = prepared_documents(vec![source_document(path, &source)]);
+        build_prepared_lexical_shard(data.path(), "wide", &prepared, "input", None, || Ok(()))
+            .expect("build lexical shard");
+        let hits = search_lexical_index(&shard_dir_for(data.path(), "wide"), "input", "spindle", 1)
+            .expect("search");
+        let hit = hits.first().expect("matching file");
+        let start_byte = source.rfind("spindle").expect("exact anchor") as u32;
+        assert_eq!(hit.start_line, Some(1));
+        assert_eq!(
+            hit.target,
+            Some(SearchTargetDto::FileRange {
+                file_path: path.to_string(),
+                start_byte,
+                end_byte: start_byte + 7,
+            })
+        );
+        assert!(
+            hit.source_excerpt
+                .as_deref()
+                .unwrap()
+                .contains("const spindle = a;")
+        );
+    }
+
+    #[test]
+    fn full_search_locates_passages_only_for_returned_candidates() {
+        let connection = Connection::open_in_memory().expect("in-memory lexical database");
+        connection
+            .execute_batch(
+                "PRAGMA user_version = 2;
+             CREATE TABLE lexical_documents (
+                 id INTEGER PRIMARY KEY, path TEXT NOT NULL, content TEXT NOT NULL,
+                 source TEXT NOT NULL, node_id TEXT, symbol_name TEXT, start_line INTEGER
+             );
+             CREATE VIRTUAL TABLE lexical_fts USING fts5(path, content);
+             INSERT INTO lexical_fts(rowid, path, content)
+             VALUES (1, 'src/a.rs', 'anchor secondary'), (2, 'src/z.rs', 'anchor secondary');",
+            )
+            .expect("lexical fixture");
+        // Legacy storage keeps the raw body separate from the FTS text and
+        // lets cancellation polls distinguish a passage scan from a SQL fetch.
+        let wide = format!("anchor\n{}\nsecondary\n", "x".repeat(1_900_000));
+        for (id, path, source) in [
+            (1, "src/a.rs", "anchor secondary"),
+            (2, "src/z.rs", wide.as_str()),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO lexical_documents(id, path, content, source)
+                 VALUES (?1, ?2, ?3, 'lexical_source')",
+                    params![id, path, source],
+                )
+                .expect("stored body");
+        }
+        let search = |limit| {
+            let polls = AtomicUsize::new(0);
+            let hits = search_lexical_index_on_connection(
+                &connection,
+                "anchor secondary",
+                limit,
+                2,
+                &mut HashMap::new(),
+                &|| {
+                    polls.fetch_add(1, Ordering::Relaxed);
+                    false
+                },
+                LexicalHitPayload::Full,
+                LexicalAdmissionPolicy::StrictLiteralV1,
+            )
+            .expect("search");
+            (hits, polls.load(Ordering::Relaxed))
+        };
+        let (first, first_polls) = search(1);
+        let (both, both_polls) = search(2);
+        assert_eq!(first[0].path, "src/a.rs");
+        assert_eq!(first[0].path, both[0].path);
+        assert_eq!(first[0].target, both[0].target);
+        assert_eq!(both[1].path, "src/z.rs");
+        assert_eq!(both[1].source_excerpt.as_deref(), Some("anchor"));
+        assert!(
+            both_polls >= first_polls + 16,
+            "expected only the longer result to trigger a passage scan: {first_polls}, {both_polls}"
+        );
+    }
+
+    #[test]
+    fn source_location_scan_observes_cancellation_inside_a_long_token() {
+        let mut content = "x".repeat(64 * 1_024);
+        content.push_str(" targetword");
+        let polls = AtomicUsize::new(0);
+        let tokens = lexical_query_tokens("targetword");
+        let query = LexicalSourceQuery::new(&tokens);
+        let result = lexical_source_match(&content, &query, &|| {
+            polls.fetch_add(1, Ordering::Relaxed) > 0
+        });
+
+        assert!(matches!(result, Err(error) if error.to_string().contains("cancelled")));
+    }
+
+    #[test]
     fn whole_file_path_only_match_has_an_explicit_file_target() {
         let project = TempDir::new().expect("project");
         std::fs::create_dir_all(project.path().join("src")).expect("src");
@@ -9870,6 +10138,7 @@ mod tests {
         limit: usize,
     ) -> Vec<LexicalHit> {
         let tokens = lexical_query_tokens(query);
+        let source_query = LexicalSourceQuery::new(&tokens);
         let frequencies = tokens
             .iter()
             .map(|token| {
@@ -9905,9 +10174,11 @@ mod tests {
                             lexical_source_target(
                                 &document.path,
                                 &document.content,
-                                &tokens,
+                                &source_query,
                                 token_match.content_weight > 0.0,
+                                &|| false,
                             )
+                            .expect("uncancelled lexical source target")
                         } else {
                             (None, None, None)
                         };
