@@ -293,10 +293,14 @@ function findingFor(result, relativePath, predicate = () => true) {
 
 function patternCore(pattern) {
   let core = pattern;
-  for (const prefix of ["(?:^|[^A-Za-z0-9])", "(?:^|[^A-Za-z0-9_])"]) {
+  for (const prefix of [
+    "(?:^|[^A-Za-z0-9])",
+    "(?:^|[^A-Za-z0-9_])",
+    "(?<![A-Za-z0-9_.-])",
+  ]) {
     if (core.startsWith(prefix)) core = core.slice(prefix.length);
   }
-  for (const suffix of ["(?![A-Za-z0-9])", "(?![A-Za-z0-9_])"]) {
+  for (const suffix of ["(?![A-Za-z0-9])", "(?![A-Za-z0-9_])", "(?![A-Za-z0-9_.-])"]) {
     if (core.endsWith(suffix)) core = core.slice(0, -suffix.length);
   }
   return core.replaceAll("\\", "").toLowerCase();
@@ -439,6 +443,19 @@ pub const HOLDOUTS: &[&str] = &[
   "HiArgs", "server.c", "core/main.rs", "haystack.rs",
 ];
 `);
+  const serverFileProbes = ["src/server.c", "src/server.c:42", "src\\SERVER.C"];
+  for (const [index, probe] of serverFileProbes.entries()) {
+    reject(`server-file-${index}.rs`, `pub const PATH: &str = ${JSON.stringify(probe)};\n`);
+  }
+  allow("source-observer.rs", `
+pub fn source(lease: &Lease) -> SourceObserver { lease.source_observer.clone() }
+`);
+  allow("unrelated-server-names.rs", `
+pub const PATHS: &[&str] = &[
+  "myserver.c", "lib/http-server.c", "server.cache", "lib/server.c_backup",
+  "server.c.bak", "ServerC",
+];
+`);
   reject("query-phrase.rs", `
 pub const QUERY: &str =
   "project loads settings refreshes source groups computes refresh info and builds an index";
@@ -493,6 +510,10 @@ pub fn newline() -> char { '\\n' }
 pub fn neutral() -> &'static str { "generic role coverage stays neutral" }
 `);
   const splitConstructionFiles = new Map([
+    ["split-family/server-path.rs", {
+      source: 'pub fn leaked() -> String { ["src", "/server", ".c"].concat() }\n',
+      marker: "srcserverc",
+    }],
     ["split-family/use-s-wr.rs", {
       source: 'pub fn leaked() -> String { ["use", "s", "wr"].concat() }\n',
       marker: "useswr",
@@ -902,6 +923,16 @@ pub const PLANTED_TERMS: &[(&str, &str)] = &[
       assert.ok(
         banFiredFor(result, "current-holdouts.rs", marker),
         `the current holdout fixture lost its ${marker} ban`,
+      );
+    }
+    for (const [index, probe] of serverFileProbes.entries()) {
+      assert.ok(
+        findingFor(
+          result,
+          `server-file-${index}.rs`,
+          ({ pattern }) => pattern != null && patternCore(pattern) === "server.c",
+        ),
+        `the residual filename ban missed ${probe}`,
       );
     }
     for (const marker of MANIFEST_MARKERS) {

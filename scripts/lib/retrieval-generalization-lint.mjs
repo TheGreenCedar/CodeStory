@@ -894,9 +894,9 @@ const residualBannedLiterals = [
       "Written only into ripgrep claim prose, never into an `expected_symbols` entry. Prose identifiers are derived from camelCase and snake_case words alone, because PascalCase prose words are as often proper nouns - `SQLite` is this product's own storage engine, `JavaScript` is a language, `URLSession` and `ValidityState` are platform APIs.",
   },
   {
-    pattern: "server\\.c",
+    pattern: "(?<![A-Za-z0-9_.-])server\\.c(?![A-Za-z0-9_.-])",
     reason:
-      "Corpus file name whose stem is a word this product writes on its own account, so `corpusFileNameMarkers` declines it. Its sibling `ae.c` is derived, because `ae` is nobody's vocabulary.",
+      "Corpus filename whose stem is ordinary product vocabulary, so `corpusFileNameMarkers` skips it. Match the complete filename, including inside paths.",
   },
   {
     pattern: "--with-holdout-clone",
