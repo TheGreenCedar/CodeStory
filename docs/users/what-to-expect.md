@@ -42,6 +42,9 @@ what each claim does *not* mean:
   CodeStory checks the source at both ends. A factory or import in a third file
   may have changed since indexing. For a rename, use `cs find NAME` to inspect
   other mentions and run the project’s normal checks.
+  When declaration bodies would push later matches out of the byte budget,
+  `find` and single-name `refs` switch to a compact location list. Pass
+  `--no-bodies` to request that list directly, then `read` the relevant sites.
 - **First index** on a large checkout can take minutes; the agent retries the
   intended CodeStory call while preparation runs.
 - **First broad search in a process** also initializes the embedded model. Later
