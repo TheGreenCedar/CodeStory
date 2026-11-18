@@ -4978,110 +4978,231 @@ function isToolCallStartEvent(event) {
   return false;
 }
 
-function normalizeTokenKey(key) {
-  const lower = key.toLowerCase();
-  if (lower === "prompt_tokens") {
-    return "input_tokens";
-  }
-  if (lower === "completion_tokens") {
-    return "output_tokens";
-  }
-  if (
-    lower === "input_tokens" ||
-    lower === "output_tokens" ||
-    lower === "total_tokens" ||
-    lower === "cached_input_tokens" ||
-    lower === "reasoning_tokens"
-  ) {
-    return lower;
-  }
-  if (lower === "reasoning_output_tokens") {
-    return "reasoning_tokens";
-  }
-  return null;
+const USAGE_FIELDS = [
+  "input_tokens", "output_tokens", "total_tokens", "cached_input_tokens",
+  "cache_write_input_tokens", "reasoning_tokens",
+];
+
+function tokenCount(value) {
+  const count = typeof value === "string" && /^\d+$/.test(value) ? Number(value) : value;
+  return Number.isSafeInteger(count) && count >= 0 ? count : null;
 }
 
-function mergeUsage(value, usage) {
-  if (!value || typeof value !== "object") {
-    return;
-  }
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      mergeUsage(item, usage);
-    }
-    return;
-  }
-
-  for (const [key, raw] of Object.entries(value)) {
-    const normalized = normalizeTokenKey(key);
-    if (normalized && Number.isFinite(Number(raw))) {
-      usage[normalized] = Math.max(usage[normalized] ?? 0, Number(raw));
-    }
-    if (raw && typeof raw === "object") {
-      mergeUsage(raw, usage);
-    }
-  }
-}
-
-function extractUsage(events) {
-  const usage = {};
-  for (const event of events) {
-    mergeUsage(event, usage);
-  }
-  if (usage.total_tokens == null) {
-    const input = usage.input_tokens ?? 0;
-    const output = usage.output_tokens ?? 0;
-    if (input || output) {
-      usage.total_tokens = input + output;
-    }
-  }
+function readUsage(value) {
+  const input = tokenCount(value?.input_tokens ?? value?.prompt_tokens);
+  const output = tokenCount(value?.output_tokens ?? value?.completion_tokens);
+  const total = tokenCount(value?.total_tokens);
+  const cached = tokenCount(value?.cached_input_tokens);
+  const written = tokenCount(value?.cache_write_input_tokens);
+  const reasoning = tokenCount(value?.reasoning_tokens ?? value?.reasoning_output_tokens);
+  const gross = input == null || output == null ? null : tokenCount(input + output);
+  if (total != null && gross != null && total !== gross) return readUsage(null);
+  // OpenAI's cached and cache-write buckets are disjoint subsets of input.
+  const invalidCache = input != null && (cached ?? 0) + (written ?? 0) > input;
   return {
-    input_tokens: usage.input_tokens ?? null,
-    output_tokens: usage.output_tokens ?? null,
-    total_tokens: usage.total_tokens ?? null,
-    cached_input_tokens: usage.cached_input_tokens ?? null,
-    reasoning_tokens: usage.reasoning_tokens ?? null,
+    input_tokens: input,
+    output_tokens: output,
+    total_tokens: total ?? gross,
+    cached_input_tokens: invalidCache ? null : cached,
+    cache_write_input_tokens: invalidCache ? null : written,
+    reasoning_tokens: output != null && reasoning > output ? null : reasoning,
   };
 }
 
-function estimateCost(usage, rates = null) {
-  const inputCost = Number.parseFloat(
-    rates?.input_per_mtok ?? process.env.CODESTORY_BENCH_INPUT_COST_PER_MTOK ?? "",
-  );
-  const outputCost = Number.parseFloat(
-    rates?.output_per_mtok ?? process.env.CODESTORY_BENCH_OUTPUT_COST_PER_MTOK ?? "",
-  );
-  if (
-    !Number.isFinite(inputCost) ||
-    !Number.isFinite(outputCost) ||
-    usage.input_tokens == null ||
-    usage.output_tokens == null
-  ) {
-    return null;
+function sumUsage(observations) {
+  return Object.fromEntries(USAGE_FIELDS.map((field) => [
+    field,
+    observations.length && observations.every((usage) => usage[field] != null)
+      ? tokenCount(observations.reduce((sum, usage) => sum + usage[field], 0))
+      : null,
+  ]));
+}
+
+function sameKnownUsage(a, b) {
+  return USAGE_FIELDS.every((field) => a[field] == null || b[field] == null || a[field] === b[field]);
+}
+
+function usageFromRequestReceipts(receipts) {
+  const byResponse = new Map();
+  const finalByThread = new Map();
+  for (const { payload } of receipts) {
+    const id = payload?.response_id;
+    if (typeof id !== "string" || !id || !payload.usage) return readUsage(null);
+    const thread = payload.thread_id ?? null;
+    const usage = readUsage(payload.usage);
+    const previous = byResponse.get(id);
+    if (previous) {
+      if (previous.thread !== thread || !sameKnownUsage(previous.usage, usage)) return readUsage(null);
+      // A replay can omit fields; the original billed request still counts once.
+      previous.usage = readUsage(Object.fromEntries(USAGE_FIELDS.map((field) => [
+        field, previous.usage[field] ?? usage[field],
+      ])));
+      continue;
+    }
+    byResponse.set(id, { thread, usage });
+    finalByThread.set(thread, payload.thread_token_usage ? readUsage(payload.thread_token_usage) : null);
   }
-  return (usage.input_tokens / 1_000_000) * inputCost + (usage.output_tokens / 1_000_000) * outputCost;
+  const byThread = new Map();
+  for (const { thread, usage } of byResponse.values()) {
+    if (!byThread.has(thread)) byThread.set(thread, []);
+    byThread.get(thread).push(usage);
+  }
+  const totals = [];
+  for (const [thread, requests] of byThread) {
+    const total = sumUsage(requests);
+    const recorded = finalByThread.get(thread);
+    if (recorded && !sameKnownUsage(total, recorded)) return readUsage(null);
+    totals.push(total);
+  }
+  return sumUsage(totals);
+}
+
+function usageFromCumulativeSnapshots(snapshots) {
+  let previous = null;
+  const highestKnown = new Map();
+  const seen = new Set();
+  for (const info of snapshots) {
+    const total = readUsage(info.total_token_usage);
+    const key = JSON.stringify(total);
+    if (seen.has(key)) continue;
+    const last = readUsage(info.last_token_usage);
+    for (const field of USAGE_FIELDS) {
+      if (total[field] == null) continue;
+      const before = previous ? previous[field] : 0;
+      if (total[field] < (highestKnown.get(field) ?? 0) ||
+          (before != null && last[field] != null && total[field] - before !== last[field])) {
+        return readUsage(null);
+      }
+      highestKnown.set(field, total[field]);
+    }
+    seen.add(key);
+    previous = total;
+  }
+  return previous;
+}
+
+function usageFromCompletedTurns(events) {
+  const turns = new Map();
+  let turn = 0;
+  let sequence = 0;
+  for (const event of events) {
+    if (event?.type === "turn.started") {
+      turn = event.turn_id ?? ++sequence;
+      if (!turns.has(turn)) turns.set(turn, null);
+    } else if (event?.type === "turn.completed" || event?.type === "turn.failed") {
+      const id = event.turn_id ?? turn;
+      const usage = readUsage(event.usage);
+      const previous = turns.get(id);
+      if (previous && !sameKnownUsage(previous, usage)) return readUsage(null);
+      if (previous) {
+        turns.set(id, readUsage(Object.fromEntries(USAGE_FIELDS.map((field) => [
+          field, previous[field] ?? usage[field],
+        ]))));
+      } else {
+        turns.set(id, usage);
+      }
+    }
+  }
+  if ([...turns.values()].some((usage) => !usage)) return readUsage(null);
+  return sumUsage([...turns.values()]);
+}
+
+function extractUsage(events) {
+  const receipts = events.filter((event) => event?.type === "token_usage_record");
+  if (receipts.length) {
+    const totals = usageFromRequestReceipts(receipts);
+    // A CLI turn summary covers the same run only for a single recorded thread.
+    if (new Set(receipts.map((event) => event.payload?.thread_id)).size === 1 &&
+        !sameKnownUsage(totals, usageFromCompletedTurns(events))) return readUsage(null);
+    return totals;
+  }
+
+  const snapshots = events
+    .filter((event) => event?.type === "event_msg" && event.payload?.type === "token_count")
+    .map((event) => event.payload.info)
+    .filter((info) => info?.total_token_usage);
+  if (snapshots.length) return usageFromCumulativeSnapshots(snapshots);
+
+  return usageFromCompletedTurns(events);
+}
+
+const COST_RATE_ENV = {
+  input_per_mtok: "CODESTORY_BENCH_INPUT_COST_PER_MTOK",
+  output_per_mtok: "CODESTORY_BENCH_OUTPUT_COST_PER_MTOK",
+  cached_input_per_mtok: "CODESTORY_BENCH_CACHED_INPUT_COST_PER_MTOK",
+  cache_write_input_per_mtok: "CODESTORY_BENCH_CACHE_WRITE_INPUT_COST_PER_MTOK",
+};
+
+function configuredCostRates(env, model) {
+  const amounts = {};
+  for (const [field, name] of Object.entries(COST_RATE_ENV)) {
+    const raw = env[name]?.trim();
+    if (raw) {
+      const rate = Number(raw);
+      if (Number.isFinite(rate) && rate >= 0) amounts[field] = rate;
+    }
+  }
+  return Object.keys(amounts).length
+    ? { currency: "USD", model, ...amounts, source: "configured_environment" }
+    : null;
+}
+
+function estimateCost(usage, rates) {
+  const { input_tokens, output_tokens, cached_input_tokens, cache_write_input_tokens } = usage;
+  if (input_tokens == null || output_tokens == null ||
+      cached_input_tokens == null || cache_write_input_tokens == null ||
+      cached_input_tokens + cache_write_input_tokens > input_tokens) return null;
+  const allocations = {
+    input_per_mtok: input_tokens - cached_input_tokens - cache_write_input_tokens,
+    output_per_mtok: output_tokens,
+    cached_input_per_mtok: cached_input_tokens,
+    cache_write_input_per_mtok: cache_write_input_tokens,
+  };
+  let cost = 0;
+  for (const [field, count] of Object.entries(allocations)) {
+    if (count === 0) continue;
+    const rate = rates?.[field];
+    if (!Number.isFinite(rate) || rate < 0) return null;
+    cost += count * rate;
+  }
+  return Number.isFinite(cost) ? cost / 1_000_000 : null;
 }
 
 function exactCandidateCostRates(env = process.env) {
-  const inputPerMtok = Number.parseFloat(env.CODESTORY_BENCH_INPUT_COST_PER_MTOK ?? "");
-  const outputPerMtok = Number.parseFloat(env.CODESTORY_BENCH_OUTPUT_COST_PER_MTOK ?? "");
-  if (
-    !Number.isFinite(inputPerMtok) ||
-    inputPerMtok <= 0 ||
-    !Number.isFinite(outputPerMtok) ||
-    outputPerMtok <= 0
-  ) {
+  const rates = configuredCostRates(env, DEFAULT_BENCHMARK_MODEL);
+  if (!(rates?.input_per_mtok > 0 && rates?.output_per_mtok > 0)) {
     throw new Error(
       "exact-candidate mode requires positive CODESTORY_BENCH_INPUT_COST_PER_MTOK and CODESTORY_BENCH_OUTPUT_COST_PER_MTOK before package authentication or repository materialization",
     );
   }
-  return {
-    currency: "USD",
-    model: DEFAULT_BENCHMARK_MODEL,
-    input_per_mtok: inputPerMtok,
-    output_per_mtok: outputPerMtok,
-    source: "configured_environment",
-  };
+  if (rates.cached_input_per_mtok == null || rates.cache_write_input_per_mtok == null) {
+    throw new Error(
+      "exact-candidate mode requires explicit CODESTORY_BENCH_CACHED_INPUT_COST_PER_MTOK and CODESTORY_BENCH_CACHE_WRITE_INPUT_COST_PER_MTOK before package authentication or repository materialization",
+    );
+  }
+  return rates;
+}
+
+function shardCostRatesFingerprint(model, rates) {
+  return digestObject({ model, rates });
+}
+
+function hasAttestedShardCostRates(summary, attestation, model) {
+  const rates = summary.cost_rates ?? null;
+  return summary.model === model && (rates == null || rates.model === model) &&
+    attestation?.cost_rates_sha256 === shardCostRatesFingerprint(model, rates);
+}
+
+function reanalysisCostRates(summary, opts) {
+  const rates = summary.cost_rates ?? null;
+  const model = summary.model ?? rates?.model ?? opts.model ?? DEFAULT_BENCHMARK_MODEL;
+  if (summary.shard || summary.aggregate) {
+    return hasAttestedShardCostRates(summary, summary.shard?.attestation ?? summary.source_attestation, model)
+      ? rates
+      : null;
+  }
+  if (rates?.model != null && rates.model !== model) return null;
+  return rates ?? configuredCostRates(process.env, model);
 }
 
 const BENCHMARK_AGENT_RUN_ID = "shared-agent";
@@ -7027,7 +7148,7 @@ async function runOne(opts, run, outDir) {
     baseline_harness_prelude: baselinePrelude?.public ?? null,
     codestory_harness_prelude: codestoryPrelude?.public ?? null,
     usage,
-    estimated_cost_usd: estimateCost(usage),
+    estimated_cost_usd: estimateCost(usage, opts.costRates),
     tool_calls_observed: toolCalls,
     codex_tool_calls_observed: codexToolCalls,
     transcript_analysis: analysis,
@@ -8886,10 +9007,13 @@ async function createDurableJsonlAppender(filePath, dependencies = {}) {
 async function recomputeRunAnalysis(result, opts, runDir, taskCache) {
   const stdoutPath = await resolveReanalysisStdoutPath(result, runDir);
   if (!stdoutPath || !existsSync(stdoutPath)) {
-    return {
+    const output = {
       ...result,
+      usage: readUsage(null),
+      estimated_cost_usd: null,
       reanalysis_error: `missing stdout artifact for ${result.repo}/${result.task_id}/${result.arm}/${result.repeat}`,
     };
+    return { ...output, resource_accounting: resourceAccountingForResult(output) };
   }
 
   const { parsed, malformed } = parseJsonLines(await readFile(stdoutPath, "utf8"));
@@ -8930,7 +9054,7 @@ async function recomputeRunAnalysis(result, opts, runDir, taskCache) {
     repo_provenance: result.repo_provenance ?? (repoConfig ? await repoProvenance(repoConfig) : null),
     codestory_cache_provenance: cacheProvenance,
     usage,
-    estimated_cost_usd: estimateCost(usage, opts.exactCandidateCostRates),
+    estimated_cost_usd: estimateCost(usage, opts.costRates),
     tool_calls_observed: analysisEvents.filter(isToolCallStartEvent).length,
     codex_tool_calls_observed: parsed.filter(isToolCallStartEvent).length,
     transcript_analysis: analysis,
@@ -8972,7 +9096,7 @@ async function reanalyzeAgentRunDirectory(opts) {
     : {};
   const reanalysisOpts = {
     ...opts,
-    exactCandidateCostRates: originalSummary.cost_rates ?? null,
+    costRates: reanalysisCostRates(originalSummary, opts),
   };
   const rows = (await readFile(runsPath, "utf8"))
     .split(/\r?\n/)
@@ -8991,7 +9115,7 @@ async function reanalyzeAgentRunDirectory(opts) {
     reanalyzed,
     "reanalyzed benchmark report",
   );
-  const costAccounting = summarizeCostAccounting(reanalyzed);
+  const costAccounting = summarizeCostAccounting(reanalyzed, originalSummary.expected_rows);
   const summaryOpts = {
     ...opts,
     runner: originalSummary.runner ?? opts.runner,
@@ -9008,6 +9132,7 @@ async function reanalyzeAgentRunDirectory(opts) {
     packet_obligation_accounting: obligationAccounting,
     summary,
     cost_accounting: costAccounting,
+    cost_rates: reanalysisOpts.costRates,
     exact_candidate_acceptance: reanalysisExactCandidateAcceptance(
       originalSummary,
       reanalyzed,
@@ -11061,6 +11186,7 @@ function resourceAccountingForResult(result) {
       output_tokens: usage.output_tokens ?? null,
       total_tokens: usage.total_tokens ?? null,
       cached_input_tokens: usage.cached_input_tokens ?? null,
+      cache_write_input_tokens: usage.cache_write_input_tokens ?? null,
       reasoning_tokens: usage.reasoning_tokens ?? null,
     },
     estimated_cost_usd: result.estimated_cost_usd ?? null,
@@ -11111,6 +11237,7 @@ function summarizeArmCostAccounting(rows) {
     failed_runs: rows.filter((row) => row.status === "fail").length,
     timeout_runs: rows.filter((row) => row.status === "timeout").length,
     missing_token_usage_runs: rows.filter((row) => row.usage?.total_tokens == null).length,
+    missing_estimated_cost_runs: rows.filter((row) => !Number.isFinite(row.estimated_cost_usd) || row.estimated_cost_usd < 0).length,
     time_spent_ms: {
       runner_wall: wallMs,
       agent_runner: agentRunnerWallMs,
@@ -11124,6 +11251,7 @@ function summarizeArmCostAccounting(rows) {
       output_tokens: sumPresentFinite(rows.map((row) => row.usage?.output_tokens)),
       total_tokens: sumPresentFinite(rows.map((row) => row.usage?.total_tokens)),
       cached_input_tokens: sumPresentFinite(rows.map((row) => row.usage?.cached_input_tokens)),
+      cache_write_input_tokens: sumPresentFinite(rows.map((row) => row.usage?.cache_write_input_tokens)),
       reasoning_tokens: sumPresentFinite(rows.map((row) => row.usage?.reasoning_tokens)),
     },
     estimated_cost_usd: sumPresentFinite(rows.map((row) => row.estimated_cost_usd)),
@@ -11204,7 +11332,7 @@ function accountingComparison(withValue, withoutValue) {
   };
 }
 
-function summarizeCostAccounting(results) {
+function summarizeCostAccounting(results, expectedRows = null) {
   const byArm = new Map();
   for (const row of results) {
     if (!byArm.has(row.arm)) {
@@ -11220,6 +11348,20 @@ function summarizeCostAccounting(results) {
 
   const withCodeStory = arms.with_codestory ?? null;
   const withoutCodeStory = arms.without_codestory ?? null;
+  const cohortKeys = (arm) => byArm.get(arm).map((row) => agentRunKey({ ...row, arm: "" })).sort();
+  const withKeys = withCodeStory ? cohortKeys("with_codestory") : [];
+  const withoutKeys = withoutCodeStory ? cohortKeys("without_codestory") : [];
+  const comparableSchedule = (expectedRows == null || results.length === expectedRows) &&
+    withKeys.length === withoutKeys.length && new Set(withKeys).size === withKeys.length &&
+    withKeys.every((key, index) => key === withoutKeys[index]);
+  const completeTokenTotal = (arm, field) =>
+    comparableSchedule && byArm.get(arm).every((row) => presentFiniteNumber(row.usage?.[field]) != null)
+      ? arms[arm].tokens_spent[field]
+      : null;
+  const compareTokens = (field) => accountingComparison(
+    completeTokenTotal("with_codestory", field),
+    completeTokenTotal("without_codestory", field),
+  );
   const withVsWithout =
     withCodeStory && withoutCodeStory
       ? {
@@ -11239,18 +11381,9 @@ function summarizeCostAccounting(results) {
                   withoutCodeStory.time_spent_ms.all_in,
                 )
               : null,
-          total_tokens: accountingComparison(
-            withCodeStory.tokens_spent.total_tokens,
-            withoutCodeStory.tokens_spent.total_tokens,
-          ),
-          input_tokens: accountingComparison(
-            withCodeStory.tokens_spent.input_tokens,
-            withoutCodeStory.tokens_spent.input_tokens,
-          ),
-          output_tokens: accountingComparison(
-            withCodeStory.tokens_spent.output_tokens,
-            withoutCodeStory.tokens_spent.output_tokens,
-          ),
+          total_tokens: compareTokens("total_tokens"),
+          input_tokens: compareTokens("input_tokens"),
+          output_tokens: compareTokens("output_tokens"),
           tool_calls: accountingComparison(
             withCodeStory.tool_calls.observed,
             withoutCodeStory.tool_calls.observed,
@@ -11264,8 +11397,8 @@ function summarizeCostAccounting(results) {
             withoutCodeStory.interaction_turns.total,
           ),
           estimated_cost_usd: accountingComparison(
-            withCodeStory.estimated_cost_usd,
-            withoutCodeStory.estimated_cost_usd,
+            !comparableSchedule || withCodeStory.missing_estimated_cost_runs ? null : withCodeStory.estimated_cost_usd,
+            !comparableSchedule || withoutCodeStory.missing_estimated_cost_runs ? null : withoutCodeStory.estimated_cost_usd,
           ),
         }
       : null;
@@ -11273,7 +11406,7 @@ function summarizeCostAccounting(results) {
   return {
     measurement_source: "runner_process_wall_clock_codex_jsonl_and_harness_prelude",
     note:
-      "Token values are parsed from Codex JSONL stdout. Tool-call and command totals include harness-run baseline and CodeStory preludes when present. Wall time includes the agent runner plus any harness prelude. CodeStory cache preparation is tracked separately and included in all-in wall time.",
+      "Token values are parsed from Codex JSONL stdout. Arm totals sum observed rows. Comparisons require complete token or cost evidence for both arms. Tool-call and command totals include harness-run baseline and CodeStory preludes when present. Wall time includes the agent runner plus any harness prelude. CodeStory cache preparation is tracked separately and included in all-in wall time.",
     generated_at: new Date().toISOString(),
     arms,
     with_vs_without: withVsWithout,
@@ -11376,6 +11509,7 @@ function summarizeRuns(results) {
         successful.map((row) => row.transcript_analysis?.direct_source_reads_total),
       ),
       missing_token_usage_runs: successful.filter((row) => row.usage?.total_tokens == null).length,
+      missing_estimated_cost_runs: successful.filter((row) => row.estimated_cost_usd == null).length,
       median_wall_ms: median(latencyEligible.map((row) => row.wall_ms)),
       observed_median_wall_ms: median(successful.map((row) => row.wall_ms)),
       median_codestory_cache_preparation_wall_ms: median(
@@ -12485,19 +12619,27 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
     const value = Number(selector(row));
     return total + (Number.isFinite(value) ? value : 0);
   }, 0);
+  const finiteNonnegative = (value) => typeof value === "number" && Number.isFinite(value) && value >= 0;
+  const finiteNonnegativeInteger = (value) => finiteNonnegative(value) && Number.isInteger(value);
   const resourceThresholds = [
-    ["tokens", (row) => row.usage?.total_tokens],
-    ["tool calls", (row) => row.tool_calls_observed],
-    ["cost", (row) => row.estimated_cost_usd],
+    ["tokens", (row) => row.usage?.total_tokens, finiteNonnegativeInteger],
+    ["tool calls", (row) => row.tool_calls_observed, finiteNonnegativeInteger],
+    ["cost", (row) => row.estimated_cost_usd, finiteNonnegative],
   ];
   const resourceTotals = {};
-  for (const [label, selector] of resourceThresholds) {
-    const baseline = sum("without_codestory", selector);
-    const published = sum("published_0_17_5", selector);
-    const candidate = sum("candidate_0_18", selector);
-    resourceTotals[label] = { without_codestory: baseline, published_0_17_5: published, candidate_0_18: candidate };
-    if (candidate > published * 1.05) reasons.push(`${label} exceed 105% of published 0.17.5`);
-    if (candidate > baseline * 0.8) reasons.push(`${label} exceed 80% of without_codestory`);
+  for (const [label, selector, measureIsKnown] of resourceThresholds) {
+    const totals = Object.fromEntries(EXACT_CANDIDATE_ARMS.map((arm) => {
+      const values = byArm[arm].map(selector);
+      return [arm, values.length === 54 && values.every(measureIsKnown) ? sumFinite(values) : null];
+    }));
+    resourceTotals[label] = totals;
+    const { without_codestory: baseline, published_0_17_5: published, candidate_0_18: candidate } = totals;
+    if (candidate != null && published != null && candidate > published * 1.05) {
+      reasons.push(`${label} exceed 105% of published 0.17.5`);
+    }
+    if (candidate != null && baseline != null && candidate > baseline * 0.8) {
+      reasons.push(`${label} exceed 80% of without_codestory`);
+    }
   }
 
   const uniqueRepoTiming = (arm, field) => {
@@ -12579,8 +12721,6 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
   }
 
   for (const row of rows) {
-    const finiteNonnegative = (value) => typeof value === "number" && Number.isFinite(value) && value >= 0;
-    const finiteNonnegativeInteger = (value) => finiteNonnegative(value) && Number.isInteger(value);
     if (
       !row.quality || typeof row.quality.pass !== "boolean" ||
       !row.usage || !finiteNonnegativeInteger(row.usage.total_tokens)
@@ -13981,11 +14121,14 @@ async function benchmarkShardAttestation(
     const { manifest_path: _manifestPath, ...snapshot } = taskSnapshotForResult(task);
     return snapshot;
   });
+  const costModel = opts.model ?? DEFAULT_BENCHMARK_MODEL;
+  const rateFingerprint = shardCostRatesFingerprint(costModel, opts.costRates ?? null);
   const flags = {
     arms: opts.arms,
     repeats: opts.repeats,
     runner: opts.runner,
     model: opts.model,
+    cost_rates_sha256: rateFingerprint,
     sandbox: opts.sandbox,
     jobs: opts.jobs,
     timeout_ms: opts.timeoutMs,
@@ -14053,6 +14196,7 @@ async function benchmarkShardAttestation(
     package_sha256: opts.candidatePackageSha256,
     manifest_sha256: sha256Bytes(stableJsonForHash(manifestContract)),
     flags_sha256: sha256Bytes(stableJsonForHash(flags)),
+    cost_rates_sha256: rateFingerprint,
     benchmark_contract_environment_sha256: benchmarkContractEnvironmentDigest,
     benchmark_contract_fingerprints: contractFingerprints,
     benchmark_contract_rows_sha256: sha256Bytes(stableJsonForHash(contractFingerprints)),
@@ -14145,6 +14289,7 @@ async function aggregateShardRuns(opts, allTasks) {
     ...common
   }) => common;
   const artifactAttestationByHostClass = new Map();
+  const costModel = opts.model ?? DEFAULT_BENCHMARK_MODEL;
   for (const shard of shards) {
     const index = shard.summary?.shard?.index;
     if (
@@ -14176,6 +14321,9 @@ async function aggregateShardRuns(opts, allTasks) {
       stableJsonForHash(commonAttestation(attestationReference))
     ) {
       throw new Error(`Shard ${index} candidate or benchmark attestation does not match`);
+    }
+    if (attestation.cost_rates_sha256 != null && !hasAttestedShardCostRates(shard.summary, attestation, costModel)) {
+      throw new Error(`Shard ${index} model or cost rates do not match its attestation`);
     }
     const hostClassKey = stableJsonForHash(attestation.host_class);
     const artifactAttestation = {
@@ -14256,12 +14404,19 @@ async function aggregateShardRuns(opts, allTasks) {
       }
     }
   }
+  const costRates = attestationReference.cost_rates_sha256 == null
+    ? null
+    : shards[0].summary.cost_rates ?? null;
   const rows = shards.flatMap((shard) =>
-    shard.rows.map((row) => ({
-      ...row,
-      host_class: shard.summary.shard.attestation.host_class,
-      shard_index: shard.summary.shard.index,
-    }))
+    shard.rows.map((row) => {
+      const output = {
+        ...row,
+        estimated_cost_usd: estimateCost(readUsage(row.usage), costRates),
+        host_class: shard.summary.shard.attestation.host_class,
+        shard_index: shard.summary.shard.index,
+      };
+      return { ...output, resource_accounting: resourceAccountingForResult(output) };
+    })
   );
   const byKey = new Map();
   for (const row of rows) {
@@ -14371,6 +14526,8 @@ async function aggregateShardRuns(opts, allTasks) {
         aggregate: true,
         shard_count: shardCount,
         source_attestation: commonAttestation(attestationReference),
+        model: costModel,
+        cost_rates: costRates,
         platform_artifacts_by_host_class: latencySummariesByHostClass.map((entry) => ({
           host_class: entry.host_class,
           platform_artifacts: entry.platform_artifacts,
@@ -15082,9 +15239,9 @@ async function main() {
   const allTasks = await loadTasks(opts);
   validateExactCandidateShape(opts, allTasks);
   validateBuilderAblationShape(opts, allTasks);
-  opts.exactCandidateCostRates = opts.exactCandidate
+  opts.costRates = opts.exactCandidate
     ? exactCandidateCostRates(process.env)
-    : null;
+    : configuredCostRates(process.env, opts.model ?? DEFAULT_BENCHMARK_MODEL);
   opts.releaseEvidenceCorpusContract = await loadReleaseEvidenceCorpusContract(allTasks, opts);
   if (opts.aggregateShards) {
     await aggregateShardRuns(opts, allTasks);
@@ -15165,7 +15322,7 @@ async function main() {
   try {
     if (opts.exactCandidate) {
       await initializeExactCandidateState(opts);
-      opts.exactCandidateLifecycle.cost_rates = opts.exactCandidateCostRates;
+      opts.exactCandidateLifecycle.cost_rates = opts.costRates;
       resumedPrefix = await loadExactCandidateResumePrefix(
         opts,
         tasks,
@@ -15298,7 +15455,7 @@ async function main() {
     canonicalResults,
     "agent benchmark report",
   );
-  const costAccounting = summarizeCostAccounting(canonicalResults);
+  const costAccounting = summarizeCostAccounting(canonicalResults, plannedRuns.length);
   const shardAttestation = await benchmarkShardAttestationForCloseout(
     opts,
     allTasks,
@@ -15374,7 +15531,7 @@ async function main() {
     packet_obligation_accounting: obligationAccounting,
     summary,
     cost_accounting: costAccounting,
-    cost_rates: opts.exactCandidateCostRates,
+    cost_rates: opts.costRates,
     exact_candidate_acceptance: opts.exactCandidate
       ? exactCandidateAcceptance(canonicalResults, opts.exactCandidateLifecycle)
       : null,

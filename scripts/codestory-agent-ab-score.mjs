@@ -684,12 +684,11 @@ function sumFinite(values) {
   return values.reduce((sum, value) => (Number.isFinite(value) ? sum + value : sum), 0);
 }
 
-function sumPresentFinite(values) {
-  const nums = values.filter((value) => Number.isFinite(value));
-  if (!nums.length) {
-    return null;
-  }
-  return nums.reduce((sum, value) => sum + value, 0);
+function completeMeasurement(rows, select, summarize) {
+  const values = rows.map(select);
+  return values.length && rows.every((row) => row.status === "pass") && values.every(Number.isFinite)
+    ? summarize(values)
+    : null;
 }
 
 function cachePreparationWallMs(preparation) {
@@ -740,17 +739,17 @@ function summarizeArm(rows, arm) {
       (row) => row.codestory_harness_prelude?.packet_sufficiency_status === "partial",
     ).length,
     totalWallMs: sumFinite(successful.map((row) => row.wall_ms)),
-    totalInputTokens: sumFinite(successful.map((row) => row.usage?.input_tokens)),
-    totalOutputTokens: sumFinite(successful.map((row) => row.usage?.output_tokens)),
-    totalTokens: sumFinite(successful.map((row) => row.usage?.total_tokens)),
-    totalEstimatedCostUsd: sumPresentFinite(successful.map((row) => row.estimated_cost_usd)),
+    totalInputTokens: completeMeasurement(armRows, (row) => row.usage?.input_tokens, sumFinite),
+    totalOutputTokens: completeMeasurement(armRows, (row) => row.usage?.output_tokens, sumFinite),
+    totalTokens: completeMeasurement(armRows, (row) => row.usage?.total_tokens, sumFinite),
+    totalEstimatedCostUsd: completeMeasurement(armRows, (row) => row.estimated_cost_usd, sumFinite),
     totalToolCalls: sumFinite(successful.map((row) => row.tool_calls_observed)),
     totalCommands: sumFinite(successful.map((row) => row.transcript_analysis?.command_count)),
     medianWallMs: median(successful.map((row) => row.wall_ms)),
-    medianInputTokens: median(successful.map((row) => row.usage?.input_tokens)),
-    medianOutputTokens: median(successful.map((row) => row.usage?.output_tokens)),
-    medianTokens: median(successful.map((row) => row.usage?.total_tokens)),
-    medianEstimatedCostUsd: median(successful.map((row) => row.estimated_cost_usd)),
+    medianInputTokens: completeMeasurement(armRows, (row) => row.usage?.input_tokens, median),
+    medianOutputTokens: completeMeasurement(armRows, (row) => row.usage?.output_tokens, median),
+    medianTokens: completeMeasurement(armRows, (row) => row.usage?.total_tokens, median),
+    medianEstimatedCostUsd: completeMeasurement(armRows, (row) => row.estimated_cost_usd, median),
     medianToolCalls: median(successful.map((row) => row.tool_calls_observed)),
     medianCommands: median(successful.map((row) => row.transcript_analysis?.command_count)),
     medianCodeStoryCommands: median(
@@ -776,10 +775,12 @@ function safeRatio(numerator, denominator, fallback = 999) {
   return numerator / denominator;
 }
 
-function score(rows) {
+function score(rows, comparableTokens) {
   const without = summarizeArm(rows, "without_codestory");
   const withCodeStory = summarizeArm(rows, "with_codestory");
-  const tokenRatio = safeRatio(withCodeStory.medianTokens, without.medianTokens);
+  const tokenRatio = Number.isFinite(comparableTokens)
+    ? safeRatio(withCodeStory.medianTokens, without.medianTokens, null)
+    : null;
   const wallRatio = safeRatio(withCodeStory.medianWallMs, without.medianWallMs);
   const toolRatio = safeRatio(withCodeStory.medianToolCalls, without.medianToolCalls);
   const commandRatio = safeRatio(withCodeStory.medianCommands, without.medianCommands);
@@ -808,7 +809,7 @@ function score(rows) {
     externalPenalty;
 
   return {
-    agentAbGap,
+    agentAbGap: tokenRatio == null ? null : agentAbGap,
     tokenRatio,
     wallRatio,
     toolRatio,
@@ -860,11 +861,13 @@ async function main() {
   const rowsPath = path.join(outDir, "reanalyzed-runs.jsonl");
   const rows = readJsonl(rowsPath);
   const cachePreparation = summarizeCachePreparation(outDir);
-  const result = score(rows);
+  const comparison = readJsonFileIfPresent(path.join(outDir, "reanalyzed-summary.json"))
+    ?.cost_accounting?.with_vs_without;
+  const result = score(rows, comparison?.total_tokens?.ratio);
   const withTotalWallIncludingPreparation =
     result.withCodeStory.totalWallMs + (cachePreparation.preparationWallMs ?? 0);
   const allInWallRatio = safeRatio(withTotalWallIncludingPreparation, result.without.totalWallMs);
-  const totalTokenRatio = safeRatio(result.withCodeStory.totalTokens, result.without.totalTokens);
+  const totalTokenRatio = result.tokenRatio == null ? null : comparison.total_tokens.ratio;
   const totalToolRatio = safeRatio(result.withCodeStory.totalToolCalls, result.without.totalToolCalls);
   const totalCommandRatio = safeRatio(result.withCodeStory.totalCommands, result.without.totalCommands);
   const agentAbGapAllIn =
@@ -877,16 +880,26 @@ async function main() {
     result.penalties.postPacketReadPenalty +
     result.penalties.externalPenalty;
 
-  printMetric("agent_ab_gap", result.agentAbGap);
-  printMetric("agent_ab_gap_all_in", agentAbGapAllIn);
-  printMetric("token_ratio", result.tokenRatio);
-  printMetric("wall_ratio", result.wallRatio);
-  printMetric("all_in_wall_ratio", allInWallRatio);
-  printMetric("total_token_ratio", totalTokenRatio);
-  printMetric("total_tool_ratio", totalToolRatio);
-  printMetric("total_command_ratio", totalCommandRatio);
-  printMetric("tool_ratio", result.toolRatio);
-  printMetric("command_ratio", result.commandRatio);
+  if (totalTokenRatio != null) {
+    printMetric("agent_ab_gap", result.agentAbGap);
+    printMetric("agent_ab_gap_all_in", agentAbGapAllIn);
+    printMetric("token_ratio", result.tokenRatio);
+    printMetric("wall_ratio", result.wallRatio);
+    printMetric("all_in_wall_ratio", allInWallRatio);
+    printMetric("total_token_ratio", totalTokenRatio);
+    printMetric("total_tool_ratio", totalToolRatio);
+    printMetric("total_command_ratio", totalCommandRatio);
+    printMetric("tool_ratio", result.toolRatio);
+    printMetric("command_ratio", result.commandRatio);
+    printMetric("with_total_tokens", result.withCodeStory.totalTokens);
+    printMetric("without_total_tokens", result.without.totalTokens);
+    printMetric("with_total_input_tokens", result.withCodeStory.totalInputTokens);
+    printMetric("without_total_input_tokens", result.without.totalInputTokens);
+    printMetric("with_total_output_tokens", result.withCodeStory.totalOutputTokens);
+    printMetric("without_total_output_tokens", result.without.totalOutputTokens);
+    printMetric("with_total_estimated_cost_usd", result.withCodeStory.totalEstimatedCostUsd);
+    printMetric("without_total_estimated_cost_usd", result.without.totalEstimatedCostUsd);
+  }
   printMetric("without_quality_passes", result.without.qualityPass);
   printMetric("with_quality_passes", result.withCodeStory.qualityPass);
   printMetric("quality_pass_delta", result.withCodeStory.qualityPass - result.without.qualityPass);
@@ -898,16 +911,10 @@ async function main() {
   printMetric("external_web_searches", (result.without.medianWebSearches ?? 0) + (result.withCodeStory.medianWebSearches ?? 0));
   printMetric("with_tokens", result.withCodeStory.medianTokens);
   printMetric("without_tokens", result.without.medianTokens);
-  printMetric("with_total_tokens", result.withCodeStory.totalTokens);
-  printMetric("without_total_tokens", result.without.totalTokens);
   printMetric("with_input_tokens", result.withCodeStory.medianInputTokens);
   printMetric("without_input_tokens", result.without.medianInputTokens);
-  printMetric("with_total_input_tokens", result.withCodeStory.totalInputTokens);
-  printMetric("without_total_input_tokens", result.without.totalInputTokens);
   printMetric("with_output_tokens", result.withCodeStory.medianOutputTokens);
   printMetric("without_output_tokens", result.without.medianOutputTokens);
-  printMetric("with_total_output_tokens", result.withCodeStory.totalOutputTokens);
-  printMetric("without_total_output_tokens", result.without.totalOutputTokens);
   printMetric("with_wall_ms", result.withCodeStory.medianWallMs);
   printMetric("without_wall_ms", result.without.medianWallMs);
   printMetric("with_total_wall_ms", result.withCodeStory.totalWallMs);
@@ -919,8 +926,6 @@ async function main() {
   printMetric("with_total_wall_ms_including_codestory_preparation", withTotalWallIncludingPreparation);
   printMetric("with_estimated_cost_usd", result.withCodeStory.medianEstimatedCostUsd);
   printMetric("without_estimated_cost_usd", result.without.medianEstimatedCostUsd);
-  printMetric("with_total_estimated_cost_usd", result.withCodeStory.totalEstimatedCostUsd);
-  printMetric("without_total_estimated_cost_usd", result.without.totalEstimatedCostUsd);
   printMetric("with_tool_calls", result.withCodeStory.medianToolCalls);
   printMetric("without_tool_calls", result.without.medianToolCalls);
   printMetric("with_total_tool_calls", result.withCodeStory.totalToolCalls);
@@ -939,9 +944,13 @@ async function main() {
   printMetric("without_web_searches", result.without.medianWebSearches);
   printArtifacts(outDir);
 
-  console.log(
-    `A/B score: gap=${result.agentAbGap.toFixed(3)} all_in_gap=${agentAbGapAllIn.toFixed(3)} token_ratio=${result.tokenRatio.toFixed(3)} wall_ratio=${result.wallRatio.toFixed(3)} all_in_wall_ratio=${allInWallRatio.toFixed(3)} with_quality=${result.withCodeStory.qualityPass}/${result.withCodeStory.successful}`,
-  );
+  if (totalTokenRatio == null) {
+    console.log("A/B score unavailable: both arms need complete, matched token usage.");
+  } else {
+    console.log(
+      `A/B score: gap=${result.agentAbGap.toFixed(3)} all_in_gap=${agentAbGapAllIn.toFixed(3)} token_ratio=${result.tokenRatio.toFixed(3)} wall_ratio=${result.wallRatio.toFixed(3)} all_in_wall_ratio=${allInWallRatio.toFixed(3)} with_quality=${result.withCodeStory.qualityPass}/${result.withCodeStory.successful}`,
+    );
+  }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
