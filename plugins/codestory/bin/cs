@@ -2,7 +2,7 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const { spawnSync } = require('node:child_process');
-const { resolveCli, runLookup } = require('../scripts/codestory-mcp.cjs');
+const { resolveCli, runLookup, runPacket } = require('../scripts/codestory-mcp.cjs');
 
 function projectRoot() {
   const git = spawnSync('git', ['rev-parse', '--show-toplevel'], {
@@ -12,12 +12,12 @@ function projectRoot() {
 }
 
 async function main() {
-  const args = process.argv.slice(2);
-  if (!['find', 'refs', 'read'].includes(args[0])) {
-    process.stdout.write('Usage: cs find TERM... | cs refs <NAME|PATH::SYMBOL|PATH:LINE>... | cs read SELECTOR...\n');
-    return args.length && !['-h', '--help'].includes(args[0]) ? 2 : 0;
+  const [command, ...args] = process.argv.slice(2);
+  if (!['find', 'refs', 'read', 'packet'].includes(command)) {
+    process.stdout.write('Usage: cs find TERM...|--question QUESTION | cs refs TARGET...|--changed | cs read SELECTOR... | cs packet --question QUESTION\n');
+    return command && !['-h', '--help'].includes(command) ? 2 : 0;
   }
-  const forwarded = args.includes('--') ? args.slice(1, args.indexOf('--')) : args.slice(1);
+  const forwarded = args.includes('--') ? args.slice(0, args.indexOf('--')) : args;
   if (forwarded.some((arg) => /^--(?:project|path|cache-dir|lookup-status)(?:=|$)/u.test(arg))) {
     throw new Error('Run cs from the target repository. Use codestory-cli for explicit project or cache selection.');
   }
@@ -26,7 +26,9 @@ async function main() {
     throw new Error('CodeStory runtime is unavailable. Start a new session with the plugin enabled and let its runtime install.');
   }
   const project = projectRoot();
-  const result = runLookup(resolved.path, project, args[0], args.slice(1));
+  const result = command === 'packet'
+    ? runPacket(resolved.path, project, args)
+    : runLookup(resolved.path, project, command, args);
   if (result.stdout) process.stdout.write(result.stdout);
   if (result.stderr) process.stderr.write(result.stderr);
   if (result.error) throw result.error;

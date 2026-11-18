@@ -4626,28 +4626,38 @@ const lookupMatchOptions = {
   limit: { type: 'integer', minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
   no_bodies: { type: 'boolean' },
 };
+const focusedLookupLimits = {
+  properties: { limit: { maximum: 20 }, max_bytes: { minimum: 1, maximum: 16_000 } },
+};
 const leanTools = [
   {
     name: 'find',
-    description: 'Find literal matches in live source, or list paths matching file globs.',
+    description: 'Find literal matches, list matching paths, or locate an implementation from a question.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
       required: ['project'],
-      properties: { project: lookupString, terms: lookupStrings, max_bytes: lookupBytes, ...lookupMatchOptions },
+      properties: {
+        project: lookupString, terms: lookupStrings, question: lookupString,
+        max_bytes: lookupBytes, ...lookupMatchOptions,
+      },
+      not: { required: ['terms', 'question'] },
+      anyOf: [{ not: { required: ['question'] } }, focusedLookupLimits],
     },
     annotations: { readOnlyHint: true },
   },
   {
     name: 'refs',
-    description: 'Find definitions and references for names or path::Symbol/path:LINE selectors.',
+    description: 'Find references by name or selector, or inspect tracked changes against HEAD.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
       required: ['project'],
-      oneOf: [{ required: ['name'] }, { required: ['targets'] }],
+      oneOf: [{ required: ['name'] }, { required: ['targets'] }, { required: ['changed'] }],
+      anyOf: [{ not: { required: ['changed'] } }, focusedLookupLimits],
       properties: {
-        project: lookupString, name: lookupString, targets: lookupStrings, max_bytes: lookupBytes, ...lookupMatchOptions,
+        project: lookupString, name: lookupString, targets: lookupStrings,
+        changed: { type: 'boolean', enum: [true] }, max_bytes: lookupBytes, ...lookupMatchOptions,
       },
     },
     annotations: { readOnlyHint: true },
@@ -4665,33 +4675,182 @@ const leanTools = [
   },
 ];
 
-function refreshLookupIndex(cli, project, data) {
+const lookupRefreshWorkerFlag = '--internal-lookup-refresh';
+const lookupRefreshMinDelayMs = 60_000;
+const lookupRefreshMaxDelayMs = 30 * 60_000;
+const lookupRefreshMaxRecordBytes = 4_096;
+
+function lookupRefreshPaths(data, project) {
+  const directory = path.join(data, 'lookup-index');
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  if (!fs.lstatSync(directory).isDirectory()) throw new Error('lookup refresh directory is not direct');
+  const key = createHash('sha256').update(project).digest('hex');
+  const base = path.join(directory, key);
+  return { key, owner: base + '.v2.owner', result: base + '.v2.result' };
+}
+
+// null means absent. Undefined means an existing path could not be proved to be ours.
+function readLookupRefreshRecord(file, key, kind) {
+  let fd;
+  try {
+    const before = fs.lstatSync(file);
+    if (!before.isFile() || before.size > lookupRefreshMaxRecordBytes) return undefined;
+    fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    const metadata = fs.fstatSync(fd);
+    if (!sameFileIdentity(before, metadata)) return undefined;
+    const buffer = Buffer.alloc(lookupRefreshMaxRecordBytes + 1);
+    const bytes = fs.readSync(fd, buffer, 0, buffer.length, 0);
+    if (bytes !== metadata.size) return undefined;
+    const value = JSON.parse(buffer.subarray(0, bytes).toString('utf8'));
+    if (value?.kind !== kind || value.project_key !== key) return undefined;
+    if (kind === 'codestory-lookup-refresh-v2-owner') {
+      if (!Number.isSafeInteger(value.pid) || value.pid <= 0 ||
+          !/^[0-9a-f]{32}$/u.test(value.token) ||
+          (value.process_start_identity !== null &&
+            (typeof value.process_start_identity !== 'string' || !value.process_start_identity))) return undefined;
+    } else if (!/^[0-9a-f]{64}$/u.test(value.runtime) ||
+        !Number.isSafeInteger(value.failures) || value.failures < 0 || value.failures > 6 ||
+        !Number.isSafeInteger(value.finished_at) || !Number.isSafeInteger(value.retry_at)) {
+      return undefined;
+    }
+    return { metadata, value };
+  } catch (error) {
+    return error.code === 'ENOENT' ? null : undefined;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
+function lookupRefreshRuntimeKey(cli) {
+  const metadata = fs.statSync(cli);
+  return createHash('sha256')
+    .update(JSON.stringify([cli, metadata.dev, metadata.ino, metadata.size, metadata.mtimeMs])).digest('hex');
+}
+
+function lookupRefreshMayStart(previous, runtime, requestedAt, now = Date.now()) {
+  if (previous === undefined) return false;
+  if (!previous || previous.value.runtime !== runtime) return true;
+  const { finished_at: finished, retry_at: retry } = previous.value;
+  // Invalid future times after a machine clock change must not postpone repairs forever.
+  if (finished <= now && requestedAt <= finished) return false;
+  return retry <= now || retry - now > lookupRefreshMaxDelayMs;
+}
+
+function lookupRefreshOwnerIsStale(owner) {
+  const checkIdentity = owner.value.process_start_identity !== null &&
+    Date.now() - owner.metadata.mtimeMs >= lookupRefreshMinDelayMs;
+  return managedCliLockOwnerIsStale(owner.value, checkIdentity) === true;
+}
+
+function refreshLookupIndex(cli, project, data, focused, requestedAt) {
   if (!data) return;
   try {
-    // The cache writer lock owns correctness; this suppresses repeated launcher starts.
-    const directory = path.join(data, 'lookup-index');
-    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-    if (!fs.lstatSync(directory).isDirectory()) return;
-    const key = createHash('sha256').update(project).digest('hex');
-    const bucket = Math.floor(Date.now() / 15_000);
-    fs.closeSync(fs.openSync(path.join(directory, `${key}.${bucket}`), 'wx', 0o600));
-    for (const name of fs.readdirSync(directory)) {
-      const match = /^([a-f0-9]{64})\.(\d+)$/u.exec(name);
-      if (match && Number(match[2]) < bucket - 1) {
-        try { fs.unlinkSync(path.join(directory, name)); } catch {}
-      }
-    }
-    const child = spawnCodeStoryCli(cli, ['index', '--project', project, '--refresh', 'auto', '--core-only'], {
-      cwd: project, detached: true, stdio: 'ignore', windowsHide: true,
+    data = path.resolve(data);
+    const state = lookupRefreshPaths(data, project);
+    const runtime = lookupRefreshRuntimeKey(cli);
+    const existing = readLookupRefreshRecord(state.owner, state.key, 'codestory-lookup-refresh-v2-owner');
+    if (existing === undefined || (existing && !lookupRefreshOwnerIsStale(existing))) return;
+    if (!lookupRefreshMayStart(readLookupRefreshRecord(state.result, state.key, 'codestory-lookup-refresh-v2-result'),
+      runtime, requestedAt)) return;
+    // A short-lived shell lookup must be able to exit while the supervisor owns the child.
+    // Only repository/runtime identity and request timing cross the private worker pipe.
+    const worker = spawn(process.execPath, [__filename, lookupRefreshWorkerFlag], {
+      cwd: project, detached: true, stdio: ['pipe', 'ignore', 'ignore'], windowsHide: true,
     });
-    child.on('error', () => {});
-    child.unref();
+    worker.on('error', () => {});
+    worker.stdin.on('error', () => {});
+    worker.stdin.end(JSON.stringify({ cli, project, data, focused, requestedAt }));
+    worker.unref();
   } catch {
     // The live reply is independent of cache permissions and background indexing.
   }
 }
 
+function publishLookupRefreshRecord(file, value, previous, token) {
+  const temporary = file + '.' + token;
+  fs.writeFileSync(temporary, JSON.stringify(value), { flag: 'wx', mode: 0o600 });
+  try {
+    if (previous === null) {
+      // Link is exclusive. A file created by another owner is never replaced.
+      fs.linkSync(temporary, file);
+    } else if (previous && sameFileIdentity(previous.metadata, fs.lstatSync(file))) {
+      fs.renameSync(temporary, file);
+    }
+  } finally {
+    if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
+  }
+}
+
+function runLookupRefresh({ cli, project, data, focused, requestedAt }) {
+  const state = lookupRefreshPaths(data, project);
+  const runtime = lookupRefreshRuntimeKey(cli);
+  const ownerKind = 'codestory-lookup-refresh-v2-owner';
+  const resultKind = 'codestory-lookup-refresh-v2-result';
+  const oldOwner = readLookupRefreshRecord(state.owner, state.key, ownerKind);
+  if (oldOwner === undefined) return;
+  if (oldOwner && (!lookupRefreshOwnerIsStale(oldOwner) ||
+      !removeManagedCliInitializationIf(state.owner, (value, file) =>
+        value?.token === oldOwner.value.token && sameFileIdentity(oldOwner.metadata, file)))) return;
+  const token = randomBytes(16).toString('hex');
+  // Sandboxed hosts can deny the process-start probe. Without it, reclaim
+  // only a claim whose owner is no longer alive.
+  const identity = processStartIdentity(process.pid);
+  // Every contender links its own complete immutable claim. Exactly one wins.
+  publishLookupRefreshRecord(state.owner, {
+    kind: ownerKind, project_key: state.key, pid: process.pid, token, process_start_identity: identity,
+  }, null, token);
+  try {
+    const previous = readLookupRefreshRecord(state.result, state.key, resultKind);
+    if (!lookupRefreshMayStart(previous, runtime, requestedAt)) return;
+    const result = spawnCodeStoryCliSync(cli,
+      ['index', '--project', project, '--format', 'json', '--refresh', 'auto', '--core-only'],
+      { cwd: project, encoding: 'utf8', maxBuffer: 2 * 1024 * 1024, timeout: 15 * 60_000, windowsHide: true });
+    let ready = false;
+    if (!result.error && result.status === 0) {
+      try {
+        const receipt = JSON.parse(result.stdout);
+        ready = typeof receipt.summary?.publication?.generation_id === 'string' &&
+          receipt.phase_timings?.incremental_plan_probe?.outcome !== 'short_circuited';
+      } catch {}
+      if (focused && ready) {
+        // A core commit can succeed without its callable companion. A neutral,
+        // one-byte observational check confirms recovery without copying a user lookup.
+        const check = spawnCodeStoryCliSync(cli, ['find', '--project', project, '--lookup-status',
+          '--question', 'codestory_lookup_readiness_probe', '--limit', '1', '--max-bytes', '1', '--no-bodies'],
+        { cwd: project, encoding: 'utf8', maxBuffer: 4_096, timeout: 30_000, windowsHide: true });
+        try {
+          ready = !check.error && check.status === 0 && JSON.parse(check.stdout).refresh_recommended === false;
+        } catch { ready = false; }
+      }
+    }
+    const failures = ready ? 0 : Math.min(6, 1 + (previous?.value.runtime === runtime ? previous.value.failures : 0));
+    const now = Date.now();
+    const delay = ready ? 0 : Math.min(lookupRefreshMaxDelayMs, lookupRefreshMinDelayMs * 2 ** (failures - 1));
+    publishLookupRefreshRecord(state.result, {
+      kind: resultKind, project_key: state.key, runtime, failures, finished_at: now, retry_at: now + delay,
+    }, previous, token);
+  } finally {
+    removeManagedCliInitializationIf(state.owner, (value) => value?.token === token && value.pid === process.pid);
+  }
+}
+
+async function runLookupRefreshWorker() {
+  const chunks = [];
+  let bytes = 0;
+  for await (const chunk of process.stdin) {
+    bytes += chunk.length;
+    if (bytes > lookupRefreshMaxRecordBytes * 4) return;
+    chunks.push(chunk);
+  }
+  const parameters = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  if (![parameters?.cli, parameters?.project, parameters?.data].every((value) =>
+      typeof value === 'string' && path.isAbsolute(value)) || typeof parameters.focused !== 'boolean' ||
+      !Number.isSafeInteger(parameters.requestedAt)) return;
+  runLookupRefresh(parameters);
+}
+
 function runLookup(cli, project, command, args) {
+  const requestedAt = Date.now();
   const separator = args.indexOf('--');
   const flags = separator === -1 ? args : args.slice(0, separator);
   const help = flags.includes('--help') || flags.includes('-h');
@@ -4706,8 +4865,18 @@ function runLookup(cli, project, command, args) {
   if (typeof reply?.text !== 'string' || typeof reply?.refresh_recommended !== 'boolean') {
     return { status: 1, stderr: 'CodeStory lookup returned an incompatible reply. Use the matching CLI.\n' };
   }
-  if (reply.refresh_recommended) refreshLookupIndex(cli, project, pluginDataDir());
+  if (reply.refresh_recommended) {
+    const focused = command === 'find' && flags.some((argument) =>
+      argument === '--question' || argument.startsWith('--question='));
+    refreshLookupIndex(cli, project, pluginDataDir(), focused, requestedAt);
+  }
   return { ...result, stdout: reply.text };
+}
+
+function runPacket(cli, project, args) {
+  return spawnCodeStoryCliSync(cli, ['packet', '--launcher-read-only', ...args], {
+    cwd: project, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, windowsHide: true,
+  });
 }
 
 function leanLookupResult(tool, args, currentStatus, runtime) {
@@ -4720,6 +4889,8 @@ function leanLookupResult(tool, args, currentStatus, runtime) {
   if (args.max_bytes !== undefined) options.push('--max-bytes', String(args.max_bytes));
   if (args.limit !== undefined) options.push('--limit', String(args.limit));
   if (args.no_bodies === true) options.push('--no-bodies');
+  if (args.question !== undefined) options.push(`--question=${args.question}`);
+  if (args.changed === true) options.push('--changed');
   const positional = args.terms || args.selectors || args.targets || (args.name === undefined ? [] : [args.name]);
   if (positional.length > 0) options.push('--', ...positional);
   const result = runLookup(runtime.path, cleanPublicProjectPath(project.project), tool, options);
@@ -5518,7 +5689,9 @@ function runLauncherError(error) {
 
 if (require.main === module) {
   installLauncherFatalHandlers();
-  if (!isMainThread && workerData?.codestoryMode === 'managed-provision') {
+  if (isMainThread && process.argv[2] === lookupRefreshWorkerFlag) {
+    runLookupRefreshWorker().catch(() => {});
+  } else if (!isMainThread && workerData?.codestoryMode === 'managed-provision') {
     runManagedProvisioningWorkerEntrypoint().catch((error) => {
       throw error;
     });
@@ -5529,6 +5702,7 @@ if (require.main === module) {
   module.exports = {
     resolveCli,
     runLookup,
+    runPacket,
     _test: {
       compareManagedCliVersions,
       applyCursorLocalOverrides,

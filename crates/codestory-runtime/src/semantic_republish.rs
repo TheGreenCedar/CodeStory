@@ -513,6 +513,15 @@ pub(super) fn semantic_projection_republish_for_runtime(
                 return Err(error);
             }
         };
+        crate::callable_search::prepare_generation(
+            staged.store_mut(),
+            storage_path,
+            root,
+            &publication,
+            source_index_policy.byte_cap,
+            cancel_token,
+            Some((&expected_publication, &[])),
+        );
         let (prepared_search_state, publish_stats, publish_duration) = commit_semantic_projection(
             staged,
             storage_path,

@@ -717,7 +717,9 @@ fn evaluate_incremental_plan_probe_with_options(
     let Ok(generation_id) = Uuid::parse_str(&publication.generation_id) else {
         probe_unavailable!(GenerationId);
     };
-    if read_search_generation_completion(&search_path, &generation_id.to_string()).is_none() {
+    if read_search_generation_completion(&search_path, &generation_id.to_string()).is_none()
+        || !crate::callable_search::generation_has_index(&search_path, &publication)
+    {
         return IncrementalPlanProbeOutcomeDto::SearchGenerationIncomplete;
     }
     // An empty plan is not a freshness receipt until every admitted source has
@@ -1133,6 +1135,7 @@ struct PreparedIncrementalRefresh {
     semantic_stats: SemanticProjectionStats,
     reused_dense_anchor_projection: bool,
     source_identity_file_ids: Option<Vec<i64>>,
+    callable_delta_eligible: bool,
     retrieval_refresh_receipt: Option<codestory_retrieval::IncrementalRetrievalRefreshReceipt>,
     semantic_refresh_scope: HashSet<codestory_contracts::graph::NodeId>,
     policy_exclusions: Vec<OversizedSourceExclusionCandidate>,
@@ -1609,6 +1612,7 @@ fn prepare_incremental_refresh(
             semantic_stats,
             reused_dense_anchor_projection,
             source_identity_file_ids,
+            callable_delta_eligible: execution_plan.files_to_remove.is_empty(),
             retrieval_refresh_receipt,
             semantic_refresh_scope,
             policy_exclusions,
@@ -1661,6 +1665,7 @@ fn run_incremental_indexing_common(
         semantic_stats: staged_semantic_stats,
         reused_dense_anchor_projection,
         source_identity_file_ids,
+        callable_delta_eligible,
         retrieval_refresh_receipt,
         semantic_refresh_scope: llm_refresh_scope,
         policy_exclusions,
@@ -1721,6 +1726,18 @@ fn run_incremental_indexing_common(
             return Err(error);
         }
     };
+    crate::callable_search::prepare_generation(
+        staged.store_mut(),
+        storage_path,
+        root,
+        &publication,
+        source_index_policy.byte_cap,
+        cancel_token,
+        previous_publication
+            .as_ref()
+            .zip(source_identity_file_ids.as_deref())
+            .filter(|_| callable_delta_eligible),
+    );
     derived_timings.search_generation_ms =
         clamp_u128_to_u32(search_generation_started.elapsed().as_millis());
     if is_indexing_cancelled(cancel_token) {

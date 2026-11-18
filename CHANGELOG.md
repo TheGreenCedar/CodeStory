@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Search for an implementation by describing what it does with `cs find --question`. Use `cs refs --changed` to see which tracked edits affect indexed functions and where other code calls them. Shell users can request broader evidence with `cs packet --question` once full retrieval is ready.
+
 - `find`, `refs` and `read` return numbered source from the current checkout. Batch names or source locations in `refs` or `read`, scope `find` and `refs` with a file glob, and bound the full lookup text in bytes. Call links identify what the pinned index resolved.
 - `codestory-cli setup` installs shell lookup instructions for Codex, Claude Code, Cursor, OpenCode and Antigravity. Cursor uses a project rule. Each setup command can remove its own instructions.
 - MCP clients can opt into a read-only catalog of `find`, `refs` and `read`. It stays stable while the matching runtime downloads. Ordinary indexing restores semantic search data after a background core-only refresh.

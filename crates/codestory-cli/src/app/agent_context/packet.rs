@@ -60,6 +60,16 @@ fn measure_packet_projection<T>(
 }
 
 pub(in crate::app) fn run_packet(cmd: PacketCommand) -> Result<()> {
+    if cmd.launcher_read_only {
+        anyhow::ensure!(
+            cmd.project.project.as_path() == std::path::Path::new("."),
+            "cs packet uses the repository it runs from. Run codestory-cli packet directly to select a different project."
+        );
+        anyhow::ensure!(
+            matches!(cmd.refresh, args::RefreshMode::None),
+            "cs packet uses --refresh none. Run codestory-cli packet directly to request a refresh."
+        );
+    }
     ensure_dot_only_for_trail(cmd.format, "packet")?;
     preflight_output_file(cmd.output_file.as_deref())?;
     preflight_output_file(cmd.diagnostics_out.as_deref())?;

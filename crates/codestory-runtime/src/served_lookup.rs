@@ -39,6 +39,11 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+mod investigation;
+mod mention_witnesses;
+mod source_candidates;
+pub use investigation::{changed_relationships, find_implementations};
+
 /// Hit lines one `find` or `refs` reply lists before it switches to counts.
 pub const DEFAULT_LIMIT: usize = 150;
 /// Lines one `find` or `refs` reply spends on declaration bodies and context,
@@ -689,22 +694,7 @@ fn list_relationships(
                 excluded += 1;
                 continue;
             }
-            let Some((source, target, line)) = edge
-                .line
-                .filter(|_| {
-                    edge.file_node_id.is_some()
-                        && is_certain(&edge)
-                        && edge.candidate_targets.is_empty()
-                })
-                .and_then(|line| {
-                    let source = index.locate(root, source_id)?;
-                    if !source.owns_callsite(&edge, line) {
-                        return None;
-                    }
-                    let target = index.locate(root, target_id)?;
-                    Some((source, target, line))
-                })
-            else {
+            let Some((source, target, line)) = index.verified_call(root, &edge) else {
                 unavailable += 1;
                 if bodies.follow_ups.unresolved.is_none() {
                     let caller_site = edge.line.and_then(|line| {
@@ -1286,6 +1276,22 @@ struct Index<'a> {
 }
 
 impl<'a> Index<'a> {
+    fn verified_call(&mut self, root: &Path, edge: &Edge) -> Option<(Located, Located, u32)> {
+        let line = edge.line.filter(|&line| line > 0)?;
+        if edge.kind != EdgeKind::CALL
+            || edge.file_node_id.is_none()
+            || !is_certain(edge)
+            || !edge.candidate_targets.is_empty()
+        {
+            return None;
+        }
+        let caller = self.locate(root, edge.effective_source())?;
+        if !caller.owns_callsite(edge, line) {
+            return None;
+        }
+        Some((caller, self.locate(root, edge.effective_target())?, line))
+    }
+
     fn new(store: &'a Store) -> Self {
         Self::scoped(store, None)
     }

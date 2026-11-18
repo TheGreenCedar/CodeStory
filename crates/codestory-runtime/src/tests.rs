@@ -5618,6 +5618,24 @@ fn semantic_projection_republish_uses_stored_core_after_source_is_removed() {
             )
             .expect("downgrade retained core to schema 29");
     });
+    let callable_count = |publication: &codestory_store::IndexPublicationRecord| {
+        let index = crate::search_publication::search_index_path_for_publication(
+            &storage_path,
+            Some(publication),
+        )
+        .unwrap()
+        .join(codestory_retrieval::callable_index::CALLABLE_INDEX_FILE);
+        codestory_retrieval::callable_index::open(
+            &index,
+            &publication.generation_id,
+            &publication.run_id,
+        )
+        .unwrap()
+        .coverage
+        .indexed_callables
+    };
+    let before_callable_count = callable_count(&before);
+    assert!(before_callable_count > 0);
     for entry in fs::read_dir(workspace.path()).expect("list fixture root") {
         let path = entry.expect("fixture entry").path();
         if path.file_name().is_some_and(|name| name == ".cache") {
@@ -5673,6 +5691,7 @@ fn semantic_projection_republish_uses_stored_core_after_source_is_removed() {
         .expect("republish from stored core");
 
     assert_eq!(outcome.previous_publication, before);
+    assert_eq!(callable_count(&outcome.publication), before_callable_count);
     assert_eq!(outcome.publication.generation, before.generation + 1);
     assert_eq!(
         outcome.publication.mode,

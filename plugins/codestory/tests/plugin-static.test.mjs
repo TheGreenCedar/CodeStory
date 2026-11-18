@@ -1767,6 +1767,74 @@ async function writeFakeCli(cliPath) {
   await chmod(cliPath, 0o755);
 }
 
+test("packaged and standalone cs packet invoke the native packet from the repository root", async () => {
+  const home = await mkdtemp(join(tmpdir(), "codestory-shell-packet-"));
+  try {
+    const project = await realpath(home);
+    const nested = join(project, "nested");
+    await mkdir(nested);
+    const init = spawnSync("git", ["init", "-q", project], { encoding: "utf8" });
+    assert.equal(init.status, 0, init.stderr || init.error?.message);
+    const cli = join(project, process.platform === "win32" ? "packet-cli.exe" : "packet-cli");
+    const version = launcherTest.pinnedCliVersion();
+    const source = `
+      const args = process.argv.slice(2);
+      if (args[0] === "--version") { console.log("codestory-cli ${version}"); }
+      else if (args.includes("--question=unavailable")) {
+        console.error("full retrieval is unavailable");
+        process.exit(7);
+      } else {
+        console.log(JSON.stringify({ cwd: process.cwd(), args }));
+      }
+    `;
+    if (process.platform === "win32") await writeWindowsCliShim(cli, source);
+    else await writeFile(cli, `#!${process.execPath}\n${source}`, { mode: 0o755 });
+    const env = {
+      ...process.env, HOME: project, USERPROFILE: project, CODEX_HOME: project,
+      PLUGIN_DATA: join(project, "data"), CODESTORY_CLI: cli, CODESTORY_PLUGIN_DISABLE_PROVISION: "1",
+    };
+    const launch = (...args) => spawnSync(process.execPath, [join(pluginRoot, "bin", "cs"), ...args], {
+      cwd: nested, env, encoding: "utf8", timeout: 5000,
+    });
+    const question = "--question=Where do retries start?\nInclude the callers.";
+    const result = launch("packet", question, "--format", "json");
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), {
+      cwd: project, args: ["packet", "--launcher-read-only", question, "--format", "json"],
+    });
+    const failed = launch("packet", "--question=unavailable");
+    assert.equal(failed.status, 7);
+    assert.equal(failed.stdout, "");
+    assert.match(failed.stderr, /full retrieval is unavailable/u);
+    const escaped = launch("packet", "--question=where", "--project", nested);
+    assert.notEqual(escaped.status, 0);
+    assert.equal(escaped.stdout, "");
+
+    const windows = process.platform === "win32";
+    const template = await readFile(join(pluginRoot, "standalone", windows ? "cs.cmd" : "cs.sh"), "utf8");
+    const standalone = join(project, windows ? "cs.cmd" : "cs");
+    const quotedCli = windows ? `"${cli.replaceAll("%", "%%")}"` : `'${cli.replaceAll("'", "'\\''")}'`;
+    await writeFile(standalone, template.replaceAll("@CODESTORY_CLI@", () => quotedCli), {
+      mode: 0o700,
+    });
+    const standaloneOptions = { cwd: nested, env, encoding: "utf8", timeout: 5000 };
+    const installed = windows
+      ? spawnSync(process.env.ComSpec || process.env.COMSPEC || "cmd.exe", [
+        "/d", "/s", "/c", `""${standalone}" packet --question=where --format json"`,
+      ], { ...standaloneOptions, windowsVerbatimArguments: true })
+      : spawnSync(standalone, ["packet", "--question=where", "--format", "json"], standaloneOptions);
+    assert.equal(installed.status, 0, installed.stderr || installed.error?.message);
+    const nativeArgs = ["--question=where", "--format", "json"];
+    assert.deepEqual(JSON.parse(installed.stdout), {
+      cwd: project, args: windows
+        ? ["packet", ...nativeArgs, "--launcher-read-only"]
+        : ["packet", "--launcher-read-only", ...nativeArgs],
+    });
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("lean launcher keeps its read-only catalog from cold startup and the shell uses typed refresh guidance", { timeout: 15_000 }, async () => {
   const home = await mkdtemp(join(tmpdir(), "codestory-lean-lookups-"));
   try {
@@ -1822,6 +1890,14 @@ test("lean launcher keeps its read-only catalog from cold startup and the shell 
       CODESTORY_MCP_TOOL_SURFACE: "lean",
     };
     const send = (id, method, params) => ({ jsonrpc: "2.0", id, method, params });
+    const question = "- Which source owns the retry?\nInclude callers.";
+    const invalid = [
+      { name: "find", arguments: { project, terms: ["retry"], question } },
+      { name: "find", arguments: { project, question, limit: 21 } },
+      { name: "find", arguments: { project, question, max_bytes: 0 } },
+      { name: "refs", arguments: { project, changed: true, targets: ["test"] } },
+      { name: "refs", arguments: { project, changed: false } },
+    ];
     const input = [
       send(1, "initialize", { protocolVersion: preferredRevision }),
       send(undefined, "notifications/initialized"),
@@ -1829,6 +1905,13 @@ test("lean launcher keeps its read-only catalog from cold startup and the shell 
       send(3, "tools/call", { name: "refs", arguments: { project, targets: ["lib.rs::test", "lib.rs:9"] } }),
       send(4, "tools/call", { name: "edit", arguments: { project } }),
       send(5, "tools/call", { name: "refs", arguments: { project, name: "test", targets: ["test"] } }),
+      send(6, "tools/call", { name: "find", arguments: {
+        project, question, file_globs: ["src/**"], limit: 2, max_bytes: 1200, no_bodies: true,
+      } }),
+      send(7, "tools/call", { name: "refs", arguments: {
+        project, changed: true, file_globs: ["**/*.rs"], limit: 3,
+      } }),
+      ...invalid.map((params, offset) => send(8 + offset, "tools/call", params)),
     ].map((frame) => JSON.stringify(frame)).join("\n") + "\n";
     const request = (runtime) => {
       const result = spawnSync(process.execPath, [launcher], {
@@ -1861,13 +1944,22 @@ test("lean launcher keeps its read-only catalog from cold startup and the shell 
     assert.equal(warm.get(3).result.content[0].text, "verified selector result\n");
     assert.equal(warm.get(4).error.code, -32602);
     assert.equal(warm.get(5).error.code, -32602);
+    assert.equal(cold.get(6).result.isError, true);
+    assert.equal(cold.get(7).result.isError, true);
+    assert.equal(warm.get(6).result.content[0].text, "no index; text matches only\n");
+    assert.equal(warm.get(7).result.content[0].text, "verified selector result\n");
+    for (const offset of invalid.keys()) assert.equal(warm.get(8 + offset).error.code, -32602);
     for (let i = 0; i < 40 && !fs.existsSync(refreshLog); i++) await delay(25);
-    assert.deepEqual(JSON.parse(await readFile(refreshLog, "utf8")).slice(3), ["--refresh", "auto", "--core-only"]);
+    assert.deepEqual(JSON.parse(await readFile(refreshLog, "utf8")).slice(3), ["--format", "json", "--refresh", "auto", "--core-only"]);
 
     const commands = (await readFile(lookupLog, "utf8")).trim().split("\n").map(JSON.parse);
-    assert.deepEqual(commands.map(([command]) => command), ["find", "refs"]);
+    assert.deepEqual(commands.map(([command]) => command), ["find", "refs", "find", "refs"]);
     assert.ok(commands.every((args) => args.includes("--lookup-status")));
     assert.deepEqual(commands[1].slice(-3), ["--", "lib.rs::test", "lib.rs:9"]);
+    assert.deepEqual(commands[2].slice(4), [
+      "--file-glob=src/**", "--max-bytes", "1200", "--limit", "2", "--no-bodies", `--question=${question}`,
+    ]);
+    assert.deepEqual(commands[3].slice(4), ["--file-glob=**/*.rs", "--limit", "3", "--changed"]);
 
     const release = join(project, "release");
     await writeReleaseFixture(release, version, (destination) => copyFile(cli, destination));
@@ -1893,6 +1985,132 @@ test("lean launcher keeps its read-only catalog from cold startup and the shell 
     } finally {
       await stopChildProcess(managed);
     }
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("shared background refresh serializes real child exits and persists bounded retry by project", { timeout: 20_000 }, async () => {
+  const home = await realpath(await mkdtemp(join(tmpdir(), "codestory-lookup-refresh-")));
+  try {
+    const data = join(home, "data");
+    const project = join(home, "project");
+    const other = join(home, "other");
+    await mkdir(project);
+    await mkdir(other);
+    const mode = join(home, "mode");
+    const release = join(home, "release-held-child");
+    const log = join(home, "attempts.jsonl");
+    const cli = join(home, process.platform === "win32" ? "lookup.exe" : "lookup");
+    const version = launcherTest.pinnedCliVersion();
+    const source = [
+      'const fs = require("node:fs");',
+      "const args = process.argv.slice(2);",
+      'if (args[0] === "--version") { console.log("codestory-cli ' + version + '"); process.exit(0); }',
+      'const mode = fs.readFileSync(' + JSON.stringify(mode) + ', "utf8");',
+      'if (args[0] === "index") {',
+      '  fs.appendFileSync(' + JSON.stringify(log) + ', JSON.stringify({project: args[2], mode}) + "\\n");',
+      '  if (mode === "hold") {',
+      '    const timer = setInterval(() => { if (fs.existsSync(' + JSON.stringify(release) + ')) { clearInterval(timer); process.exitCode = 17; } }, 15);',
+      '    setTimeout(() => { clearInterval(timer); process.exitCode = 19; }, 6000).unref();',
+      '  } else {',
+      '    console.log(JSON.stringify({summary: {publication: {generation_id: "test-generation"}},',
+      '      phase_timings: {incremental_plan_probe: {outcome: mode === "no-progress" ? "short_circuited" : "plan_not_empty"}}}));',
+      '  }',
+      '} else {',
+      '  const probe = args.includes("codestory_lookup_readiness_probe");',
+      '  console.log(JSON.stringify({text: probe ? "" : "live reply\\n", refresh_recommended: !probe || mode === "unusable"}));',
+      '}',
+    ].join("\n");
+    if (process.platform === "win32") await writeWindowsCliShim(cli, source);
+    else await writeFile(cli, "#!" + process.execPath + "\n" + source, { mode: 0o755 });
+
+    const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+    const standalone = join(pluginRoot, "bin", "cs");
+    const question = "private prompt must stay out of retry state";
+    const env = {
+      ...process.env, HOME: home, USERPROFILE: home, CODEX_HOME: home, PLUGIN_DATA: data,
+      CODESTORY_CLI: cli, CODESTORY_PLUGIN_DISABLE_PROVISION: "1", CODESTORY_MCP_TOOL_SURFACE: "lean",
+    };
+    const lookup = (cwd, lean = false) => {
+      const frames = lean ? [
+        { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: preferredRevision } },
+        { jsonrpc: "2.0", method: "notifications/initialized" },
+        { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "find", arguments: { project: cwd, question } } },
+      ].map((item) => JSON.stringify(item)).join("\n") + "\n" : undefined;
+      const client = spawnSync(process.execPath, lean ? [launcher] : [standalone, "find", "--question", question],
+        { cwd, env, input: frames, encoding: "utf8", timeout: 5000 });
+      assert.equal(client.status, 0, client.stderr || client.error?.message);
+      if (lean) {
+        const replies = client.stdout.trim().split(/\r?\n/u).map(JSON.parse);
+        assert.equal(replies.find((item) => item.id === 2)?.result?.content[0].text, "live reply\n");
+      } else {
+        assert.equal(client.stdout, "live reply\n");
+      }
+    };
+    const filenames = (cwd) => {
+      const stem = join(data, "lookup-index", createHash("sha256").update(cwd).digest("hex"));
+      return { result: stem + ".v2.result", owner: stem + ".v2.owner" };
+    };
+    const paths = filenames(project);
+    const attempts = async () => (await readFile(log, "utf8")).trim().split("\n").map(JSON.parse);
+    const current = async (filename = paths.result) => JSON.parse(await readFile(filename, "utf8"));
+    const waitResult = async (failures) => {
+      for (let i = 0; i < 200; i++) {
+        if (fs.existsSync(paths.result) && !fs.existsSync(paths.owner)) {
+          const state = await current();
+          if (state.failures === failures) return state;
+        }
+        await delay(20);
+      }
+      assert.fail("no observed background result for " + failures + " failures");
+    };
+    const expire = async (state) => {
+      const now = Date.now();
+      await writeFile(paths.result, JSON.stringify({ ...state, finished_at: now - 60_001, retry_at: now - 1 }));
+    };
+
+    await writeFile(mode, "hold");
+    lookup(project);
+    await waitForPath(log);
+    lookup(project, true);
+    assert.equal((await attempts()).length, 1, "shared shell and lean calls must avoid a second writer");
+    await writeFile(release, "");
+    const failed = await waitResult(1);
+    assert.equal(failed.retry_at - failed.finished_at, 60_000);
+    assert.ok(!(await readFile(paths.result, "utf8")).includes(question));
+    lookup(project);
+    assert.equal((await attempts()).length, 1, "fresh process must honor durable backoff");
+
+    await expire(failed);
+    await writeFile(mode, "no-progress");
+    lookup(project, true);
+    const noProgress = await waitResult(2);
+    assert.equal(noProgress.retry_at - noProgress.finished_at, 120_000);
+    await expire(noProgress);
+    await writeFile(mode, "unusable");
+    lookup(project);
+    const unusable = await waitResult(3);
+    assert.equal(unusable.retry_at - unusable.finished_at, 240_000);
+
+    // A new project is independent even while the original is backed off.
+    const otherFiles = filenames(other);
+    await writeFile(otherFiles.owner, "foreign owner bytes");
+    lookup(other);
+    assert.equal(await readFile(otherFiles.owner, "utf8"), "foreign owner bytes");
+    assert.equal((await attempts()).length, 3);
+    await rm(otherFiles.owner);
+    await writeFile(mode, "success");
+    lookup(other, true);
+    await waitForPath(otherFiles.result);
+    assert.equal((await current(otherFiles.result)).failures, 0);
+    await expire(unusable);
+    lookup(project);
+    assert.equal((await waitResult(0)).retry_at - (await current()).finished_at, 0);
+    await writeFile(mode, "no-progress");
+    lookup(project, true);
+    assert.equal((await waitResult(1)).failures, 1, "successful publication permits later drift and resets backoff");
+    assert.equal((await attempts()).length, 6);
   } finally {
     await rm(home, { recursive: true, force: true });
   }

@@ -191,7 +191,12 @@ pub(super) fn materialize_equivalent_search_generation(
             })?;
             let name = entry.file_name();
             let name_text = name.to_string_lossy();
-            if name_text == SEARCH_GENERATION_COMPLETION_FILE || name_text.ends_with(".lock") {
+            // An equivalent graph may have changed function-body text. The
+            // callable component must be prepared from this publication's source.
+            if name_text == SEARCH_GENERATION_COMPLETION_FILE
+                || name_text == codestory_retrieval::callable_index::CALLABLE_INDEX_FILE
+                || name_text.ends_with(".lock")
+            {
                 continue;
             }
             if !file_type.is_file() {

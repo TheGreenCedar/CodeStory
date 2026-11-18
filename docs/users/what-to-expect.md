@@ -35,6 +35,9 @@ what each claim does *not* mean:
 
 ## Repo size and freshness
 
+- **Finding an implementation.** Try `cs find --question "Where are retry delays calculated?"`. The reply shows likely functions and the source that connects them. If a relevant function appears as a short excerpt or a text mention, copy its `path:start-end` into `cs read`. An unindexed checkout can return live text matches. Run `codestory-cli index --core-only` to prepare the index for verified relationships.
+- **Reviewing edits.** Run `cs refs --changed` to see which functions a tracked edit touches, where the index found callers, and which tests mention a changed name. Run those tests to check behavior. `--file-glob` narrows both the changed files and the search for tests. Use `--no-bodies` for a compact list.
+- **Broad investigation**. Run `cs packet --question "How do retries work across this service?"` for the canonical bounded packet. This route requires full retrieval readiness and uses the repository you run it from.
 - **Shell lookups** read the current files even on an unindexed checkout. An
   index can add symbol names and source ranges when it matches the file.
   To check several known symbols together, pass them to one command, such as
@@ -47,8 +50,8 @@ what each claim does *not* mean:
   `--no-bodies` to request that list directly, then `read` the relevant sites.
 - **First index** on a large checkout can take minutes; the agent retries the
   intended CodeStory call while preparation runs.
-- **First broad search in a process** also initializes the embedded model. Later
-  repositories in that process reuse the warm engine.
+- **First broad search** can load the bundled model. Projects using the same
+  per-user embedding server can reuse it until the server goes idle.
 - **Incremental refresh** after small edits is usually fast; stale local
   navigation is a freshness problem, not a prompt problem.
 - **Very large or unusual layouts** (generated trees, vendored giants) may index
@@ -60,10 +63,16 @@ what each claim does *not* mean:
   is not observed. Narrow the indexed scope (exclude generated or vendored
   trees) to get full freshness checking back.
 
-The released executable contains its model and embedding backend. There is no
-separate model download or service startup. A verified content-addressed model
-copy may be materialized in the CodeStory cache for memory mapping and reused
-after restart.
+The released executable contains its model and embedding backend. CodeStory
+starts the per-user embedding server automatically and can reuse a verified
+copy of the bundled model from its cache after restart.
+
+For example, in the codex-autoresearch dashboard, asking how a long chart is
+sampled located `chartPointBudget` and the call from `sampleTrendChartData` to
+`sampleTimeline`. After editing the sampler, `cs refs --changed` identified
+that same caller. A regression test then exposed what a source lookup alone
+could miss. The old sampler met the point limit while dropping early and
+middle runs. [Upstream change and regression test](https://github.com/TheGreenCedar/codex-autoresearch/commit/218b294678d24435be6ba4f20b306d73b70566cf)
 
 ## When output looks weak
 

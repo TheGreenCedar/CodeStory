@@ -1047,6 +1047,15 @@ pub(super) fn index_full_for_runtime_with_options(
             return Err(error);
         }
     };
+    crate::callable_search::prepare_generation(
+        staged.store_mut(),
+        storage_path,
+        root,
+        publication,
+        source_index_policy.byte_cap,
+        cancel_token,
+        None,
+    );
     if is_indexing_cancelled(cancel_token) {
         drop(prepared_search_state);
         let _ = staged.discard();

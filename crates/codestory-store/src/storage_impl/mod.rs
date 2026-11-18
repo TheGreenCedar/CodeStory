@@ -32,6 +32,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
+mod callable_definitions;
+pub use callable_definitions::{CallableDefinition, CallableDefinitionFile};
+
 mod bookmarks;
 mod core_retention;
 mod helpers;

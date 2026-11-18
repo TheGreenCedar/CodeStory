@@ -165,6 +165,7 @@ mod affected;
 mod agent;
 mod call_path_grammar;
 mod call_path_kernel;
+mod callable_search;
 mod evidence_projection_v3;
 mod index_commit;
 mod index_coverage;

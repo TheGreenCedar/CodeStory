@@ -240,6 +240,128 @@ fn index_lookup_fixture(workspace: &Path, cache_dir: &Path) {
 }
 
 #[test]
+fn investigation_finds_a_body_and_links_disjoint_edits_to_verified_callers() {
+    let project = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    let root = project.path();
+    run_git(root, &["init", "-q"]);
+    run_git(root, &["config", "core.hooksPath", ".disabled-hooks"]);
+    fs::write(
+        root.join("go.mod"),
+        "module example.test/adjust\n\ngo 1.20\n",
+    )
+    .unwrap();
+    let original = "package adjust\nfunc Delay() int {\n    // exponential retry jitter window\n    return 100\n}\nfunc Middle() int { return 555 }\nfunc Cutoff() int {\n    return 20\n}\n";
+    fs::write(root.join("delay.go"), original).unwrap();
+    fs::write(
+        root.join("caller.go"),
+        "package adjust\nfunc Schedule() int {\n    return Delay()\n}\n",
+    )
+    .unwrap();
+    fs::write(root.join("delay_test.go"), "package adjust\nimport \"testing\"\nfunc TestDelay(t *testing.T) { if Delay() < 1 { t.Fatal(\"delay\") } }\n").unwrap();
+    run_git(
+        root,
+        &[
+            "add",
+            "--",
+            "go.mod",
+            "delay.go",
+            "caller.go",
+            "delay_test.go",
+        ],
+    );
+    run_git(
+        root,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgSign=false",
+            "commit",
+            "-qm",
+            "initial",
+        ],
+    );
+    let lookup = |args: &[&str]| run_lookup(root, cache.path(), args);
+    let question = [
+        "find",
+        "--question",
+        "exponential retry jitter window",
+        "--limit",
+        "1",
+    ];
+    assert!(lookup(&question).contains("index unavailable"));
+    run_cli_json(
+        root,
+        cache.path(),
+        &["index", "--core-only", "--format", "json"],
+    );
+    let answer = lookup(&question);
+    assert!(
+        answer.contains("delay.go:2-5") && answer.contains("exponential retry jitter window"),
+        "{answer}"
+    );
+    assert!(answer.contains("Schedule -> Delay"), "{answer}");
+    let approximate = lookup(&["find", "--question", "retry jitter for RPC", "--limit", "1"]);
+    assert!(
+        approximate.contains("no matches for RPC")
+            && approximate.contains("1. delay.go:2-5 Delay")
+            && !approximate.contains("Schedule -> Delay"),
+        "{approximate}"
+    );
+    let scoped = lookup(&[
+        "find",
+        "--question",
+        "retry jitter",
+        "--file-glob",
+        "caller.go",
+    ]);
+    assert!(!scoped.contains("delay.go"), "{scoped}");
+
+    fs::write(
+        root.join("delay.go"),
+        original.replace("100", "101").replace("20", "23"),
+    )
+    .unwrap();
+    fs::write(root.join("scratch.go"), "package scratch\n").unwrap();
+    let changed = lookup(&["refs", "--changed"]);
+    assert!(
+        changed.contains("+4     return 101") && changed.contains("+8     return 23"),
+        "{changed}"
+    );
+    assert!(
+        changed.contains("HEAD before edit") && changed.contains("caller caller.go:3 Schedule"),
+        "{changed}"
+    );
+    assert!(
+        changed.contains("delay_test.go:3") && changed.contains("unexecuted"),
+        "{changed}"
+    );
+    assert!(
+        !changed.contains("Middle") && !changed.contains("scratch.go"),
+        "{changed}"
+    );
+    let capped = lookup(&["refs", "--changed", "--max-bytes", "95"]);
+    assert!(capped.len() <= 95 && capped.contains("omitted"), "{capped}");
+    fs::write(
+        root.join("caller.go"),
+        "package adjust\nfunc Schedule() int { return 1 }\n",
+    )
+    .unwrap();
+    let stale = lookup(&["refs", "--changed"]);
+    assert!(!stale.contains("caller caller.go:3 Schedule"), "{stale}");
+    run_git(root, &["add", "scratch.go"]);
+    fs::remove_file(root.join("delay.go")).unwrap();
+    let mixed = lookup(&["refs", "--changed"]);
+    assert!(
+        mixed.contains("Added since HEAD") && mixed.contains("Removed from worktree"),
+        "{mixed}"
+    );
+}
+
+#[test]
 fn refs_batches_verified_calls_and_scopes_the_whole_reply() {
     let workspace = tempdir().expect("workspace");
     let cache = tempdir().expect("cache");
@@ -4911,4 +5033,31 @@ fn context_json_reports_deep_trace_by_default() {
     );
     assert_retrieval_failure_output(context);
 }
+#[test]
+fn packet_launcher_rejects_project_changes_and_refresh_before_opening() {
+    let workspace = tempdir().expect("workspace");
+    let other = tempdir().expect("another workspace");
+    let other = other.path().to_str().expect("UTF-8 fixture");
+    for (option, value, reason) in [
+        ("--project", other, "uses the repository it runs from"),
+        ("--path", other, "uses the repository it runs from"),
+        ("--refresh", "auto", "uses --refresh none"),
+    ] {
+        let output = test_support::cli_command()
+            .current_dir(workspace.path())
+            .args([
+                "packet",
+                "--launcher-read-only",
+                "--question=where",
+                option,
+                value,
+            ])
+            .output()
+            .expect("run packet through launcher mode");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success() && output.stdout.is_empty());
+        assert!(stderr.contains(reason), "{stderr}");
+    }
+}
+
 mod test_support;

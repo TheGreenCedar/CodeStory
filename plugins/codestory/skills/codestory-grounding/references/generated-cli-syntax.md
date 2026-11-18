@@ -22,7 +22,7 @@ Root usage: `codestory-cli <COMMAND>`
 | `cache` | `codestory-cli cache <COMMAND>` |
 | `search` | `codestory-cli search [OPTIONS] --query <QUERY>` |
 | `find` | `codestory-cli find [OPTIONS] [TERM]...` |
-| `refs` | `codestory-cli refs [OPTIONS] <TARGET>...` |
+| `refs` | `codestory-cli refs [OPTIONS] [TARGET]...` |
 | `drill` | `codestory-cli drill [OPTIONS] --anchors <ANCHORS>... --output-dir <DIR>` |
 | `drill-suite` | `codestory-cli drill-suite [OPTIONS] --case-file <FILE> --output-dir <DIR>` |
 | `symbol` | `codestory-cli symbol [OPTIONS] <--id <NODE_ID>|--query <QUERY>>` |

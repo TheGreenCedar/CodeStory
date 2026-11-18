@@ -590,6 +590,12 @@ pub(crate) struct PacketCommand {
     pub(crate) project: ProjectArgs,
     #[arg(
         long,
+        hide = true,
+        conflicts_with_all = ["cache_dir", "output_file", "diagnostics_out"]
+    )]
+    pub(crate) launcher_read_only: bool,
+    #[arg(
+        long,
         help = "Broad repository question or task to ground in one packet."
     )]
     pub(crate) question: String,
@@ -664,10 +670,15 @@ pub(crate) struct PacketCommand {
     )]
     pub(crate) diagnostics_out: Option<PathBuf>,
     #[cfg(feature = "benchmark-support")]
-    #[arg(long, hide = true)]
+    #[arg(long, hide = true, conflicts_with = "launcher_read_only")]
     pub(crate) benchmark_disable_dense_semantic: bool,
     #[cfg(feature = "benchmark-support")]
-    #[arg(long, value_name = "PATH", hide = true)]
+    #[arg(
+        long,
+        value_name = "PATH",
+        hide = true,
+        conflicts_with = "launcher_read_only"
+    )]
     pub(crate) benchmark_retrieval_proof_out: Option<PathBuf>,
 }
 
@@ -1260,18 +1271,24 @@ pub(crate) struct FindCommand {
     )]
     pub(crate) terms: Vec<String>,
     #[arg(
+        long,
+        conflicts_with = "terms",
+        value_name = "QUESTION",
+        help = "Find likely implementations with verified source and relationships instead of matching literal terms."
+    )]
+    pub(crate) question: Option<String>,
+    #[arg(
         long = "file-glob",
         value_name = "GLOB",
-        help = "Only search paths matching this glob. Without a TERM, list the matching paths."
+        help = "Only search paths matching this glob. Without a TERM or --question, list the matching paths."
     )]
     pub(crate) file_globs: Vec<String>,
     #[arg(
         long,
         value_name = "N",
-        default_value_t = codestory_runtime::served_lookup::DEFAULT_LIMIT,
-        help = "Lines to list before the remaining matches are only counted per file."
+        help = "Maximum listed matches (default: 150), or implementation candidates with --question (default: 5, maximum: 20)."
     )]
-    pub(crate) limit: usize,
+    pub(crate) limit: Option<usize>,
     #[command(flatten)]
     pub(crate) bodies: BodyArgs,
 }
@@ -1291,7 +1308,7 @@ pub(crate) struct BodyArgs {
     )]
     pub(crate) body_lines: usize,
     #[arg(long, default_value_t = codestory_runtime::served_lookup::DEFAULT_MAX_BYTES,
-        help = "Maximum UTF-8 bytes in the entire reply (0 disables the cap).")]
+        help = "Maximum UTF-8 bytes in the reply. Use 1–16000 for focused lookups. 0 disables the cap for literal or named lookups.")]
     pub(crate) max_bytes: usize,
     #[arg(long, hide = true)]
     pub(crate) lookup_status: bool,
@@ -1310,10 +1327,16 @@ pub(crate) struct RefsCommand {
     pub(crate) project: ProjectArgs,
     #[arg(
         value_name = "TARGET",
-        required = true,
+        required_unless_present = "changed",
         help = "A name, qualified name, path::Symbol or path:LINE. Multiple targets share one reply."
     )]
     pub(crate) targets: Vec<String>,
+    #[arg(
+        long,
+        conflicts_with = "targets",
+        help = "Inspect tracked worktree changes against HEAD with verified callers and other source witnesses."
+    )]
+    pub(crate) changed: bool,
     #[arg(
         long = "file-glob",
         value_name = "GLOB",
@@ -1323,10 +1346,9 @@ pub(crate) struct RefsCommand {
     #[arg(
         long,
         value_name = "N",
-        default_value_t = codestory_runtime::served_lookup::DEFAULT_LIMIT,
-        help = "Lines to list before the remaining references are only counted per file."
+        help = "Maximum listed references (default: 150), or changed candidates with --changed (default: 5, maximum: 20)."
     )]
-    pub(crate) limit: usize,
+    pub(crate) limit: Option<usize>,
     #[command(flatten)]
     pub(crate) bodies: BodyArgs,
 }
@@ -3688,6 +3710,67 @@ mod tests {
         match cli.command {
             Command::Context(cmd) => assert_eq!(cmd.id.as_deref(), Some("-3816661223164617416")),
             _ => panic!("expected context command"),
+        }
+    }
+
+    #[test]
+    fn focused_lookups_do_not_accept_literal_terms_or_targets() {
+        let find = Cli::try_parse_from([
+            "codestory-cli",
+            "find",
+            "--question=Where do retries start?",
+            "--file-glob",
+            "src/**",
+            "--limit",
+            "2",
+        ])
+        .expect("focused find should accept scope and limit");
+        let Command::Find(find) = find.command else {
+            panic!("expected find command");
+        };
+        assert_eq!(find.question.as_deref(), Some("Where do retries start?"));
+        assert!(find.terms.is_empty());
+        assert_eq!(find.file_globs, ["src/**"]);
+        assert_eq!(find.limit, Some(2));
+
+        let refs = Cli::try_parse_from(["codestory-cli", "refs", "--changed"])
+            .expect("changed refs should not require a positional target");
+        let Command::Refs(refs) = refs.command else {
+            panic!("expected refs command");
+        };
+        assert!(refs.changed && refs.targets.is_empty());
+        assert_eq!(refs.limit, None);
+
+        for args in [
+            ["find", "--question=where", "retry"],
+            ["refs", "--changed", "Retry"],
+        ] {
+            let error = Cli::try_parse_from(["codestory-cli"].into_iter().chain(args)).unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+        assert_eq!(
+            Cli::try_parse_from(["codestory-cli", "refs"])
+                .unwrap_err()
+                .kind(),
+            clap::error::ErrorKind::MissingRequiredArgument,
+        );
+    }
+
+    #[test]
+    fn packet_launcher_declines_cache_and_output_overrides() {
+        let normal = ["codestory-cli", "packet", "--question=explain indexing"];
+        let wrapped = normal.into_iter().chain(["--launcher-read-only"]);
+        let parsed = Cli::try_parse_from(wrapped.clone()).expect("launcher packet should parse");
+        let Command::Packet(packet) = parsed.command else {
+            panic!("expected packet command");
+        };
+        assert_eq!(packet.refresh, RefreshMode::None);
+        assert_eq!(packet.project.project, PathBuf::from("."));
+        for option in ["--cache-dir", "--output-file", "--diagnostics-out"] {
+            let args = [option, "/tmp/other"];
+            let error = Cli::try_parse_from(wrapped.clone().chain(args)).unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+            assert!(Cli::try_parse_from(normal.into_iter().chain(args)).is_ok());
         }
     }
 
