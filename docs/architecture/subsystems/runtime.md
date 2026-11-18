@@ -31,6 +31,7 @@ adapter syntax, SQLite mechanics, parsers, or model execution.
 - `src/grounding.rs` and `src/support.rs`: grounding and support assembly
 - `src/served_lookup.rs` reads live source for `find`, `refs` and `read`. It attaches a call binding from a pinned publication only after matching the caller and callee source. Other files involved in resolution may have changed. Refresh guidance reports drift observed during the lookup.
 - Implementation searches rank the path, name and definition text stored for each indexed function or method. Before showing code, the runtime checks the current file and the exact definition range. It shows verified call sites and can follow a literal reference into another function. A literal reference is labelled separately when the binding is unknown.
+- When an unchanged published core lacks a usable function index, an explicit refresh can build it alongside the sealed generation. The replacement belongs to that exact core and run. The existing broad-search data and active publication stay usable throughout repair.
 - For tracked edits, the workspace compares a pinned Git HEAD tree with the current worktree. The runtime maps changed line ranges to a matching indexed file on either side. It labels pre-edit declarations and verifies the caller's current source before showing a call site.
 - `src/search/`: runtime search state and graph-native documents
 - `src/agent/`: execution residuals (orchestrator, retrieval-primary, packet

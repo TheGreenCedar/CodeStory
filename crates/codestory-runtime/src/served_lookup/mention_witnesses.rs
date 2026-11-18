@@ -1,11 +1,10 @@
 //! Exact source mentions expand focused lookup without implying a call binding.
 
 use super::*;
-use crate::callable_search::CallableHit;
+use crate::callable_search::{CallableHit, open_generation_index};
 use crate::search_publication::{
     read_search_generation_completion, search_index_path_for_publication,
 };
-use codestory_retrieval::callable_index::{self, CALLABLE_INDEX_FILE};
 
 const CANDIDATES: usize = 24;
 const VERIFIED_BYTES: u64 = 6 * 1024 * 1024;
@@ -63,11 +62,7 @@ pub(super) fn append_mentions(
     if read_search_generation_completion(&dir, &publication.generation_id).is_none() {
         return;
     }
-    let Ok(reader) = callable_index::open(
-        &dir.join(CALLABLE_INDEX_FILE),
-        &publication.generation_id,
-        &publication.run_id,
-    ) else {
+    let Ok((_, reader)) = open_generation_index(&dir, &publication) else {
         return;
     };
     let specs = anchors

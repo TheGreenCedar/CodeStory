@@ -717,9 +717,7 @@ fn evaluate_incremental_plan_probe_with_options(
     let Ok(generation_id) = Uuid::parse_str(&publication.generation_id) else {
         probe_unavailable!(GenerationId);
     };
-    if read_search_generation_completion(&search_path, &generation_id.to_string()).is_none()
-        || !crate::callable_search::generation_has_index(&search_path, &publication)
-    {
+    if read_search_generation_completion(&search_path, &generation_id.to_string()).is_none() {
         return IncrementalPlanProbeOutcomeDto::SearchGenerationIncomplete;
     }
     // An empty plan is not a freshness receipt until every admitted source has
@@ -1648,10 +1646,42 @@ fn run_incremental_indexing_common(
     )?;
     let prepared = match prepared {
         IncrementalRefreshPreparation::Unchanged { probe, wall } => {
-            return Ok(unchanged_incremental_run_summary(
-                probe,
-                wall.finish(core_started.elapsed(), None),
-            ));
+            let mut repaired = false;
+            if let Some(publication) = &probe.publication {
+                match crate::callable_search::repair_pinned_generation(
+                    storage_path,
+                    root,
+                    publication,
+                    source_index_policy.byte_cap,
+                    cancel_token,
+                    || {
+                        let checked = probe_incremental_plan_with_options(
+                            root,
+                            storage_path,
+                            source_index_policy,
+                            skip_semantic_docs,
+                        );
+                        checked.short_circuited()
+                            && checked.publication == probe.publication
+                            && checked.source_seals == probe.source_seals
+                            && checked.repository_tracking_digest
+                                == probe.repository_tracking_digest
+                    },
+                ) {
+                    Ok(value) => repaired = value,
+                    Err(error) => {
+                        tracing::warn!(%error,"optional callable index repair did not publish")
+                    }
+                }
+            }
+            ensure_indexing_active(cancel_token)?;
+            let mut summary =
+                unchanged_incremental_run_summary(probe, wall.finish(core_started.elapsed(), None));
+            if repaired && let Some(probe) = summary.phase_timings.incremental_plan_probe.as_mut() {
+                // Report successful optional repair without claiming a core commit or losing skipped-work accounting.
+                probe.outcome = IncrementalPlanProbeOutcomeDto::SearchGenerationIncomplete;
+            }
+            return Ok(summary);
         }
         IncrementalRefreshPreparation::Prepared(prepared) => prepared,
     };

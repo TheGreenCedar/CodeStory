@@ -24,6 +24,60 @@ pub(super) fn search_index_generation_root(storage_path: &Path) -> PathBuf {
     codestory_workspace::search_generation_directory_for_storage(storage_path)
 }
 
+// Independently repaired callable postings never alter the original search generation.
+const CALLABLE_OVERLAY_DIRECTORY: &str = ".codestory-callable-overlays";
+
+pub(super) fn callable_overlay_path(
+    search_path: &Path,
+    publication: &IndexPublicationRecord,
+) -> Option<PathBuf> {
+    let generation = Uuid::parse_str(&publication.generation_id).ok()?;
+    let run = Uuid::parse_str(&publication.run_id).ok()?;
+    Some(
+        search_path
+            .parent()?
+            .join(CALLABLE_OVERLAY_DIRECTORY)
+            .join(format!("{generation}.{run}.sqlite3")),
+    )
+}
+
+fn prune_callable_overlays(root: &Path, deletion: &OwnedDeletionRoot, relative_root: &Path) {
+    let overlays = root.join(CALLABLE_OVERLAY_DIRECTORY);
+    if !std::fs::symlink_metadata(&overlays).is_ok_and(|metadata| metadata.is_dir()) {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(&overlays) else {
+        return;
+    };
+    // Normally there is one repair per retained generation. Leave foreign names
+    // and unprovable artifacts alone, and bound maintenance even on a noisy cache.
+    for entry in entries.take(32).flatten() {
+        let name = entry.file_name();
+        let Some((generation, run)) = name
+            .to_str()
+            .and_then(|name| name.strip_suffix(".sqlite3"))
+            .and_then(|stem| stem.split_once('.'))
+        else {
+            continue;
+        };
+        if Uuid::parse_str(generation).is_err()
+            || Uuid::parse_str(run).is_err()
+            || !root
+                .join(generation)
+                .symlink_metadata()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            || !codestory_retrieval::callable_index::has_generation_binding(
+                &entry.path(),
+                generation,
+                run,
+            )
+        {
+            continue;
+        }
+        let _ = deletion.remove(&relative_root.join(CALLABLE_OVERLAY_DIRECTORY).join(name));
+    }
+}
+
 pub(super) fn search_index_path_for_publication(
     storage_path: &Path,
     publication: Option<&IndexPublicationRecord>,
@@ -392,7 +446,10 @@ pub(super) fn prune_search_generations(
             ))
         })?
         .filter_map(Result::ok)
-        .filter(|entry| !entry.file_name().to_string_lossy().ends_with(".lock"))
+        .filter(|entry| {
+            let name = entry.file_name();
+            name != CALLABLE_OVERLAY_DIRECTORY && !name.to_string_lossy().ends_with(".lock")
+        })
         .collect::<Vec<_>>();
     generations.sort_by_key(|entry| {
         std::cmp::Reverse(
@@ -447,6 +504,7 @@ pub(super) fn prune_search_generations(
             }
         }
     }
+    prune_callable_overlays(&root, &deletion, Path::new(relative_root));
     Ok(())
 }
 

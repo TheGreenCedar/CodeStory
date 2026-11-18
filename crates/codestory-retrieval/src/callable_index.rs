@@ -296,7 +296,7 @@ fn create_schema(tx: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
-pub fn open(path: &Path, generation: &str, run: &str) -> Result<Reader> {
+fn open_connection(path: &Path) -> Result<Connection> {
     if !std::fs::symlink_metadata(path)?.is_file() {
         bail!("callable index must be a regular file");
     }
@@ -305,6 +305,10 @@ pub fn open(path: &Path, generation: &str, run: &str) -> Result<Reader> {
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     connection.execute_batch("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF;")?;
+    Ok(connection)
+}
+
+fn read_binding(connection: &Connection, generation: &str, run: &str) -> Result<(usize, Coverage)> {
     let (version, stored_generation, stored_run, total_terms, coverage) = connection.query_row(
         "SELECT version,generation,run,terms,documents,partial_files,omitted_files,omitted_definitions FROM meta",
         [], |row| Ok((row.get::<_, i32>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, read_size(row, 3)?, Coverage {
@@ -315,6 +319,37 @@ pub fn open(path: &Path, generation: &str, run: &str) -> Result<Reader> {
     if version != SCHEMA_VERSION || stored_generation != generation || stored_run != run {
         bail!("callable index does not belong to the selected core generation");
     }
+    Ok((total_terms, coverage))
+}
+
+/// Ownership proof for this optional cache even when another table is damaged.
+pub fn has_generation_binding(path: &Path, generation: &str, run: &str) -> bool {
+    open_connection(path)
+        .and_then(|connection| read_binding(&connection, generation, run))
+        .is_ok()
+}
+
+/// Seal and publish a separately staged, fully bound callable repair.
+pub fn publish_staged(
+    staged: &Path,
+    destination: &Path,
+    generation: &str,
+    run: &str,
+) -> Result<()> {
+    drop(open(staged, generation, run)?);
+    match std::fs::symlink_metadata(destination) {
+        Ok(_) if !has_generation_binding(destination, generation, run) => {
+            bail!("callable overlay destination has no matching ownership receipt");
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+        _ => {}
+    }
+    crate::copy_on_write::publish_immutable_file_atomic(staged, destination)
+}
+
+pub fn open(path: &Path, generation: &str, run: &str) -> Result<Reader> {
+    let connection = open_connection(path)?;
+    let (total_terms, coverage) = read_binding(&connection, generation, run)?;
     // Prepare without reading postings so an incomplete cache can be rebuilt on the next index.
     connection.prepare(
         "SELECT s.id,s.path,s.checksum,s.bytes,d.id,d.node_id,d.name,d.start_line,d.end_line,

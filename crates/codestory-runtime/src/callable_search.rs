@@ -1,6 +1,6 @@
 //! Core-only ranked callable locations. Ranking never walks the project tree.
 use crate::search_publication::{
-    SearchGenerationCatalogGuard, read_search_generation_completion,
+    SearchGenerationCatalogGuard, callable_overlay_path, read_search_generation_completion,
     search_index_path_for_publication,
 };
 use crate::support::{BoundedTextRead, read_file_text_limited};
@@ -11,6 +11,7 @@ use codestory_retrieval::callable_index::{
     self, CALLABLE_INDEX_FILE, Definition, PreviousGeneration, Writer,
 };
 use codestory_store::{CallableDefinition, CallableDefinitionFile, IndexPublicationRecord, Store};
+use codestory_workspace::owned_deletion::OwnedDeletionRoot;
 use codestory_workspace::{ProjectRelativePathResolution, resolve_project_relative_path};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
@@ -86,24 +87,19 @@ pub(crate) fn query(
             CallableCoverage::Missing,
         ));
     }
-    let artifact = path.join(CALLABLE_INDEX_FILE);
-    if std::fs::symlink_metadata(&artifact).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
-    {
-        return Ok(CallableSearchOutcome::unavailable(
-            CallableCoverage::Missing,
-        ));
-    }
+    let (_, reader) = match open_generation_index(&path, &publication) {
+        Ok(selected) => selected,
+        Err(coverage) => return Ok(CallableSearchOutcome::unavailable(coverage)),
+    };
     let ranking_limit = limit.min(MAX_RETURNED_HITS);
-    let read = callable_index::open(&artifact, &publication.generation_id, &publication.run_id)
-        .and_then(|reader| {
-            let ranked = reader.rank(
-                question,
-                ranking_limit.saturating_mul(4),
-                in_scope,
-                &cancelled,
-            )?;
-            Ok((reader.coverage, ranked))
-        });
+    let read = reader
+        .rank(
+            question,
+            ranking_limit.saturating_mul(4),
+            in_scope,
+            &cancelled,
+        )
+        .map(|ranked| (reader.coverage, ranked));
     let (coverage, ranked) = match read {
         Ok(ranked) => ranked,
         Err(error) => {
@@ -284,6 +280,139 @@ fn hex_hash(content: &str) -> String {
     format!("{:x}", Sha256::digest(content.as_bytes()))
 }
 
+/// Prefer an independently repaired cache for this exact generation while
+/// keeping the original published search generation observational.
+pub(super) fn open_generation_index(
+    search_path: &Path,
+    publication: &IndexPublicationRecord,
+) -> std::result::Result<(PathBuf, callable_index::Reader), CallableCoverage> {
+    let overlay = callable_overlay_path(search_path, publication).filter(|path| {
+        path.parent().is_some_and(|parent| {
+            std::fs::symlink_metadata(parent).is_ok_and(|metadata| metadata.is_dir())
+        })
+    });
+    let mut unavailable = false;
+    for path in overlay
+        .into_iter()
+        .chain(std::iter::once(search_path.join(CALLABLE_INDEX_FILE)))
+    {
+        match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            _ => {
+                if let Ok(reader) =
+                    callable_index::open(&path, &publication.generation_id, &publication.run_id)
+                {
+                    return Ok((path, reader));
+                }
+                unavailable = true;
+            }
+        }
+    }
+    Err(if unavailable {
+        CallableCoverage::Unavailable
+    } else {
+        CallableCoverage::Missing
+    })
+}
+
+/// Repair only the optional search cache for an already-pinned complete core.
+/// The writer validates its source inventory again before the atomic move.
+pub(super) fn repair_pinned_generation(
+    storage_path: &Path,
+    root: &Path,
+    publication: &IndexPublicationRecord,
+    max_file_bytes: u64,
+    cancel: Option<&CancellationToken>,
+    validate_sources: impl FnOnce() -> bool,
+) -> Result<bool> {
+    let cancelled = || cancel.is_some_and(CancellationToken::is_cancelled);
+    if cancelled() {
+        return Ok(false);
+    }
+    let path = search_index_path_for_publication(storage_path, Some(publication))
+        .map_err(|error| anyhow::anyhow!("{}", error.message))?;
+    if generation_has_index(&path, publication) {
+        return Ok(false);
+    }
+    let Some(artifact) = callable_overlay_path(&path, publication) else {
+        return Ok(false);
+    };
+    let storage = Store::open_observational(storage_path)?;
+    let snapshot = storage.read_snapshot()?;
+    if snapshot
+        .storage()
+        .get_complete_index_publication()?
+        .as_ref()
+        != Some(publication)
+    {
+        return Ok(false);
+    }
+    let _guard = SearchGenerationCatalogGuard::acquire(storage_path)
+        .map_err(|error| anyhow::anyhow!("{}", error.message))?;
+    if read_search_generation_completion(&path, &publication.generation_id).is_none()
+        || generation_has_index(&path, publication)
+        || cancelled()
+    {
+        return Ok(false);
+    }
+
+    let folder = artifact.parent().expect("overlay has an owned directory");
+    match std::fs::create_dir(folder) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    if !std::fs::symlink_metadata(folder)?.is_dir() {
+        return Ok(false);
+    }
+    match std::fs::symlink_metadata(&artifact) {
+        Ok(_)
+            if !callable_index::has_generation_binding(
+                &artifact,
+                &publication.generation_id,
+                &publication.run_id,
+            ) =>
+        {
+            return Ok(false);
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+        _ => {}
+    }
+    let temporary_name = format!(".{}.staged", uuid::Uuid::new_v4());
+    let temporary = folder.join(&temporary_name);
+    let deletion = OwnedDeletionRoot::open(folder)?;
+    callable_index::write(
+        &temporary,
+        &publication.generation_id,
+        &publication.run_id,
+        None,
+        |writer| populate(writer, snapshot.storage(), root, max_file_bytes, &cancelled),
+        &cancelled,
+    )?;
+    let result = (|| {
+        if cancelled()
+            || !validate_sources()
+            || cancelled()
+            || Store::database_complete_index_publication(storage_path)?.as_ref()
+                != Some(publication)
+            || cancelled()
+        {
+            return Ok(false);
+        }
+        callable_index::publish_staged(
+            &temporary,
+            &artifact,
+            &publication.generation_id,
+            &publication.run_id,
+        )?;
+        Ok(generation_has_index(&path, publication))
+    })();
+    if temporary.exists() {
+        let _ = deletion.remove(Path::new(&temporary_name));
+    }
+    result
+}
+
 /// A callable failure leaves the normal core/symbol generation usable.
 /// Fresh stages bind the artifact to their own generation and run.
 pub(super) fn prepare_generation(
@@ -333,8 +462,11 @@ fn prepare_generation_inner(
     }
     let artifact = path.join(CALLABLE_INDEX_FILE);
     if let Some((previous, affected_files)) = previous {
-        let source = search_index_path_for_publication(storage_path, Some(previous))?
-            .join(CALLABLE_INDEX_FILE);
+        let previous_path = search_index_path_for_publication(storage_path, Some(previous))?;
+        let source = open_generation_index(&previous_path, previous)
+            .ok()
+            .map(|(path, _)| path)
+            .unwrap_or_else(|| previous_path.join(CALLABLE_INDEX_FILE));
         let mut changed = affected_files.to_vec();
         changed.sort_unstable();
         changed.dedup();
@@ -396,12 +528,7 @@ pub(super) fn generation_has_index(
     search_path: &Path,
     publication: &IndexPublicationRecord,
 ) -> bool {
-    callable_index::open(
-        &search_path.join(CALLABLE_INDEX_FILE),
-        &publication.generation_id,
-        &publication.run_id,
-    )
-    .is_ok()
+    open_generation_index(search_path, publication).is_ok()
 }
 
 fn populate(
@@ -587,12 +714,12 @@ mod tests {
     }
 
     #[test]
-    fn callable_search_missing_or_damaged_artifact_is_observational() {
+    fn callable_search_repair_preserves_full_core_and_prior_search_generation() {
         let workspace = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
         let root = workspace.path();
         let storage = cache.path().join("codestory.db");
-        fs::write(root.join("lib.rs"), "pub fn report_checksum() {}\n").unwrap();
+        fs::write(root.join("lib.rs"), "/// Check quota and return the saved checksum.\npub fn report_checksum(value: usize) -> usize {\n    value.wrapping_add(7)\n}\n").unwrap();
         let controller = AppController::new_with_config(crate::test_sidecar_runtime_from_env());
         controller
             .open_project_summary_with_storage_path(root.to_path_buf(), storage.clone())
@@ -603,61 +730,142 @@ mod tests {
         let publication = Store::database_index_publication(&storage)
             .unwrap()
             .unwrap();
-        let path = search_index_path_for_publication(&storage, Some(&publication))
-            .unwrap()
-            .join(CALLABLE_INDEX_FILE);
+        let core_path = codestory_store::resolve_core_database_path(&storage).unwrap();
+        let core_bytes = fs::read(&core_path).unwrap();
+        let counts = |storage: &Path| {
+            let store = Store::open_observational(storage).unwrap();
+            let connection = store.get_connection();
+            ["symbol_search_doc", "dense_anchor_input"].map(|table| {
+                connection
+                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap()
+            })
+        };
+        let original_counts = counts(&storage);
+        assert!(
+            original_counts.iter().all(|n| *n > 0),
+            "{original_counts:?}"
+        );
+        let path = search_index_path_for_publication(&storage, Some(&publication)).unwrap();
+        let primary = path.join(CALLABLE_INDEX_FILE);
+        let overlay = callable_overlay_path(&path, &publication).unwrap();
         let saved = cache.path().join("artifact-backup");
-        fs::rename(&path, &saved).unwrap();
+        fs::rename(&primary, &saved).unwrap();
         let missing = current_query(&storage, root, "report checksum", |_| true);
-        assert!(missing.hits.is_empty());
         assert_eq!(missing.coverage, CallableCoverage::Missing);
-        assert!(missing.refresh_recommended && !path.exists());
-        controller
-            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
-            .unwrap();
-        let repaired = Store::database_index_publication(&storage)
-            .unwrap()
-            .unwrap();
-        assert_ne!(repaired, publication);
+        assert!(missing.refresh_recommended && !primary.exists() && !overlay.exists());
+
+        let refresh = || {
+            controller
+                .run_indexing_blocking_without_runtime_refresh_with_options(
+                    IndexMode::Incremental,
+                    true,
+                )
+                .unwrap()
+        };
+        let original_marker =
+            fs::read(crate::search_publication::search_generation_completion_path(&path)).unwrap();
+        let repaired = refresh();
+        let probe = repaired.incremental_plan_probe.unwrap();
+        assert_eq!(
+            probe.outcome,
+            codestory_contracts::api::IncrementalPlanProbeOutcomeDto::SearchGenerationIncomplete
+        );
+        assert!(probe.skipped_search_state_rebuild);
+        assert!(overlay.is_file() && !primary.exists());
+        assert_eq!(
+            fs::read(crate::search_publication::search_generation_completion_path(&path)).unwrap(),
+            original_marker
+        );
         assert_eq!(
             current_query(&storage, root, "report checksum", |_| true)
                 .hits
                 .len(),
             1
         );
-        controller
-            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+        let unchanged = refresh();
+        assert_eq!(
+            unchanged.incremental_plan_probe.unwrap().outcome,
+            codestory_contracts::api::IncrementalPlanProbeOutcomeDto::ShortCircuited
+        );
+
+        fs::rename(&overlay, cache.path().join("overlay-backup")).unwrap();
+        fs::write(&primary, fs::read(saved).unwrap()).unwrap();
+        rusqlite::Connection::open(&primary)
+            .unwrap()
+            .execute_batch("DROP TABLE posting")
             .unwrap();
+        let damaged_bytes = fs::read(&primary).unwrap();
+        let damaged = current_query(&storage, root, "report checksum", |_| true);
+        assert_eq!(damaged.coverage, CallableCoverage::Unavailable);
+        assert!(damaged.refresh_recommended && damaged.hits.is_empty());
+
+        assert!(
+            !repair_pinned_generation(&storage, root, &publication, 2_000_000, None, || false)
+                .unwrap()
+        );
+        assert!(
+            !overlay.exists(),
+            "failed source revalidation must keep the staged file invisible"
+        );
+        fs::create_dir(&overlay).unwrap();
+        fs::write(overlay.join("marker"), b"outside overlay ownership").unwrap();
+        assert_eq!(
+            refresh().incremental_plan_probe.unwrap().outcome,
+            codestory_contracts::api::IncrementalPlanProbeOutcomeDto::ShortCircuited
+        );
+        assert_eq!(
+            fs::read(overlay.join("marker")).unwrap(),
+            b"outside overlay ownership"
+        );
+        fs::remove_file(overlay.join("marker")).unwrap();
+        fs::remove_dir(&overlay).unwrap();
+
+        fs::write(&overlay, b"foreign regular destination").unwrap();
+        assert_eq!(
+            refresh().incremental_plan_probe.unwrap().outcome,
+            codestory_contracts::api::IncrementalPlanProbeOutcomeDto::ShortCircuited,
+        );
+        assert_eq!(fs::read(&overlay).unwrap(), b"foreign regular destination");
+        fs::remove_file(&overlay).unwrap();
+
+        refresh();
+        // A valid generation/run header proves ownership even if postings are damaged.
+        let original_overlay = cache.path().join("owned-overlay-backup");
+        fs::rename(&overlay, &original_overlay).unwrap();
+        fs::write(&overlay, fs::read(original_overlay).unwrap()).unwrap();
+        rusqlite::Connection::open(&overlay)
+            .unwrap()
+            .execute_batch("DROP TABLE posting")
+            .unwrap();
+        let mut permissions = fs::metadata(&overlay).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&overlay, permissions).unwrap();
+        assert!(callable_index::has_generation_binding(
+            &overlay,
+            &publication.generation_id,
+            &publication.run_id
+        ));
+        assert!(current_query(&storage, root, "report checksum", |_| true).refresh_recommended);
+
+        refresh();
+        assert_eq!(
+            fs::read(&primary).unwrap(),
+            damaged_bytes,
+            "never rewrite the original search generation"
+        );
+        let repaired = current_query(&storage, root, "report checksum", |_| true);
+        assert_eq!(repaired.hits.len(), 1);
+        assert!(!repaired.refresh_recommended);
         assert_eq!(
             Store::database_index_publication(&storage)
                 .unwrap()
                 .unwrap(),
-            repaired
+            publication
         );
-
-        let path = search_index_path_for_publication(&storage, Some(&repaired))
-            .unwrap()
-            .join(CALLABLE_INDEX_FILE);
-        let backup = cache.path().join("artifact-new-backup");
-        fs::rename(&path, &backup).unwrap();
-        fs::write(&path, fs::read(backup).unwrap()).unwrap();
-        rusqlite::Connection::open(&path)
-            .unwrap()
-            .execute_batch("DROP TABLE posting")
-            .unwrap();
-        let damaged_bytes = fs::read(&path).unwrap();
-        let damaged = current_query(&storage, root, "report checksum", |_| true);
-        assert_eq!(damaged.coverage, CallableCoverage::Unavailable);
-        assert!(damaged.refresh_recommended && damaged.hits.is_empty());
-        assert_eq!(fs::read(&path).unwrap(), damaged_bytes);
-        controller
-            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
-            .unwrap();
-        assert_eq!(
-            current_query(&storage, root, "report checksum", |_| true)
-                .hits
-                .len(),
-            1
-        );
+        assert_eq!(counts(&storage), original_counts);
+        assert_eq!(fs::read(&core_path).unwrap(), core_bytes);
     }
 }
