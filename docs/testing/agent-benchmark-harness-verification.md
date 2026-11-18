@@ -167,13 +167,23 @@ node scripts/codestory-agent-ab-benchmark.mjs `
   --max-source-reads-after-packet 0
 ```
 
-The run ledger records per-run `wall_ms`, token usage, estimated cost when
-`CODESTORY_BENCH_INPUT_COST_PER_MTOK` and
-`CODESTORY_BENCH_OUTPUT_COST_PER_MTOK` are configured, observed tool calls, tool
-categories, web searches, command counts, command categories, direct source
-reads, observed repository-context actions after the first CodeStory action,
-ordinary source reads after the first packet, duplicate file reads, and
-manifest quality scores.
+The run ledger records per-run `wall_ms`, observed Codex token usage, estimated
+cost, observed tool calls, tool categories, web searches, command counts, command
+categories, direct source reads, observed repository-context actions after the
+first CodeStory action, ordinary source reads after the first packet, duplicate
+file reads, and manifest quality scores.
+
+Configured token rates are stored with the run for offline reanalysis. When a
+saved run has no rates, the reanalysis command accepts the same environment
+settings. Set `CODESTORY_BENCH_INPUT_COST_PER_MTOK` for fresh
+input and `CODESTORY_BENCH_OUTPUT_COST_PER_MTOK` for output. Set
+`CODESTORY_BENCH_CACHED_INPUT_COST_PER_MTOK` for cache hits and
+`CODESTORY_BENCH_CACHE_WRITE_INPUT_COST_PER_MTOK` for cache writes when those
+buckets contain tokens. Use rates that apply to the run's model and service.
+An unknown token count or rate for a used bucket leaves the estimate unavailable.
+Arm summaries show observed totals and withhold comparisons when either arm has
+missing token or cost evidence.
+
 For the `without_codestory` arm, the harness mechanically runs a strictly
 no-CodeStory local-context prelude before starting the nested agent. It derives
 plain `rg` search terms from the prompt, reads bounded snippets from selected
