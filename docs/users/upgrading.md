@@ -1,4 +1,31 @@
-# Upgrading to CodeStory 0.17.6
+# Upgrading CodeStory
+
+## From 0.17.7 to 0.18
+
+Refresh the plugin package and open a fresh host session. The plugin selects
+its matching CLI. Existing named-tool clients can keep their MCP settings.
+The opt-in `lean` profile exposes `find`, `refs`, and `read`. Clients that
+select `family-v1` use `call` and `describe`.
+
+Custom clients that validate MCP output should fetch the tool catalog again
+after upgrading. The 20 named tools retain their names. On the two newer
+protocol revisions, `context`, `packet`, `search` and `snippet` can return
+new fields. An application that keeps a strict 0.17.7 output schema can reject
+those replies.
+
+The first index refresh can rebuild derived data. Keep the existing cache and
+let CodeStory prepare it. If you may need to return to 0.17.7, stop the clients
+that use the cache and copy it, including the annotation sidecar, before
+upgrading. Keep the verified 0.17.7 archive with the copy. To return to 0.17.7,
+stop the 0.18 clients and use the matching old plugin and CLI with that
+pre-upgrade copy. Retain the newer cache separately for annotations written
+after the upgrade.
+
+Lookups can read live files while the local navigation index is missing or
+stale. A normal refresh restores the semantic projection after a core-only
+refresh. If the runtime is unavailable, continue with direct source reads.
+
+## From 0.17.5 to 0.17.6
 
 CodeStory 0.17.6 adopts publication schema 3. This is a breaking response-schema
 change for integrations built against 0.17.5. Install the matching plugin and

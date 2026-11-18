@@ -29,6 +29,7 @@ adapter syntax, SQLite mechanics, parsers, or model execution.
 
 - `src/lib.rs` and `src/services.rs`: project/index services and retained state
 - `src/grounding.rs` and `src/support.rs`: grounding and support assembly
+- `src/served_lookup.rs` reads live source for `find`, `refs` and `read`. It attaches a call binding from a pinned publication only after matching the caller and callee source. Other files involved in resolution may have changed. Refresh guidance reports drift observed during the lookup.
 - `src/search/`: runtime search state and graph-native documents
 - `src/agent/`: execution residuals (orchestrator, retrieval-primary, packet
   batch/probe/search, traces). Packet *planning* lives in

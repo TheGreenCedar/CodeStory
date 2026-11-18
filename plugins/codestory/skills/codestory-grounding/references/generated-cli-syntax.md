@@ -8,6 +8,7 @@ Root usage: `codestory-cli <COMMAND>`
 
 | Command | Usage |
 | --- | --- |
+| `setup` | `codestory-cli setup [OPTIONS] <HOST>` |
 | `index` | `codestory-cli index [OPTIONS]` |
 | `ground` | `codestory-cli ground [OPTIONS]` |
 | `report` | `codestory-cli report [OPTIONS]` |
@@ -20,6 +21,8 @@ Root usage: `codestory-cli <COMMAND>`
 | `agent` | `codestory-cli agent <COMMAND>` |
 | `cache` | `codestory-cli cache <COMMAND>` |
 | `search` | `codestory-cli search [OPTIONS] --query <QUERY>` |
+| `find` | `codestory-cli find [OPTIONS] [TERM]...` |
+| `refs` | `codestory-cli refs [OPTIONS] <TARGET>...` |
 | `drill` | `codestory-cli drill [OPTIONS] --anchors <ANCHORS>... --output-dir <DIR>` |
 | `drill-suite` | `codestory-cli drill-suite [OPTIONS] --case-file <FILE> --output-dir <DIR>` |
 | `symbol` | `codestory-cli symbol [OPTIONS] <--id <NODE_ID>|--query <QUERY>>` |
@@ -30,6 +33,7 @@ Root usage: `codestory-cli <COMMAND>`
 | `callees` | `codestory-cli callees [OPTIONS] <--id <NODE_ID>|--query <QUERY>>` |
 | `trace` | `codestory-cli trace [OPTIONS] <--id <NODE_ID>|--query <QUERY>>` |
 | `snippet` | `codestory-cli snippet [OPTIONS] <--id <NODE_ID>|--query <QUERY>>` |
+| `read` | `codestory-cli read [OPTIONS] <SELECTOR>...` |
 | `query` | `codestory-cli query [OPTIONS] <QUERY|--sql <SQL>>` |
 | `explore` | `codestory-cli explore [OPTIONS] <--id <NODE_ID>|--query <QUERY>>` |
 | `files` | `codestory-cli files [OPTIONS]` |
