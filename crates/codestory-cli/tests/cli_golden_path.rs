@@ -328,6 +328,24 @@ fn refs_batches_verified_calls_and_scopes_the_whole_reply() {
     let drifted = lookup(&["refs", "main.go::Start", "worker/worker.go::Forward"]);
     assert!(drifted.contains("relationships unavailable"), "{drifted}");
     assert!(!drifted.contains(" -> "), "{drifted}");
+    assert!(
+        drifted.contains("follow-up (unresolved binding): read main.go:4"),
+        "{drifted}"
+    );
+    let bounded = lookup(&["refs", "main.go::Start", "--max-bytes", "90"]);
+    assert!(
+        bounded.len() <= 90 && bounded.contains("omitted (--max-bytes)"),
+        "{bounded}"
+    );
+    assert!(
+        bounded.contains("follow-up (unresolved binding): read main.go:4"),
+        "{bounded}"
+    );
+    let unknown = lookup(&["refs", "missing.go:2", "--max-bytes", "48"]);
+    assert!(
+        unknown.len() <= 48 && !unknown.contains("follow-up"),
+        "{unknown}"
+    );
 }
 
 #[test]
@@ -366,6 +384,20 @@ fn refs_limit_applies_to_distinct_verified_sites() {
     let capped = lookup(&[]);
     assert_eq!(capped.matches("Start -> Finish").count(), 1, "{capped}");
     assert!(capped.contains("additional call sites omitted"), "{capped}");
+    assert!(
+        capped.contains("follow-up (omitted site): read peer.go:2"),
+        "{capped}"
+    );
+    let bounded = lookup(&["--max-bytes", "90"]);
+    assert!(
+        bounded.len() <= 90 && bounded.contains("omitted (--max-bytes)"),
+        "{bounded}"
+    );
+    assert!(
+        bounded.contains("follow-up (omitted site): read peer.go:2"),
+        "{bounded}"
+    );
+    assert_eq!(lookup(&["--max-bytes", "3"]), "...");
 
     let scoped = lookup(&["--file-glob", "!peer.go"]);
     assert_eq!(scoped.matches("Start -> Finish").count(), 1, "{scoped}");
@@ -378,6 +410,13 @@ fn refs_limit_applies_to_distinct_verified_sites() {
         "{scoped}"
     );
     assert!(!scoped.contains("lack verified source"), "{scoped}");
+    assert!(!scoped.contains("peer.go"), "{scoped}");
+    let scoped = lookup(&["--file-glob", "!peer.go", "--max-bytes", "75"]);
+    assert!(
+        scoped.len() <= 75 && scoped.contains("follow-up: read caller.go:2"),
+        "{scoped}"
+    );
+    assert!(!scoped.contains("peer.go"), "{scoped}");
 
     fs::remove_file(root.join("peer.go")).unwrap();
     let drifted = lookup(&[]);
@@ -390,6 +429,11 @@ fn refs_limit_applies_to_distinct_verified_sites() {
         !drifted.contains("additional call sites omitted"),
         "{drifted}"
     );
+    assert!(
+        drifted.contains("follow-up (unresolved binding): read callee.go:2"),
+        "{drifted}"
+    );
+    assert!(!drifted.contains("peer.go"), "{drifted}");
 }
 
 #[test]

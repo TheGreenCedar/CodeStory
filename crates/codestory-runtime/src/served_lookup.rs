@@ -92,9 +92,14 @@ pub struct LookupReply {
     pub refresh_recommended: bool,
 }
 
-fn lookup_reply(out: String, max_bytes: usize, index: Option<&Index<'_>>) -> LookupReply {
+fn lookup_reply(
+    out: String,
+    max_bytes: usize,
+    index: Option<&Index<'_>>,
+    follow_ups: &[Option<&str>],
+) -> LookupReply {
     LookupReply {
-        text: bound_reply(out, max_bytes),
+        text: bound_reply(out, max_bytes, follow_ups),
         refresh_recommended: index.is_none_or(|index| index.refresh_recommended),
     }
 }
@@ -159,7 +164,7 @@ pub fn find_bounded(
             let _ = writeln!(out, "{} more files", paths.len() - limit);
         }
         if !lookup_status {
-            return Ok(lookup_reply(out, max_bytes, None));
+            return Ok(lookup_reply(out, max_bytes, None, &[]));
         }
         return Ok(with_pinned_index(storage_path, |store| {
             let mut index = store.map(Index::new);
@@ -170,7 +175,7 @@ pub fn find_bounded(
                     }
                 }
             }
-            lookup_reply(out, max_bytes, index.as_ref())
+            lookup_reply(out, max_bytes, index.as_ref(), &[])
         }));
     }
     let needles = terms.iter().map(String::as_bytes).collect::<Vec<_>>();
@@ -186,7 +191,7 @@ pub fn find_bounded(
         let mut bodies = body_lines.map(Bodies::new);
         list_hits(&mut out, &files, limit, index.as_mut(), bodies.as_mut());
         finish_bodies(&mut out, bodies);
-        lookup_reply(out, max_bytes, index.as_ref())
+        lookup_reply(out, max_bytes, index.as_ref(), &[])
     }))
 }
 
@@ -262,7 +267,7 @@ pub fn refs_batch(
                 }
             };
             finish_bodies(&mut out, bodies);
-            lookup_reply(out, max_bytes, index.as_ref())
+            lookup_reply(out, max_bytes, index.as_ref(), &[])
         }));
     }
     relationship_reply(
@@ -348,6 +353,7 @@ fn relationship_reply(
             remaining: body_lines.unwrap_or(0),
             printed: Printed::default(),
             max_bytes,
+            follow_ups: RelationshipFollowUps::default(),
         };
         for selector in selectors {
             let _ = writeln!(out, "== {}", printable(selector));
@@ -366,6 +372,11 @@ fn relationship_reply(
                 let files = hits
                     .get(wanted[wanted.len() - 1])
                     .map_or(&[][..], Vec::as_slice);
+                if let Some(file) = files.first()
+                    && let Some(&line) = file.hit_lines.first()
+                {
+                    bodies.follow_ups.remember_source(&file.path, line);
+                }
                 relationship_name_target(&mut out, index.as_mut(), files, &wanted, &mut remaining)
             };
             if let Some(id) = found
@@ -377,7 +388,12 @@ fn relationship_reply(
         if let Some(index) = &mut index {
             list_relationships(&mut out, root, index, &roots, limit, &mut bodies);
         }
-        lookup_reply(out, max_bytes, index.as_ref())
+        let follow_ups = [
+            bodies.follow_ups.omitted.as_deref(),
+            bodies.follow_ups.unresolved.as_deref(),
+            bodies.follow_ups.source.as_deref(),
+        ];
+        lookup_reply(out, max_bytes, index.as_ref(), &follow_ups)
     }))
 }
 
@@ -385,6 +401,21 @@ struct RelationshipBodies {
     remaining: usize,
     printed: Printed,
     max_bytes: usize,
+    follow_ups: RelationshipFollowUps,
+}
+
+#[derive(Default)]
+struct RelationshipFollowUps {
+    omitted: Option<String>,
+    unresolved: Option<String>,
+    source: Option<String>,
+}
+
+impl RelationshipFollowUps {
+    fn remember_source(&mut self, path: &str, line: u32) {
+        self.source
+            .get_or_insert_with(|| format!("follow-up: read {path}:{line}\n"));
+    }
 }
 
 fn relationship_file_target(
@@ -500,6 +531,7 @@ impl RelationshipBodies {
             }
             _ => return,
         };
+        self.follow_ups.remember_source(path, anchor);
         let mut budget = self.remaining.clamp(1, APPROXIMATE_LINE_CAP);
         if self.remaining == 0 {
             last = anchor;
@@ -624,7 +656,6 @@ fn list_relationships(
     let mut sites = 0;
     let mut unavailable = 0;
     let mut excluded = 0;
-    let mut more = false;
     'traverse: while let Some((id, follow)) = queue.pop_front() {
         if visited.contains(&(id, Follow::Both)) || !visited.insert((id, follow)) {
             continue;
@@ -671,32 +702,55 @@ fn list_relationships(
                 excluded += 1;
                 continue;
             }
-            let Some((source, target, file_id, line)) = edge
+            let Some((source, target, line)) = edge
                 .line
-                .filter(|_| is_certain(&edge) && edge.candidate_targets.is_empty())
+                .filter(|_| {
+                    edge.file_node_id.is_some()
+                        && is_certain(&edge)
+                        && edge.candidate_targets.is_empty()
+                })
                 .and_then(|line| {
-                    let file_id = edge.file_node_id?;
                     let source = index.locate(root, source_id)?;
-                    let def = source.definition();
-                    if source.home.id != file_id
-                        || !(def.start..=def.end.min(source.last)).contains(&line)
-                    {
+                    if !source.owns_callsite(&edge, line) {
                         return None;
                     }
                     let target = index.locate(root, target_id)?;
-                    Some((source, target, file_id, line))
+                    Some((source, target, line))
                 })
             else {
                 unavailable += 1;
+                if bodies.follow_ups.unresolved.is_none() {
+                    let caller_site = edge.line.and_then(|line| {
+                        opened
+                            .iter()
+                            .find(|decl| {
+                                decl.definition().id == source_id && decl.owns_callsite(&edge, line)
+                            })
+                            .map(|decl| (decl.path(), line))
+                    });
+                    let hint = caller_site.or_else(|| {
+                        opened
+                            .iter()
+                            .find(|decl| decl.definition().id == id)
+                            .map(|decl| (decl.path(), decl.first))
+                    });
+                    bodies.follow_ups.unresolved = hint.map(|(path, line)| {
+                        format!("follow-up (unresolved binding): read {path}:{line}\n")
+                    });
+                }
                 continue;
             };
-            if !seen_sites.insert((file_id, line, source_id, target_id)) {
+            if !seen_sites.insert((source.home.id, line, source_id, target_id)) {
                 continue;
             }
             if sites == limit {
-                more = true;
+                bodies.follow_ups.omitted = Some(format!(
+                    "follow-up (omitted site): read {}:{line}\n",
+                    source.path()
+                ));
                 break 'traverse;
             }
+            bodies.follow_ups.remember_source(source.path(), line);
             if sites == 0 {
                 out.push_str(
                     "pinned index call bindings (caller and callee files match the index). Other binding inputs may have changed.\n",
@@ -730,14 +784,28 @@ fn list_relationships(
             out,
             "{unavailable} call edge(s) lack verified source at an endpoint or a certain binding in the pinned index"
         );
+        if bodies.follow_ups.unresolved.is_none()
+            && let Some(decl) = opened.first()
+        {
+            bodies.follow_ups.unresolved = Some(format!(
+                "follow-up (unresolved binding): read {}:{}\n",
+                decl.path(),
+                decl.first
+            ));
+        }
+        if let Some(follow_up) = &bodies.follow_ups.unresolved {
+            out.push_str(follow_up);
+        }
     }
     if excluded != 0 {
         let _ = writeln!(out, "{excluded} call edge(s) excluded by --file-glob");
     }
-    if more {
+    if let Some(follow_up) = &bodies.follow_ups.omitted {
         out.push_str("additional call sites omitted from pinned index (--limit)\n");
+        out.push_str(follow_up);
     }
     for decl in &opened {
+        bodies.follow_ups.remember_source(decl.path(), decl.first);
         let lines = decl.home.text.lines().collect::<Vec<_>>();
         let first = decl.first;
         let last = decl.last;
@@ -811,11 +879,11 @@ pub fn read_bounded(
                 max_bytes,
             );
         }
-        lookup_reply(out, max_bytes, index.as_ref())
+        lookup_reply(out, max_bytes, index.as_ref(), &[])
     }))
 }
 
-fn bound_reply(mut out: String, max_bytes: usize) -> String {
+fn bound_reply(mut out: String, max_bytes: usize, follow_ups: &[Option<&str>]) -> String {
     const OMITTED: &str = "... output omitted (--max-bytes)\n";
     if max_bytes == 0 || out.len() <= max_bytes {
         return out;
@@ -823,11 +891,25 @@ fn bound_reply(mut out: String, max_bytes: usize) -> String {
     if max_bytes < OMITTED.len() {
         return "...\n".get(..max_bytes.min(4)).unwrap_or("").into();
     }
-    let prefix_end = out.as_bytes()[..max_bytes - OMITTED.len()]
+    let space = max_bytes - OMITTED.len();
+    let follow_up = follow_ups
+        .iter()
+        .copied()
+        .flatten()
+        .find(|hint| hint.len() <= space)
+        .unwrap_or("");
+    let prefix_end = out.as_bytes()[..space - follow_up.len()]
         .iter()
         .rposition(|&byte| byte == b'\n')
         .map_or(0, |last_line| last_line + 1);
     out.truncate(prefix_end);
+    if !follow_up.is_empty()
+        && !out
+            .lines()
+            .any(|line| line == follow_up.trim_end_matches('\n'))
+    {
+        out.push_str(follow_up);
+    }
     out.push_str(OMITTED);
     out
 }
@@ -1183,6 +1265,12 @@ impl Located {
 
     fn path(&self) -> &str {
         &self.home.file.path
+    }
+
+    fn owns_callsite(&self, edge: &Edge, line: u32) -> bool {
+        let def = self.definition();
+        edge.file_node_id == Some(self.home.id)
+            && (def.start..=def.end.min(self.last)).contains(&line)
     }
 
     /// One row that says where to read it.
