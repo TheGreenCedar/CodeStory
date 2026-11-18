@@ -445,15 +445,15 @@ pub const HOLDOUTS: &[&str] = &[
 `);
   const serverFileProbes = ["src/server.c", "src/server.c:42", "src\\SERVER.C"];
   for (const [index, probe] of serverFileProbes.entries()) {
-    reject(`server-file-${index}.rs`, `pub const PATH: &str = ${JSON.stringify(probe)};\n`);
+    reject(`server-file-${index}.rs`, `pub const PATH: &str = r"${probe}";\n`);
   }
   allow("source-observer.rs", `
 pub fn source(lease: &Lease) -> SourceObserver { lease.source_observer.clone() }
 `);
   allow("unrelated-server-names.rs", `
 pub const PATHS: &[&str] = &[
-  "myserver.c", "lib/http-server.c", "server.cache", "lib/server.c_backup",
-  "server.c.bak", "ServerC",
+  "myserver.c", "lib/http-server.c", "server.cache", "src/server.cache",
+  "src/server.c_backup", "src/server.c.bak", "ServerC",
 ];
 `);
   reject("query-phrase.rs", `
@@ -933,6 +933,14 @@ pub const PLANTED_TERMS: &[(&str, &str)] = &[
           ({ pattern }) => pattern != null && patternCore(pattern) === "server.c",
         ),
         `the residual filename ban missed ${probe}`,
+      );
+      assert.ok(
+        findingFor(
+          result,
+          `server-file-${index}.rs`,
+          ({ pattern }) => pattern != null && patternCore(pattern) === "src/server.c",
+        ),
+        `the derived path ban missed ${probe}`,
       );
     }
     for (const marker of MANIFEST_MARKERS) {

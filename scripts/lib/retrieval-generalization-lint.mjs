@@ -1074,7 +1074,13 @@ function compactBoundaryPatterns(boundaryPatterns) {
 }
 
 function benchmarkManifestDerivedPatterns(markerSet = benchmarkCorpusMarkerSet) {
-  return [...markerSet.descriptive].sort().map(escapeRegExp);
+  return [...markerSet.descriptive].sort().map((marker) => {
+    const pattern = escapeRegExp(marker);
+    // One-letter file extensions can be prefixes of unrelated filenames.
+    return /^[A-Za-z0-9_./-]+\/[A-Za-z0-9_.-]+\.[A-Za-z]$/.test(marker)
+      ? `${pattern}(?![A-Za-z0-9_.-])`
+      : pattern;
+  });
 }
 
 // Repository identity is short enough ("swr", "okio", "mdn") that substring
