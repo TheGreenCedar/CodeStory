@@ -12,6 +12,7 @@
 mod cache;
 mod cache_clean;
 mod cache_inventory;
+pub mod callable_index;
 mod candidate;
 mod capabilities;
 mod config;

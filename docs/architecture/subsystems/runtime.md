@@ -29,6 +29,10 @@ adapter syntax, SQLite mechanics, parsers, or model execution.
 
 - `src/lib.rs` and `src/services.rs`: project/index services and retained state
 - `src/grounding.rs` and `src/support.rs`: grounding and support assembly
+- `src/served_lookup.rs` reads live source for `find`, `refs` and `read`. It attaches a call binding from a pinned publication only after matching the caller and callee source. Other files involved in resolution may have changed. Refresh guidance reports drift observed during the lookup.
+- Implementation searches rank the path, name and definition text stored for each indexed function or method. Before showing code, the runtime checks the current file and the exact definition range. It shows verified call sites and can follow a literal reference into another function. A literal reference is labelled separately when the binding is unknown.
+- When an unchanged published core lacks a usable function index, an explicit refresh can build it alongside the sealed generation. The replacement belongs to that exact core and run. The existing broad-search data and active publication stay usable throughout repair.
+- For tracked edits, the workspace compares a pinned Git HEAD tree with the current worktree. The runtime maps changed line ranges to a matching indexed file on either side. It labels pre-edit declarations and verifies the caller's current source before showing a call site.
 - `src/search/`: runtime search state and graph-native documents
 - `src/agent/`: execution residuals (orchestrator, retrieval-primary, packet
   batch/probe/search, traces). Packet *planning* lives in
@@ -37,13 +41,18 @@ adapter syntax, SQLite mechanics, parsers, or model execution.
 
 ## Publication contract
 
-A complete core publication may retain verified malformed UTF-8 source with a
-`malformed` coverage gap. It retains the file identity and content digest, not
-structural units, symbol documents, or proof facts. Both full and incremental
-refresh reverify those bytes before publication. A transition from valid to
-malformed removes the old projection; unchanged malformed source does not
-trigger a retry. Unreadable source, incomplete discovery, source drift, and
-collector failures still prevent publication.
+A complete core publication may carry a structural file rejected by strict
+UTF-8 decoding or format validation as a `binary` or `malformed` coverage gap.
+The publication keeps its verified file identity and digest. It supplies no
+structural, callable, symbol, or proof projection for that file. Full and
+incremental refresh reverify the bytes before publishing. A readable file
+that becomes opaque loses its old projection. An unchanged, verified opaque
+file stays out of the refresh plan and counts as omitted in callable coverage.
+
+Unreadable files, source drift, incomplete discovery, failed collectors, and
+opaque claims without verified source or with surviving projections block
+publication. Covered files remain searchable when a verified opaque gap exists,
+and whole-project coverage reports the gap.
 
 Runtime publishes the core index through store, then asks retrieval to finalize
 immutable lexical/vector/SCIP state when a broad operation needs it. On reads it

@@ -4307,12 +4307,25 @@ impl IndexService {
         storage_path: PathBuf,
         mode: Option<IndexMode>,
     ) -> Result<(ProjectSummary, Option<IndexingPhaseTimings>), ApiError> {
+        self.refresh_core_index_blocking_with_options(root, storage_path, mode, false)
+    }
+
+    pub fn refresh_core_index_blocking_with_options(
+        &self,
+        root: PathBuf,
+        storage_path: PathBuf,
+        mode: Option<IndexMode>,
+        skip_semantic_docs: bool,
+    ) -> Result<(ProjectSummary, Option<IndexingPhaseTimings>), ApiError> {
         let timings = if let Some(mode) = mode {
             self.controller
                 .bind_project_paths_for_refresh(root.clone(), storage_path.clone())?;
             Some(
                 self.controller
-                    .run_indexing_blocking_without_runtime_refresh(mode)?,
+                    .run_indexing_blocking_without_runtime_refresh_with_options(
+                        mode,
+                        skip_semantic_docs,
+                    )?,
             )
         } else {
             None

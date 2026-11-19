@@ -162,13 +162,45 @@ pub(super) fn compute_call_resolution(
         });
     }
 
-    if is_go_selector_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
-        && receiver_owner.is_none()
-    {
-        let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
+    if is_go_selector_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref()) {
+        let typed = callsite_identity.as_deref().is_some_and(|identity| {
+            identity
+                .split('|')
+                .any(|part| part == crate::languages::go::TYPED_RECEIVER_CALLSITE_MARKER)
+        });
+        let proven = receiver_owner.and_then(|owner| match receiver_module {
+            None => {
+                pass.find_go_local_method_readonly(candidate_index, *file_id, owner, target_name)
+            }
+            Some(module) => {
+                pass.find_go_imported_method_readonly(candidate_index, module, owner, target_name)
+            }
+        });
+        // A path suffix alone can nominate a candidate but cannot prove a
+        // module binding. In particular, a checkout may omit its go.mod.
+        let resolved = proven
+            .map(|candidate| {
+                let confidence = if typed {
+                    pass.policy.call_same_file
+                } else {
+                    pass.policy.call_same_module
+                };
+                (candidate, confidence)
+            })
+            .or_else(|| {
+                let (module, owner) = receiver_module.zip(receiver_owner)?;
+                candidate_index
+                    .find_go_imported_owner_member_readonly(module, owner, target_name)
+                    .map(|candidate| (candidate, pass.policy.call_same_module))
+            });
+        if pass.flags.store_candidates
+            && let Some((candidate, _)) = resolved
+        {
+            candidate_ids.push(candidate);
+        }
         return Ok(ComputedResolution {
-            update,
-            strategy: None,
+            update: build_resolved_edge_update(*edge_id, resolved, candidate_ids.as_slice())?,
+            strategy: resolved.map(|_| ResolutionStrategy::CallSameModule),
         });
     }
 
@@ -433,29 +465,6 @@ pub(super) fn compute_call_resolution(
                 ResolutionStrategy::CallSameModule,
             ));
         }
-    }
-
-    if selected.is_none()
-        && receiver_module.is_none()
-        && matches!(
-            semantic_language_bucket(caller_file_path.as_deref()),
-            Some("go" | "dart")
-        )
-        && let Some(owner_name) = receiver_owner
-        && let Some(candidate) = candidate_index.find_same_directory_owner_member_readonly(
-            caller_file_path.as_deref(),
-            owner_name,
-            target_name,
-        )
-    {
-        if pass.flags.store_candidates {
-            candidate_ids.push(candidate);
-        }
-        selected = Some((
-            candidate,
-            pass.policy.call_same_module,
-            ResolutionStrategy::CallSameModule,
-        ));
     }
 
     // C# same-root-namespace arm: a receiver-owner-annotated callsite whose

@@ -24,6 +24,7 @@ project's immutable config and never rereads or mutates process environment.
 ## Entry points
 
 - `src/args.rs` and `src/app.rs`: CLI schema, dispatch, and lifecycle commands
+- `src/app/lookup_commands.rs` renders live lookup text and optional refresh guidance for shell and lean MCP launchers. `src/app/setup.rs` owns host-specific instruction locations and launcher installation.
 - `src/app/drill.rs` and `src/app/source_commands.rs`: drill and source-navigation command owners
 - `src/app/diagnostics.rs`, `src/app/resolution.rs`, and `src/app/rendering.rs`: readiness, target resolution, and stable output mapping
 - `src/app/artifacts.rs` and `src/app/server.rs`: bounded artifact writes and transport startup

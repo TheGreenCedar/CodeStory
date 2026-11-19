@@ -8,6 +8,16 @@ Marketplace](https://cursor.com/marketplace). Searching that catalog for
 Add this repository as a marketplace in Customize, then install **codestory**
 from it.
 
+## Set up shell lookups
+
+In the Git repository you work on, run `codestory-cli setup cursor`. It adds
+`.cursor/rules/codestory-lookups.mdc` at the Git root with instructions for
+`cs find`, `cs refs`, and `cs read`. Run `codestory-cli setup cursor --remove`
+from the same repository to remove the managed rule.
+
+For instructions across projects, use **Customize → Rules → User Rules** in
+Cursor. [Cursor rule documentation](https://cursor.com/docs/rules#user-rules)
+
 ## Requirements
 
 - One of the [supported platform and accelerator combinations](README.md#platform-summary);

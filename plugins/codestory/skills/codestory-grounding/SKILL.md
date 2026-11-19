@@ -1,6 +1,6 @@
 ---
 name: codestory-grounding
-description: Use when discovering repository structure, tracing relationships, analyzing change impact, or validating CodeStory retrieval or an installed plugin through the CodeStory plugin MCP. Skip only for bounded inspection or editing of named files that does not require those operations.
+description: Look up live source, trace repository relationships, analyze change impact, or validate the installed CodeStory plugin. Use the bundled cs command or the project-scoped MCP tools.
 ---
 
 # CodeStory Grounding
@@ -13,13 +13,25 @@ edits during a review.
 Pass an absolute `project` root on every call. Keep project, source and
 publication identities attached when combining results across repositories.
 
+## Live source lookups
+
+From the repository, use `cs find TERM` for literal text, `cs refs NAME` for definitions and mentions, and `cs read PATH:START-END` for numbered source. Batch known names, `path::Symbol` or `path:LINE` selectors in `refs`. When `cs` is outside `PATH`, run `node` with the absolute path to `../../bin/cs` relative to this skill. Ordinary source reads can fill any gap.
+
+Use `cs find --question "DESCRIPTION"` for likely implementations, source excerpts, and available relationships. If the callable index cannot verify a result, the command can return a bounded sample of live text. Use `cs refs --changed` to inspect tracked edits against HEAD and find possible callers or tests. Test mentions are leads for the project's normal test command. Narrow either lookup with `--file-glob`. For broad evidence, `cs packet --question "DESCRIPTION"` uses canonical full retrieval when ready.
+
+Text references show the written name in source. Verified call bindings come from the pinned index with both endpoint files checked against their recorded bytes. Imports or factories elsewhere may have changed. Treat an omitted binding as unknown.
+
+For `CODESTORY_MCP_TOOL_SURFACE=lean`, use `find({project, question})` and `refs({project, changed: true})` for those focused modes. The lean tools are `find`, `refs`, and `read`. Every call takes an absolute `project`. Named and `family-v1` MCP retain canonical `packet`. A `family-v1` client uses `call({operation, arguments})` and `describe({operation, project})`.
+
 ## Code-mode tools and results
 
 ### Inspect selected tool declarations
 
 When the needed operation is known, inspect its exact callable declaration.
 If you need an inventory first, print tool names, then inspect the declarations
-for the operations you choose. All operations remain available.
+for the operations your host exposes. In lean mode, use `find` with the
+question, then pass a returned `path:start-end` to `read` when the excerpt
+leaves part of the implementation out.
 
 In hosts exposing `ALL_TOOLS`, a names-only inventory avoids printing every
 request and response schema:
@@ -28,8 +40,8 @@ request and response schema:
 text(ALL_TOOLS.filter(tool => /codestory/i.test(tool.name)).map(tool => tool.name));
 ```
 
-After choosing an operation, match its actual exposed name exactly. This example
-selects search; choose any operation or set of operations the task needs:
+After choosing an operation, match its actual exposed name exactly. For example,
+in a host using the named catalog, inspect `search` with:
 
 ```javascript
 const selectedNames = new Set(["mcp__codestory__search"]);
@@ -104,6 +116,8 @@ unioned. Preserve an explicit user-supplied query, and add bounded targeted
 lookups for separate names when useful. For behavior-oriented discovery, use
 the ordinary search mode when richer evidence is needed; it requires full
 retrieval readiness and may trigger managed preparation.
+
+Named and `family-v1` clients can use these operations.
 
 | Need | Operation |
 | --- | --- |

@@ -206,6 +206,11 @@ pub(crate) fn verified_file_checked(
     if format!("{:x}", Sha256::digest(&bytes)) != expected_hash {
         return Err(VerifiedFileError::Stale);
     }
+    if codestory_indexer::structural::is_structural_candidate_path(&path)
+        && !codestory_indexer::structural::is_structural_source_text(&bytes)
+    {
+        return Err(VerifiedFileError::Unavailable);
+    }
     Ok(VerifiedSourceFile {
         path,
         content: String::from_utf8(bytes).map_err(|_| VerifiedFileError::Unavailable)?,

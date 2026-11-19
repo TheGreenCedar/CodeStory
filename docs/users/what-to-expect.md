@@ -35,10 +35,23 @@ what each claim does *not* mean:
 
 ## Repo size and freshness
 
+- **Finding an implementation.** Try `cs find --question "Where are retry delays calculated?"`. The reply shows likely functions and the source that connects them. Put an exact location in the question, for example ``cs find --question 'Explain `src/retry.go:42` and its callers'``. The reply leads with source it can verify at the supplied location, including the matching old side of a proposed diff. These excerpts follow the normal ignore rules. If a relevant function appears as a short excerpt or a text mention, copy its `path:start-end` into `cs read`. An unindexed checkout can return live text matches. Run `codestory-cli index --core-only` to prepare the index for verified relationships.
+- **Reviewing edits.** Run `cs refs --changed` to see which functions a tracked edit touches, where the index found callers, and which tests mention a changed name. Run those tests to check behavior. `--file-glob` narrows both the changed files and the search for tests. Use `--no-bodies` for a compact list.
+- **Broad investigation**. Run `cs packet --question "How do retries work across this service?"` for the canonical bounded packet. This route requires full retrieval readiness and uses the repository you run it from.
+- **Shell lookups** read the current files even on an unindexed checkout. An
+  index can add symbol names and source ranges when it matches the file.
+  To check several known symbols together, pass them to one command, such as
+  `cs refs api.go::Start worker.go::Run`. Call links come from the pinned index.
+  CodeStory checks the source at both ends. A factory or import in a third file
+  may have changed since indexing. For a rename, use `cs find NAME` to inspect
+  other mentions and run the project’s normal checks.
+  When declaration bodies would push later matches out of the byte budget,
+  `find` and single-name `refs` switch to a compact location list. Pass
+  `--no-bodies` to request that list directly, then `read` the relevant sites.
 - **First index** on a large checkout can take minutes; the agent retries the
   intended CodeStory call while preparation runs.
-- **First broad search in a process** also initializes the embedded model. Later
-  repositories in that process reuse the warm engine.
+- **First broad search** can load the bundled model. Projects using the same
+  per-user embedding server can reuse it until the server goes idle.
 - **Incremental refresh** after small edits is usually fast; stale local
   navigation is a freshness problem, not a prompt problem.
 - **Very large or unusual layouts** (generated trees, vendored giants) may index
@@ -50,10 +63,16 @@ what each claim does *not* mean:
   is not observed. Narrow the indexed scope (exclude generated or vendored
   trees) to get full freshness checking back.
 
-The released executable contains its model and embedding backend. There is no
-separate model download or service startup. A verified content-addressed model
-copy may be materialized in the CodeStory cache for memory mapping and reused
-after restart.
+The released executable contains its model and embedding backend. CodeStory
+starts the per-user embedding server automatically and can reuse a verified
+copy of the bundled model from its cache after restart.
+
+For example, in the codex-autoresearch dashboard, asking how a long chart is
+sampled located `chartPointBudget` and the call from `sampleTrendChartData` to
+`sampleTimeline`. After editing the sampler, `cs refs --changed` identified
+that same caller. A regression test then exposed what a source lookup alone
+could miss. The old sampler met the point limit while dropping early and
+middle runs. [Upstream change and regression test](https://github.com/TheGreenCedar/codex-autoresearch/commit/218b294678d24435be6ba4f20b306d73b70566cf)
 
 ## When output looks weak
 
@@ -67,12 +86,16 @@ Plain-language trust boundaries and good vs blocked sessions:
 
 Recovery steps: [Troubleshooting](troubleshooting.md).
 
-## Benchmarks are not your repo
+## Benchmarks
 
-Public holdout suites measure token and time reduction on **pinned OSS packages**
-under controlled tasks. They do not guarantee the same numbers in your checkout.
+In the `codestory-cli setup codex` trial, Codex used shell lookups on its own.
+On large repositories, raw token use was nearly flat and the setup missed the
+correctness target. It met 72 of 75 requirements, compared with 74 of 75 for
+plain Codex. On small repositories, both groups met all 45 requirements, and the
+setup group used fewer raw tokens in that cohort. General token savings and
+equal correctness across repository sizes remain unestablished.
 
-What the holdout proves and does not prove:
-[Evaluation scope in the README](../../README.md#evaluation).
+See the setup results, earlier comparisons, and command timings in
+[Evaluation](../../README.md#evaluation).
 
 Better prompts help every session: [Prompt patterns](prompt-patterns.md).

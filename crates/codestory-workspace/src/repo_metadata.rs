@@ -93,6 +93,22 @@ const MAX_METADATA_TREE_ENTRIES: usize = 100_000;
 const MAX_REWRITE_BLOB_BYTES: u64 = 1_000_000;
 const MAX_REWRITE_SIMILARITY_PERMUTATIONS: usize = 1_000;
 
+/// Find the nearest Git worktree containing an existing directory.
+pub fn discover_git_worktree_root(start: &Path) -> Result<PathBuf> {
+    let start = canonical_existing(start).context("resolve the starting directory")?;
+    for ancestor in start.ancestors() {
+        let dot_git = ancestor.join(".git");
+        match fs::symlink_metadata(&dot_git) {
+            Ok(_) => return Ok(MetadataRoots::resolve(ancestor)?.root),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspect {}", dot_git.display()));
+            }
+        }
+    }
+    bail!("current directory is outside a Git working tree")
+}
+
 /// One problem that prevented a complete repository metadata observation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositoryMetadataIssue {
@@ -462,6 +478,94 @@ pub fn read_repository_changes(
     RepositoryReader::open(project_root)?.changes(scope)
 }
 
+/// Tracked paths touched in the index or worktree, with their pre-edit contents
+/// from one HEAD tree. An unreadable blob is distinct from a newly added file.
+pub struct TrackedEdit {
+    pub path: PathBuf,
+    pub before_path: PathBuf,
+    pub conflicted: bool,
+    pub before: Result<Option<Vec<u8>>>,
+}
+
+pub struct TrackedEdits {
+    pub head_tree: String,
+    pub files: Vec<TrackedEdit>,
+    pub omitted: usize,
+}
+
+pub fn read_tracked_edits(
+    root: &Path,
+    in_scope: impl Fn(&Path) -> bool,
+    file_limit: usize,
+    byte_limit: u64,
+) -> Result<TrackedEdits> {
+    use std::collections::BTreeMap;
+    let reader = RepositoryReader::open(root)?;
+    let repo = &reader.repository;
+    let tree_id = repo.head_tree_id_or_empty()?.detach();
+    let mut paths = BTreeMap::new();
+    for change in reader.changes(RepositoryChangeScope::Head)? {
+        let path = bytes_to_path(&change.path)?;
+        if !in_scope(&path) {
+            continue;
+        }
+        let (previous, conflicted) = paths.entry(path).or_insert((None, false));
+        if let Some(from) = change.previous_path {
+            *previous = Some(bytes_to_path(&from)?);
+        }
+        *conflicted |= change.kind == RepositoryChangeKind::Unmerged;
+    }
+    let tree = repo.find_tree(tree_id)?;
+    let omitted = paths.len().saturating_sub(file_limit);
+    let mut files = Vec::new();
+    for (path, (previous, conflicted)) in paths.into_iter().take(file_limit) {
+        let before_path = previous.unwrap_or_else(|| path.clone());
+        let before = (|| {
+            if !in_scope(&before_path) {
+                bail!("original path outside scope");
+            }
+            let Some(entry) = tree.lookup_entry_by_path(&before_path)? else {
+                return Ok(None);
+            };
+            if !entry.mode().is_blob() {
+                bail!("not a regular file in HEAD");
+            }
+            let header = repo.find_header(entry.object_id())?;
+            if !header.kind().is_blob() || header.size() > byte_limit {
+                bail!("HEAD blob unavailable or exceeds read limit");
+            }
+            Ok(Some(repo.find_blob(entry.object_id())?.take_data()))
+        })();
+        files.push(TrackedEdit {
+            path,
+            before_path,
+            conflicted,
+            before,
+        });
+    }
+    if repo.head_tree_id_or_empty()?.detach() != tree_id {
+        bail!("HEAD changed during the status read");
+    }
+    reader.ensure_metadata_boundary_unchanged()?;
+    Ok(TrackedEdits {
+        head_tree: tree_id.to_string(),
+        files,
+        omitted,
+    })
+}
+
+/// Line ranges are zero-based and half-open on their respective sides.
+pub fn changed_line_ranges(
+    before: &str,
+    after: &str,
+) -> Vec<(std::ops::Range<u32>, std::ops::Range<u32>)> {
+    use gix::diff::blob::{Algorithm, Diff, InternedInput};
+    let input = InternedInput::new(before, after);
+    let mut diff = Diff::compute(Algorithm::Histogram, &input);
+    diff.postprocess_lines(&input);
+    diff.hunks().map(|hunk| (hunk.before, hunk.after)).collect()
+}
+
 struct RepositoryReader {
     root: PathBuf,
     repository: gix::Repository,
@@ -589,7 +693,7 @@ impl RepositoryReader {
             }
         };
 
-        let dirty = match self.status_items(false) {
+        let dirty = match self.status_items(false, true) {
             Ok(items) => !items.is_empty(),
             Err(error) => {
                 issues.push(RepositoryMetadataIssue::new(
@@ -632,10 +736,13 @@ impl RepositoryReader {
     }
 
     fn changes(&self, scope: RepositoryChangeScope) -> Result<Vec<RepositoryChange>> {
-        let items = self.status_items(matches!(
-            scope,
-            RepositoryChangeScope::Head | RepositoryChangeScope::Staged
-        ))?;
+        let items = self.status_items(
+            matches!(
+                scope,
+                RepositoryChangeScope::Head | RepositoryChangeScope::Staged
+            ),
+            scope == RepositoryChangeScope::Untracked,
+        )?;
         let mut changes = items
             .into_iter()
             .filter_map(|item| change_from_status_item(item, scope))
@@ -657,7 +764,11 @@ impl RepositoryReader {
         Ok(())
     }
 
-    fn status_items(&self, track_tree_index_rewrites: bool) -> Result<Vec<gix::status::Item>> {
+    fn status_items(
+        &self,
+        track_tree_index_rewrites: bool,
+        include_untracked: bool,
+    ) -> Result<Vec<gix::status::Item>> {
         if self.has_external_worktree_filters() {
             bail!(
                 "repository config declares an external clean or process filter; worktree status was not inspected"
@@ -680,7 +791,11 @@ impl RepositoryReader {
             .repository
             .status(gix::progress::Discard)
             .context("prepare repository status")?
-            .untracked_files(gix::status::UntrackedFiles::Files)
+            .untracked_files(if include_untracked {
+                gix::status::UntrackedFiles::Files
+            } else {
+                gix::status::UntrackedFiles::None
+            })
             .index_worktree_submodules(None);
         let platform = if track_tree_index_rewrites {
             platform.tree_index_track_renames(gix::status::tree_index::TrackRenames::Given(

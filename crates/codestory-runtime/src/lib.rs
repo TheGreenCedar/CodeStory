@@ -165,6 +165,7 @@ mod affected;
 mod agent;
 mod call_path_grammar;
 mod call_path_kernel;
+mod callable_search;
 mod evidence_projection_v3;
 mod index_commit;
 mod index_coverage;
@@ -191,6 +192,7 @@ mod search_state_cache;
 mod search_terms;
 mod semantic_projection;
 mod semantic_republish;
+pub mod served_lookup;
 mod snippets;
 #[cfg(feature = "v3-evidence-separation-support")]
 #[doc(hidden)]

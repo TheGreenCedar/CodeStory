@@ -98,6 +98,7 @@ mod proof_resolution;
 /// oversized-source cap this crate enforces.
 #[cfg(test)]
 mod projection_fence_tests;
+pub mod qualified_callable;
 pub mod resolution;
 pub mod semantic;
 pub mod structural;
@@ -1427,14 +1428,22 @@ impl<'a> ProjectionWriter<'a> {
     }
 
     fn accept_storage(&mut self, mut local_storage: IntermediateStorage) -> Result<()> {
-        // A verified malformed snapshot replaces the old projection with source
-        // identity only. An operational failure cannot authorize that removal.
-        let verified_malformed = !local_storage.file_content_hashes.is_empty()
-            && !local_storage.errors.is_empty()
-            && local_storage
-                .errors
-                .iter()
-                .all(|error| error.coverage_reason == Some(FileCoverageReason::Malformed));
+        // A verified format or encoding rejection replaces the old projection
+        // with source identity only. Operational failures cannot authorize removal.
+        let verified_rejected_source = !local_storage.errors.is_empty()
+            && local_storage.files.first().is_some_and(|file| {
+                local_storage
+                    .file_content_hashes
+                    .iter()
+                    .any(|hash| hash.file_id == file.id)
+                    && local_storage.errors.iter().all(|error| {
+                        error.file_id == Some(NodeId(file.id))
+                            && matches!(
+                                error.coverage_reason,
+                                Some(FileCoverageReason::Malformed | FileCoverageReason::Binary)
+                            )
+                    })
+            });
         let mut source_identity_only = false;
         if let Some((file_id, file_complete, file_path)) = local_storage
             .files
@@ -1453,7 +1462,7 @@ impl<'a> ProjectionWriter<'a> {
                 .storage
                 .get_callable_projection_states_for_file(file_id)
                 .map_err(|e| anyhow!("Storage state lookup error: {:?}", e))?;
-            let replace_file_owned_projection = verified_malformed
+            let replace_file_owned_projection = verified_rejected_source
                 || !local_storage.structural_text_projections.is_empty()
                 || local_storage
                     .files
@@ -1553,14 +1562,15 @@ impl<'a> ProjectionWriter<'a> {
                 retain_file_identity_rows(&mut local_storage, file_id, false);
                 self.stats.source_identity_only_files =
                     self.stats.source_identity_only_files.saturating_add(1);
-            } else if !file_complete && !verified_malformed {
+            } else if !file_complete && !verified_rejected_source {
                 // An unreadable, drifting, oversized, or parser-partial source is retry
                 // evidence, not proof that its previous symbols disappeared. Preserve the
                 // last verified projection and update only the file/error rows below.
                 local_storage
                     .nodes
                     .retain(|node| node.id != NodeId(file_id));
-                local_storage.file_extraction_identities.clear();
+                // Verified parser-partial extraction still records its source
+                // and producer; it does not certify the inherited graph complete.
                 self.stats.graph_projection_changed = true;
             } else {
                 let cleanup_started = Instant::now();
@@ -2174,10 +2184,9 @@ impl WorkspaceIndexer {
             let resolver =
                 prepared_resolver.expect("graph changes prepared the resolution context");
             let resolution_scope = if go_return_inputs_changed {
-                // Factory signatures and module ownership can change without a
-                // caller source byte changing. Reset and recompute this narrow
-                // call class repository-wide.
-                let mut invalidated = resolver.invalidate_go_return_method_resolutions(storage)?;
+                // Receiver declarations, factory signatures and module ownership
+                // can change while caller bytes stay put.
+                let mut invalidated = resolver.invalidate_go_method_resolutions(storage)?;
                 if go_module_control_changed {
                     invalidated = invalidated.saturating_add(
                         resolver.invalidate_go_package_function_resolutions(storage)?,
@@ -3666,7 +3675,11 @@ impl WorkspaceIndexer {
                 },
             ));
         }
-        let bytes = std::fs::read(&full_path).map_err(|error| {
+        let snapshot = structural::read_structural_source_snapshot(
+            &full_path,
+            self.structural_source_byte_cap,
+        )
+        .map_err(|error| {
             incomplete_file_storage(
                 &full_path,
                 None,
@@ -3682,9 +3695,28 @@ impl WorkspaceIndexer {
                 },
             )
         })?;
+        let Some((bytes, _)) = snapshot else {
+            return Err(incomplete_file_storage(
+                &full_path,
+                None,
+                language,
+                codestory_contracts::graph::ErrorInfo {
+                    message: format!(
+                        "Structural source {:?} exceeds the {} byte raw source limit",
+                        path, self.structural_source_byte_cap
+                    ),
+                    file_id: None,
+                    line: None,
+                    column: None,
+                    is_fatal: false,
+                    index_step: codestory_contracts::graph::IndexStep::Indexing,
+                    coverage_reason: Some(FileCoverageReason::Oversized),
+                },
+            ));
+        };
         let content_hash = source_content_hash(&bytes);
         let source = structural::decode_structural_source(bytes).map_err(|error| {
-            incomplete_file_storage(
+            let mut rejected = incomplete_file_storage(
                 &full_path,
                 None,
                 language,
@@ -3697,7 +3729,30 @@ impl WorkspaceIndexer {
                     index_step: codestory_contracts::graph::IndexStep::Indexing,
                     coverage_reason: Some(FileCoverageReason::Binary),
                 },
-            )
+            );
+            match structural::read_structural_source_snapshot(
+                &full_path,
+                self.structural_source_byte_cap,
+            ) {
+                Ok(Some((current, modification_time)))
+                    if source_content_hash(&current) == content_hash =>
+                {
+                    let file = &mut rejected.files[0];
+                    file.modification_time = modification_time;
+                    rejected
+                        .file_content_hashes
+                        .push(codestory_store::FileContentHash {
+                            file_id: file.id,
+                            content_hash: content_hash.clone(),
+                        });
+                    rejected
+                }
+                _ => changed_source_storage(
+                    &full_path,
+                    language,
+                    anyhow!("opaque bytes could not be reverified after the indexing read"),
+                ),
+            }
         })?;
         let artifact_cache_path = index_artifact_cache_path(root, &full_path);
         let artifact_cache_key = artifact_cache_path.as_ref().and_then(|cache_path| {
@@ -4342,13 +4397,21 @@ pub fn current_file_extraction_revision(language: &str) -> Option<&'static str> 
     match language {
         "python" => Some(languages::python::CALLABLE_DECLARATION_REVISION),
         "rust" => Some(languages::rust::CALLABLE_DECLARATION_REVISION),
+        "go" => Some(languages::go::CALL_BINDING_REVISION),
+        "dart" => Some("dart-library-call-bindings-v2"),
         _ => None,
     }
 }
 
 fn add_current_file_extraction_identities(storage: &mut IntermediateStorage) {
     for file in &storage.files {
-        if !file.indexed || !file.complete {
+        if !file.indexed
+            || !file.complete
+                && storage
+                    .errors
+                    .iter()
+                    .any(|error| error.file_id == Some(NodeId(file.id)))
+        {
             continue;
         }
         let Some(revision) = current_file_extraction_revision(&file.language) else {
@@ -9239,7 +9302,10 @@ fn append_manual_receiver_call_edges(
         // for them, so a second spec for an already-claimed callsite can never
         // mint a competing resolved edge — the marker lands on the existing
         // edge instead and resolution stays with the resolution pass.
-        if binding_marker.is_some() || spec.owner_module.is_some() {
+        if binding_marker
+            .is_some_and(|marker| marker != languages::go::TYPED_RECEIVER_CALLSITE_MARKER)
+            || spec.owner_module.is_some()
+        {
             let owner_module = spec.owner_module.as_deref();
             // A class-anchored spec's callsite lives in a constructor body,
             // where the rule file's self-placeholder is never attributed to a

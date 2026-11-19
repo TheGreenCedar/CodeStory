@@ -186,6 +186,154 @@ test("fail-open tool schemas are the generated canonical MCP catalog", async () 
   );
 });
 
+function familyWireFixture(body, { revision = preferredRevision, surface = "family-v1", setup = "", catalog = "undefined" } = {}) {
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const fixture = `
+    ${setup}
+    const {EventEmitter}=require('node:events');const {PassThrough}=require('node:stream');
+    const run=require(${JSON.stringify(launcher)})._test.runFailOpenMcp;
+    let ready=false,starts=0;const seen=[],raw=[];
+    const child=new EventEmitter();child.stdin=new PassThrough();child.stdout=new PassThrough();child.stderr=new PassThrough();child.exitCode=null;child.signalCode=null;child.kill=()=>true;
+    let input='';child.stdin.setEncoding('utf8');child.stdin.on('data',chunk=>{input+=chunk;const lines=input.split(/\\r?\\n/u);input=lines.pop()||'';for(const line of lines)if(line){raw.push(line);seen.push(JSON.parse(line));}});
+    run({plugin_runtime:{plugin_version:'fixture',warnings:[]},runtime:{state:'preparing'},managed_retrieval:{state:'preparing'},warnings:[],readiness:[]},{shouldHandoff:()=>ready,startRuntime:()=>{starts++;return child},onRuntimeFailure:()=>{},${catalog === "undefined" ? "" : `catalog:${catalog},`}});
+    const sendRaw=line=>process.stdin.emit('data',line+'\\n');const send=frame=>sendRaw(JSON.stringify(frame));
+    const init=()=>send({jsonrpc:'2.0',id:'init',method:'initialize',params:{protocolVersion:${JSON.stringify(revision)}}});
+    const ack=()=>child.stdout.write(JSON.stringify({jsonrpc:'2.0',id:'init',result:{protocolVersion:${JSON.stringify(revision)},_meta:{codestory_protocol:{discovery_contract_sha256:${JSON.stringify(discoveryDigest(revision))}},codestory_publication:{schema_version:5,minimum_compatible_schema_version:5}}}})+'\\n');
+    ${body}
+    process.stderr.write('FAMILY_TRACE:'+JSON.stringify({starts,seen,raw})+'\\n');
+  `;
+  const result = spawnSync(process.execPath, ["-e", fixture], {
+    env: { ...process.env, CODESTORY_MCP_TOOL_SURFACE: surface }, encoding: "utf8", timeout: 5000,
+  });
+  const trace = result.stderr.split(/\r?\n/u).find((line) => line.startsWith("FAMILY_TRACE:"));
+  return { ...result, frames: result.stdout.trim() ? result.stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line)) : [], trace: trace ? JSON.parse(trace.slice(13)) : null };
+}
+
+test("family-v1 keeps listing and describe local and lowers only canonical calls", () => {
+  for (const [revision, profile] of Object.entries(generatedCatalog.revisionProfiles)) {
+    const call = { jsonrpc: "2.0", id: "work", method: "tools/call", params: { name: "call", arguments: { operation: "search", arguments: { project: repoRoot, query: "fixture", repo_text: "off", limit: 5 } }, _meta: { kept: true } } };
+    const result = familyWireFixture(`
+      init();send({jsonrpc:'2.0',method:'notifications/initialized'});
+      send({jsonrpc:'2.0',id:'before',method:'tools/list'});
+      send({...${JSON.stringify(call)},id:'preparing'});
+      for(const operation of ${JSON.stringify(profile.tools.map(({ name }) => name))})send({jsonrpc:'2.0',id:'describe-'+operation,method:'tools/call',params:{name:'describe',arguments:{operation,project:${JSON.stringify(repoRoot)}}}});
+      if(starts!==0)throw new Error('local discovery started runtime');
+      ready=true;send(${JSON.stringify(call)});ack();
+      child.stdout.write(${JSON.stringify('{"jsonrpc":"2.0","id":"work","result":{"content":[{"type":"text","text":"canonical"}],"structuredContent":{"kind":"complete","gaps":[],"count":9007199254740993},"_meta":{"kept":true,"n":0.1234567890123456789012345}}}')}+'\\n');
+      send({jsonrpc:'2.0',id:'after',method:'tools/list'});
+      send({jsonrpc:'2.0',id:'after-describe',method:'tools/call',params:{name:'describe',arguments:{operation:'search',project:${JSON.stringify(repoRoot)}}}});
+      process.env.CODESTORY_MCP_TOOL_SURFACE='named';send({jsonrpc:'2.0',id:'captured',method:'tools/list'});
+    `, { revision });
+    assert.equal(result.status, 0, result.stderr);
+    const named = familyWireFixture(`init();send({jsonrpc:'2.0',id:'named-list',method:'tools/list'});send(${JSON.stringify({ ...call, id: "preparing", params: { ...call.params, name: "search", arguments: call.params.arguments.arguments } })});`, { revision, surface: "named" });
+    assert.equal(named.status, 0, named.stderr);
+    assert.equal(named.trace.starts, 0);
+    assert.deepEqual(named.frames.find(({ id }) => id === "named-list").result.tools, profile.tools);
+    assert.deepEqual(result.frames.find(({ id }) => id === "preparing").result, named.frames.find(({ id }) => id === "preparing").result);
+    for (const id of ["before", "after", "captured"]) {
+      const tools = result.frames.find((frame) => frame.id === id).result.tools;
+      assert.deepEqual(tools.map(({ name }) => name), ["call", "describe"]);
+      assert.deepEqual(tools[0].inputSchema.properties.operation.enum, profile.tools.map(({ name }) => name));
+      assert.deepEqual(tools[0].inputSchema.required, ["operation", "arguments"]);
+      assert.equal(tools[0].inputSchema.additionalProperties, false);
+    }
+    assert.equal(result.trace.starts, 1);
+    assert.deepEqual(result.trace.seen.map(({ method }) => method), ["initialize", "notifications/initialized", "tools/call"]);
+    assert.deepEqual(result.trace.seen[2], { ...call, params: { ...call.params, name: "search", arguments: call.params.arguments.arguments } });
+    for (const tool of profile.tools) {
+      const frame = result.frames.find(({ id }) => id === `describe-${tool.name}`);
+      const value = toolTextJson(frame);
+      assert.equal(value.interface_version, "family-v1");
+      assert.equal(value.discovery_contract_sha256, discoveryDigest(revision));
+      assert.deepEqual(value.tool, tool);
+    }
+    const rawResult = result.stdout.split(/\r?\n/u).find((line) => line.includes('"id":"work"'));
+    assert.ok(rawResult.includes('"count":9007199254740993'));
+    assert.ok(rawResult.includes('"n":0.1234567890123456789012345'));
+  }
+});
+
+test("family-v1 rejects invalid envelopes and inner contracts before handoff", () => {
+  const invalid = [
+    { name: "search", arguments: { project: repoRoot, query: "fixture" } },
+    { name: "call", project: repoRoot, arguments: { operation: "search", arguments: { project: repoRoot, query: "fixture" } } },
+    { name: "call", arguments: { operation: "not-an-operation", arguments: { project: repoRoot } } },
+    { name: "call", arguments: { operation: "search", arguments: { project: repoRoot, query: "fixture" }, project: repoRoot } },
+    { name: "call", arguments: { operation: "search", arguments: [] } },
+    ...[{}, { project: ".", query: "fixture" }, { project: repoRoot }, { project: repoRoot, query: 17 }, { project: repoRoot, query: "fixture", limit: 0 }, { project: repoRoot, query: "fixture", unknown: true }, { project: repoRoot, query: "fixture", repo_text: "bad" }].map((argumentsValue) => ({ name: "call", arguments: { operation: "search", arguments: argumentsValue } })),
+    { name: "call", arguments: { operation: "snippet", arguments: { project: repoRoot, id: "1", path: "a.rs" } } },
+    { name: "describe", arguments: { operation: "search", project: "." } },
+    { name: "describe", arguments: { operation: "search", project: repoRoot, unknown: true } },
+  ];
+  for (const ready of [false, true]) {
+    const result = familyWireFixture(`init();ready=${ready};for(const [i,params]of ${JSON.stringify(invalid)}.entries())send({jsonrpc:'2.0',id:'bad-'+i,method:'tools/call',params});send({jsonrpc:'2.0',method:'tools/call',params:{name:'call',arguments:{operation:'status',arguments:{project:${JSON.stringify(repoRoot)}}}}});`);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.trace.starts, 0);
+    assert.equal(result.frames.length, invalid.length + 1, "family notification emitted a response");
+    for (let i = 0; i < invalid.length; i++) assert.equal(result.frames.find(({ id }) => id === `bad-${i}`).error?.code, -32602, `case ${i}`);
+  }
+  for (const inputSchema of [{}, { type: "object" }, { type: "object", properties: { project: { type: "string", minLength: 1 } }, required: ["project"] }]) {
+    const catalog = `(()=>{const c=require(${JSON.stringify(join(pluginRoot, "generated-mcp-catalog.json"))});for(const p of [c,...Object.values(c.revisionProfiles)])p.tools.find(t=>t.name==='search').inputSchema=${JSON.stringify(inputSchema)};return c})()`;
+    const result = familyWireFixture(`init();ready=true;send({jsonrpc:'2.0',id:'incomplete',method:'tools/call',params:{name:'call',arguments:{operation:'search',arguments:{project:${JSON.stringify(repoRoot)},unexpected:true}}}});`, { catalog });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.trace.starts, 0, "incomplete generated input contract started a runtime");
+    assert.equal(result.frames.find(({ id }) => id === "incomplete")?.error?.code, -32603);
+  }
+  for (const revision of Object.keys(generatedCatalog.revisionProfiles)) {
+    const result = familyWireFixture(`init();ready=true;send([{jsonrpc:'2.0',id:'A',method:'tools/list'},{jsonrpc:'2.0',id:'B',method:'tools/call',params:{name:'call',arguments:{operation:'status',arguments:{project:${JSON.stringify(repoRoot)}}}}}]);`, { revision });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.trace.starts, 0);
+    assert.deepEqual(result.frames.at(-1), { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid Request" } });
+  }
+});
+
+test("family-v1 preserves local IDs and numeric lowering with duplicate last-member semantics", () => {
+  const request = `{"jsonrpc":"2.0", "id":9007199254740993,"method":"tools/call","params":{"name":"call","arguments":{"operation":"status","operation":"search","arguments":{"project":${JSON.stringify(repoRoot)},"query":17,"query":"fixture spaced \\t text","repo_text":"off","limit":5e+0}},"_meta":{"number":0.1234567890123456789012345}}}`;
+  const describe = `{"jsonrpc":"2.0","id":9007199254740995,"method":"tools/call","params":{"name":"describe","arguments":{"operation":"search","project":${JSON.stringify(repoRoot)}}}}`;
+  const invalid = '{"jsonrpc":"2.0","id":9007199254740997,"method":"tools/call","params":{"name":"call","arguments":{"operation":"unknown","arguments":{}}}}';
+  const second = request.replace('"id":9007199254740993', '"id":9007199254740992');
+  const result = familyWireFixture(`init();sendRaw(${JSON.stringify(describe)});sendRaw(${JSON.stringify(invalid)});ready=true;sendRaw(${JSON.stringify(request)});sendRaw(${JSON.stringify(second)});ack();child.stdout.write('{"jsonrpc":"2.0","id":9007199254740992,"result":{"kept":true}}\\n');child.emit('close',17,null);`);
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(result.stdout.includes('"id":9007199254740995'));
+  assert.ok(result.stdout.includes('"id":9007199254740997'));
+  const forwarded = result.trace.raw.find((line) => line.includes('"name":"search"'));
+  assert.ok(forwarded.includes('"id":9007199254740993'));
+  assert.ok(forwarded.includes('"limit":5e+0'));
+  assert.ok(forwarded.includes('"number":0.1234567890123456789012345'));
+  assert.equal(JSON.parse(forwarded).params.arguments.query, "fixture spaced \t text");
+  assert.equal(result.trace.seen.filter(({ method }) => method === "tools/call").length, 2);
+  assert.ok(result.stdout.split(/\r?\n/u).some((line) => line.includes('"id":9007199254740993') && line.includes('"error"')), "failed pending call lost exact ID");
+  const identities = [
+    ["9007199254740993", "9007199254740992", false],
+    ["1e0", "1", true], ["1e0", "1.0", true], ["1.2300e+2", "123", true],
+    ["-0.00e8", "0", true], ["1e-400", "0", false], ["1e-400", "10e-401", true],
+    ["0.123456789012345678901", "0.123456789012345678902", false],
+    ['"1"', "1", false], ['"same"', '"same"', true], ["null", "null", true],
+  ];
+  for (const [requestId, replyId, completes] of identities) {
+    const pending = request.replace('"id":9007199254740993', `"id":${requestId}`);
+    const reply = `{"jsonrpc":"2.0","id":${replyId},"result":{"identity_fixture":true}}`;
+    const probe = familyWireFixture(`init();ready=true;sendRaw(${JSON.stringify(pending)});ack();child.stdout.write(${JSON.stringify(reply)}+'\\n');child.emit('close',17,null);`);
+    assert.equal(probe.status, 0, probe.stderr);
+    const failures = probe.stdout.split(/\r?\n/u).filter((line) => line.includes('"error":'));
+    assert.equal(failures.length, completes ? 0 : 1, `identity ${requestId} -> ${replyId}`);
+    if (!completes) assert.ok(failures[0].includes(`"id":${requestId}`), "failure ID changed");
+    assert.ok(probe.stdout.includes(reply), "canonical child reply changed");
+  }
+  for (const setup of ["JSON.rawJSON=undefined;", "const parse=JSON.parse;JSON.parse=(text,reviver)=>parse(text,typeof reviver==='function'?function(key,value){return reviver.call(this,key,value);}:reviver);"]) {
+    const unsupported = familyWireFixture("init();ready=true;sendRaw(" + JSON.stringify(request) + ");", { setup });
+    assert.notEqual(unsupported.status, 0);
+    assert.match(unsupported.stderr, /family_v1_lossless_json_unavailable/u);
+  }
+  for (const catalog of ["null", "{tools:[{name:'search',inputSchema:null}],resources:[],resourceTemplates:[]}", `(()=>{const c=require(${JSON.stringify(join(pluginRoot, "generated-mcp-catalog.json"))});for(const p of Object.values(c.revisionProfiles))p.tools[0].inputSchema={type:'object',additionalProperties:17};return c})()`]) {
+    const missing = familyWireFixture("init();ready=true;send({jsonrpc:'2.0',id:'list',method:'tools/list'});", { catalog });
+    assert.ok(missing.status !== 0 || missing.frames.find(({ id }) => id === "list")?.error, "missing catalog advertised a callable family");
+  }
+  const wrong = familyWireFixture("init();", { surface: "unknown" });
+  assert.notEqual(wrong.status, 0);
+  assert.match(wrong.stderr, /mcp_tool_surface_invalid/u);
+});
+
 test("launcher wire contract matches the generated catalog read from the real CLI", async () => {
   // The launcher must not read the catalog at run time to find its skew
   // detector, so the constants are mirrored. This is the pin that keeps the
@@ -1618,6 +1766,355 @@ async function writeFakeCli(cliPath) {
   );
   await chmod(cliPath, 0o755);
 }
+
+test("packaged and standalone cs packet invoke the native packet from the repository root", async () => {
+  const home = await mkdtemp(join(tmpdir(), "codestory-shell-packet-"));
+  try {
+    const project = await realpath(home);
+    const nested = join(project, "nested");
+    await mkdir(nested);
+    const init = spawnSync("git", ["init", "-q", project], { encoding: "utf8" });
+    assert.equal(init.status, 0, init.stderr || init.error?.message);
+    const cli = join(project, process.platform === "win32" ? "packet-cli.exe" : "packet-cli");
+    const version = launcherTest.pinnedCliVersion();
+    const source = `
+      const args = process.argv.slice(2);
+      if (args[0] === "--version") { console.log("codestory-cli ${version}"); }
+      else if (args.includes("--question=unavailable")) {
+        console.error("full retrieval is unavailable");
+        process.exit(7);
+      } else {
+        console.log(JSON.stringify({ cwd: process.cwd(), args }));
+      }
+    `;
+    if (process.platform === "win32") await writeWindowsCliShim(cli, source);
+    else await writeFile(cli, `#!${process.execPath}\n${source}`, { mode: 0o755 });
+    const env = {
+      ...process.env, HOME: project, USERPROFILE: project, CODEX_HOME: project,
+      PLUGIN_DATA: join(project, "data"), CODESTORY_CLI: cli, CODESTORY_PLUGIN_DISABLE_PROVISION: "1",
+    };
+    const launch = (...args) => spawnSync(process.execPath, [join(pluginRoot, "bin", "cs"), ...args], {
+      cwd: nested, env, encoding: "utf8", timeout: 5000,
+    });
+    const question = "--question=Where do retries start?\nInclude the callers.";
+    const result = launch("packet", question, "--format", "json");
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), {
+      cwd: project, args: ["packet", "--launcher-read-only", question, "--format", "json"],
+    });
+    const failed = launch("packet", "--question=unavailable");
+    assert.equal(failed.status, 7);
+    assert.equal(failed.stdout, "");
+    assert.match(failed.stderr, /full retrieval is unavailable/u);
+    const escaped = launch("packet", "--question=where", "--project", nested);
+    assert.notEqual(escaped.status, 0);
+    assert.equal(escaped.stdout, "");
+
+    const windows = process.platform === "win32";
+    const template = await readFile(join(pluginRoot, "standalone", windows ? "cs.cmd" : "cs.sh"), "utf8");
+    const standalone = join(project, windows ? "cs.cmd" : "cs");
+    const quotedCli = windows ? `"${cli.replaceAll("%", "%%")}"` : `'${cli.replaceAll("'", "'\\''")}'`;
+    await writeFile(standalone, template.replaceAll("@CODESTORY_CLI@", () => quotedCli), {
+      mode: 0o700,
+    });
+    const standaloneOptions = { cwd: nested, env, encoding: "utf8", timeout: 5000 };
+    const installed = windows
+      ? spawnSync(process.env.ComSpec || process.env.COMSPEC || "cmd.exe", [
+        "/d", "/s", "/c", `""${standalone}" packet --question=where --format json"`,
+      ], { ...standaloneOptions, windowsVerbatimArguments: true })
+      : spawnSync(standalone, ["packet", "--question=where", "--format", "json"], standaloneOptions);
+    assert.equal(installed.status, 0, installed.stderr || installed.error?.message);
+    const nativeArgs = ["--question=where", "--format", "json"];
+    assert.deepEqual(JSON.parse(installed.stdout), {
+      cwd: project, args: windows
+        ? ["packet", ...nativeArgs, "--launcher-read-only"]
+        : ["packet", "--launcher-read-only", ...nativeArgs],
+    });
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("lean launcher keeps its read-only catalog from cold startup and the shell uses typed refresh guidance", { timeout: 15_000 }, async () => {
+  const home = await mkdtemp(join(tmpdir(), "codestory-lean-lookups-"));
+  try {
+    const project = await realpath(home);
+    const data = join(project, "data");
+    const lookupLog = join(project, "lookups.jsonl");
+    const refreshLog = join(project, "refresh.json");
+    const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+    const cli = join(project, process.platform === "win32" ? "lookup.exe" : "lookup");
+    const version = launcherTest.pinnedCliVersion();
+    const source = `
+      const { appendFileSync, writeFileSync } = require("node:fs");
+      const args = process.argv.slice(2);
+      if (args[0] === "--version") { console.log("codestory-cli ${version}"); }
+      else if (args.includes("--help") && !args.includes("--lookup-status")) { console.log("lookup help"); }
+      else if (args[0] === "serve" && process.env.CODESTORY_PLUGIN_PROVISIONING_PROBE === "1") {
+        require("node:readline").createInterface({ input: process.stdin }).once("line", line => {
+          const req = JSON.parse(line);
+          console.log(JSON.stringify({
+            jsonrpc: "2.0", id: req.id,
+            result: {
+              protocolVersion: req.params.protocolVersion, capabilities: {},
+              serverInfo: { name: "fixture", version: ${JSON.stringify(version)} },
+              _meta: {
+                codestory_protocol: { discovery_contract_sha256: ${JSON.stringify(discoveryDigest())} },
+                codestory_publication: { schema_version: 5, minimum_compatible_schema_version: 5 },
+              },
+            },
+          }));
+          process.exit(0);
+        });
+      }
+      else if (args[0] === "index") { writeFileSync(${JSON.stringify(refreshLog)}, JSON.stringify(args)); }
+      else {
+        appendFileSync(${JSON.stringify(lookupLog)}, JSON.stringify(args) + "\\n");
+        const refresh = args[0] === "refs";
+        console.log(JSON.stringify({
+          text: refresh ? "verified selector result\\n" : "no index; text matches only\\n",
+          refresh_recommended: refresh,
+        }));
+      }
+    `;
+    if (process.platform === "win32") await writeWindowsCliShim(cli, source);
+    else await writeFile(cli, `#!${process.execPath}\n${source}`, { mode: 0o755 });
+    const env = {
+      ...process.env,
+      HOME: project,
+      USERPROFILE: project,
+      CODEX_HOME: project,
+      PLUGIN_DATA: data,
+      CODESTORY_CLI: "",
+      CODESTORY_PLUGIN_DISABLE_PROVISION: "1",
+      CODESTORY_MCP_TOOL_SURFACE: "lean",
+    };
+    const send = (id, method, params) => ({ jsonrpc: "2.0", id, method, params });
+    const question = "- Which source owns the retry?\nInclude callers.";
+    const invalid = [
+      { name: "find", arguments: { project, terms: ["retry"], question } },
+      { name: "find", arguments: { project, question, limit: 21 } },
+      { name: "find", arguments: { project, question, max_bytes: 0 } },
+      { name: "refs", arguments: { project, changed: true, targets: ["test"] } },
+      { name: "refs", arguments: { project, changed: false } },
+    ];
+    const input = [
+      send(1, "initialize", { protocolVersion: preferredRevision }),
+      send(undefined, "notifications/initialized"),
+      send(2, "tools/list"),
+      send(3, "tools/call", { name: "refs", arguments: { project, targets: ["lib.rs::test", "lib.rs:9"] } }),
+      send(4, "tools/call", { name: "edit", arguments: { project } }),
+      send(5, "tools/call", { name: "refs", arguments: { project, name: "test", targets: ["test"] } }),
+      send(6, "tools/call", { name: "find", arguments: {
+        project, question, file_globs: ["src/**"], limit: 2, max_bytes: 1200, no_bodies: true,
+      } }),
+      send(7, "tools/call", { name: "refs", arguments: {
+        project, changed: true, file_globs: ["**/*.rs"], limit: 3,
+      } }),
+      ...invalid.map((params, offset) => send(8 + offset, "tools/call", params)),
+    ].map((frame) => JSON.stringify(frame)).join("\n") + "\n";
+    const request = (runtime) => {
+      const result = spawnSync(process.execPath, [launcher], {
+        encoding: "utf8", input, env: { ...env, CODESTORY_CLI: runtime }, timeout: 5000,
+      });
+      assert.equal(result.status, 0, result.stderr);
+      return new Map(result.stdout.trim().split(/\r?\n/u).map((line) => {
+        const frame = JSON.parse(line);
+        return [frame.id, frame];
+      }));
+    };
+    const cold = request("");
+    const shell = spawnSync(process.execPath, [join(pluginRoot, "bin", "cs"), "find", "fixture"], {
+      cwd: project, env: { ...env, CODESTORY_CLI: cli }, encoding: "utf8", timeout: 5000,
+    });
+    assert.equal(shell.status, 0, shell.stderr);
+    assert.equal(shell.stdout, "no index; text matches only\n");
+    assert.equal(fs.existsSync(join(data, "lookup-index")), false);
+    const help = spawnSync(process.execPath, [join(pluginRoot, "bin", "cs"), "find", "--help"], {
+      cwd: project, env: { ...env, CODESTORY_CLI: cli }, encoding: "utf8", timeout: 5000,
+    });
+    assert.equal(help.status, 0, help.stderr);
+    assert.equal(help.stdout, "lookup help\n");
+
+    const warm = request(cli);
+    assert.deepEqual(cold.get(2).result, warm.get(2).result);
+    assert.deepEqual(cold.get(2).result.tools.map(({ name }) => name), ["find", "refs", "read"]);
+    assert.equal(cold.get(1).result.capabilities.tools.listChanged, false);
+    assert.equal(cold.get(3).result.isError, true);
+    assert.equal(warm.get(3).result.content[0].text, "verified selector result\n");
+    assert.equal(warm.get(4).error.code, -32602);
+    assert.equal(warm.get(5).error.code, -32602);
+    assert.equal(cold.get(6).result.isError, true);
+    assert.equal(cold.get(7).result.isError, true);
+    assert.equal(warm.get(6).result.content[0].text, "no index; text matches only\n");
+    assert.equal(warm.get(7).result.content[0].text, "verified selector result\n");
+    for (const offset of invalid.keys()) assert.equal(warm.get(8 + offset).error.code, -32602);
+    for (let i = 0; i < 40 && !fs.existsSync(refreshLog); i++) await delay(25);
+    assert.deepEqual(JSON.parse(await readFile(refreshLog, "utf8")).slice(3), ["--format", "json", "--refresh", "auto", "--core-only"]);
+
+    const commands = (await readFile(lookupLog, "utf8")).trim().split("\n").map(JSON.parse);
+    assert.deepEqual(commands.map(([command]) => command), ["find", "refs", "find", "refs"]);
+    assert.ok(commands.every((args) => args.includes("--lookup-status")));
+    assert.deepEqual(commands[1].slice(-3), ["--", "lib.rs::test", "lib.rs:9"]);
+    assert.deepEqual(commands[2].slice(4), [
+      "--file-glob=src/**", "--max-bytes", "1200", "--limit", "2", "--no-bodies", `--question=${question}`,
+    ]);
+    assert.deepEqual(commands[3].slice(4), ["--file-glob=**/*.rs", "--limit", "3", "--changed"]);
+
+    const release = join(project, "release");
+    await writeReleaseFixture(release, version, (destination) => copyFile(cli, destination));
+    const managedData = join(project, "managed");
+    const managed = spawn(process.execPath, [launcher], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: { ...env, PLUGIN_DATA: managedData, CODESTORY_PLUGIN_DISABLE_PROVISION: "0", CODESTORY_PLUGIN_RELEASE_DIR: release },
+    });
+    const observed = observeLauncherResponses(managed);
+    try {
+      managed.stdin.write(input);
+      await waitForPath(join(managedData, ".codestory-mcp-runtime.json"));
+      managed.stdin.end([
+        send(6, "tools/list"),
+        send(7, "tools/call", { name: "read", arguments: { project, selectors: ["lib.rs:9"] } }),
+      ].map((frame) => JSON.stringify(frame)).join("\n") + "\n");
+      assert.equal((await observed.completed)[0], 0);
+      const frames = new Map(observed.responses.map((frame) => [frame.id, frame]));
+      assert.deepEqual(frames.get(2).result, cold.get(2).result);
+      assert.deepEqual(frames.get(6).result, cold.get(2).result);
+      assert.equal(frames.get(7).result.content[0].text, "no index; text matches only\n");
+      assert.ok(observed.responses.every((frame) => frame.method !== "notifications/tools/list_changed"));
+    } finally {
+      await stopChildProcess(managed);
+    }
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("shared background refresh serializes real child exits and persists bounded retry by project", { timeout: 20_000 }, async () => {
+  const home = await realpath(await mkdtemp(join(tmpdir(), "codestory-lookup-refresh-")));
+  try {
+    const data = join(home, "data");
+    const project = join(home, "project");
+    const other = join(home, "other");
+    await mkdir(project);
+    await mkdir(other);
+    const mode = join(home, "mode");
+    const release = join(home, "release-held-child");
+    const log = join(home, "attempts.jsonl");
+    const cli = join(home, process.platform === "win32" ? "lookup.exe" : "lookup");
+    const version = launcherTest.pinnedCliVersion();
+    const source = [
+      'const fs = require("node:fs");',
+      "const args = process.argv.slice(2);",
+      'if (args[0] === "--version") { console.log("codestory-cli ' + version + '"); process.exit(0); }',
+      'const mode = fs.readFileSync(' + JSON.stringify(mode) + ', "utf8");',
+      'if (args[0] === "index") {',
+      '  fs.appendFileSync(' + JSON.stringify(log) + ', JSON.stringify({project: args[2], mode}) + "\\n");',
+      '  if (mode === "hold") {',
+      '    const timer = setInterval(() => { if (fs.existsSync(' + JSON.stringify(release) + ')) { clearInterval(timer); process.exitCode = 17; } }, 15);',
+      '    setTimeout(() => { clearInterval(timer); process.exitCode = 19; }, 6000).unref();',
+      '  } else {',
+      '    console.log(JSON.stringify({summary: {publication: {generation_id: "test-generation"}},',
+      '      phase_timings: {incremental_plan_probe: {outcome: mode === "no-progress" ? "short_circuited" : "plan_not_empty"}}}));',
+      '  }',
+      '} else {',
+      '  const probe = args.includes("codestory_lookup_readiness_probe");',
+      '  console.log(JSON.stringify({text: probe ? "" : "live reply\\n", refresh_recommended: !probe || mode === "unusable"}));',
+      '}',
+    ].join("\n");
+    if (process.platform === "win32") await writeWindowsCliShim(cli, source);
+    else await writeFile(cli, "#!" + process.execPath + "\n" + source, { mode: 0o755 });
+
+    const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+    const standalone = join(pluginRoot, "bin", "cs");
+    const question = "private prompt must stay out of retry state";
+    const env = {
+      ...process.env, HOME: home, USERPROFILE: home, CODEX_HOME: home, PLUGIN_DATA: data,
+      CODESTORY_CLI: cli, CODESTORY_PLUGIN_DISABLE_PROVISION: "1", CODESTORY_MCP_TOOL_SURFACE: "lean",
+    };
+    const lookup = (cwd, lean = false) => {
+      const frames = lean ? [
+        { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: preferredRevision } },
+        { jsonrpc: "2.0", method: "notifications/initialized" },
+        { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "find", arguments: { project: cwd, question } } },
+      ].map((item) => JSON.stringify(item)).join("\n") + "\n" : undefined;
+      const client = spawnSync(process.execPath, lean ? [launcher] : [standalone, "find", "--question", question],
+        { cwd, env, input: frames, encoding: "utf8", timeout: 5000 });
+      assert.equal(client.status, 0, client.stderr || client.error?.message);
+      if (lean) {
+        const replies = client.stdout.trim().split(/\r?\n/u).map(JSON.parse);
+        assert.equal(replies.find((item) => item.id === 2)?.result?.content[0].text, "live reply\n");
+      } else {
+        assert.equal(client.stdout, "live reply\n");
+      }
+    };
+    const filenames = (cwd) => {
+      const stem = join(data, "lookup-index", createHash("sha256").update(cwd).digest("hex"));
+      return { result: stem + ".v2.result", owner: stem + ".v2.owner" };
+    };
+    const paths = filenames(project);
+    const attempts = async () => (await readFile(log, "utf8")).trim().split("\n").map(JSON.parse);
+    const current = async (filename = paths.result) => JSON.parse(await readFile(filename, "utf8"));
+    const waitResult = async (failures) => {
+      for (let i = 0; i < 200; i++) {
+        if (fs.existsSync(paths.result) && !fs.existsSync(paths.owner)) {
+          const state = await current();
+          if (state.failures === failures) return state;
+        }
+        await delay(20);
+      }
+      assert.fail("no observed background result for " + failures + " failures");
+    };
+    const expire = async (state) => {
+      const now = Date.now();
+      await writeFile(paths.result, JSON.stringify({ ...state, finished_at: now - 60_001, retry_at: now - 1 }));
+    };
+
+    await writeFile(mode, "hold");
+    lookup(project);
+    await waitForPath(log);
+    lookup(project, true);
+    assert.equal((await attempts()).length, 1, "shared shell and lean calls must avoid a second writer");
+    await writeFile(release, "");
+    const failed = await waitResult(1);
+    assert.equal(failed.retry_at - failed.finished_at, 60_000);
+    assert.ok(!(await readFile(paths.result, "utf8")).includes(question));
+    lookup(project);
+    assert.equal((await attempts()).length, 1, "fresh process must honor durable backoff");
+
+    await expire(failed);
+    await writeFile(mode, "no-progress");
+    lookup(project, true);
+    const noProgress = await waitResult(2);
+    assert.equal(noProgress.retry_at - noProgress.finished_at, 120_000);
+    await expire(noProgress);
+    await writeFile(mode, "unusable");
+    lookup(project);
+    const unusable = await waitResult(3);
+    assert.equal(unusable.retry_at - unusable.finished_at, 240_000);
+
+    // A new project is independent even while the original is backed off.
+    const otherFiles = filenames(other);
+    await writeFile(otherFiles.owner, "foreign owner bytes");
+    lookup(other);
+    assert.equal(await readFile(otherFiles.owner, "utf8"), "foreign owner bytes");
+    assert.equal((await attempts()).length, 3);
+    await rm(otherFiles.owner);
+    await writeFile(mode, "success");
+    lookup(other, true);
+    await waitForPath(otherFiles.result);
+    assert.equal((await current(otherFiles.result)).failures, 0);
+    await expire(unusable);
+    lookup(project);
+    assert.equal((await waitResult(0)).retry_at - (await current()).finished_at, 0);
+    await writeFile(mode, "no-progress");
+    lookup(project, true);
+    assert.equal((await waitResult(1)).failures, 1, "successful publication permits later drift and resets backoff");
+    assert.equal((await attempts()).length, 6);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
 
 async function writeLifecycleCli(cliPath) {
   const script = [

@@ -20,6 +20,7 @@ const {
 
 const pluginRoot = path.dirname(__dirname);
 const launchCwd = workerData?.codestoryLaunchCwd || process.cwd();
+const mcpToolSurface = process.env.CODESTORY_MCP_TOOL_SURFACE || 'named';
 const binaryName = process.platform === 'win32' ? 'codestory-cli.exe' : 'codestory-cli';
 function positiveDurationEnv(name, fallback) {
   const raw = process.env[name];
@@ -338,6 +339,7 @@ function usablePluginDataDir(dataDir) {
 
 function pluginDataDir() {
   return process.env.PLUGIN_DATA
+    || process.env.CLAUDE_PLUGIN_DATA
     || process.env.COPILOT_PLUGIN_DATA
     || process.env.CODESTORY_PLUGIN_DATA
     || inferredCodexPluginDataDir()
@@ -3891,6 +3893,122 @@ function failOpenToolCatalog(catalog = canonicalMcpCatalog) {
   return JSON.parse(JSON.stringify(catalog.tools));
 }
 
+const canProjectDiscoveryLosslessly = (() => {
+  try {
+    if (typeof JSON.rawJSON !== 'function') return false;
+    let source;
+    JSON.parse('0', (_key, value, context) => {
+      source = context?.source;
+      return value;
+    });
+    return source === '0' && JSON.stringify(JSON.rawJSON('0')) === '0';
+  } catch {
+    return false;
+  }
+})();
+
+function losslessDiscoveryFrame(text) {
+  if (!canProjectDiscoveryLosslessly) return null;
+  try {
+    return JSON.parse(text, (_key, value, context) =>
+      typeof value === 'number' ? JSON.rawJSON(context.source) : value);
+  } catch {
+    return null;
+  }
+}
+
+function requireMcpToolSurface() {
+  if (!['named', 'family-v1', 'lean'].includes(mcpToolSurface)) {
+    throw Object.assign(new Error('mcp_tool_surface_invalid:expected_named_family-v1_or_lean'), {
+      code: 'mcp_tool_surface_invalid',
+    });
+  }
+  if (mcpToolSurface === 'family-v1' && !canProjectDiscoveryLosslessly) {
+    throw Object.assign(new Error('family_v1_lossless_json_unavailable'), {
+      code: 'family_v1_lossless_json_unavailable',
+    });
+  }
+  return mcpToolSurface;
+}
+
+// ID tokens already passed JSON parsing. Compare decimal value without rounding
+// or expanding exponent zeroes; serialization still keeps the original token.
+function familyJsonRpcIdKey(token) {
+  if (typeof token !== 'string') return null;
+  if (token === 'null' || token.startsWith('"')) return `literal:${token}`;
+  const match = /^(-?)(\d+)(?:\.(\d+))?(?:[eE]([+-]?\d+))?$/u.exec(token);
+  if (!match) return null;
+  const fraction = match[3] || '';
+  const coefficient = `${match[2]}${fraction}`.replace(/^0+/u, '');
+  if (!coefficient) return 'number:0';
+  const digits = coefficient.replace(/0+$/u, '');
+  const exponent = BigInt(match[4] || '0') - BigInt(fraction.length)
+    + BigInt(coefficient.length - digits.length);
+  return `number:${match[1]}${digits}e${exponent}`;
+}
+
+function familyToolCatalog(tools) {
+  const schemaValid = (schema) => {
+    if (!isPlainObject(schema) || Object.keys(schema).some((key) =>
+      !failOpenValidatedSchemaKeywords.includes(key))) return false;
+    if (Object.hasOwn(schema, 'properties') && !isPlainObject(schema.properties)) return false;
+    if (Object.hasOwn(schema, 'additionalProperties') && typeof schema.additionalProperties !== 'boolean') return false;
+    if (Object.hasOwn(schema, 'enum') && (!Array.isArray(schema.enum) || schema.enum.length === 0)) return false;
+    if (Object.hasOwn(schema, 'description') && typeof schema.description !== 'string') return false;
+    if (['minimum', 'maximum'].some((key) => Object.hasOwn(schema, key)
+      && (typeof schema[key] !== 'number' || !Number.isFinite(schema[key])))) return false;
+    if (['minLength', 'maxLength', 'minItems', 'maxItems'].some((key) => Object.hasOwn(schema, key)
+      && (!Number.isSafeInteger(schema[key]) || schema[key] < 0))) return false;
+    if (Object.hasOwn(schema, 'required') && (!Array.isArray(schema.required)
+      || schema.required.some((name) => typeof name !== 'string'))) return false;
+    if (Object.hasOwn(schema, 'type') && ([schema.type].flat().length === 0 || ![schema.type].flat().every((type) =>
+      ['object', 'array', 'string', 'boolean', 'integer', 'number', 'null'].includes(type)))) return false;
+    if (Object.values(schema.properties || {}).some((member) => !schemaValid(member))) return false;
+    if (Object.hasOwn(schema, 'items') && !schemaValid(schema.items)) return false;
+    if (Object.hasOwn(schema, 'not') && !schemaValid(schema.not)) return false;
+    return ['allOf', 'anyOf', 'oneOf'].every((key) => !Object.hasOwn(schema, key)
+      || (Array.isArray(schema[key]) && schema[key].length > 0 && schema[key].every(schemaValid)));
+  };
+  const generatedObjectContract = (schema) => (schema.type === 'object'
+    && schema.additionalProperties === false
+    && schema.properties?.project?.type === 'string'
+    && schema.properties.project.minLength >= 1
+    && schema.required?.includes('project'))
+    || schema.allOf?.some(generatedObjectContract);
+  if (!Array.isArray(tools) || tools.length === 0 || tools.some((tool) =>
+    !isPlainObject(tool) || typeof tool.name !== 'string' || !tool.name
+    || !schemaValid(tool.inputSchema) || !generatedObjectContract(tool.inputSchema)
+    || (Object.hasOwn(tool, 'outputSchema') && !isPlainObject(tool.outputSchema)))
+    || new Set(tools.map(({ name }) => name)).size !== tools.length) {
+    throw new Error('family_v1_catalog_invalid');
+  }
+  const operation = { type: 'string', enum: tools.map(({ name }) => name) };
+  return [{
+    name: 'call',
+    description: 'Call one canonical CodeStory operation. Its complete input contract is available through describe; arguments owns the required absolute project. This grant covers every operation.',
+    inputSchema: {
+      type: 'object', additionalProperties: false,
+      properties: { operation, arguments: { type: 'object' } },
+      required: ['operation', 'arguments'],
+    },
+    annotations: {
+      destructiveHint: tools.some(({ annotations }) => annotations?.destructiveHint !== false),
+      idempotentHint: tools.every(({ annotations }) => annotations?.idempotentHint === true),
+      openWorldHint: tools.some(({ annotations }) => annotations?.openWorldHint !== false),
+      readOnlyHint: tools.every(({ annotations }) => annotations?.readOnlyHint === true),
+    },
+  }, {
+    name: 'describe',
+    description: 'Read the complete canonical descriptor for one CodeStory operation without starting its runtime. Optional when the version-matched contract is already known.',
+    inputSchema: {
+      type: 'object', additionalProperties: false,
+      properties: { operation, project: { type: 'string', minLength: 1 } },
+      required: ['operation', 'project'],
+    },
+    annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: false, readOnlyHint: true },
+  }];
+}
+
 function emergencyStatusToolCatalog() {
   return [{
     name: 'status',
@@ -4500,17 +4618,310 @@ function failOpenInvalidParamsError(id, tool, violations) {
   );
 }
 
+const lookupString = { type: 'string', minLength: 1 };
+const lookupStrings = { type: 'array', minItems: 1, items: lookupString };
+const lookupBytes = { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER };
+const lookupMatchOptions = {
+  file_globs: { type: 'array', items: lookupString },
+  limit: { type: 'integer', minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
+  no_bodies: { type: 'boolean' },
+};
+const focusedLookupLimits = {
+  properties: { limit: { maximum: 20 }, max_bytes: { minimum: 1, maximum: 16_000 } },
+};
+const leanTools = [
+  {
+    name: 'find',
+    description: 'Find literal matches, list matching paths, or locate an implementation from a question.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['project'],
+      properties: {
+        project: lookupString, terms: lookupStrings, question: lookupString,
+        max_bytes: lookupBytes, ...lookupMatchOptions,
+      },
+      not: { required: ['terms', 'question'] },
+      anyOf: [{ not: { required: ['question'] } }, focusedLookupLimits],
+    },
+    annotations: { readOnlyHint: true },
+  },
+  {
+    name: 'refs',
+    description: 'Find references by name or selector, or inspect tracked changes against HEAD.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['project'],
+      oneOf: [{ required: ['name'] }, { required: ['targets'] }, { required: ['changed'] }],
+      anyOf: [{ not: { required: ['changed'] } }, focusedLookupLimits],
+      properties: {
+        project: lookupString, name: lookupString, targets: lookupStrings,
+        changed: { type: 'boolean', enum: [true] }, max_bytes: lookupBytes, ...lookupMatchOptions,
+      },
+    },
+    annotations: { readOnlyHint: true },
+  },
+  {
+    name: 'read',
+    description: 'Read live files and declarations via path, path::Symbol, path:LINE, or path:A-B.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['project', 'selectors'],
+      properties: { project: lookupString, selectors: lookupStrings, max_bytes: lookupBytes },
+    },
+    annotations: { readOnlyHint: true },
+  },
+];
+
+const lookupRefreshWorkerFlag = '--internal-lookup-refresh';
+const lookupRefreshMinDelayMs = 60_000;
+const lookupRefreshMaxDelayMs = 30 * 60_000;
+const lookupRefreshMaxRecordBytes = 4_096;
+
+function lookupRefreshPaths(data, project) {
+  const directory = path.join(data, 'lookup-index');
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  if (!fs.lstatSync(directory).isDirectory()) throw new Error('lookup refresh directory is not direct');
+  const key = createHash('sha256').update(project).digest('hex');
+  const base = path.join(directory, key);
+  return { key, owner: base + '.v2.owner', result: base + '.v2.result' };
+}
+
+// null means absent. Undefined means an existing path could not be proved to be ours.
+function readLookupRefreshRecord(file, key, kind) {
+  let fd;
+  try {
+    const before = fs.lstatSync(file);
+    if (!before.isFile() || before.size > lookupRefreshMaxRecordBytes) return undefined;
+    fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    const metadata = fs.fstatSync(fd);
+    if (!sameFileIdentity(before, metadata)) return undefined;
+    const buffer = Buffer.alloc(lookupRefreshMaxRecordBytes + 1);
+    const bytes = fs.readSync(fd, buffer, 0, buffer.length, 0);
+    if (bytes !== metadata.size) return undefined;
+    const value = JSON.parse(buffer.subarray(0, bytes).toString('utf8'));
+    if (value?.kind !== kind || value.project_key !== key) return undefined;
+    if (kind === 'codestory-lookup-refresh-v2-owner') {
+      if (!Number.isSafeInteger(value.pid) || value.pid <= 0 ||
+          !/^[0-9a-f]{32}$/u.test(value.token) ||
+          (value.process_start_identity !== null &&
+            (typeof value.process_start_identity !== 'string' || !value.process_start_identity))) return undefined;
+    } else if (!/^[0-9a-f]{64}$/u.test(value.runtime) ||
+        !Number.isSafeInteger(value.failures) || value.failures < 0 || value.failures > 6 ||
+        !Number.isSafeInteger(value.finished_at) || !Number.isSafeInteger(value.retry_at)) {
+      return undefined;
+    }
+    return { metadata, value };
+  } catch (error) {
+    return error.code === 'ENOENT' ? null : undefined;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
+function lookupRefreshRuntimeKey(cli) {
+  const metadata = fs.statSync(cli);
+  return createHash('sha256')
+    .update(JSON.stringify([cli, metadata.dev, metadata.ino, metadata.size, metadata.mtimeMs])).digest('hex');
+}
+
+function lookupRefreshMayStart(previous, runtime, requestedAt, now = Date.now()) {
+  if (previous === undefined) return false;
+  if (!previous || previous.value.runtime !== runtime) return true;
+  const { finished_at: finished, retry_at: retry } = previous.value;
+  // Invalid future times after a machine clock change must not postpone repairs forever.
+  if (finished <= now && requestedAt <= finished) return false;
+  return retry <= now || retry - now > lookupRefreshMaxDelayMs;
+}
+
+function lookupRefreshOwnerIsStale(owner) {
+  const checkIdentity = owner.value.process_start_identity !== null &&
+    Date.now() - owner.metadata.mtimeMs >= lookupRefreshMinDelayMs;
+  return managedCliLockOwnerIsStale(owner.value, checkIdentity) === true;
+}
+
+function refreshLookupIndex(cli, project, data, focused, requestedAt) {
+  if (!data) return;
+  try {
+    data = path.resolve(data);
+    const state = lookupRefreshPaths(data, project);
+    const runtime = lookupRefreshRuntimeKey(cli);
+    const existing = readLookupRefreshRecord(state.owner, state.key, 'codestory-lookup-refresh-v2-owner');
+    if (existing === undefined || (existing && !lookupRefreshOwnerIsStale(existing))) return;
+    if (!lookupRefreshMayStart(readLookupRefreshRecord(state.result, state.key, 'codestory-lookup-refresh-v2-result'),
+      runtime, requestedAt)) return;
+    // A short-lived shell lookup must be able to exit while the supervisor owns the child.
+    // Only repository/runtime identity and request timing cross the private worker pipe.
+    const worker = spawn(process.execPath, [__filename, lookupRefreshWorkerFlag], {
+      cwd: project, detached: true, stdio: ['pipe', 'ignore', 'ignore'], windowsHide: true,
+    });
+    worker.on('error', () => {});
+    worker.stdin.on('error', () => {});
+    worker.stdin.end(JSON.stringify({ cli, project, data, focused, requestedAt }));
+    worker.unref();
+  } catch {
+    // The live reply is independent of cache permissions and background indexing.
+  }
+}
+
+function publishLookupRefreshRecord(file, value, previous, token) {
+  const temporary = file + '.' + token;
+  fs.writeFileSync(temporary, JSON.stringify(value), { flag: 'wx', mode: 0o600 });
+  try {
+    if (previous === null) {
+      // Link is exclusive. A file created by another owner is never replaced.
+      fs.linkSync(temporary, file);
+    } else if (previous && sameFileIdentity(previous.metadata, fs.lstatSync(file))) {
+      fs.renameSync(temporary, file);
+    }
+  } finally {
+    if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
+  }
+}
+
+function runLookupRefresh({ cli, project, data, focused, requestedAt }) {
+  const state = lookupRefreshPaths(data, project);
+  const runtime = lookupRefreshRuntimeKey(cli);
+  const ownerKind = 'codestory-lookup-refresh-v2-owner';
+  const resultKind = 'codestory-lookup-refresh-v2-result';
+  const oldOwner = readLookupRefreshRecord(state.owner, state.key, ownerKind);
+  if (oldOwner === undefined) return;
+  if (oldOwner && (!lookupRefreshOwnerIsStale(oldOwner) ||
+      !removeManagedCliInitializationIf(state.owner, (value, file) =>
+        value?.token === oldOwner.value.token && sameFileIdentity(oldOwner.metadata, file)))) return;
+  const token = randomBytes(16).toString('hex');
+  // Sandboxed hosts can deny the process-start probe. Without it, reclaim
+  // only a claim whose owner is no longer alive.
+  const identity = processStartIdentity(process.pid);
+  // Every contender links its own complete immutable claim. Exactly one wins.
+  publishLookupRefreshRecord(state.owner, {
+    kind: ownerKind, project_key: state.key, pid: process.pid, token, process_start_identity: identity,
+  }, null, token);
+  try {
+    const previous = readLookupRefreshRecord(state.result, state.key, resultKind);
+    if (!lookupRefreshMayStart(previous, runtime, requestedAt)) return;
+    const result = spawnCodeStoryCliSync(cli,
+      ['index', '--project', project, '--format', 'json', '--refresh', 'auto', '--core-only'],
+      { cwd: project, encoding: 'utf8', maxBuffer: 2 * 1024 * 1024, timeout: 15 * 60_000, windowsHide: true });
+    let ready = false;
+    if (!result.error && result.status === 0) {
+      try {
+        const receipt = JSON.parse(result.stdout);
+        ready = typeof receipt.summary?.publication?.generation_id === 'string' &&
+          receipt.phase_timings?.incremental_plan_probe?.outcome !== 'short_circuited';
+      } catch {}
+      if (focused && ready) {
+        // A core commit can succeed without its callable companion. A neutral,
+        // one-byte observational check confirms recovery without copying a user lookup.
+        const check = spawnCodeStoryCliSync(cli, ['find', '--project', project, '--lookup-status',
+          '--question', 'codestory_lookup_readiness_probe', '--limit', '1', '--max-bytes', '1', '--no-bodies'],
+        { cwd: project, encoding: 'utf8', maxBuffer: 4_096, timeout: 30_000, windowsHide: true });
+        try {
+          ready = !check.error && check.status === 0 && JSON.parse(check.stdout).refresh_recommended === false;
+        } catch { ready = false; }
+      }
+    }
+    const failures = ready ? 0 : Math.min(6, 1 + (previous?.value.runtime === runtime ? previous.value.failures : 0));
+    const now = Date.now();
+    const delay = ready ? 0 : Math.min(lookupRefreshMaxDelayMs, lookupRefreshMinDelayMs * 2 ** (failures - 1));
+    publishLookupRefreshRecord(state.result, {
+      kind: resultKind, project_key: state.key, runtime, failures, finished_at: now, retry_at: now + delay,
+    }, previous, token);
+  } finally {
+    removeManagedCliInitializationIf(state.owner, (value) => value?.token === token && value.pid === process.pid);
+  }
+}
+
+async function runLookupRefreshWorker() {
+  const chunks = [];
+  let bytes = 0;
+  for await (const chunk of process.stdin) {
+    bytes += chunk.length;
+    if (bytes > lookupRefreshMaxRecordBytes * 4) return;
+    chunks.push(chunk);
+  }
+  const parameters = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  if (![parameters?.cli, parameters?.project, parameters?.data].every((value) =>
+      typeof value === 'string' && path.isAbsolute(value)) || typeof parameters.focused !== 'boolean' ||
+      !Number.isSafeInteger(parameters.requestedAt)) return;
+  runLookupRefresh(parameters);
+}
+
+function runLookup(cli, project, command, args) {
+  const requestedAt = Date.now();
+  const separator = args.indexOf('--');
+  const flags = separator === -1 ? args : args.slice(0, separator);
+  const help = flags.includes('--help') || flags.includes('-h');
+  const lookupArgs = [command, '--project', project];
+  if (!help) lookupArgs.push('--lookup-status');
+  const result = spawnCodeStoryCliSync(cli, [...lookupArgs, ...args], {
+    cwd: project, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: 30_000, windowsHide: true,
+  });
+  if (help || result.error || result.status !== 0) return result;
+  let reply;
+  try { reply = JSON.parse(result.stdout); } catch {}
+  if (typeof reply?.text !== 'string' || typeof reply?.refresh_recommended !== 'boolean') {
+    return { status: 1, stderr: 'CodeStory lookup returned an incompatible reply. Use the matching CLI.\n' };
+  }
+  if (reply.refresh_recommended) {
+    const focused = command === 'find' && flags.some((argument) =>
+      argument === '--question' || argument.startsWith('--question='));
+    refreshLookupIndex(cli, project, pluginDataDir(), focused, requestedAt);
+  }
+  return { ...result, stdout: reply.text };
+}
+
+function runPacket(cli, project, args) {
+  return spawnCodeStoryCliSync(cli, ['packet', '--launcher-read-only', ...args], {
+    cwd: project, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, windowsHide: true,
+  });
+}
+
+function leanLookupResult(tool, args, currentStatus, runtime) {
+  if (!runtime) return failOpenToolResult(tool, currentStatus(), args);
+  const project = selectExplicitProject(args.project);
+  if (!project.ok) {
+    return { isError: true, content: [{ type: 'text', text: `${project.code}: ${project.message}` }] };
+  }
+  const options = (args.file_globs || []).map((glob) => `--file-glob=${glob}`);
+  if (args.max_bytes !== undefined) options.push('--max-bytes', String(args.max_bytes));
+  if (args.limit !== undefined) options.push('--limit', String(args.limit));
+  if (args.no_bodies === true) options.push('--no-bodies');
+  if (args.question !== undefined) options.push(`--question=${args.question}`);
+  if (args.changed === true) options.push('--changed');
+  const positional = args.terms || args.selectors || args.targets || (args.name === undefined ? [] : [args.name]);
+  if (positional.length > 0) options.push('--', ...positional);
+  const result = runLookup(runtime.path, cleanPublicProjectPath(project.project), tool, options);
+  if (result.error || result.status !== 0) {
+    return { isError: true, content: [{ type: 'text', text: (result.stderr || result.error?.message || result.stdout || `exit ${result.status}`).trim() }] };
+  }
+  return { content: [{ type: 'text', text: result.stdout }] };
+}
+
 function runFailOpenMcp(status, options = {}) {
+  const surface = requireMcpToolSurface();
+  const familySurface = surface === 'family-v1';
+  const leanSurface = surface === 'lean';
   const baseCurrentStatus = () => (typeof status === 'function' ? status() : status);
   const catalog = Object.hasOwn(options, 'catalog') ? options.catalog : canonicalMcpCatalog;
   let catalogFailure = null;
   let tools;
+  let familyTools;
   let resources;
   let resourceTemplates;
   const catalogProfile = (revision) => catalog?.revisionProfiles?.[revision] ?? catalog;
   const selectCatalogProfile = (revision) => {
+    if (leanSurface) {
+      tools = leanTools;
+      resources = [];
+      resourceTemplates = [];
+      return;
+    }
     const profile = catalogProfile(revision);
     tools = failOpenToolCatalog(profile);
+    if (familySurface) familyTools = familyToolCatalog(tools);
     if (!Array.isArray(profile?.resources) || !Array.isArray(profile?.resourceTemplates)) {
       throw new Error('generated_mcp_catalog_missing:run_generate_codestory_skill_syntax');
     }
@@ -4544,9 +4955,10 @@ function runFailOpenMcp(status, options = {}) {
   let runtimeReadyNotified = false;
   let stdinEnded = false;
   let handoffStderrObservation = null;
-  const delegatedRequestIds = new Set();
+  const delegatedRequests = new Map();
   let handoffFailureHandled = false;
   const notifyRuntimeReady = () => {
+    if (leanSurface) return;
     if (!initializedNotification || runtimeReadyNotified) return;
     if (
       typeof options.shouldHandoff === 'function' &&
@@ -4604,14 +5016,14 @@ function runFailOpenMcp(status, options = {}) {
         process.exit(failureDetails.code || 1);
         return;
       }
-      for (const id of delegatedRequestIds) {
+      for (const [id, exactId] of delegatedRequests) {
         process.stdout.write(`${JSON.stringify(jsonrpcError(
-          JSON.parse(id),
+          familySurface ? losslessDiscoveryFrame(exactId) : JSON.parse(id),
           -32000,
           detailedReason,
         ))}\n`);
       }
-      delegatedRequestIds.clear();
+      delegatedRequests.clear();
       options.onRuntimeFailure({
         reason: detailedReason,
         reasonCode: runtimeFailureCode(reasonCode),
@@ -4702,7 +5114,13 @@ function runFailOpenMcp(status, options = {}) {
             continue;
           }
           for (const reply of Array.isArray(parsed) ? parsed : [parsed]) {
-            if (reply?.id !== undefined) delegatedRequestIds.delete(JSON.stringify(reply.id));
+            if (reply?.id === undefined) continue;
+            let key = JSON.stringify(reply.id);
+            if (familySurface) {
+              const preciseReply = losslessDiscoveryFrame(output);
+              key = familyJsonRpcIdKey(JSON.stringify(preciseReply?.id));
+            }
+            delegatedRequests.delete(key);
           }
           process.stdout.write(`${output}\n`);
         }
@@ -4782,9 +5200,61 @@ function runFailOpenMcp(status, options = {}) {
     if (request.method === 'initialize' && request.id !== undefined) {
       initializeRequest = request;
     }
+    if (familySurface && (request.method === 'tools/list' || request.method === 'tools/call')) {
+      if (request.id === undefined) return null;
+      if (catalogFailure || !familyTools) {
+        return jsonrpcError(request.id, -32603, 'family_v1_catalog_invalid');
+      }
+      if (request.method === 'tools/list') {
+        return request.id === undefined ? null : jsonrpcResult(request.id, { tools: familyTools });
+      }
+      const familyTool = familyTools.find(({ name }) => name === request.params?.name);
+      if (!familyTool) return jsonrpcError(request.id, -32602, `unknown family tool: ${request.params?.name || '<missing>'}`);
+      const envelope = request.params?.arguments;
+      const violations = validatePublishedSchemaValue(familyTool.inputSchema, envelope);
+      for (const field of Object.keys(request.params || {})) {
+        if (!['name', 'arguments', '_meta'].includes(field)) {
+          violations.push(publishedSchemaViolation('unknown_property', `/params/${field}`, 'unknown family call field'));
+        }
+      }
+      if (violations.length) return failOpenInvalidParamsError(request.id, familyTool.name, violations);
+      const canonicalTool = tools.find(({ name }) => name === envelope.operation);
+      if (familyTool.name === 'call') {
+        violations.push(...validatePublishedSchemaValue(canonicalTool.inputSchema, envelope.arguments, '/arguments/arguments'));
+      }
+      const project = familyTool.name === 'call' ? envelope.arguments.project : envelope.project;
+      const selection = selectExplicitProject(project);
+      if (!selection.ok) violations.push(publishedSchemaViolation(selection.code,
+        familyTool.name === 'call' ? '/arguments/arguments/project' : '/arguments/project', selection.message));
+      if (violations.length) return failOpenInvalidParamsError(request.id, familyTool.name, violations);
+      if (familyTool.name === 'describe') {
+        const description = {
+          interface_version: 'family-v1',
+          protocol_version: v3Session?.negotiated ?? managedCliMcpProtocolVersion,
+          discovery_contract_sha256: v3Session?.discoveryContractSha256
+            ?? catalog.wireContract.discoveryContracts[v3Session?.negotiated ?? managedCliMcpProtocolVersion],
+          plugin_version: resolvedVersionForStatus(currentStatus()),
+          cli_version: pinnedCliVersion(),
+          tool: canonicalTool,
+        };
+        return jsonrpcResult(request.id, revisionNativeFailOpenToolResult(
+          v3Session?.negotiated ?? managedCliMcpProtocolVersion,
+          { structuredContent: description },
+        ));
+      }
+      const precise = losslessDiscoveryFrame(rawLine);
+      if (!precise) return jsonrpcError(request.id, -32603, 'family_v1_lossless_json_unavailable');
+      request = { ...request, params: { ...request.params, name: envelope.operation, arguments: envelope.arguments } };
+      rawLine = JSON.stringify({ ...precise, params: {
+        ...precise.params, name: envelope.operation, arguments: precise.params.arguments.arguments,
+      } });
+    }
     const delegated = allowHandoff && request.method !== 'initialize' ? maybeHandoff() : null;
     if (delegated) {
-      if (request.id !== undefined) delegatedRequestIds.add(JSON.stringify(request.id));
+      if (request.id !== undefined) {
+        const exactId = familySurface ? JSON.stringify(losslessDiscoveryFrame(rawLine)?.id) : null;
+        delegatedRequests.set(familySurface ? familyJsonRpcIdKey(exactId) : JSON.stringify(request.id), exactId);
+      }
       handoffDispatch(rawLine);
       return null;
     }
@@ -4793,6 +5263,13 @@ function runFailOpenMcp(status, options = {}) {
     if (request.method === 'initialize') {
       const liveStatus = currentStatus();
       negotiatedProtocol = negotiateMcpProtocolVersion(request.params?.protocolVersion);
+      if (leanSurface) {
+        return jsonrpcResult(request.id, {
+          protocolVersion: negotiatedProtocol.negotiated,
+          capabilities: { tools: { listChanged: false } },
+          serverInfo: { name: 'codestory', version: resolvedVersionForStatus(liveStatus) },
+        });
+      }
       try {
         v3Session = v3LauncherSession(
           request.params?.protocolVersion,
@@ -4818,6 +5295,8 @@ function runFailOpenMcp(status, options = {}) {
       });
     } else if (request.method === 'tools/list') {
       response = jsonrpcResult(request.id, { tools });
+    } else if (leanSurface && request.method === 'ping') {
+      response = jsonrpcResult(request.id, {});
     } else if (request.method === 'resources/list') {
       response = jsonrpcResult(request.id, { resources });
     } else if (request.method === 'resources/templates/list') {
@@ -4866,7 +5345,14 @@ function runFailOpenMcp(status, options = {}) {
       if (!tool) {
         response = jsonrpcError(request.id, -32602, `unknown tool: ${toolName || '<missing>'}`);
       } else {
-        const violations = validateFailOpenToolArguments(tool, argumentsValue);
+        const violations = leanSurface
+          ? validatePublishedSchemaValue(tool.inputSchema, argumentsValue)
+          : validateFailOpenToolArguments(tool, argumentsValue);
+        if (leanSurface && violations.length === 0) {
+          return jsonrpcResult(request.id, leanLookupResult(
+            toolName, argumentsValue, currentStatus, options.lookupRuntime?.(),
+          ));
+        }
         response = violations.length > 0
           ? failOpenInvalidParamsError(request.id, toolName, violations)
           : jsonrpcResult(
@@ -4893,11 +5379,17 @@ function runFailOpenMcp(status, options = {}) {
     }
     if (!Array.isArray(frame)) {
       const response = handleRequest(frame, line);
-      if (response) process.stdout.write(`${JSON.stringify(response)}\n`);
+      if (response) {
+        if (familySurface && isPlainObject(frame) && validJsonRpcId(frame.id)) {
+          const precise = losslessDiscoveryFrame(line);
+          if (precise && Object.hasOwn(precise, 'id')) response.id = precise.id;
+        }
+        process.stdout.write(`${JSON.stringify(response)}\n`);
+      }
       return;
     }
     const revision = negotiatedProtocol?.negotiated ?? managedCliMcpProtocolVersion;
-    if (frame.length === 0 || revision === '2025-06-18' || revision === '2025-11-25') {
+    if (familySurface || frame.length === 0 || revision === '2025-06-18' || revision === '2025-11-25') {
       process.stdout.write(`${JSON.stringify(jsonrpcError(null, -32600, 'Invalid Request'))}\n`);
       return;
     }
@@ -4905,7 +5397,7 @@ function runFailOpenMcp(status, options = {}) {
     if (delegated) {
       for (const request of frame) {
         if (validateJsonRpcRequest(request) && request.id !== undefined) {
-          delegatedRequestIds.add(JSON.stringify(request.id));
+          delegatedRequests.set(JSON.stringify(request.id), null);
         }
       }
       handoffDispatch(line);
@@ -5040,6 +5532,9 @@ function spawnStdioRuntime(resolved, runtimeCwd, stdio) {
 }
 
 async function main() {
+  const lean = requireMcpToolSurface() === 'lean';
+  const runMcp = (status, options, lookupRuntime) =>
+    runFailOpenMcp(status, lean ? { lookupRuntime } : options);
   const runtimeCwd = releasePluginCacheCwd();
   const installed = await resolveCli({ provision: false });
   if (
@@ -5072,7 +5567,7 @@ async function main() {
         });
       });
     });
-    diagnostic = runFailOpenMcp(() => status, {
+    diagnostic = runMcp(() => status, {
       shouldHandoff: () => Boolean(ready),
       startRuntime: () => spawnStdioRuntime(ready, runtimeCwd, ['pipe', 'pipe', 'pipe']),
       onRuntimeFailure: (failure) => {
@@ -5104,7 +5599,7 @@ async function main() {
           },
         });
       },
-    });
+    }, () => ready);
     return;
   }
   const resolved = installed;
@@ -5113,7 +5608,7 @@ async function main() {
   if (failOpenReason) {
     resolved.managedCliRetention = managedCliRetentionReport(resolved, probe, { dryRun: true });
     rememberLaunch(resolved, runtimeCwd);
-    runFailOpenMcp(fallbackDiagnostic(resolved, probe, failOpenReason, {
+    runMcp(fallbackDiagnostic(resolved, probe, failOpenReason, {
       projectRoot: null,
       projectRootSource: 'request_argument',
     }));
@@ -5127,7 +5622,7 @@ async function main() {
     summary: 'CodeStory is handing the initialized MCP session to its verified stdio runtime.',
   });
   let handoffReady = true;
-  runFailOpenMcp(() => status, {
+  runMcp(() => status, {
     shouldHandoff: () => handoffReady,
     startRuntime: () => spawnStdioRuntime(resolved, runtimeCwd, ['pipe', 'pipe', 'pipe']),
     onRuntimeFailure: (failure) => {
@@ -5160,10 +5655,15 @@ async function main() {
         },
       });
     },
-  });
+  }, () => resolved);
 }
 
 function runLauncherError(error) {
+  if (['mcp_tool_surface_invalid', 'family_v1_lossless_json_unavailable'].includes(error.code)) {
+    process.stderr.write(`${error.message}\n`);
+    process.exitCode = 1;
+    return;
+  }
   releasePluginCacheCwd();
   const resolved = {
     source: 'launcher',
@@ -5189,7 +5689,9 @@ function runLauncherError(error) {
 
 if (require.main === module) {
   installLauncherFatalHandlers();
-  if (!isMainThread && workerData?.codestoryMode === 'managed-provision') {
+  if (isMainThread && process.argv[2] === lookupRefreshWorkerFlag) {
+    runLookupRefreshWorker().catch(() => {});
+  } else if (!isMainThread && workerData?.codestoryMode === 'managed-provision') {
     runManagedProvisioningWorkerEntrypoint().catch((error) => {
       throw error;
     });
@@ -5198,6 +5700,9 @@ if (require.main === module) {
   }
 } else {
   module.exports = {
+    resolveCli,
+    runLookup,
+    runPacket,
     _test: {
       compareManagedCliVersions,
       applyCursorLocalOverrides,

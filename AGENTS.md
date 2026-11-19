@@ -95,6 +95,11 @@ adapter to compensate for incorrect upstream state.
 
 ### Reads, activation, and publication
 
+- `served_lookup` in `codestory-runtime` owns live `find`, `refs`, and `read`
+  results. The shell and lean MCP launchers use the same version-matched CLI
+  and structured refresh advice. Call bindings describe the pinned index,
+  even when both endpoint files still match.
+
 - Status, doctor, and other read surfaces are observational. They must not
   download assets, refresh indexes, start repair, or mutate sidecar state.
   Project-scoped product tool calls own activation and automatic managed

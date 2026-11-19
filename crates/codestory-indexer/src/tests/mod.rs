@@ -1872,6 +1872,88 @@ fn parser_partial_append_lf_reuses_the_equivalent_graph_projection() -> Result<(
     Ok(())
 }
 
+#[test]
+fn parser_partial_incremental_refresh_retains_current_extraction_identity() -> Result<()> {
+    for (name, language, source) in [
+        (
+            "partial.rs",
+            "rust",
+            "pub fn retained_partial_anchor() -> i32 { 1 }\npub fn broken( {\n",
+        ),
+        (
+            "partial.py",
+            "python",
+            "def retained_python_anchor():\n    return 1\n\ndef broken(\n",
+        ),
+    ] {
+        let dir = tempdir()?;
+        let path = dir.path().join(name);
+        std::fs::write(&path, source)?;
+        let refresh = codestory_workspace::RefreshInfo {
+            mode: codestory_workspace::BuildMode::Incremental,
+            files_to_index: vec![path.clone()],
+            files_to_remove: Vec::new(),
+            existing_file_ids: HashMap::new(),
+        };
+        let mut storage = Storage::new_in_memory()?;
+        let indexer = WorkspaceIndexer::new(dir.path().to_path_buf());
+        let revision = current_file_extraction_revision(language).expect("revision");
+        indexer.run_incremental(&mut storage, &refresh, &EventBus::new(), None)?;
+        let file = storage.get_file_by_path(&path)?.expect("partial file");
+        assert!(file.indexed && !file.complete, "{name}: {file:?}");
+        assert!(storage.get_errors(None)?.is_empty());
+        assert!(
+            storage
+                .files_with_extraction_revision_mismatch(language, revision)?
+                .is_empty(),
+            "{name}: first partial extraction must record current producer"
+        );
+        assert!(
+            !storage.file_extraction_identity_matches(file.id, language, revision)?,
+            "partial identity must not certify complete cache reuse"
+        );
+        // Existing partial projections take the incremental preservation branch.
+        // Neither a metadata-only refresh nor an equal-graph LF edit may erase the stamp.
+        for replacement in [source.to_string(), format!("{source}\n")] {
+            std::fs::write(&path, &replacement)?;
+            indexer.run_incremental(&mut storage, &refresh, &EventBus::new(), None)?;
+            assert!(!storage.get_file_by_path(&path)?.unwrap().complete);
+            assert_eq!(
+                storage.get_file_content_hash(file.id)?.as_deref(),
+                Some(source_content_hash(replacement.as_bytes()).as_str())
+            );
+            assert!(
+                storage
+                    .files_with_extraction_revision_mismatch(language, revision)?
+                    .is_empty(),
+                "{name}: incremental partial stamp lost"
+            );
+        }
+        for obsolete in [Some("obsolete-revision"), None] {
+            if let Some(obsolete) = obsolete {
+                storage.get_connection().execute("UPDATE file_extraction_identity SET extraction_revision = ?1 WHERE file_id = ?2", rusqlite::params![obsolete, file.id])?;
+            } else {
+                storage.get_connection().execute(
+                    "DELETE FROM file_extraction_identity WHERE file_id = ?1",
+                    [file.id],
+                )?;
+            }
+            assert_eq!(
+                storage.files_with_extraction_revision_mismatch(language, revision)?,
+                vec![file.id]
+            );
+            indexer.run_incremental(&mut storage, &refresh, &EventBus::new(), None)?;
+            assert!(
+                storage
+                    .files_with_extraction_revision_mismatch(language, revision)?
+                    .is_empty(),
+                "{name}: real refresh must converge after {obsolete:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// `LineOffsets` replaced `source.lines().nth()` in the visibility classifier,
 /// so any disagreement with `str::lines()` silently changes the projected
 /// access of a member — no panic, no error row, just a different graph. This
@@ -1996,6 +2078,7 @@ fn parser_result_changed_with_restored_mtime_is_incomplete_and_not_cached() -> R
 
     assert!(result.cache_write.is_none());
     assert!(result.local_storage.file_content_hashes.is_empty());
+    assert!(result.local_storage.file_extraction_identities.is_empty());
     assert_eq!(result.local_storage.files.len(), 1);
     assert!(!result.local_storage.files[0].complete);
     assert!(result.local_storage.errors.iter().any(|error| {
