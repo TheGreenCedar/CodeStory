@@ -19,6 +19,29 @@ pub fn find_implementations(
         ));
     }
     let scope = lookup_scope(root, file_globs)?;
+    let explicit = super::explicit_source::render(
+        root,
+        scope.as_ref(),
+        question,
+        limit,
+        body_lines,
+        max_bytes,
+    );
+    let limit = limit - explicit.locations;
+    // A finite budget used up by the prefix must not become the
+    // generic lookup's zero (unlimited) sentinel.
+    if limit == 0 || (max_bytes != 0 && explicit.text.len() == max_bytes) {
+        return Ok(LookupReply {
+            text: explicit.text,
+            refresh_recommended: false,
+        });
+    }
+    let body_lines = body_lines.map(|lines| lines.saturating_sub(explicit.source_lines));
+    let max_bytes = if max_bytes == 0 {
+        0
+    } else {
+        max_bytes - explicit.text.len()
+    };
     let (mut reply, live_query) = with_pinned_index(storage_path, |store| {
         let unavailable = || {
             (LookupReply {
@@ -177,6 +200,9 @@ pub fn find_implementations(
             root, &terms, file_globs, limit, body_lines, max_bytes,
         )?;
         reply.text = bound_reply(format!("{}{live}", reply.text), max_bytes, &[]);
+    }
+    if !explicit.text.is_empty() {
+        reply.text.insert_str(0, &explicit.text);
     }
     Ok(reply)
 }

@@ -39,6 +39,7 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+mod explicit_source;
 mod investigation;
 mod mention_witnesses;
 mod source_candidates;
@@ -938,13 +939,18 @@ impl LiveFile {
     }
 }
 
+fn live_walk_builder(root: &Path) -> ignore::WalkBuilder {
+    let mut walk = ignore::WalkBuilder::new(root);
+    walk.add_custom_ignore_filename(".rgignore");
+    walk
+}
+
 /// Honor ignore rules and omit hidden files and symlink entries.
 fn live_walk(
     root: &Path,
     file_globs: &[String],
 ) -> Result<impl Iterator<Item = PathBuf>, ApiError> {
-    let mut walk = ignore::WalkBuilder::new(root);
-    walk.add_custom_ignore_filename(".rgignore");
+    let mut walk = live_walk_builder(root);
     if let Some(scope) = lookup_scope(root, file_globs)? {
         walk.overrides(scope);
     }

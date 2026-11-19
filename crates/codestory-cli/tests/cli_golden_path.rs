@@ -362,6 +362,271 @@ fn investigation_finds_a_body_and_links_disjoint_edits_to_verified_callers() {
 }
 
 #[test]
+fn investigation_honors_explicit_sources_before_general_results() {
+    let project = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    let root = project.path();
+    let sample = root.join("checkout.go");
+    let original = "package checkout\ntype Cart struct{}\nfunc (c *Cart) Charge() int { return 17 }\nfunc Schedule() int { return (&Cart{}).Charge() }\n";
+    fs::write(&sample, original).unwrap();
+    fs::write(
+        root.join("other.go"),
+        "package checkout\ntype Other struct{}\nfunc (c *Other) Charge() int { return 900 }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("retry.rs"),
+        "struct Queue;\nimpl Queue {\n    fn retry(&self) {}\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("accounts.py"),
+        "class Ledger:\n    def record(self):\n        return True\n",
+    )
+    .unwrap();
+    let lookup = |args: &[&str]| run_lookup(root, cache.path(), args);
+    let question = |text| lookup(&["find", "--question", text]);
+    let named = question("Where is `(*Cart).Charge` and which callers might matter?");
+    assert!(
+        named.starts_with("Explicit locations in current source:"),
+        "{named}"
+    );
+    assert!(
+        named.contains("checkout.go:3-3 (qualified declaration)"),
+        "{named}"
+    );
+    assert!(
+        named.contains("3: func (c *Cart) Charge() int { return 17 }"),
+        "{named}"
+    );
+    assert!(named.contains("Live text candidates."), "{named}");
+    for (query, location) in [
+        (
+            "Inspect `Queue::retry`.",
+            "retry.rs:3-3 (qualified declaration)",
+        ),
+        (
+            "Inspect `accounts.Ledger.record`.",
+            "accounts.py:2-2 (qualified declaration)",
+        ),
+        (
+            "Inspect checkout.go:2-3 for type context.",
+            "checkout.go:2-3 (supplied path)",
+        ),
+    ] {
+        assert!(question(query).contains(location), "{query}");
+    }
+    for query in [
+        "Explain HTTP retry or `accounts.Ledger.proposed`.",
+        "Find `(Cart).Charge`.",
+        "Inspect `../checkout.go:3`.",
+        "Inspect `accounts.Ledger`.",
+    ] {
+        assert!(
+            !question(query).contains("Explicit locations in current source:"),
+            "{query}"
+        );
+    }
+    let hidden = lookup(&[
+        "find",
+        "--question",
+        "Explain `checkout.go:3`.",
+        "--file-glob",
+        "other.go",
+    ]);
+    assert!(!hidden.contains("checkout.go:3"), "{hidden}");
+    let compact = lookup(&[
+        "find",
+        "--question",
+        "Explain `checkout.go:3`.",
+        "--no-bodies",
+        "--limit",
+        "1",
+    ]);
+    assert!(
+        compact.contains("checkout.go:3-3") && !compact.contains("return 17"),
+        "{compact}"
+    );
+    let capped = lookup(&[
+        "find",
+        "--question",
+        "Explain `checkout.go:3`.",
+        "--max-bytes",
+        "170",
+    ]);
+    assert!(capped.len() <= 170, "{capped}");
+
+    let diff = "Review the callers affected by this proposed change.\n```diff\ndiff --git a/checkout.go b/checkout.go\n--- a/checkout.go\n+++ b/checkout.go\n@@ -2,3 +2,3 @@\n type Cart struct{}\n-func (c *Cart) Charge() int { return 17 }\n+func (c *Cart) Charge() int { return -5 }\n func Schedule() int { return (&Cart{}).Charge() }\n```";
+    let cold = question(diff);
+    assert!(
+        cold.contains("checkout.go:2-4 (diff before side)"),
+        "{cold}"
+    );
+    assert!(
+        cold.contains("3: func (c *Cart) Charge() int { return 17 }"),
+        "{cold}"
+    );
+    assert!(!cold.contains("return -5"), "{cold}");
+    run_cli_json(
+        root,
+        cache.path(),
+        &["index", "--core-only", "--format", "json"],
+    );
+    let warm = question(diff);
+    assert!(
+        warm.starts_with("Explicit locations in current source:"),
+        "{warm}"
+    );
+    assert!(
+        warm.contains("checkout.go:2-4 (diff before side)"),
+        "{warm}"
+    );
+    fs::write(&sample, original.replace("return 17", "return 23")).unwrap();
+    let stale = question(diff);
+    assert!(!stale.contains("(diff before side)"), "{stale}");
+    let live = question("Inspect `checkout.go:3` and explain its behavior.");
+    assert!(
+        live.contains("3: func (c *Cart) Charge() int { return 23 }"),
+        "{live}"
+    );
+    fs::write(
+        root.join("duplicate.go"),
+        "package fork\ntype Cart struct{}\nfunc (c *Cart) Charge() int { return 41 }\n",
+    )
+    .unwrap();
+    let ambiguous = question("Where is `(*Cart).Charge`?");
+    assert!(
+        !ambiguous.contains("(qualified declaration)"),
+        "{ambiguous}"
+    );
+}
+
+#[test]
+fn investigation_implicit_sources_respect_normal_admission() {
+    let project = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    let root = project.path();
+    run_git(root, &["init", "-q"]);
+    fs::create_dir(root.join("nested")).unwrap();
+    fs::create_dir(root.join(".hidden")).unwrap();
+    fs::write(root.join(".ignore"), "config.local\n").unwrap();
+    fs::write(root.join("nested/.gitignore"), "git_excluded.rs\n").unwrap();
+    fs::write(root.join("nested/.ignore"), "local.go\n").unwrap();
+    fs::write(root.join("nested/.rgignore"), "settings.py\n").unwrap();
+    for (path, text) in [
+        ("config.local", "selection key\nSAMPLE_LOCAL_MARKER\n"),
+        (".env", "SAMPLE_HIDDEN_MARKER\n"),
+        (".hidden/config.rs", "fn SAMPLE_HIDDEN_DIRECTORY() {}\n"),
+        ("nested/git_excluded.rs", "fn SAMPLE_GIT_MARKER() {}\n"),
+        (
+            "nested/settings.py",
+            "class Ledger:\n    def record(self):\n        return 'SAMPLE_RGIGNORE_MARKER'\n",
+        ),
+        (
+            "nested/local.go",
+            "package demo\ntype Ledger struct{}\nfunc (c *Ledger) record() { println(\"SAMPLE_NESTED_IGNORE\") }\n",
+        ),
+        (
+            "loader.go",
+            "package demo\nfunc LoadConfig() { // discover .env or load config.local\n}\n",
+        ),
+    ] {
+        fs::write(root.join(path), text).unwrap();
+    }
+    let lookup = |args: &[&str]| run_lookup(root, cache.path(), args);
+    let ask = |text| lookup(&["find", "--question", text]);
+    let scoped = |text, glob| lookup(&["find", "--question", text, "--file-glob", glob]);
+    for (prompt, marker) in [
+        ("Which code discovers `.env`?", "SAMPLE_HIDDEN_MARKER"),
+        (
+            "Which function loads `config.local`?",
+            "SAMPLE_LOCAL_MARKER",
+        ),
+        (
+            "Which function loads `config.local:2`?",
+            "SAMPLE_LOCAL_MARKER",
+        ),
+        ("Where is `.hidden/config.rs:1`?", "SAMPLE_HIDDEN_DIRECTORY"),
+        ("Where is `nested/git_excluded.rs`?", "SAMPLE_GIT_MARKER"),
+        (
+            "Locate `nested.settings.Ledger.record`.",
+            "SAMPLE_RGIGNORE_MARKER",
+        ),
+        ("Locate `(*Ledger).record`.", "SAMPLE_NESTED_IGNORE"),
+    ] {
+        let found = ask(prompt);
+        assert!(
+            !found.contains("Explicit locations in current source:"),
+            "{found}"
+        );
+        assert!(!found.contains(marker), "{found}");
+    }
+    assert!(ask("Which code discovers `.env`?").contains("loader.go"));
+    assert!(ask("Which function loads `config.local`?").contains("loader.go"));
+    let diff = "Review this proposed change.\n```diff\n--- a/config.local\n+++ b/config.local\n@@ -1,2 +1,2 @@\n selection key\n-SAMPLE_LOCAL_MARKER\n+replacement\n```";
+    let proposed = ask(diff);
+    assert!(!proposed.contains("(diff before side)"), "{proposed}");
+    assert!(!proposed.contains("SAMPLE_LOCAL_MARKER"), "{proposed}");
+    for (prompt, glob) in [
+        ("Which function loads `config.local`?", "*"),
+        ("Which function loads `config.local`?", "config.local"),
+        ("Which code discovers `.env`?", ".env"),
+        (
+            "Locate `nested.settings.Ledger.record`.",
+            "nested/settings.py",
+        ),
+        ("Locate `(*Ledger).record`.", "nested/local.go"),
+        (diff, "config.local"),
+    ] {
+        let answer = scoped(prompt, glob);
+        assert!(
+            !answer.contains("Explicit locations in current source:"),
+            "{answer}"
+        );
+    }
+    let deliberate = lookup(&["read", "config.local:2", ".env:1"]);
+    assert!(
+        deliberate.contains("SAMPLE_LOCAL_MARKER") && deliberate.contains("SAMPLE_HIDDEN_MARKER"),
+        "{deliberate}"
+    );
+    let positive = scoped("Show `loader.go:2`.", "*.go");
+    assert!(
+        positive.contains("loader.go:2-2 (supplied path)"),
+        "{positive}"
+    );
+    for cap in ["127", "128", "129", "170"] {
+        let reply = lookup(&[
+            "find",
+            "--question",
+            "Show `loader.go:2`.",
+            "--max-bytes",
+            cap,
+        ]);
+        assert!(reply.len() <= cap.parse().unwrap(), "{reply}");
+    }
+    #[cfg(unix)]
+    {
+        let outside = tempdir().unwrap();
+        fs::write(
+            outside.path().join("outside.go"),
+            "package app\nfunc SAMPLE_OUTSIDE_MARKER() {}\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("alias")).unwrap();
+        std::os::unix::fs::symlink(root.join("config.local"), root.join("alias.local")).unwrap();
+        let outside = ask("Read `alias/outside.go:2` and `alias.local:2`.");
+        assert!(
+            !outside.contains("Explicit locations in current source:"),
+            "{outside}"
+        );
+        assert!(
+            !outside.contains("SAMPLE_OUTSIDE_MARKER") && !outside.contains("SAMPLE_LOCAL_MARKER"),
+            "{outside}"
+        );
+    }
+}
+
+#[test]
 fn refs_batches_verified_calls_and_scopes_the_whole_reply() {
     let workspace = tempdir().expect("workspace");
     let cache = tempdir().expect("cache");

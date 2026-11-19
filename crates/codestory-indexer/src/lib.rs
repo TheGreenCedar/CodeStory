@@ -98,6 +98,7 @@ mod proof_resolution;
 /// oversized-source cap this crate enforces.
 #[cfg(test)]
 mod projection_fence_tests;
+pub mod qualified_callable;
 pub mod resolution;
 pub mod semantic;
 pub mod structural;
