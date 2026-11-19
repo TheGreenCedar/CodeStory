@@ -235,7 +235,7 @@ fn discoverable_path(root: &Path, absolute: &Path, relative: &Path) -> bool {
         budget = remaining;
     }
     let target = absolute.to_path_buf();
-    live_walk_builder(root)
+    walk_live_source(root)
         .max_depth(Some(depth))
         .filter_entry(move |entry| {
             target.starts_with(entry.path())
@@ -388,7 +388,7 @@ fn find_named_files(
     found: &mut [Vec<Location>],
     discovery: &[usize],
 ) -> bool {
-    let mut walk = live_walk_builder(root);
+    let mut walk = walk_live_source(root);
     walk.sort_by_file_path(Path::cmp);
     let Ok(canonical_root) = root.canonicalize() else {
         return true;

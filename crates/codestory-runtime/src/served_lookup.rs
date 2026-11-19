@@ -939,7 +939,7 @@ impl LiveFile {
     }
 }
 
-fn live_walk_builder(root: &Path) -> ignore::WalkBuilder {
+fn walk_live_source(root: &Path) -> ignore::WalkBuilder {
     let mut walk = ignore::WalkBuilder::new(root);
     walk.add_custom_ignore_filename(".rgignore");
     walk
@@ -950,7 +950,7 @@ fn live_walk(
     root: &Path,
     file_globs: &[String],
 ) -> Result<impl Iterator<Item = PathBuf>, ApiError> {
-    let mut walk = live_walk_builder(root);
+    let mut walk = walk_live_source(root);
     if let Some(scope) = lookup_scope(root, file_globs)? {
         walk.overrides(scope);
     }

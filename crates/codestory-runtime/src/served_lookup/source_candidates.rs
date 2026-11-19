@@ -40,7 +40,7 @@ pub(super) fn live_candidates(
     }
     // Count visited directories as well as files so a sparse glob also has
     // a work limit. Match the ordinary live walk's ignore configuration.
-    let mut walk = live_walk_builder(root);
+    let mut walk = walk_live_source(root);
     if let Some(scope) = lookup_scope(root, file_globs)? {
         walk.overrides(scope);
     }
