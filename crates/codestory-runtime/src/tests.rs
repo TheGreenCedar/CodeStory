@@ -4852,6 +4852,99 @@ fn a_partially_parsed_file_is_reported_incomplete_not_indexed() {
     );
 }
 
+#[test]
+fn stable_parser_partial_extraction_is_fresh_without_claiming_complete_coverage() {
+    let _env = hybrid_test_env();
+    let workspace = tempdir().expect("workspace");
+    for (name, source) in [
+        (
+            "partial.rs",
+            "pub fn retained_partial_anchor() -> i32 { 1 }\npub fn broken( {\n",
+        ),
+        (
+            "partial.py",
+            "def retained_python_anchor():\n    return 1\n\ndef broken(\n",
+        ),
+    ] {
+        fs::write(workspace.path().join(name), source).expect("partial source");
+    }
+    let storage_path = workspace.path().join(".cache/codestory.db");
+    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open project");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("publish verified partial source");
+    let storage = Storage::open(&storage_path).expect("storage");
+    for name in ["partial.rs", "partial.py"] {
+        let file = storage
+            .get_file_by_path(&workspace.path().join(name))
+            .expect("file")
+            .expect("indexed partial file");
+        assert!(
+            file.indexed && !file.complete,
+            "fixture must remain parser-partial: {file:?}"
+        );
+    }
+    assert!(storage.get_errors(None).expect("errors").is_empty());
+    let manifest = WorkspaceManifest::open_with_storage_owned_exclusions(
+        workspace.path().to_path_buf(),
+        &storage_path,
+    )
+    .expect("workspace manifest");
+    let freshness = index_freshness_from_storage(workspace.path(), &manifest, &storage);
+    assert_eq!(
+        freshness.status,
+        IndexFreshnessStatusDto::Fresh,
+        "byte-identical published parser-partial source must converge: {freshness:?}"
+    );
+    assert_eq!(freshness.changed_file_count, 0);
+    let initial_publication = storage.get_complete_index_publication().unwrap();
+    drop(storage);
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+        .expect("unchanged parser-partial files reuse the current publication");
+    let storage = Store::open_read_only(&storage_path).unwrap();
+    assert_eq!(
+        storage.get_complete_index_publication().unwrap(),
+        initial_publication
+    );
+    let observations = crate::agent::packet_compiler::observe_admitted_source_coverage(
+        &controller,
+        &storage,
+        &["partial.rs".into(), "partial.py".into()],
+    );
+    assert_eq!(observations.len(), 2);
+    assert!(observations.iter().all(|row| row.status
+        == codestory_contracts::api::SourceCoverageStatusDto::Incomplete
+        && row.reason == Some(codestory_contracts::graph::FileCoverageReason::ParserPartial)));
+    assert!(
+        crate::agent::packet_coverage::PacketCoverageInput::from_observations(&observations)
+            .blocks_packet_availability()
+    );
+    for query in ["retained_partial_anchor", "retained_python_anchor"] {
+        let results = controller
+            .search_results(SearchRequest {
+                query: query.into(),
+                repo_text: SearchRepoTextMode::Off,
+                limit_per_source: 3,
+                expand_search_plan: false,
+                hybrid_weights: None,
+                hybrid_limits: None,
+            })
+            .expect("fresh partial source admits core-only search");
+        assert!(
+            results.hits.iter().any(|hit| hit.display_name == query),
+            "{query}: {:?}",
+            results.hits
+        );
+    }
+}
+
 /// CAP-1b: the production path from a citation's path to an exclusion row.
 ///
 /// The unit tests for the cap set `source_coverage` directly, so they never
@@ -8753,7 +8846,7 @@ fn full_and_incremental_publications_advance_one_durable_generation() {
 }
 
 #[test]
-fn structural_full_generations_reuse_unchanged_cache_and_preserve_previous_on_invalid_input() {
+fn structural_full_generations_reuse_cache_and_keep_explicit_rejected_source_gaps() {
     let process_cache = tempfile::tempdir().expect("owned runtime cache root");
     let workspace = tempdir().expect("workspace dir");
     let markdown_path = workspace.path().join("guide.md");
@@ -8915,29 +9008,28 @@ fn structural_full_generations_reuse_unchanged_cache_and_preserve_previous_on_in
     assert_eq!(structural_before_failure.cache_rows.len(), 2);
 
     fs::write(&markdown_path, [0xff, 0xfe, 0xfd]).expect("write invalid utf8");
-    let error = controller
+    controller
         .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
-        .expect_err("invalid structural input must fail closed");
-    assert_eq!(error.code, "source_binary");
-    assert!(error.details.as_ref().is_some_and(|details| {
-        details
-            .coverage_gaps
+        .expect("verified opaque structural input retains an identity-only gap");
+    let rejected_publication = Store::database_index_publication(&storage_path)
+        .expect("read rejected-source publication")
+        .expect("unrelated source remains published");
+    assert_eq!(rejected_publication.generation, third.generation + 1);
+    let storage = Store::open_read_only(&storage_path).unwrap();
+    let manifest = storage
+        .validate_structural_text_unit_publication(&rejected_publication)
+        .unwrap();
+    assert_eq!(manifest.projection_count, 1, "only valid JSON is projected");
+    assert!(
+        crate::stored_file_coverage_diagnostics(workspace.path(), &storage)
+            .unwrap()
             .iter()
-            .any(|gap| gap.reason == FileCoverageReason::Binary)
-    }));
-    let preserved = Store::database_index_publication(&storage_path)
-        .expect("read preserved publication")
-        .expect("preserved publication");
-    assert_eq!(preserved, third);
-    Store::open_read_only(&storage_path)
-        .expect("open preserved publication")
-        .validate_structural_text_unit_publication(&preserved)
-        .expect("previous structural manifest remains valid");
-    assert_eq!(
-        structural_live_identity(&storage_path),
-        structural_before_failure,
-        "collector failure changed the prior structural manifest or cache identity"
+            .any(|gap| gap.path == "guide.md"
+                && gap.reason == FileCoverageReason::Binary
+                && gap.verified_source
+                && !gap.projection_available)
     );
+    drop(storage);
     assert_no_staged_publication_artifacts(&storage_path);
 
     fs::write(&markdown_path, "# Replacement\n").expect("restore markdown");

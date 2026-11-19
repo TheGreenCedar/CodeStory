@@ -504,8 +504,13 @@ named fault and race cases for:
   rows after a bound;
 - Markdown fence, YAML block-scalar/URL, TOML multiline-string, shell heredoc,
   and PowerShell block-comment false-anchor suppression;
-- distinct malformed, binary/non-UTF-8, and unreadable coverage round trips,
-  plus previous-publication survival for those outcomes;
+- verified malformed and opaque structural files retain only source identity
+  and an explicit coverage gap through full, incremental, and no-op refresh;
+  callable coverage reports opaque files as omitted;
+- verified opaque-to-readable and readable-to-opaque transitions replace the
+  appropriate projection. Missing diagnostics or digests, stale projections,
+  unreadable bytes, and same-mtime drift must never authorize an omission;
+  failed verification preserves the previous publication;
 - structural cache compatibility, corruption, restored-mtime source changes,
   per-file incremental replacement, and structural-only copy-forward;
 - missing, legacy, corrupt, or source-drifted structural manifests at full,

@@ -369,6 +369,7 @@ impl PreparedCoreCommit {
         mut self,
         mode: CoreCommitMode,
         cancel_token: Option<&CancellationToken>,
+        source_index_policy: &SourceIndexPolicy,
     ) -> Result<(SearchStateBuildResult, StagedSnapshotPublishStats, Duration), ApiError> {
         #[cfg(test)]
         publication_test_checkpoint(PublicationTestBoundary::CatalogLock, cancel_token)?;
@@ -400,7 +401,10 @@ impl PreparedCoreCommit {
         #[cfg(test)]
         publication_test_checkpoint(PublicationTestBoundary::DatabaseReplacement, cancel_token)?;
         ensure_indexing_active(cancel_token)?;
-        crate::index_coverage::revalidate_malformed_sources(self.staged_mut().store_mut())?;
+        crate::index_coverage::revalidate_rejected_sources(
+            self.staged_mut().store_mut(),
+            source_index_policy,
+        )?;
         let staged_path = self.staged_mut().path().to_path_buf();
         let staged = self
             .staged

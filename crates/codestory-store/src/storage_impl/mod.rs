@@ -3127,7 +3127,8 @@ pub struct FileContentHash {
     pub content_hash: String,
 }
 
-/// Successful extraction identity, committed with the exact file projection.
+/// Verified source and extraction producer, committed with the file projection.
+/// Parser-partial identity does not certify complete coverage or cache reuse.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileExtractionIdentity {
     pub file_id: i64,
@@ -9031,7 +9032,13 @@ impl Storage {
             let file = batch.files.iter().find(|file| file.id == identity.file_id);
             if !extraction_file_ids.insert(identity.file_id)
                 || !file.is_some_and(|file| {
-                    file.indexed && file.complete && file.language == identity.language
+                    file.indexed
+                        && file.language == identity.language
+                        && (file.complete
+                            || !batch
+                                .file_errors
+                                .iter()
+                                .any(|error| error.file_id == Some(NodeId(identity.file_id))))
                 })
                 || file_content_hashes.get(&identity.file_id).copied()
                     != Some(identity.source_content_hash.as_str())
@@ -9043,7 +9050,7 @@ impl Storage {
                 || identity.extraction_revision.trim().is_empty()
             {
                 return Err(StorageError::Other(format!(
-                    "extraction identity {} does not describe a complete verified file projection",
+                    "extraction identity {} does not describe a verified error-free file extraction",
                     identity.file_id
                 )));
             }
@@ -14593,6 +14600,26 @@ impl Storage {
             });
         }
         Ok(errors)
+    }
+
+    /// Detect stale derived rows for a file whose publication is identity-only.
+    pub fn file_has_source_projection(&self, file_id: i64) -> Result<bool, StorageError> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM node WHERE file_node_id=?1 AND id<>?1)
+                     OR EXISTS(SELECT 1 FROM occurrence WHERE file_node_id=?1)
+                     OR EXISTS(SELECT 1 FROM edge WHERE file_node_id=?1)
+                     OR EXISTS(SELECT 1 FROM structural_text_projection WHERE file_id=?1)
+                     OR EXISTS(SELECT 1 FROM structural_text_unit WHERE file_id=?1)
+                     OR EXISTS(SELECT 1 FROM file_extraction_identity WHERE file_id=?1)
+                     OR EXISTS(SELECT 1 FROM callable_projection_state WHERE file_id=?1)
+                     OR EXISTS(SELECT 1 FROM symbol_search_doc WHERE file_node_id=?1)
+                     OR EXISTS(SELECT 1 FROM dense_anchor_input WHERE file_node_id=?1)
+                     OR EXISTS(SELECT 1 FROM proof_resolution_fact WHERE file_id=?1)",
+                params![file_id],
+                |row| row.get(0),
+            )
+            .map_err(StorageError::from)
     }
 
     /// Read only the coverage reasons attached to one admitted file.

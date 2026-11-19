@@ -1071,6 +1071,7 @@ pub(super) fn index_full_for_runtime_with_options(
             finish_recovery_marker: recovering_incomplete_run,
         },
         cancel_token,
+        source_index_policy,
     )?;
     let core_retention = crate::activation_retrieval::apply_core_gc_after_publication(
         runtime,

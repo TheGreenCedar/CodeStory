@@ -41,13 +41,18 @@ adapter syntax, SQLite mechanics, parsers, or model execution.
 
 ## Publication contract
 
-A complete core publication may retain verified malformed UTF-8 source with a
-`malformed` coverage gap. It retains the file identity and content digest, not
-structural units, symbol documents, or proof facts. Both full and incremental
-refresh reverify those bytes before publication. A transition from valid to
-malformed removes the old projection; unchanged malformed source does not
-trigger a retry. Unreadable source, incomplete discovery, source drift, and
-collector failures still prevent publication.
+A complete core publication may carry a structural file rejected by strict
+UTF-8 decoding or format validation as a `binary` or `malformed` coverage gap.
+The publication keeps its verified file identity and digest. It supplies no
+structural, callable, symbol, or proof projection for that file. Full and
+incremental refresh reverify the bytes before publishing. A readable file
+that becomes opaque loses its old projection. An unchanged, verified opaque
+file stays out of the refresh plan and counts as omitted in callable coverage.
+
+Unreadable files, source drift, incomplete discovery, failed collectors, and
+opaque claims without verified source or with surviving projections block
+publication. Covered files remain searchable when a verified opaque gap exists,
+and whole-project coverage reports the gap.
 
 Runtime publishes the core index through store, then asks retrieval to finalize
 immutable lexical/vector/SCIP state when a broad operation needs it. On reads it

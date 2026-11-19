@@ -6,7 +6,9 @@ use crate::search_publication::{
 use crate::support::{BoundedTextRead, read_file_text_limited};
 use anyhow::{Result, bail};
 use codestory_contracts::api::ApiError;
+use codestory_contracts::graph::FileCoverageReason;
 use codestory_indexer::CancellationToken;
+use codestory_indexer::structural::{is_structural_candidate_path, is_structural_source_text};
 use codestory_retrieval::callable_index::{
     self, CALLABLE_INDEX_FILE, Definition, PreviousGeneration, Writer,
 };
@@ -193,7 +195,11 @@ fn verify_file(
     else {
         return None;
     };
-    if bytes_read != hit.file_bytes || hex_hash(&contents) != hash {
+    if bytes_read != hit.file_bytes
+        || hex_hash(&contents) != hash
+        || (is_structural_candidate_path(&info.path)
+            && !is_structural_source_text(contents.as_bytes()))
+    {
         return None;
     }
     Some(VerifiedFile {
@@ -563,7 +569,13 @@ fn populate_file(
         bail!("callable index build cancelled");
     }
     let partial = !file.complete;
-    if !file.indexed {
+    if !file.indexed
+        || (partial
+            && is_structural_candidate_path(&file.path)
+            && store
+                .get_file_coverage_reasons(file.id)?
+                .contains(&FileCoverageReason::Binary))
+    {
         return writer.file_status(file.id, partial, true, 0);
     }
     let definitions = store.callable_definitions_for_file(file.id)?;
@@ -577,7 +589,10 @@ fn populate_file(
     let BoundedTextRead::Contents { contents, .. } = read_file_text_limited(&absolute, cap) else {
         return writer.file_status(file.id, partial, true, 0);
     };
-    if hex_hash(&contents) != hash {
+    if hex_hash(&contents) != hash
+        || (is_structural_candidate_path(&file.path)
+            && !is_structural_source_text(contents.as_bytes()))
+    {
         return writer.file_status(file.id, partial, true, 0);
     }
     let offsets = line_offsets(&contents);

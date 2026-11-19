@@ -90,17 +90,74 @@ pub fn index_structural_file(path: &Path) -> Result<IntermediateStorage> {
     finalize_structural_storage(path, &source, &source_content_hash, storage)
 }
 
-pub(crate) fn decode_structural_source(
-    bytes: Vec<u8>,
-) -> std::result::Result<String, StructuralCollectionError> {
-    if bytes.contains(&0)
+/// Whether raw bytes meet the structural collector's text contract.
+pub fn is_structural_source_text(bytes: &[u8]) -> bool {
+    !has_binary_controls(bytes) && std::str::from_utf8(bytes).is_ok()
+}
+
+fn has_binary_controls(bytes: &[u8]) -> bool {
+    bytes.contains(&0)
         || bytes
             .iter()
             .any(|byte| *byte < 0x09 || (*byte > 0x0d && *byte < 0x20 && *byte != 0x1b))
-    {
+}
+
+pub(crate) fn decode_structural_source(
+    bytes: Vec<u8>,
+) -> std::result::Result<String, StructuralCollectionError> {
+    if has_binary_controls(&bytes) {
         return Err(StructuralCollectionError::Binary);
     }
     String::from_utf8(bytes).map_err(|_| StructuralCollectionError::Binary)
+}
+
+/// One complete regular-file read at the active structural byte bound.
+/// An over-limit file has no source identity to publish.
+pub fn read_structural_source_snapshot(
+    path: &Path,
+    cap: u64,
+) -> std::io::Result<Option<(Vec<u8>, i64)>> {
+    use std::io::Read;
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other(
+            "structural source is not a regular file",
+        ));
+    }
+    if metadata.len() > cap {
+        return Ok(None);
+    }
+    let mut file = std::fs::File::open(path)?;
+    let before = file.metadata()?;
+    if !before.is_file() {
+        return Err(std::io::Error::other(
+            "structural source is not a regular file",
+        ));
+    }
+    if before.len() > cap {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(cap.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > cap {
+        return Ok(None);
+    }
+    let after = file.metadata()?;
+    let modified = before.modified()?;
+    if before.len() != bytes.len() as u64
+        || before.len() != after.len()
+        || after.modified()? != modified
+    {
+        return Err(std::io::Error::other(
+            "structural source changed during the read",
+        ));
+    }
+    Ok(Some((
+        bytes,
+        codestory_workspace::clamp_system_time_to_epoch_millis(modified),
+    )))
 }
 
 pub(crate) fn structural_producer(path: &Path) -> Option<&'static str> {

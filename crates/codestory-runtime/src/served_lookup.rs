@@ -1008,7 +1008,8 @@ fn scan_live_tree(
 }
 
 /// Read a searchable text file into `bytes`. Files larger than 4 MB or with a
-/// NUL in their first kilobyte are not text this lookup serves.
+/// NUL in their first kilobyte are skipped. Structural text must also match
+/// the collector's strict source contract.
 fn read_live_text(path: &Path, bytes: &mut Vec<u8>) -> bool {
     bytes.clear();
     let Ok(file) = std::fs::File::open(path) else {
@@ -1023,6 +1024,8 @@ fn read_live_text(path: &Path, bytes: &mut Vec<u8>) -> bool {
     }
     bytes.len() as u64 <= MAX_FILE_BYTES
         && !bytes[..bytes.len().min(BINARY_PROBE_BYTES)].contains(&0)
+        && (!codestory_indexer::structural::is_structural_candidate_path(path)
+            || codestory_indexer::structural::is_structural_source_text(bytes))
 }
 
 fn match_live_file(

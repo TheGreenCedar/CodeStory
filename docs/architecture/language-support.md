@@ -26,10 +26,13 @@ a partial tree. Runtime treats it as `parser_partial` only when the indexed byte
 have a verified content hash, the file carries no file-level error, and storage
 does not require a retry. That row remains `complete=false` so diagnostics do
 not overstate parser coverage, but it does not block an otherwise atomic core
-publication. Malformed, binary/non-UTF-8, unreadable, changed, incompletely
-discovered, or collector-failed source remains a publication blocker.
-Verified byte- or structural-unit-bound policy exclusions remain source
-inventory only and make no graph, semantic, typed-target, or sufficiency claim.
+publication. A reverified structural file can retain its identity and
+content digest as a `malformed` or `binary` coverage gap. It provides no
+structural anchors or callable evidence, and readable files remain searchable.
+Unreadable, changed, incompletely discovered, or collector-failed source still
+blocks publication. An opaque gap also blocks publication when its raw identity
+cannot be verified or an old projection survives. Verified byte- or
+structural-unit-bound policy exclusions remain inventory only.
 
 ## Current Runtime Claims
 
@@ -127,9 +130,12 @@ descendants before inventory metadata or content reads. Repository ancestors
 with those names do not affect admission. A structural file is accepted only
 as a complete UTF-8 projection within the 1 MiB and 2,048-unit bounds
 (policy-carried, and deliberately below the larger parser-backed headroom);
-malformed, binary, unreadable, source-drifted, cancelled, or failed collection
-does not publish reusable units. Cache identity v2 invalidates pre-limit
-artifacts, and cache hits independently enforce the same unit bound.
+malformed or binary input can record a verified identity-only gap after a
+bounded read and re-verification. It contributes no reusable units and counts
+as omitted from callable coverage when it is binary. Unreadable, changed,
+cancelled, or collector-failed input cannot authorize a new publication.
+Cache identity v2 invalidates pre-limit artifacts, and cache hits independently
+enforce the same unit bound.
 
 Safe wording: structural-text anchors prove only that their collector found the
 cited source span; their `source_range_only` status must not be upgraded into

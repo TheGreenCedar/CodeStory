@@ -8,6 +8,10 @@
 - `codestory-cli setup` installs shell lookup instructions for Codex, Claude Code, Cursor, OpenCode and Antigravity. Cursor uses a project rule. Each setup command can remove its own instructions.
 - MCP clients can opt into a read-only catalog of `find`, `refs` and `read`. It stays stable while the matching runtime downloads. Ordinary indexing restores semantic search data after a background core-only refresh.
 
+- CodeStory keeps readable files searchable when a repository contains a structural file it cannot decode. Coverage reports the omitted file.
+
+- Files with syntax errors can stay up to date when CodeStory verifies the source it could parse. Coverage still reports what the parser could not establish.
+
 ## 0.18.0
 
 - Packets reuse one repository identity snapshot while selecting a response, avoiding repeated Git status scans within the same request.

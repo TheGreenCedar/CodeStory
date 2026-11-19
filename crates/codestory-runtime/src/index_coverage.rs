@@ -17,6 +17,7 @@ use codestory_workspace::{
     OversizedSourceExclusionCandidate, RefreshExecutionPlan, RefreshMode, SourceIndexPolicy,
     WorkspaceInventoryOutcome, WorkspaceManifest, project_identity_v3,
 };
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -51,10 +52,14 @@ fn file_coverage_reason(
     errors_by_file: &HashMap<i64, Vec<FileCoverageReason>>,
     has_verified_content: bool,
 ) -> Option<FileCoverageReason> {
+    let reasons = errors_by_file.get(&file.id);
     if file.complete {
-        return None;
+        // A complete marker cannot hide a conflicting opaque rejection.
+        return reasons
+            .filter(|reasons| reasons.contains(&FileCoverageReason::Binary))
+            .map(|_| FileCoverageReason::Binary);
     }
-    if let Some(reason) = errors_by_file.get(&file.id).and_then(|reasons| {
+    if let Some(reason) = reasons.and_then(|reasons| {
         reasons
             .iter()
             .find(|reason| {
@@ -67,7 +72,10 @@ fn file_coverage_reason(
     }) {
         return Some(*reason);
     }
-    if !file.complete && file.indexed && has_verified_content {
+    if file.indexed
+        && has_verified_content
+        && !codestory_indexer::structural::is_structural_candidate_path(&file.path)
+    {
         Some(FileCoverageReason::ParserPartial)
     } else {
         Some(FileCoverageReason::CollectorFailure)
@@ -86,36 +94,87 @@ pub(crate) fn file_coverage_retryable(reason: FileCoverageReason) -> bool {
 pub(crate) fn coverage_gap_blocks_publication(gap: &FileCoverageDiagnosticDto) -> bool {
     match gap.reason {
         FileCoverageReason::ParserPartial => !gap.verified_source,
-        FileCoverageReason::Malformed => !gap.verified_source || gap.projection_available,
+        FileCoverageReason::Malformed | FileCoverageReason::Binary => {
+            !gap.verified_source || gap.projection_available
+        }
         _ => true,
     }
 }
 
-/// Malformed files have no projection to validate. Recheck their authenticated
-/// source identity at the final commit fence, including same-mtime replacement.
-pub(crate) fn revalidate_malformed_sources(storage: &Store) -> Result<(), ApiError> {
-    let malformed = storage
+/// Identity-only rejections are rechecked at the publication fence and before
+/// a no-op can reuse a stored publication. An opaque gap requires a genuine
+/// strict decoder rejection of the same bounded raw bytes.
+pub(crate) fn revalidate_rejected_sources(
+    storage: &Store,
+    policy: &SourceIndexPolicy,
+) -> Result<(), ApiError> {
+    let rejected = storage
         .get_errors(None)
         .map_err(|error| ApiError::internal(format!("Failed to read coverage errors: {error}")))?
         .into_iter()
-        .filter(|error| error.coverage_reason == Some(FileCoverageReason::Malformed))
-        .filter_map(|error| error.file_id.map(|id| id.0))
+        .filter_map(|error| {
+            let reason = error.coverage_reason?;
+            matches!(
+                reason,
+                FileCoverageReason::Malformed | FileCoverageReason::Binary
+            )
+            .then_some((error.file_id.map(|id| id.0), reason))
+        })
         .collect::<HashSet<_>>();
-    if malformed.is_empty() {
+    if rejected.is_empty() {
         return Ok(());
     }
     let files = storage.files().inventory().map_err(|error| {
         ApiError::internal(format!("Failed to read source identities: {error}"))
     })?;
+    let files = files
+        .iter()
+        .map(|file| (file.id, file))
+        .collect::<HashMap<_, _>>();
     codestory_workspace::reverify_source_freshness_from_content();
-    for file in files.iter().filter(|file| malformed.contains(&file.id)) {
-        if file.content_hash.is_none()
-            || codestory_workspace::stored_file_requires_reindex(&file.path, file)
-        {
-            return Err(ApiError::new(
+    for (id, reason) in rejected {
+        let invalid = || {
+            ApiError::new(
                 "source_changed",
-                "Malformed source could not be reverified at publication; the candidate was discarded.",
-            ));
+                "Rejected source could not be reverified at publication; the candidate was discarded.",
+            )
+        };
+        let file = id.and_then(|id| files.get(&id)).ok_or_else(invalid)?;
+        let Some(expected_hash) = file.content_hash.as_deref() else {
+            return Err(invalid());
+        };
+        if reason == FileCoverageReason::Malformed {
+            if codestory_workspace::stored_file_requires_reindex(&file.path, file) {
+                return Err(invalid());
+            }
+            continue;
+        }
+        if !file.indexed
+            || file.complete
+            || file.retry_required
+            || !codestory_indexer::structural::is_structural_candidate_path(&file.path)
+            || storage
+                .file_has_source_projection(file.id)
+                .map_err(|error| {
+                    ApiError::internal(format!(
+                        "Failed to inspect rejected source projection: {error}"
+                    ))
+                })?
+        {
+            return Err(invalid());
+        }
+        let maximum = policy.structural_byte_cap.min(policy.byte_cap);
+        let Some((bytes, modified)) =
+            codestory_indexer::structural::read_structural_source_snapshot(&file.path, maximum)
+                .map_err(|_| invalid())?
+        else {
+            return Err(invalid());
+        };
+        if modified != file.modification_time
+            || codestory_indexer::structural::is_structural_source_text(&bytes)
+            || format!("{:x}", Sha256::digest(&bytes)) != expected_hash
+        {
+            return Err(invalid());
         }
     }
     Ok(())
@@ -367,32 +426,44 @@ pub(crate) fn stored_file_coverage_diagnostics(
             );
         }
     }
-    Ok(files
-        .iter()
-        .filter_map(|file| {
-            let verified_source = verified_file_ids.contains(&file.id);
-            let dedicated_openapi_source = file.language == "openapi"
-                && verified_source
-                && dedicated_openapi_projection_file_ids.contains(&file.id);
-            let structural_projection_verified = dedicated_openapi_source
-                || !codestory_indexer::structural::is_structural_candidate_path(&file.path)
-                || (verified_source && structural_projection_file_ids.contains(&file.id));
-            let reason = if file.complete && !structural_projection_verified {
-                Some(FileCoverageReason::CollectorFailure)
-            } else {
-                file_coverage_reason(file, &errors_by_file, verified_source)
-            };
-            reason.map(|reason| FileCoverageDiagnosticDto {
-                path: runtime_relative_path(root, &file.path),
-                reason,
-                retryable: file_coverage_retryable(reason),
-                verified_source,
-                projection_available: file.indexed
-                    && verified_source
-                    && structural_projection_verified,
-            })
-        })
-        .collect())
+    let mut diagnostics = Vec::new();
+    for file in &files {
+        let verified_source = verified_file_ids.contains(&file.id);
+        let dedicated_openapi_source = file.language == "openapi"
+            && verified_source
+            && dedicated_openapi_projection_file_ids.contains(&file.id);
+        let structural_projection_verified = dedicated_openapi_source
+            || !codestory_indexer::structural::is_structural_candidate_path(&file.path)
+            || (verified_source && structural_projection_file_ids.contains(&file.id));
+        let reason = if file.complete && !structural_projection_verified {
+            Some(FileCoverageReason::CollectorFailure)
+        } else {
+            file_coverage_reason(file, &errors_by_file, verified_source)
+        };
+        let Some(reason) = reason else {
+            continue;
+        };
+        let projection_available = if reason == FileCoverageReason::Binary {
+            file.complete
+                || storage
+                    .file_has_source_projection(file.id)
+                    .map_err(|error| {
+                        ApiError::internal(format!(
+                            "Failed to inspect rejected source projection: {error}"
+                        ))
+                    })?
+        } else {
+            file.indexed && verified_source && structural_projection_verified
+        };
+        diagnostics.push(FileCoverageDiagnosticDto {
+            path: runtime_relative_path(root, &file.path),
+            reason,
+            retryable: file_coverage_retryable(reason),
+            verified_source,
+            projection_available,
+        });
+    }
+    Ok(diagnostics)
 }
 
 pub(crate) fn source_coverage_failure_code(
@@ -546,7 +617,10 @@ impl IndexedFilesAggregation {
                         verified_source,
                         projection_available: file.indexed
                             && verified_source
-                            && reason != FileCoverageReason::Malformed,
+                            && !matches!(
+                                reason,
+                                FileCoverageReason::Malformed | FileCoverageReason::Binary
+                            ),
                     })
             })
             .collect();

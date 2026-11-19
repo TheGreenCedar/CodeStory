@@ -66,9 +66,12 @@ callers for argument expressions; canonical declarations, including one-line
 functions, remain eligible owners.
 Parser body metadata joins the outer declaration coordinates to the proper
 execution-body range. Successful verified extraction and current cache replay
-record the Python extraction revision with the file's source hash; incomplete
-extraction cannot certify an inherited projection. A revision mismatch forces
-file projection replacement before equality-based reuse.
+record the Python or Rust extraction revision with the file's source hash.
+Indexed, hash-verified parser-partial files with no file-level error retain this
+producer identity while remaining incomplete; the identity certifies neither
+complete coverage nor inherited-graph cache reuse. Missing or outdated producer
+identity still selects the file for refresh. For complete projections, a revision
+mismatch forces replacement before equality-based reuse.
 
 ## What Gets Flushed
 
@@ -131,9 +134,11 @@ rather than compiled into the collector, so an operator override reaches them an
 an exclusion names the bound that refused it. A bound failure rejects the whole
 file instead of publishing a truncated projection. Structural cache identity
 v2 invalidates pre-limit artifacts, and cache hits enforce the same unit cap.
-Invalid UTF-8/binary bytes, malformed format syntax, and unreadable sources
-retain distinct coverage reasons and do not create reusable structural cache
-entries.
+Invalid UTF-8 or binary bytes, malformed format syntax, and unreadable sources
+retain distinct coverage reasons. A bounded opaque file can retain its raw
+content digest after the indexer rereads it and verifies the bytes. It produces
+no structural projection or cache entry. Structural text readers use the same
+UTF-8 and binary-control checks.
 
 ## Resolution and Semantic Fallback
 

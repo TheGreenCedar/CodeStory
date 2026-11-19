@@ -662,6 +662,8 @@ fn evaluate_incremental_plan_probe_with_options(
     if stored_coverage
         .iter()
         .any(crate::index_coverage::coverage_gap_blocks_publication)
+        || crate::index_coverage::revalidate_rejected_sources(&storage, source_index_policy)
+            .is_err()
     {
         return IncrementalPlanProbeOutcomeDto::StoredCoverageGap;
     }
@@ -1782,8 +1784,11 @@ fn run_incremental_indexing_common(
         .core_staging_and_mutation
         .saturating_add(staging_started.elapsed());
     let commit_started = Instant::now();
-    let (prepared_search_state, staged_publish_stats, publish_duration) =
-        prepared_commit.commit(CoreCommitMode::Incremental, cancel_token)?;
+    let (prepared_search_state, staged_publish_stats, publish_duration) = prepared_commit.commit(
+        CoreCommitMode::Incremental,
+        cancel_token,
+        source_index_policy,
+    )?;
     let core_retention = crate::activation_retrieval::apply_core_gc_after_publication(
         runtime,
         storage_path,
